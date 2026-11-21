@@ -675,6 +675,10 @@ fn build_lattice(
     edges_by_end
 }
 
+/// Retain full `RwkvState` tensors only for the most recent `STREAM_STATE_WINDOW` keystroke layers
+/// to keep iOS keyboard extension Dirty RAM bounded (< ~12 MB even for 100-key continuous typing).
+const STREAM_STATE_WINDOW: usize = 24;
+
 #[derive(Default)]
 pub struct PinyinStream {
     layers: Vec<Vec<PinyinPath>>,
@@ -701,6 +705,16 @@ impl PinyinStream {
         while self.layers.len() > n {
             self.layers.pop();
         }
+        // If user backspaced past the retained state window, rebuild cleanly from layer 0
+        if decoder.model.is_some() && self.layers.len() > 1 {
+            let check_start = self.layers.len().saturating_sub(STREAM_STATE_WINDOW).max(1);
+            let missing_state = self.layers[check_start..]
+                .iter()
+                .any(|layer| layer.iter().any(|p| p.state.mat_state.is_empty()));
+            if missing_state {
+                self.layers.clear();
+            }
+        }
         if self.layers.is_empty() {
             self.layers.push(vec![PinyinPath {
                 text: String::new(),
@@ -720,6 +734,17 @@ impl PinyinStream {
                 self.layers[end] = next_paths;
             } else {
                 self.layers.push(next_paths);
+            }
+            // Evict heavy RWKV recurrent tensors from layers older than the active phrase window
+            if self.layers.len() > STREAM_STATE_WINDOW + 1 {
+                let evict_idx = self.layers.len() - STREAM_STATE_WINDOW - 1;
+                if evict_idx > 0 {
+                    for p in &mut self.layers[evict_idx] {
+                        if !p.state.mat_state.is_empty() {
+                            p.state = RwkvState::default();
+                        }
+                    }
+                }
             }
         }
         build_pinyin_candidates(n, raw_code, &lattice, &self.layers, decoder)
@@ -1014,7 +1039,7 @@ fn extend_pinyin_layer(
                 let cache_key = (step.parent_key.0, step.parent_key.1, step.first);
                 let state_after_c1 = prefix_cache.entry(cache_key).or_insert_with(|| {
                     let mut st = step.parent.state.clone();
-                    nv.step_token(nv.char_to_token(step.first), &mut st);
+                    nv.step_token_heads(nv.char_to_token(step.first), &mut st, true, false);
                     st
                 });
                 let raw_lp1 = nv.score_next_char(&step.parent.state, step.first);
@@ -1078,11 +1103,12 @@ fn extend_pinyin_layer(
                 cached.clone()
             } else {
                 let mut s = step.parent.state.clone();
-                nv.step_token(nv.char_to_token(step.first), &mut s);
+                nv.step_token_heads(nv.char_to_token(step.first), &mut s, step.n_chars == 1, false);
                 s
             };
             personal_context = personal_context.push(step.first);
-            for ch in step.text.chars().skip(1) {
+            let mut rem = step.text.chars().skip(1).peekable();
+            while let Some(ch) = rem.next() {
                 let raw_lp = nv.score_next_char(&st, ch);
                 let lp = if personalize {
                     personal.interpolate_logp(
@@ -1095,7 +1121,8 @@ fn extend_pinyin_layer(
                     raw_lp
                 };
                 score += neural_w * lp;
-                nv.step_token(nv.char_to_token(ch), &mut st);
+                let is_last = rem.peek().is_none();
+                nv.step_token_heads(nv.char_to_token(ch), &mut st, is_last, false);
                 personal_context = personal_context.push(ch);
             }
             st

@@ -15,6 +15,7 @@ pub const TOK_BOS: usize = 0;
 pub const TOK_UNK: usize = 1;
 pub const TOK_COMMA: usize = 2;
 pub const TOK_PERIOD: usize = 3;
+pub const TOK_ENG_NUM: usize = 4;
 pub const CJK_LUT_BASE: u32 = 0x3400;
 pub const CJK_LUT_LEN: usize = 0xA000 - 0x3400; // 27,648 BMP CJK codepoints (0x3400..=0x9FFF)
 const HEADER_LEN: usize = 64;
@@ -363,6 +364,7 @@ pub struct NeuralOffsets {
     pub summary: NeuralLmSummary,
     pub tok_to_char: Vec<char>,
     pub has_punct_tokens: bool,
+    pub has_eng_num_token: bool,
     pub(crate) profile_id: u64,
     lut_off: usize,
     emb_w_off: usize,
@@ -485,6 +487,9 @@ impl NeuralOffsets {
         let has_punct_tokens = vocab_size > TOK_PERIOD
             && tok_to_char[TOK_COMMA] == '\0'
             && tok_to_char[TOK_PERIOD] == '\0';
+        let has_eng_num_token = has_punct_tokens
+            && vocab_size > TOK_ENG_NUM
+            && tok_to_char[TOK_ENG_NUM] == '\0';
 
         Ok(Self {
             summary: NeuralLmSummary {
@@ -497,6 +502,7 @@ impl NeuralOffsets {
             },
             tok_to_char,
             has_punct_tokens,
+            has_eng_num_token,
             profile_id: blob.iter().step_by((blob.len() / 64).max(1)).fold(
                 blob.len() as u64,
                 |hash, &byte| (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3),
@@ -610,21 +616,28 @@ impl NeuralContextTracker {
     }
 
     fn step_context_str(&mut self, nv: &NeuralView<'_>, text: &str) {
-        let mut prev_punct: Option<usize> = None;
+        let mut prev_special: Option<usize> = None;
         for ch in text.chars() {
             let u = ch as u32;
             if (CJK_LUT_BASE..0xA000).contains(&u) {
                 let tok = nv.char_to_token(ch);
                 nv.step_token(tok, &mut self.active);
-                prev_punct = None;
+                prev_special = None;
             } else if let Some(ptok) = nv.punct_to_token(ch) {
-                if prev_punct != Some(ptok) {
+                if prev_special != Some(ptok) {
                     nv.step_token(ptok, &mut self.active);
-                    prev_punct = Some(ptok);
+                    prev_special = Some(ptok);
                 }
+            } else if nv.offs.has_eng_num_token && ch.is_ascii_alphanumeric() {
+                if prev_special != Some(TOK_ENG_NUM) {
+                    nv.step_token(TOK_ENG_NUM, &mut self.active);
+                    prev_special = Some(TOK_ENG_NUM);
+                }
+            } else if nv.offs.has_eng_num_token && prev_special == Some(TOK_ENG_NUM) && matches!(ch, ' ' | '-' | '_' | '.' | '+' | '/') {
+                // Keep bridging ASCII tokens like "Git PR" or "v2.1" inside a single <ENG_NUM> span
             } else {
                 self.reset_to_bos(Some(nv));
-                prev_punct = None;
+                prev_special = None;
             }
         }
     }
@@ -705,8 +718,14 @@ impl<'a> NeuralView<'a> {
         (row, sc, ub)
     }
 
-    /// Advance recurrent state by 1 token and update cached output projections (`~38 µs` on Apple Silicon).
+    /// Advance recurrent state by 1 token and update all cached output heads (`p1`, `mtp_h`, `key1_logp`).
     pub fn step_token(&self, tok: usize, state: &mut RwkvState) {
+        self.step_token_heads(tok, state, true, true);
+    }
+
+    /// Advance recurrent state by 1 token, computing only the requested output heads.
+    /// Pinyin beam search skips `key1_logp` (and `mtp_h` on intermediate multi-char steps) for zero-loss speedup.
+    pub fn step_token_heads(&self, tok: usize, state: &mut RwkvState, compute_mtp: bool, compute_key1: bool) {
         let s = &self.offs.summary;
         let d = s.d_model;
         let h = s.n_heads;
@@ -764,6 +783,51 @@ impl<'a> NeuralView<'a> {
                 }
 
                 let s_mat = &mut st_l[head * HEAD_DIM * HEAD_DIM..(head + 1) * HEAD_DIM * HEAD_DIM];
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    use core::arch::aarch64::*;
+                    let wp = w_dec.as_ptr();
+                    let kp = k_hat.as_ptr();
+                    let rp = r_vec.as_ptr();
+                    let sm_ptr = s_mat.as_mut_ptr();
+                    for i in 0..HEAD_DIM {
+                        let vi = proj_6d[2 * d + base + i];
+                        let beta_i = sigmoid(proj_6d[4 * d + base + i]);
+                        let gi = proj_6d[5 * d + base + i];
+                        let rho_i = read_f32(self.blob, loff.rho_off + (base + i) * 4);
+
+                        let sp = sm_ptr.add(i * HEAD_DIM);
+                        let mut vp0 = vdupq_n_f32(0.0);
+                        let mut vp1 = vdupq_n_f32(0.0);
+                        let mut j = 0usize;
+                        while j < HEAD_DIM {
+                            let d0 = vmulq_f32(vld1q_f32(sp.add(j)), vld1q_f32(wp.add(j)));
+                            let d1 = vmulq_f32(vld1q_f32(sp.add(j + 4)), vld1q_f32(wp.add(j + 4)));
+                            vst1q_f32(sp.add(j), d0);
+                            vst1q_f32(sp.add(j + 4), d1);
+                            vp0 = vfmaq_f32(vp0, d0, vld1q_f32(kp.add(j)));
+                            vp1 = vfmaq_f32(vp1, d1, vld1q_f32(kp.add(j + 4)));
+                            j += 8;
+                        }
+                        let v_pred = vaddvq_f32(vaddq_f32(vp0, vp1));
+                        let delta_v = vdupq_n_f32(beta_i * (vi - v_pred));
+                        let mut ro0 = vdupq_n_f32(0.0);
+                        let mut ro1 = vdupq_n_f32(0.0);
+                        j = 0;
+                        while j < HEAD_DIM {
+                            let n0 = vfmaq_f32(vld1q_f32(sp.add(j)), delta_v, vld1q_f32(kp.add(j)));
+                            let n1 = vfmaq_f32(vld1q_f32(sp.add(j + 4)), delta_v, vld1q_f32(kp.add(j + 4)));
+                            vst1q_f32(sp.add(j), n0);
+                            vst1q_f32(sp.add(j + 4), n1);
+                            ro0 = vfmaq_f32(ro0, n0, vld1q_f32(rp.add(j)));
+                            ro1 = vfmaq_f32(ro1, n1, vld1q_f32(rp.add(j + 4)));
+                            j += 8;
+                        }
+                        let read_out = rho_i * r_vec[i] * vi + vaddvq_f32(vaddq_f32(ro0, ro1));
+                        y_tm[base + i] = read_out * silu(gi);
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..HEAD_DIM {
                     let vi = proj_6d[2 * d + base + i];
                     let beta_i = sigmoid(proj_6d[4 * d + base + i]);
@@ -815,7 +879,7 @@ impl<'a> NeuralView<'a> {
             }
         }
 
-        // 3. Final RMSNorm & cached output heads (`p1`, `mtp_h`, `key1_logp`)
+        // 3. Final RMSNorm & cached output heads (`p1`, optional `mtp_h`, optional `key1_logp`)
         rms_norm(&x[..d], &self.blob[self.offs.ln_out_off..self.offs.ln_out_off + d * 4], &mut u[..d]);
         let h_sc = quantize_act_i8(&u[..d], &mut q_buf[..d]);
 
@@ -823,18 +887,22 @@ impl<'a> NeuralView<'a> {
         self.eval_qmat(&self.offs.w_dn, &q_buf[..d], h_sc, r, d, &mut p1_fp[..r]);
         state.p1_scale = quantize_act_i8(&p1_fp[..r], &mut state.p1_q[..r]);
 
-        self.eval_qmat(&self.offs.w_mtp_h, &q_buf[..d], h_sc, r, d, &mut state.mtp_h[..r]);
-
-        let mut k1_raw = [0.0f32; 25];
-        self.eval_qmat(&self.offs.w_key1, &q_buf[..d], h_sc, 25, d, &mut k1_raw);
-        let max_k = k1_raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum_exp = 0.0f32;
-        for &v in &k1_raw {
-            sum_exp += (v - max_k).exp();
+        if compute_mtp {
+            self.eval_qmat(&self.offs.w_mtp_h, &q_buf[..d], h_sc, r, d, &mut state.mtp_h[..r]);
         }
-        let log_z = max_k + sum_exp.ln();
-        for i in 0..25 {
-            state.key1_logp[i] = k1_raw[i] - log_z;
+
+        if compute_key1 {
+            let mut k1_raw = [0.0f32; 25];
+            self.eval_qmat(&self.offs.w_key1, &q_buf[..d], h_sc, 25, d, &mut k1_raw);
+            let max_k = k1_raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0f32;
+            for &v in &k1_raw {
+                sum_exp += (v - max_k).exp();
+            }
+            let log_z = max_k + sum_exp.ln();
+            for i in 0..25 {
+                state.key1_logp[i] = k1_raw[i] - log_z;
+            }
         }
     }
 
