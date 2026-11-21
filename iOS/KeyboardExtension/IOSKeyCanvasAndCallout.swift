@@ -377,7 +377,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
         var committedByRollover: Bool = false
     }
 
-    private var snapshot: IOSKeyboardLayoutEngine.LayoutSnapshot?
+    private(set) var snapshot: IOSKeyboardLayoutEngine.LayoutSnapshot?
     var validNextMask: UInt32 = 0x03FF_FFFF
     var nextKeyPriors: [UInt8] = Array(repeating: 100, count: 26)
     var touchOffsets: [Float] = Array(repeating: 0, count: 52)
