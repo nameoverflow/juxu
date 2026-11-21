@@ -21,7 +21,7 @@ public final class JuxuInputController: IMKInputController {
     private func configurePanelCallbacks() {
         CandidatePanelController.shared.onSelect = { [weak self] relIdx in
             guard let self else { return }
-            let out = WubiBridge.shared.selectCandidate(
+            let out = JuxuBridge.shared.selectCandidate(
                 pageRelIndex: relIdx,
                 timestampMs: Self.nowMs()
             )
@@ -29,7 +29,7 @@ public final class JuxuInputController: IMKInputController {
         }
         CandidatePanelController.shared.onPage = { [weak self] delta in
             guard let self else { return }
-            let out = WubiBridge.shared.turnPage(delta: delta)
+            let out = JuxuBridge.shared.turnPage(delta: delta)
             self.applyEngineOutput(out, client: self.activeClient)
         }
     }
@@ -51,7 +51,7 @@ public final class JuxuInputController: IMKInputController {
     public override func deactivateServer(_ sender: Any!) {
         VoiceSessionController.sharedIfLoaded?.handleDeactivate()
         commitPendingAndHide(sender)
-        WubiBridge.shared.flushUserDataIfNeeded()
+        JuxuBridge.shared.flushUserDataIfNeeded()
         autoSpaceTracker.invalidate()
         lastExpectedAnchor = nil
         sawClientSupportForRanges = false
@@ -60,18 +60,18 @@ public final class JuxuInputController: IMKInputController {
 
     public override func commitComposition(_ sender: Any!) {
         commitPendingAndHide(sender)
-        WubiBridge.shared.flushUserDataIfNeeded()
+        JuxuBridge.shared.flushUserDataIfNeeded()
     }
 
     private func commitPendingAndHide(_ sender: Any!) {
         let clientObj = (sender as? (any IMKTextInput & NSObjectProtocol)) ?? activeClient
-        let pre = WubiBridge.shared.state.preedit
+        let pre = JuxuBridge.shared.state.preedit
         if !pre.isEmpty {
-            let rawText = WubiBridge.shared.state.candidates.first?.text ?? pre
+            let rawText = JuxuBridge.shared.state.candidates.first?.text ?? pre
             let formatted = formatTextForCommit(rawText, splitInternal: true, client: clientObj)
             clientObj?.insertText(formatted, replacementRange: NSRange(location: NSNotFound, length: NSNotFound))
             advanceExpectedAnchor(by: formatted.utf16.count)
-            WubiBridge.shared.clearComposition()
+            JuxuBridge.shared.clearComposition()
         }
         CandidatePanelController.shared.hide()
         ModeIndicatorPanelController.shared.hide()
@@ -116,7 +116,7 @@ public final class JuxuInputController: IMKInputController {
             } else if flags.isEmpty && shiftKeyDownAlone {
                 shiftKeyDownAlone = false
                 if event.timestamp - shiftDownTimestamp < 0.35 {
-                    let out = WubiBridge.shared.toggleAsciiMode()
+                    let out = JuxuBridge.shared.toggleAsciiMode()
                     applyEngineOutput(out, client: clientObj)
                     if out.preedit.isEmpty {
                         let caret = queryCaretRect(client: clientObj)
@@ -147,7 +147,7 @@ public final class JuxuInputController: IMKInputController {
         let hasCtrl = mods.contains(.control)
         let scalar: UInt32 = event.characters?.unicodeScalars.first?.value ?? 0
 
-        let out = WubiBridge.shared.handleKey(
+        let out = JuxuBridge.shared.handleKey(
             keyCode: event.keyCode,
             scalar: scalar,
             hasCmdOrCtrl: hasCtrl,
@@ -163,7 +163,7 @@ public final class JuxuInputController: IMKInputController {
     }
 
     private func applyEngineOutput(
-        _ out: WubiActionState,
+        _ out: JuxuActionState,
         client: (any IMKTextInput & NSObjectProtocol)?
     ) {
         if out.bell {
@@ -177,7 +177,7 @@ public final class JuxuInputController: IMKInputController {
                 replacementRange: NSRange(location: NSNotFound, length: NSNotFound)
             )
             advanceExpectedAnchor(by: formatted.utf16.count)
-            WubiBridge.shared.flushUserDataIfNeeded()
+            JuxuBridge.shared.flushUserDataIfNeeded()
         }
 
         let markedText = out.macOSPreedit
@@ -246,7 +246,7 @@ public final class JuxuInputController: IMKInputController {
 
     public override func menu() -> NSMenu! {
         let m = NSMenu(title: "句序")
-        let curSchema = WubiBridge.shared.prefs.schemaId
+        let curSchema = JuxuBridge.shared.prefs.schemaId
         let curCategory = InputSchemaCategory.category(for: curSchema)
 
         for category in InputSchemaCategory.allCases {
@@ -272,11 +272,11 @@ public final class JuxuInputController: IMKInputController {
             keyEquivalent: ""
         )
         typoItem.target = self
-        typoItem.state = WubiBridge.shared.prefs.typoEnabled ? .on : .off
+        typoItem.state = JuxuBridge.shared.prefs.typoEnabled ? .on : .off
         m.addItem(typoItem)
 
         let orientItem = NSMenuItem(
-            title: WubiBridge.shared.prefs.vertical ? "切换为横排候选栏" : "切换为竖排候选栏",
+            title: JuxuBridge.shared.prefs.vertical ? "切换为横排候选栏" : "切换为竖排候选栏",
             action: #selector(toggleOrientation(_:)),
             keyEquivalent: ""
         )
@@ -289,7 +289,7 @@ public final class JuxuInputController: IMKInputController {
             keyEquivalent: ""
         )
         autoSpaceItem.target = self
-        autoSpaceItem.state = WubiBridge.shared.prefs.autoSpaceZhEn ? .on : .off
+        autoSpaceItem.state = JuxuBridge.shared.prefs.autoSpaceZhEn ? .on : .off
         m.addItem(autoSpaceItem)
 
         // Only expose voice quick controls in menu after voice entry is enabled
@@ -328,25 +328,25 @@ public final class JuxuInputController: IMKInputController {
     }
 
     @objc private func selectSchemaFromMenu(_ sender: NSMenuItem) {
-        WubiBridge.shared.switchSchema(UInt32(sender.tag))
+        JuxuBridge.shared.switchSchema(UInt32(sender.tag))
     }
 
     @objc private func toggleTypoCorrection(_ sender: Any?) {
-        var p = WubiBridge.shared.prefs
+        var p = JuxuBridge.shared.prefs
         p.typoEnabled.toggle()
-        WubiBridge.shared.applyAndSavePreferences(p)
+        JuxuBridge.shared.applyAndSavePreferences(p)
     }
 
     @objc private func toggleOrientation(_ sender: Any?) {
-        var p = WubiBridge.shared.prefs
+        var p = JuxuBridge.shared.prefs
         p.vertical.toggle()
-        WubiBridge.shared.applyAndSavePreferences(p)
+        JuxuBridge.shared.applyAndSavePreferences(p)
     }
 
     @objc private func toggleAutoSpace(_ sender: Any?) {
-        var p = WubiBridge.shared.prefs
+        var p = JuxuBridge.shared.prefs
         p.autoSpaceZhEn.toggle()
-        WubiBridge.shared.applyAndSavePreferences(p)
+        JuxuBridge.shared.applyAndSavePreferences(p)
     }
 
     @objc private func toggleVoiceProviderMode(_ sender: Any?) {
@@ -373,7 +373,7 @@ public final class JuxuInputController: IMKInputController {
         let beforeContext = readHostContextBefore(client: client)
         var vocab = voicePrefs.parsedCustomVocabulary
         if voicePrefs.syncJuxuLexicon {
-            vocab.append(contentsOf: WubiBridge.shared.userPhrases.prefix(40).map(\.text))
+            vocab.append(contentsOf: JuxuBridge.shared.userPhrases.prefix(40).map(\.text))
         }
         return VoiceContext(
             bundleIdentifier: client?.bundleIdentifier(),
@@ -476,7 +476,7 @@ public final class JuxuInputController: IMKInputController {
         }
 
         let hostBefore = readHostContextBefore(client: client)
-        let options = AutoSpaceOptions(prefs: WubiBridge.shared.prefs)
+        let options = AutoSpaceOptions(prefs: JuxuBridge.shared.prefs)
         if !IsSecureEventInputEnabled(),
            AutoSpaceFormatter.isAutoSpaceRightTrigger(chars, options: options)
         {
@@ -511,7 +511,7 @@ public final class JuxuInputController: IMKInputController {
     ) -> String {
         guard !IsSecureEventInputEnabled() else { return text }
         let hostBefore = readHostContextBefore(client: client)
-        let options = AutoSpaceOptions(prefs: WubiBridge.shared.prefs)
+        let options = AutoSpaceOptions(prefs: JuxuBridge.shared.prefs)
         return autoSpaceTracker.prepareCommit(
             text,
             hostBefore: hostBefore,

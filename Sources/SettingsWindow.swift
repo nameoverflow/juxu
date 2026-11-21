@@ -22,14 +22,14 @@ public enum SettingsSection: String, CaseIterable, Identifiable {
 }
 
 public struct SettingsRootView: View {
-    @ObservedObject public var bridge: WubiBridge
+    @ObservedObject public var bridge: JuxuBridge
     @State public var selectedSection: SettingsSection
     @State private var newPhraseInput: String = ""
     @State private var phraseBanner: String = ""
     @State private var labCommittedText: String = "输入"
     @State private var lastTouchInfo: String = "点按下方键帽或两键交界处体验连续高斯热区与 N-gram 置信度纠错"
 
-    public init(bridge: WubiBridge, initialSection: SettingsSection = .schema) {
+    public init(bridge: JuxuBridge, initialSection: SettingsSection = .schema) {
         self.bridge = bridge
         self._selectedSection = State(initialValue: initialSection)
     }
@@ -643,8 +643,8 @@ public struct SettingsRootView: View {
 
     // MARK: - Reusable Helpers
 
-    private func samplePreviewState(vertical: Bool) -> WubiActionState {
-        WubiActionState(
+    private func samplePreviewState(vertical: Bool) -> JuxuActionState {
+        JuxuActionState(
             consumed: true,
             bell: false,
             asciiMode: false,
@@ -659,10 +659,10 @@ public struct SettingsRootView: View {
             userPhraseCount: bridge.userPhrases.count,
             calibratedKeyCount: bridge.state.calibratedKeyCount,
             candidates: [
-                WubiCandidateItem(index: 1, text: "我们", comment: "⌖trwu 96%", badge: 2, confidence: 0.96, isExact: false),
-                WubiCandidateItem(index: 2, text: "形序", comment: "", badge: 5, confidence: 0.02, isExact: true),
-                WubiCandidateItem(index: 3, text: "国", comment: "⚡l", badge: 1, confidence: 0.01, isExact: true),
-                WubiCandidateItem(index: 4, text: "语言", comment: "", badge: 0, confidence: 0.01, isExact: true),
+                JuxuCandidateItem(index: 1, text: "我们", comment: "⌖trwu 96%", badge: 2, confidence: 0.96, isExact: false),
+                JuxuCandidateItem(index: 2, text: "形序", comment: "", badge: 5, confidence: 0.02, isExact: true),
+                JuxuCandidateItem(index: 3, text: "国", comment: "⚡l", badge: 1, confidence: 0.01, isExact: true),
+                JuxuCandidateItem(index: 4, text: "语言", comment: "", badge: 0, confidence: 0.01, isExact: true),
             ]
         )
     }
@@ -784,7 +784,7 @@ public struct SettingsRootView: View {
         }
     }
 
-    private func binding<T>(_ keyPath: WritableKeyPath<WubiPreferences, T>) -> Binding<T> {
+    private func binding<T>(_ keyPath: WritableKeyPath<JuxuPreferences, T>) -> Binding<T> {
         Binding(
             get: { bridge.prefs[keyPath: keyPath] },
             set: { newVal in

@@ -15,8 +15,8 @@ pub mod user_data;
 #[cfg(test)]
 mod tests {
     use crate::code::{compose_phrase_code, expand_wildcards, PackedCode, PackedPinyin, Stem2};
-    use crate::config::{FourthEmptyBehavior, WubiConfig, WubiSchema};
-    use crate::engine::{CandidateBadge, WubiEngine, KEY_SPACE};
+    use crate::config::{FourthEmptyBehavior, JuxuConfig, InputSchema};
+    use crate::engine::{CandidateBadge, JuxuEngine, KEY_SPACE};
     use crate::format::{
         pack_trigram, serialize_wbaux, serialize_wbdict, AuxBuildInput, AuxView, CharMeta,
         DictBuildInput, DictView, ENTRY_FLAG_SINGLE_CHAR, WBAUX_MAGIC,
@@ -257,8 +257,8 @@ mod tests {
 
     #[test]
     fn four_code_auto_commit_and_fifth_push() {
-        let mut engine = WubiEngine::new(WubiConfig::default());
-        engine.load_dict(WubiSchema::Wubi86, build_sample_dict_86());
+        let mut engine = JuxuEngine::new(JuxuConfig::default());
+        engine.load_dict(InputSchema::Wubi86, build_sample_dict_86());
 
         // `trwu` ("我们") is unique at 4 codes -> auto-commits immediately on 'u'!
         for ch in ['t', 'r', 'w'] {
@@ -295,12 +295,12 @@ mod tests {
 
     #[test]
     fn auto_phrase_and_cross_schema_switching() {
-        let mut cfg = WubiConfig::default();
+        let mut cfg = JuxuConfig::default();
         cfg.auto_phrase = true;
         cfg.auto_phrase_threshold = 2;
-        let mut engine = WubiEngine::new(cfg);
-        engine.load_dict(WubiSchema::Wubi86, build_sample_dict_86());
-        engine.load_dict(WubiSchema::Wubi98, build_sample_dict_98());
+        let mut engine = JuxuEngine::new(cfg);
+        engine.load_dict(InputSchema::Wubi86, build_sample_dict_86());
+        engine.load_dict(InputSchema::Wubi98, build_sample_dict_98());
 
         // Type "棱" (`swfh`) + "镜" (`qujq`) twice consecutively
         for round in 0..2u64 {
@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(out86.commit_text, "棱镜");
 
         // Switch to 98 Wubi! "棱镜" automatically re-indexes to 98 code `swqp`!
-        engine.set_schema(WubiSchema::Wubi98);
+        engine.set_schema(InputSchema::Wubi98);
         for ch in ['s', 'w', 'q'] {
             let _ = engine.handle_key_event(0, Some(ch), false, 4000);
         }
@@ -340,8 +340,8 @@ mod tests {
 
     #[test]
     fn z_pinyin_reverse_lookup_and_wildcard() {
-        let mut engine = WubiEngine::new(WubiConfig::default());
-        engine.load_dict(WubiSchema::Wubi86, build_sample_dict_86());
+        let mut engine = JuxuEngine::new(JuxuConfig::default());
+        engine.load_dict(InputSchema::Wubi86, build_sample_dict_86());
         engine.set_aux(build_sample_aux());
 
         for ch in ['z', 'g', 'u', 'o'] {
@@ -364,8 +364,8 @@ mod tests {
 
     #[test]
     fn touch_boundary_typo_rescue_bigram_and_adaptive_hitbox() {
-        let mut engine = WubiEngine::new(WubiConfig::default());
-        engine.load_dict(WubiSchema::Wubi86, build_sample_dict_86());
+        let mut engine = JuxuEngine::new(JuxuConfig::default());
+        engine.load_dict(InputSchema::Wubi86, build_sample_dict_86());
         engine.set_aux(build_sample_aux());
 
         // 1. Empty-code rescue on touchscreen: user aims for `trwu` ("我们"),
@@ -451,8 +451,8 @@ mod tests {
         assert!((aux.trigram_boost('输', '入', '法') - 3.4).abs() < 0.02);
         assert_eq!(aux.trigram_boost('我', '入', '法'), 0.0);
 
-        let mut engine = WubiEngine::new(WubiConfig::default());
-        engine.load_dict(WubiSchema::Wubi86, build_sample_dict_86());
+        let mut engine = JuxuEngine::new(JuxuConfig::default());
+        engine.load_dict(InputSchema::Wubi86, build_sample_dict_86());
         engine.set_aux(aux);
 
         // Commit "输入" (`lwgl`), then slip `u`->`i` border (6.46, 0.02) on `ifcy` ("法") vs `ufcy` ("䇂")
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn config_auto_space_toml_roundtrip() {
-        let mut cfg = WubiConfig::default();
+        let mut cfg = JuxuConfig::default();
         assert!(cfg.auto_space_zh_en);
         assert!(cfg.auto_space_digits);
         assert!(cfg.typo.missed_space_correction);
@@ -524,7 +524,7 @@ mod tests {
         cfg.auto_space_digits = false;
         cfg.typo.missed_space_correction = false;
         let toml = cfg.to_toml_string();
-        let parsed = WubiConfig::from_toml_str(&toml);
+        let parsed = JuxuConfig::from_toml_str(&toml);
         assert!(parsed.auto_space_zh_en);
         assert!(!parsed.auto_space_digits);
         assert!(!parsed.typo.missed_space_correction);
@@ -532,8 +532,8 @@ mod tests {
 
     #[test]
     fn missed_space_empty_split_and_toggle() {
-        let mut engine = WubiEngine::new(WubiConfig::default());
-        engine.load_dict(WubiSchema::Wubi86, build_sample_dict_86());
+        let mut engine = JuxuEngine::new(JuxuConfig::default());
+        engine.load_dict(InputSchema::Wubi86, build_sample_dict_86());
         engine.set_aux(build_sample_aux());
 
         // Type 3-code `wun` ("们") without Space, followed by `q` ("我") -> `wunq` is empty!
@@ -653,10 +653,10 @@ mod tests {
         }))
         .unwrap();
 
-        let mut cfg = WubiConfig::default();
-        cfg.schema = WubiSchema::Xiaohe;
-        let mut engine = WubiEngine::new(cfg);
-        engine.load_dict(WubiSchema::Xiaohe, dict);
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::Xiaohe;
+        let mut engine = JuxuEngine::new(cfg);
+        engine.load_dict(InputSchema::Xiaohe, dict);
 
         // In Xiaohe, 'z' is a normal letter key (not Wubi omnipotent mode)!
         let out_z = engine.handle_key_event(0, Some('z'), false, 100);
@@ -694,9 +694,9 @@ mod tests {
             ],
         });
         let pdict = PinyinDictView::from_bytes(py_bytes).unwrap();
-        let mut cfg = WubiConfig::default();
-        cfg.schema = WubiSchema::Pinyin;
-        let mut engine = WubiEngine::new(cfg);
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::Pinyin;
+        let mut engine = JuxuEngine::new(cfg);
         engine.load_pinyin_dict(pdict);
 
         // 1. Full sentence: "womenshurufa" -> "我们输入法"
@@ -753,9 +753,9 @@ mod tests {
             ],
         });
         let pdict = PinyinDictView::from_bytes(py_bytes).unwrap();
-        let mut cfg = WubiConfig::default();
-        cfg.schema = WubiSchema::XiaoheShuangpin;
-        let mut engine = WubiEngine::new(cfg);
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::XiaoheShuangpin;
+        let mut engine = JuxuEngine::new(cfg);
         engine.load_pinyin_dict(pdict);
 
         // 1. Full Shuangpin sentence: wo + mf(men) + uu(shu) + ru + fa -> "我们输入法"

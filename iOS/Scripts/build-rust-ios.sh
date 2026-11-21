@@ -14,4 +14,4 @@ else
 fi
 
 cargo build --release --manifest-path "$REPO_ROOT/Core/Cargo.toml" --lib --target "$TARGET"
-cp "$REPO_ROOT/Core/target/$TARGET/release/libwubi_core.a" "$OUT_DIR/libwubi_core.a"
+cp "$REPO_ROOT/Core/target/$TARGET/release/libjuxu_core.a" "$OUT_DIR/libjuxu_core.a"

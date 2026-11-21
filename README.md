@@ -4,7 +4,7 @@
 
 ## 核心特性
 
-1. **零外部依赖、零拷贝 `mmap` 通用内核 (`Core/wubi-core`)**：
+1. **零外部依赖、零拷贝 `mmap` 通用内核 (`Core/juxu-core`)**：
    - 纯 Rust `std` + POSIX `mmap`，`[dependencies]` 为零，同时编译为 `aarch64-apple-darwin`、`aarch64-apple-ios` 与 `aarch64-apple-ios-sim` 静态库。
    - 1–4 码五笔采用保序 Base-27 `u32` 定长分桶，编译生成紧凑只读词典（`wubi86.wbdict` / `wubi98.wbdict` / `wubi06.wbdict` + `wubi_aux.wbaux` `WBAUX003`）。
    - 冷启动映射 `~1 ms`，单次击键含 24-beam 误触解码平均耗时 **< 0.1 ms**，只读 `mmap` 的 `INT8` 神经语言模型权重 Dirty RSS = 0（循环状态含 8 步退格回滚环仅 ~600 KB）。
@@ -35,7 +35,7 @@ make ios-previews  # 渲染 iPhone 2x Retina 虚拟键盘与宿主 App 预览图
 ```
 
 ### 真机 / 模拟器运行 iOS 端
-在装有完整 `Xcode.app` 的 Mac 上打开 `iOS/PrisWubi.xcodeproj`，选择 `PrisWubiApp` Scheme 并在 Signing & Capabilities 选定你的开发 Team，按 `⌘R` 即可自动触发 `iOS/Scripts/build-rust-ios.sh` 编译 Rust 静态库并安装到 iPhone 或模拟器。
+在装有完整 `Xcode.app` 的 Mac 上打开 `iOS/PrisWubi.xcodeproj`，选择 `JuxuApp` Scheme 并在 Signing & Capabilities 选定你的开发 Team，按 `⌘R` 即可自动触发 `iOS/Scripts/build-rust-ios.sh` 编译 Rust 静态库并安装到 iPhone 或模拟器。
 
 ## 开源协议与词库来源
 

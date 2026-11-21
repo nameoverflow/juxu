@@ -1,13 +1,13 @@
-use crate::config::{WubiConfig, WubiSchema};
-use crate::engine::{EngineOutput, WubiEngine};
+use crate::config::{JuxuConfig, InputSchema};
+use crate::engine::{EngineOutput, JuxuEngine};
 use crate::format::{AuxView, DictView};
 use crate::pinyin_dict::PinyinDictView;
 use crate::user_data::{TouchKeyOffset, UserStore, MAX_TOUCH_OFFSET};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
-pub struct WubiEngineHandle {
-    pub inner: WubiEngine,
+pub struct JuxuEngineHandle {
+    pub inner: JuxuEngine,
 }
 
 #[inline]
@@ -44,7 +44,7 @@ fn json_escape(s: &str, out: &mut String) {
     out.push('"');
 }
 
-fn serialize_action_and_state(engine: &WubiEngine, act: Option<&EngineOutput>) -> String {
+fn serialize_action_and_state(engine: &JuxuEngine, act: Option<&EngineOutput>) -> String {
     let mut j = String::with_capacity(512);
     j.push('{');
     let consumed = act.map(|a| a.consumed).unwrap_or(false);
@@ -127,14 +127,14 @@ fn serialize_action_and_state(engine: &WubiEngine, act: Option<&EngineOutput>) -
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_new() -> *mut WubiEngineHandle {
-    Box::into_raw(Box::new(WubiEngineHandle {
-        inner: WubiEngine::default(),
+pub extern "C" fn juxu_engine_new() -> *mut JuxuEngineHandle {
+    Box::into_raw(Box::new(JuxuEngineHandle {
+        inner: JuxuEngine::default(),
     }))
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_free(handle: *mut WubiEngineHandle) {
+pub extern "C" fn juxu_engine_free(handle: *mut JuxuEngineHandle) {
     if !handle.is_null() {
         unsafe {
             drop(Box::from_raw(handle));
@@ -143,7 +143,7 @@ pub extern "C" fn wubi_engine_free(handle: *mut WubiEngineHandle) {
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_string_free(ptr: *mut c_char) {
+pub extern "C" fn juxu_string_free(ptr: *mut c_char) {
     if !ptr.is_null() {
         unsafe {
             drop(CString::from_raw(ptr));
@@ -152,8 +152,8 @@ pub extern "C" fn wubi_string_free(ptr: *mut c_char) {
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_load_dict_mmap(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_load_dict_mmap(
+    handle: *mut JuxuEngineHandle,
     schema_id: u32,
     path: *const c_char,
 ) -> bool {
@@ -165,7 +165,7 @@ pub extern "C" fn wubi_engine_load_dict_mmap(
     };
     match DictView::open_mmap(p) {
         Ok(dict) => {
-            h.inner.load_dict(WubiSchema::from_id(schema_id), dict);
+            h.inner.load_dict(InputSchema::from_id(schema_id), dict);
             true
         }
         Err(_) => false,
@@ -173,8 +173,8 @@ pub extern "C" fn wubi_engine_load_dict_mmap(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_load_aux_mmap(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_load_aux_mmap(
+    handle: *mut JuxuEngineHandle,
     path: *const c_char,
 ) -> bool {
     let Some(h) = (unsafe { handle.as_mut() }) else {
@@ -193,8 +193,8 @@ pub extern "C" fn wubi_engine_load_aux_mmap(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_load_pinyin_dict_mmap(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_load_pinyin_dict_mmap(
+    handle: *mut JuxuEngineHandle,
     path: *const c_char,
 ) -> bool {
     let Some(h) = (unsafe { handle.as_mut() }) else {
@@ -213,18 +213,18 @@ pub extern "C" fn wubi_engine_load_pinyin_dict_mmap(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_retain_only_schema_dict(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_retain_only_schema_dict(
+    handle: *mut JuxuEngineHandle,
     schema_id: u32,
 ) {
     if let Some(h) = unsafe { handle.as_mut() } {
-        h.inner.retain_only_schema_dict(WubiSchema::from_id(schema_id));
+        h.inner.retain_only_schema_dict(InputSchema::from_id(schema_id));
     }
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_load_config(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_load_config(
+    handle: *mut JuxuEngineHandle,
     path: *const c_char,
 ) -> bool {
     let Some(h) = (unsafe { handle.as_mut() }) else {
@@ -233,7 +233,7 @@ pub extern "C" fn wubi_engine_load_config(
     let Some(p) = cstr_to_str(path) else {
         return false;
     };
-    match WubiConfig::load_file(p) {
+    match JuxuConfig::load_file(p) {
         Ok(cfg) => {
             h.inner.set_config(cfg);
             true
@@ -243,8 +243,8 @@ pub extern "C" fn wubi_engine_load_config(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_save_config(
-    handle: *const WubiEngineHandle,
+pub extern "C" fn juxu_engine_save_config(
+    handle: *const JuxuEngineHandle,
     path: *const c_char,
 ) -> bool {
     let Some(h) = (unsafe { handle.as_ref() }) else {
@@ -257,20 +257,20 @@ pub extern "C" fn wubi_engine_save_config(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_set_config_toml(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_set_config_toml(
+    handle: *mut JuxuEngineHandle,
     toml_str: *const c_char,
 ) {
     let Some(h) = (unsafe { handle.as_mut() }) else {
         return;
     };
     if let Some(s) = cstr_to_str(toml_str) {
-        h.inner.set_config(WubiConfig::from_toml_str(s));
+        h.inner.set_config(JuxuConfig::from_toml_str(s));
     }
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_get_config_toml(handle: *const WubiEngineHandle) -> *mut c_char {
+pub extern "C" fn juxu_engine_get_config_toml(handle: *const JuxuEngineHandle) -> *mut c_char {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return into_c_string(String::new());
     };
@@ -278,8 +278,8 @@ pub extern "C" fn wubi_engine_get_config_toml(handle: *const WubiEngineHandle) -
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_load_user_data(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_load_user_data(
+    handle: *mut JuxuEngineHandle,
     path: *const c_char,
 ) -> bool {
     let Some(h) = (unsafe { handle.as_mut() }) else {
@@ -304,8 +304,8 @@ pub extern "C" fn wubi_engine_load_user_data(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_save_user_data(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_save_user_data(
+    handle: *mut JuxuEngineHandle,
     path: *const c_char,
 ) -> bool {
     let Some(h) = (unsafe { handle.as_mut() }) else {
@@ -323,28 +323,28 @@ pub extern "C" fn wubi_engine_save_user_data(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_is_user_dirty(handle: *const WubiEngineHandle) -> bool {
+pub extern "C" fn juxu_engine_is_user_dirty(handle: *const JuxuEngineHandle) -> bool {
     unsafe { handle.as_ref() }
         .map(|h| h.inner.user.dirty)
         .unwrap_or(false)
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_set_schema(handle: *mut WubiEngineHandle, schema_id: u32) {
+pub extern "C" fn juxu_engine_set_schema(handle: *mut JuxuEngineHandle, schema_id: u32) {
     if let Some(h) = unsafe { handle.as_mut() } {
-        h.inner.set_schema(WubiSchema::from_id(schema_id));
+        h.inner.set_schema(InputSchema::from_id(schema_id));
     }
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_get_schema(handle: *const WubiEngineHandle) -> u32 {
+pub extern "C" fn juxu_engine_get_schema(handle: *const JuxuEngineHandle) -> u32 {
     unsafe { handle.as_ref() }
         .map(|h| h.inner.config.schema as u32)
         .unwrap_or(86)
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_set_ascii_mode(handle: *mut WubiEngineHandle, ascii_mode: bool) {
+pub extern "C" fn juxu_engine_set_ascii_mode(handle: *mut JuxuEngineHandle, ascii_mode: bool) {
     if let Some(h) = unsafe { handle.as_mut() } {
         h.inner.ascii_mode = ascii_mode;
         if ascii_mode {
@@ -354,14 +354,14 @@ pub extern "C" fn wubi_engine_set_ascii_mode(handle: *mut WubiEngineHandle, asci
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_get_ascii_mode(handle: *const WubiEngineHandle) -> bool {
+pub extern "C" fn juxu_engine_get_ascii_mode(handle: *const JuxuEngineHandle) -> bool {
     unsafe { handle.as_ref() }
         .map(|h| h.inner.ascii_mode)
         .unwrap_or(false)
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_toggle_ascii_json(handle: *mut WubiEngineHandle) -> *mut c_char {
+pub extern "C" fn juxu_engine_toggle_ascii_json(handle: *mut JuxuEngineHandle) -> *mut c_char {
     let Some(h) = (unsafe { handle.as_mut() }) else {
         return into_c_string("{}".to_string());
     };
@@ -370,8 +370,8 @@ pub extern "C" fn wubi_engine_toggle_ascii_json(handle: *mut WubiEngineHandle) -
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_set_key_layout(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_set_key_layout(
+    handle: *mut JuxuEngineHandle,
     centers_xy_52: *const f32,
     origin_x: f32,
     origin_y: f32,
@@ -394,7 +394,7 @@ pub extern "C" fn wubi_engine_set_key_layout(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_reset_touch_profile(handle: *mut WubiEngineHandle) {
+pub extern "C" fn juxu_engine_reset_touch_profile(handle: *mut JuxuEngineHandle) {
     if let Some(h) = unsafe { handle.as_mut() } {
         h.inner.user.touch_profile.reset();
         h.inner.user.dirty = true;
@@ -402,8 +402,8 @@ pub extern "C" fn wubi_engine_reset_touch_profile(handle: *mut WubiEngineHandle)
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_set_touch_profile(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_set_touch_profile(
+    handle: *mut JuxuEngineHandle,
     offsets_xy_52: *const f32,
     counts_26: *const u32,
 ) {
@@ -425,8 +425,8 @@ pub extern "C" fn wubi_engine_set_touch_profile(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_add_user_phrase(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_add_user_phrase(
+    handle: *mut JuxuEngineHandle,
     phrase: *const c_char,
 ) -> *mut c_char {
     let Some(h) = (unsafe { handle.as_mut() }) else {
@@ -450,8 +450,8 @@ pub extern "C" fn wubi_engine_add_user_phrase(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_remove_user_phrase(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_remove_user_phrase(
+    handle: *mut JuxuEngineHandle,
     phrase: *const c_char,
 ) -> bool {
     let Some(h) = (unsafe { handle.as_mut() }) else {
@@ -464,8 +464,8 @@ pub extern "C" fn wubi_engine_remove_user_phrase(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_list_user_phrases_json(
-    handle: *const WubiEngineHandle,
+pub extern "C" fn juxu_engine_list_user_phrases_json(
+    handle: *const JuxuEngineHandle,
 ) -> *mut c_char {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return into_c_string("[]".to_string());
@@ -496,22 +496,22 @@ pub extern "C" fn wubi_engine_list_user_phrases_json(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_clear(handle: *mut WubiEngineHandle) {
+pub extern "C" fn juxu_engine_clear(handle: *mut JuxuEngineHandle) {
     if let Some(h) = unsafe { handle.as_mut() } {
         h.inner.clear_composition();
     }
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_is_composing(handle: *const WubiEngineHandle) -> bool {
+pub extern "C" fn juxu_engine_is_composing(handle: *const JuxuEngineHandle) -> bool {
     unsafe { handle.as_ref() }
         .map(|h| h.inner.is_composing())
         .unwrap_or(false)
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_handle_key_json(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_handle_key_json(
+    handle: *mut JuxuEngineHandle,
     keycode: u16,
     unicode_scalar: u32,
     has_cmd_or_ctrl: bool,
@@ -532,8 +532,8 @@ pub extern "C" fn wubi_engine_handle_key_json(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_push_touch_json(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_push_touch_json(
+    handle: *mut JuxuEngineHandle,
     reported_ascii: u8,
     x: f32,
     y: f32,
@@ -550,8 +550,8 @@ pub extern "C" fn wubi_engine_push_touch_json(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_select_candidate_json(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_select_candidate_json(
+    handle: *mut JuxuEngineHandle,
     page_rel_index: u32,
     timestamp_ms: u64,
 ) -> *mut c_char {
@@ -565,8 +565,8 @@ pub extern "C" fn wubi_engine_select_candidate_json(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_page_turn_json(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_page_turn_json(
+    handle: *mut JuxuEngineHandle,
     delta: i32,
 ) -> *mut c_char {
     let Some(h) = (unsafe { handle.as_mut() }) else {
@@ -587,8 +587,8 @@ pub extern "C" fn wubi_engine_page_turn_json(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_select_abs_candidate_json(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_select_abs_candidate_json(
+    handle: *mut JuxuEngineHandle,
     abs_index: u32,
     timestamp_ms: u64,
 ) -> *mut c_char {
@@ -602,8 +602,8 @@ pub extern "C" fn wubi_engine_select_abs_candidate_json(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_all_candidates_json(
-    handle: *const WubiEngineHandle,
+pub extern "C" fn juxu_engine_all_candidates_json(
+    handle: *const JuxuEngineHandle,
     max_count: u32,
 ) -> *mut c_char {
     let Some(h) = (unsafe { handle.as_ref() }) else {
@@ -631,8 +631,8 @@ pub extern "C" fn wubi_engine_all_candidates_json(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_touch_profile_json(
-    handle: *const WubiEngineHandle,
+pub extern "C" fn juxu_engine_touch_profile_json(
+    handle: *const JuxuEngineHandle,
 ) -> *mut c_char {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return into_c_string("[]".to_string());
@@ -653,7 +653,7 @@ pub extern "C" fn wubi_engine_touch_profile_json(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_state_json(handle: *const WubiEngineHandle) -> *mut c_char {
+pub extern "C" fn juxu_engine_state_json(handle: *const JuxuEngineHandle) -> *mut c_char {
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return into_c_string("{}".to_string());
     };
@@ -661,8 +661,8 @@ pub extern "C" fn wubi_engine_state_json(handle: *const WubiEngineHandle) -> *mu
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_set_context(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_set_context(
+    handle: *mut JuxuEngineHandle,
     context_utf8: *const c_char,
 ) {
     let Some(h) = (unsafe { handle.as_mut() }) else {
@@ -676,8 +676,8 @@ pub extern "C" fn wubi_engine_set_context(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_accept_prediction(
-    handle: *mut WubiEngineHandle,
+pub extern "C" fn juxu_engine_accept_prediction(
+    handle: *mut JuxuEngineHandle,
     text_utf8: *const c_char,
     timestamp_ms: u64,
 ) {
@@ -690,8 +690,8 @@ pub extern "C" fn wubi_engine_accept_prediction(
 }
 
 #[no_mangle]
-pub extern "C" fn wubi_engine_predict_next_json(
-    handle: *const WubiEngineHandle,
+pub extern "C" fn juxu_engine_predict_next_json(
+    handle: *const JuxuEngineHandle,
     max_count: u32,
 ) -> *mut c_char {
     let Some(h) = (unsafe { handle.as_ref() }) else {

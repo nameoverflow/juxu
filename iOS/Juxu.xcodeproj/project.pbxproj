@@ -7,52 +7,51 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		08A2F0FC5FBBDF4C8390C323 /* IOSClipboardSuggestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A2F23093302CAA84B17A813 /* IOSClipboardSuggestion.swift */; };
-		20120FE97B3DF1BE17A1624C /* IOSKeyboardLayoutEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46BFE2C74F587006381BE169 /* IOSKeyboardLayoutEngine.swift */; };
-		2705B999A6481022BAD1DB39 /* PrisWubiSimulatorUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0E0C2A664DEF77854F30144 /* PrisWubiSimulatorUITests.swift */; };
-		3B91DB6F08BD291324C7F59F /* Dicts in Resources */ = {isa = PBXBuildFile; fileRef = 4D60E7763D07F95ABBAEB1FB /* Dicts */; };
-		48FA02D8D885A464ADFAD3EC /* PrisWubiKeyboard.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 895957823C12BAD9918BCE57 /* PrisWubiKeyboard.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
-		52688FDA34C00CFDF27C0B0F /* Dicts in Resources */ = {isa = PBXBuildFile; fileRef = 4D60E7763D07F95ABBAEB1FB /* Dicts */; };
-		599F971128820597BB41C57D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = DB10A68869F7E8CF905F22CE /* Assets.xcassets */; };
-		66559368D6973DD958B0EE10 /* IOSClipboardSuggestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A2F23093302CAA84B17A813 /* IOSClipboardSuggestion.swift */; };
-		7CC4D534B0A7BA6292D31EDE /* HostAppViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 243163324BBE91D33C30790C /* HostAppViews.swift */; };
-		A1CB4068CED62C1F4DFA4235 /* WubiCoreBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0F8BEB9ECAABD35AF6083D /* WubiCoreBridge.swift */; };
-		A9C35FE15444D2A8090A6122 /* PrisWubiIOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83417D86C9956F95A118786E /* PrisWubiIOSApp.swift */; };
-		CB9BFE31B6DA37297CE5AFB3 /* IOSClipboardSuggestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A2F23093302CAA84B17A813 /* IOSClipboardSuggestion.swift */; };
-		CD1750029CA61E65EC9FC488 /* IOSKeyboardLayoutEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46BFE2C74F587006381BE169 /* IOSKeyboardLayoutEngine.swift */; };
-		D484CBEE5B491EDFF773FF4C /* KeyboardViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41095DFC764371A82348C216 /* KeyboardViewController.swift */; };
-		D783274D638E2724F0F64ACC /* IOSKeyCanvasAndCallout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A37E7DC85A2DEF721A9FC0D /* IOSKeyCanvasAndCallout.swift */; };
-		EE9D9EE96D7CB218C086B040 /* IOSCandidateViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BEB0944F1CB511242465F68 /* IOSCandidateViews.swift */; };
-		F3B95164686C060718238200 /* WubiCoreBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0F8BEB9ECAABD35AF6083D /* WubiCoreBridge.swift */; };
-		F76C453CE90A5D457BA9D38D /* IOSKeyCanvasAndCallout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A37E7DC85A2DEF721A9FC0D /* IOSKeyCanvasAndCallout.swift */; };
-		F8D839E5085B2BDA6971BBA5 /* IOSKeyboardLayoutEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46BFE2C74F587006381BE169 /* IOSKeyboardLayoutEngine.swift */; };
+		008725A433CF6C1CEBAC8B26 /* JuxuCoreBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA4851968512984F458C2F8B /* JuxuCoreBridge.swift */; };
+		05E3B6DEEB22BDBE4BA06924 /* JuxuCoreBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA4851968512984F458C2F8B /* JuxuCoreBridge.swift */; };
+		0816F150C3383360292586F7 /* IOSClipboardSuggestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A2F23093302CAA84B17A813 /* IOSClipboardSuggestion.swift */; };
+		39D621C48C2CF0455B554F74 /* IOSKeyCanvasAndCallout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A37E7DC85A2DEF721A9FC0D /* IOSKeyCanvasAndCallout.swift */; };
+		5DCC91E5DFE8D70D278A31DC /* JuxuKeyboard.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = C253F25FDE1E8C779AFF9213 /* JuxuKeyboard.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		5EAA3BEE7A7BCDB7C06D7B7C /* IOSClipboardSuggestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A2F23093302CAA84B17A813 /* IOSClipboardSuggestion.swift */; };
+		624A67351A73C7FC58FBC829 /* JuxuIOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19A1D915964E6580B34439D6 /* JuxuIOSApp.swift */; };
+		6B31044FEF6F5F6C4767331D /* IOSCandidateViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BEB0944F1CB511242465F68 /* IOSCandidateViews.swift */; };
+		7F84523776A38177D1B68795 /* HostAppViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 243163324BBE91D33C30790C /* HostAppViews.swift */; };
+		83EE6DDED376BDD976C36DDD /* IOSKeyboardLayoutEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46BFE2C74F587006381BE169 /* IOSKeyboardLayoutEngine.swift */; };
+		BB5F70E39FF4E8327C6C5973 /* IOSKeyCanvasAndCallout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A37E7DC85A2DEF721A9FC0D /* IOSKeyCanvasAndCallout.swift */; };
+		C3DAD1A3AB6810D8E6F020BB /* Dicts in Resources */ = {isa = PBXBuildFile; fileRef = 4D60E7763D07F95ABBAEB1FB /* Dicts */; };
+		CF542AEFBBE5DA069467D84C /* IOSClipboardSuggestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A2F23093302CAA84B17A813 /* IOSClipboardSuggestion.swift */; };
+		DBB3D262269A132D137F2053 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = DB10A68869F7E8CF905F22CE /* Assets.xcassets */; };
+		DCA3497C2C8296A691DCDD73 /* IOSKeyboardLayoutEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46BFE2C74F587006381BE169 /* IOSKeyboardLayoutEngine.swift */; };
+		EB0F49300595A101B917AE53 /* JuxuSimulatorUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4805FBA9279DF629D5764A1 /* JuxuSimulatorUITests.swift */; };
+		F6F77395A230984DE25EBF82 /* IOSKeyboardLayoutEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46BFE2C74F587006381BE169 /* IOSKeyboardLayoutEngine.swift */; };
+		FAE742F298440BE241429A50 /* KeyboardViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41095DFC764371A82348C216 /* KeyboardViewController.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
-		38C551597A6A637C239A7406 /* PBXContainerItemProxy */ = {
+		63DFBF2B01441D5BAFBAC307 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = F73591C99474D135B8918429 /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = 277C3E6AB194CA14C1D036EB;
-			remoteInfo = PrisWubiKeyboard;
+			remoteGlobalIDString = 69104A23A4AEA48A33FB0F48;
+			remoteInfo = JuxuKeyboard;
 		};
-		5BE806F8CFDA7CFCCDB7A895 /* PBXContainerItemProxy */ = {
+		9B3CBDCA561C7700D19CE345 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = F73591C99474D135B8918429 /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = FA69B631156E5F45429B66C7;
-			remoteInfo = PrisWubiApp;
+			remoteGlobalIDString = 2F379AA38AF35D1612DBCC25;
+			remoteInfo = JuxuApp;
 		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
-		EE059FCF8D40A40A15C2E1F3 /* Embed Foundation Extensions */ = {
+		74F5CB74889603B854955651 /* Embed Foundation Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
 			dstPath = "";
 			dstSubfolderSpec = 13;
 			files = (
-				48FA02D8D885A464ADFAD3EC /* PrisWubiKeyboard.appex in Embed Foundation Extensions */,
+				5DCC91E5DFE8D70D278A31DC /* JuxuKeyboard.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -60,27 +59,27 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		1B813BC27275E0B10FBB8017 /* PrisWubiUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = PrisWubiUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		19A1D915964E6580B34439D6 /* JuxuIOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JuxuIOSApp.swift; sourceTree = "<group>"; };
 		243163324BBE91D33C30790C /* HostAppViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostAppViews.swift; sourceTree = "<group>"; };
 		3A37E7DC85A2DEF721A9FC0D /* IOSKeyCanvasAndCallout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSKeyCanvasAndCallout.swift; sourceTree = "<group>"; };
 		3BEB0944F1CB511242465F68 /* IOSCandidateViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSCandidateViews.swift; sourceTree = "<group>"; };
 		41095DFC764371A82348C216 /* KeyboardViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardViewController.swift; sourceTree = "<group>"; };
 		46BFE2C74F587006381BE169 /* IOSKeyboardLayoutEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSKeyboardLayoutEngine.swift; sourceTree = "<group>"; };
-		4D10150E530BA062150D64E6 /* PrisWubiApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = PrisWubiApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		4D60E7763D07F95ABBAEB1FB /* Dicts */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Dicts; path = ../Resources/Dicts; sourceTree = SOURCE_ROOT; };
 		7A2F23093302CAA84B17A813 /* IOSClipboardSuggestion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSClipboardSuggestion.swift; sourceTree = "<group>"; };
-		83417D86C9956F95A118786E /* PrisWubiIOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrisWubiIOSApp.swift; sourceTree = "<group>"; };
-		895957823C12BAD9918BCE57 /* PrisWubiKeyboard.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = PrisWubiKeyboard.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		BA0F8BEB9ECAABD35AF6083D /* WubiCoreBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WubiCoreBridge.swift; sourceTree = "<group>"; };
+		9D9959B2E33DB0F350D4E94B /* JuxuApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = JuxuApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C253F25FDE1E8C779AFF9213 /* JuxuKeyboard.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = JuxuKeyboard.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		DB10A68869F7E8CF905F22CE /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		E0E0C2A664DEF77854F30144 /* PrisWubiSimulatorUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrisWubiSimulatorUITests.swift; sourceTree = "<group>"; };
+		EBDA5FF7141F3B13707A961D /* JuxuUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = JuxuUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		F4805FBA9279DF629D5764A1 /* JuxuSimulatorUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JuxuSimulatorUITests.swift; sourceTree = "<group>"; };
+		FA4851968512984F458C2F8B /* JuxuCoreBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JuxuCoreBridge.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
 		054A2D4E661547530E0DDAFA /* UITests */ = {
 			isa = PBXGroup;
 			children = (
-				E0E0C2A664DEF77854F30144 /* PrisWubiSimulatorUITests.swift */,
+				F4805FBA9279DF629D5764A1 /* JuxuSimulatorUITests.swift */,
 			);
 			path = UITests;
 			sourceTree = "<group>";
@@ -109,7 +108,7 @@
 			children = (
 				DB10A68869F7E8CF905F22CE /* Assets.xcassets */,
 				243163324BBE91D33C30790C /* HostAppViews.swift */,
-				83417D86C9956F95A118786E /* PrisWubiIOSApp.swift */,
+				19A1D915964E6580B34439D6 /* JuxuIOSApp.swift */,
 			);
 			path = HostApp;
 			sourceTree = "<group>";
@@ -130,9 +129,9 @@
 		A85EA8039CF1560E6492EC6A /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				4D10150E530BA062150D64E6 /* PrisWubiApp.app */,
-				895957823C12BAD9918BCE57 /* PrisWubiKeyboard.appex */,
-				1B813BC27275E0B10FBB8017 /* PrisWubiUITests.xctest */,
+				9D9959B2E33DB0F350D4E94B /* JuxuApp.app */,
+				C253F25FDE1E8C779AFF9213 /* JuxuKeyboard.appex */,
+				EBDA5FF7141F3B13707A961D /* JuxuUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -140,7 +139,7 @@
 		AA05DB9794ECE7E3EEB21DCE /* Sources */ = {
 			isa = PBXGroup;
 			children = (
-				BA0F8BEB9ECAABD35AF6083D /* WubiCoreBridge.swift */,
+				FA4851968512984F458C2F8B /* JuxuCoreBridge.swift */,
 			);
 			name = Sources;
 			path = ../Sources;
@@ -149,63 +148,62 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		277C3E6AB194CA14C1D036EB /* PrisWubiKeyboard */ = {
+		2F379AA38AF35D1612DBCC25 /* JuxuApp */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = B52E98F4BE0E1AAF3AD6DB73 /* Build configuration list for PBXNativeTarget "PrisWubiKeyboard" */;
+			buildConfigurationList = 815801164546D723092C84FF /* Build configuration list for PBXNativeTarget "JuxuApp" */;
 			buildPhases = (
-				4ACCA66CF547BE0995CF38E4 /* Build Rust Wubi Core Staticlib */,
-				BFE4D73933991F3E361FB3D4 /* Sources */,
-				76BC550608E8D3A6AF3E98D0 /* Resources */,
+				722F84A2622C462C238B88CC /* Build Rust Wubi Core Staticlib */,
+				FF6A3B2DC7E2533D41292630 /* Sources */,
+				860B342F29AE6538E804BCA9 /* Resources */,
+				74F5CB74889603B854955651 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				1A5C09296700F307EF74262E /* PBXTargetDependency */,
 			);
-			name = PrisWubiKeyboard;
+			name = JuxuApp;
 			packageProductDependencies = (
 			);
-			productName = PrisWubiKeyboard;
-			productReference = 895957823C12BAD9918BCE57 /* PrisWubiKeyboard.appex */;
-			productType = "com.apple.product-type.app-extension";
+			productName = JuxuApp;
+			productReference = 9D9959B2E33DB0F350D4E94B /* JuxuApp.app */;
+			productType = "com.apple.product-type.application";
 		};
-		74C692D3A932891CF0A1F80B /* PrisWubiUITests */ = {
+		498B39CF026AE72958D5E1E2 /* JuxuUITests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 4F80DA6B85066E88C029090E /* Build configuration list for PBXNativeTarget "PrisWubiUITests" */;
+			buildConfigurationList = 2D75925EBD9CC70F45FE5612 /* Build configuration list for PBXNativeTarget "JuxuUITests" */;
 			buildPhases = (
-				7D4459AC67EF382673E2EB65 /* Sources */,
+				6623754624BC9AED2645C9A5 /* Sources */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-				05C56E85B8ED5DAD2EBE6AD9 /* PBXTargetDependency */,
+				69276015C0D805A6F949E66C /* PBXTargetDependency */,
 			);
-			name = PrisWubiUITests;
+			name = JuxuUITests;
 			packageProductDependencies = (
 			);
-			productName = PrisWubiUITests;
-			productReference = 1B813BC27275E0B10FBB8017 /* PrisWubiUITests.xctest */;
+			productName = JuxuUITests;
+			productReference = EBDA5FF7141F3B13707A961D /* JuxuUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
-		FA69B631156E5F45429B66C7 /* PrisWubiApp */ = {
+		69104A23A4AEA48A33FB0F48 /* JuxuKeyboard */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 4F6F8ED2DFC8B5862E7171C2 /* Build configuration list for PBXNativeTarget "PrisWubiApp" */;
+			buildConfigurationList = 44C20C44F408D3DDA885E0AF /* Build configuration list for PBXNativeTarget "JuxuKeyboard" */;
 			buildPhases = (
-				BF328630AF75688F564AB1B2 /* Build Rust Wubi Core Staticlib */,
-				FD3EDB085D34BE6C89ED78DB /* Sources */,
-				31EF02CC6017DF198612B9A5 /* Resources */,
-				EE059FCF8D40A40A15C2E1F3 /* Embed Foundation Extensions */,
+				4311DDFEB7644233212317B1 /* Build Rust Wubi Core Staticlib */,
+				7F01AF21D90DAE4BB254C13B /* Sources */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-				595613D2EADBF8AA1FF4816B /* PBXTargetDependency */,
 			);
-			name = PrisWubiApp;
+			name = JuxuKeyboard;
 			packageProductDependencies = (
 			);
-			productName = PrisWubiApp;
-			productReference = 4D10150E530BA062150D64E6 /* PrisWubiApp.app */;
-			productType = "com.apple.product-type.application";
+			productName = JuxuKeyboard;
+			productReference = C253F25FDE1E8C779AFF9213 /* JuxuKeyboard.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -216,14 +214,14 @@
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1600;
 				TargetAttributes = {
-					277C3E6AB194CA14C1D036EB = {
+					2F379AA38AF35D1612DBCC25 = {
 						ProvisioningStyle = Automatic;
 					};
-					74C692D3A932891CF0A1F80B = {
+					498B39CF026AE72958D5E1E2 = {
 						ProvisioningStyle = Automatic;
-						TestTargetID = FA69B631156E5F45429B66C7;
+						TestTargetID = 2F379AA38AF35D1612DBCC25;
 					};
-					FA69B631156E5F45429B66C7 = {
+					69104A23A4AEA48A33FB0F48 = {
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -242,35 +240,27 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				FA69B631156E5F45429B66C7 /* PrisWubiApp */,
-				277C3E6AB194CA14C1D036EB /* PrisWubiKeyboard */,
-				74C692D3A932891CF0A1F80B /* PrisWubiUITests */,
+				2F379AA38AF35D1612DBCC25 /* JuxuApp */,
+				69104A23A4AEA48A33FB0F48 /* JuxuKeyboard */,
+				498B39CF026AE72958D5E1E2 /* JuxuUITests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		31EF02CC6017DF198612B9A5 /* Resources */ = {
+		860B342F29AE6538E804BCA9 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				599F971128820597BB41C57D /* Assets.xcassets in Resources */,
-				3B91DB6F08BD291324C7F59F /* Dicts in Resources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		76BC550608E8D3A6AF3E98D0 /* Resources */ = {
-			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				52688FDA34C00CFDF27C0B0F /* Dicts in Resources */,
+				DBB3D262269A132D137F2053 /* Assets.xcassets in Resources */,
+				C3DAD1A3AB6810D8E6F020BB /* Dicts in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		4ACCA66CF547BE0995CF38E4 /* Build Rust Wubi Core Staticlib */ = {
+		4311DDFEB7644233212317B1 /* Build Rust Wubi Core Staticlib */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -289,7 +279,7 @@
 			shellPath = /bin/sh;
 			shellScript = "sh \"$PROJECT_DIR/Scripts/build-rust-ios.sh\"\n";
 		};
-		BF328630AF75688F564AB1B2 /* Build Rust Wubi Core Staticlib */ = {
+		722F84A2622C462C238B88CC /* Build Rust Wubi Core Staticlib */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -311,63 +301,82 @@
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		7D4459AC67EF382673E2EB65 /* Sources */ = {
+		6623754624BC9AED2645C9A5 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				66559368D6973DD958B0EE10 /* IOSClipboardSuggestion.swift in Sources */,
-				D783274D638E2724F0F64ACC /* IOSKeyCanvasAndCallout.swift in Sources */,
-				20120FE97B3DF1BE17A1624C /* IOSKeyboardLayoutEngine.swift in Sources */,
-				2705B999A6481022BAD1DB39 /* PrisWubiSimulatorUITests.swift in Sources */,
+				0816F150C3383360292586F7 /* IOSClipboardSuggestion.swift in Sources */,
+				BB5F70E39FF4E8327C6C5973 /* IOSKeyCanvasAndCallout.swift in Sources */,
+				F6F77395A230984DE25EBF82 /* IOSKeyboardLayoutEngine.swift in Sources */,
+				EB0F49300595A101B917AE53 /* JuxuSimulatorUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		BFE4D73933991F3E361FB3D4 /* Sources */ = {
+		7F01AF21D90DAE4BB254C13B /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				EE9D9EE96D7CB218C086B040 /* IOSCandidateViews.swift in Sources */,
-				08A2F0FC5FBBDF4C8390C323 /* IOSClipboardSuggestion.swift in Sources */,
-				F76C453CE90A5D457BA9D38D /* IOSKeyCanvasAndCallout.swift in Sources */,
-				F8D839E5085B2BDA6971BBA5 /* IOSKeyboardLayoutEngine.swift in Sources */,
-				D484CBEE5B491EDFF773FF4C /* KeyboardViewController.swift in Sources */,
-				F3B95164686C060718238200 /* WubiCoreBridge.swift in Sources */,
+				6B31044FEF6F5F6C4767331D /* IOSCandidateViews.swift in Sources */,
+				CF542AEFBBE5DA069467D84C /* IOSClipboardSuggestion.swift in Sources */,
+				39D621C48C2CF0455B554F74 /* IOSKeyCanvasAndCallout.swift in Sources */,
+				DCA3497C2C8296A691DCDD73 /* IOSKeyboardLayoutEngine.swift in Sources */,
+				008725A433CF6C1CEBAC8B26 /* JuxuCoreBridge.swift in Sources */,
+				FAE742F298440BE241429A50 /* KeyboardViewController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		FD3EDB085D34BE6C89ED78DB /* Sources */ = {
+		FF6A3B2DC7E2533D41292630 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				7CC4D534B0A7BA6292D31EDE /* HostAppViews.swift in Sources */,
-				CB9BFE31B6DA37297CE5AFB3 /* IOSClipboardSuggestion.swift in Sources */,
-				CD1750029CA61E65EC9FC488 /* IOSKeyboardLayoutEngine.swift in Sources */,
-				A9C35FE15444D2A8090A6122 /* PrisWubiIOSApp.swift in Sources */,
-				A1CB4068CED62C1F4DFA4235 /* WubiCoreBridge.swift in Sources */,
+				7F84523776A38177D1B68795 /* HostAppViews.swift in Sources */,
+				5EAA3BEE7A7BCDB7C06D7B7C /* IOSClipboardSuggestion.swift in Sources */,
+				83EE6DDED376BDD976C36DDD /* IOSKeyboardLayoutEngine.swift in Sources */,
+				05E3B6DEEB22BDBE4BA06924 /* JuxuCoreBridge.swift in Sources */,
+				624A67351A73C7FC58FBC829 /* JuxuIOSApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
-		05C56E85B8ED5DAD2EBE6AD9 /* PBXTargetDependency */ = {
+		1A5C09296700F307EF74262E /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = FA69B631156E5F45429B66C7 /* PrisWubiApp */;
-			targetProxy = 5BE806F8CFDA7CFCCDB7A895 /* PBXContainerItemProxy */;
+			target = 69104A23A4AEA48A33FB0F48 /* JuxuKeyboard */;
+			targetProxy = 63DFBF2B01441D5BAFBAC307 /* PBXContainerItemProxy */;
 		};
-		595613D2EADBF8AA1FF4816B /* PBXTargetDependency */ = {
+		69276015C0D805A6F949E66C /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = 277C3E6AB194CA14C1D036EB /* PrisWubiKeyboard */;
-			targetProxy = 38C551597A6A637C239A7406 /* PBXContainerItemProxy */;
+			target = 2F379AA38AF35D1612DBCC25 /* JuxuApp */;
+			targetProxy = 9B3CBDCA561C7700D19CE345 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		1CFAA5080D3DB1CE3CDCF519 /* Release */ = {
+		0278E11B79A11CECDA32A9F9 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = KeyboardExtension/JuxuKeyboard.entitlements;
+				INFOPLIST_FILE = KeyboardExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu.keyboard;
+				PRODUCT_NAME = JuxuKeyboard;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		11F67B72ED9D9EA71082F805 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = HostApp/PrisWubiApp.entitlements;
+				CODE_SIGN_ENTITLEMENTS = HostApp/JuxuApp.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				INFOPLIST_FILE = HostApp/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
@@ -382,7 +391,7 @@
 			};
 			name = Release;
 		};
-		3594E8B72F4ADF1A045411D4 /* Release */ = {
+		25C2BB3C3D7BAAE2682B072E /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
@@ -396,9 +405,46 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu.uitests;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = PrisWubiApp;
+				TEST_TARGET_NAME = JuxuApp;
+			};
+			name = Debug;
+		};
+		3583AD75346D00BB6493C77D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu.uitests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = JuxuApp;
 			};
 			name = Release;
+		};
+		498405ACD238A12938AD536C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = HostApp/JuxuApp.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				INFOPLIST_FILE = HostApp/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu;
+				PRODUCT_NAME = JuxuApp;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
 		};
 		4E45AEA48D979B2DB9F7758A /* Debug */ = {
 			isa = XCBuildConfiguration;
@@ -464,33 +510,14 @@
 				ONLY_ACTIVE_ARCH = YES;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
-					"-lwubi_core",
+					"-ljuxu_core",
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
-				SWIFT_OBJC_BRIDGING_HEADER = "$(PROJECT_DIR)/../Core/include/wubi_core.h";
+				SWIFT_OBJC_BRIDGING_HEADER = "$(PROJECT_DIR)/../Core/include/juxu_core.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 6.0;
-			};
-			name = Debug;
-		};
-		587AC00B8647CBB215997A53 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = HostApp/PrisWubiApp.entitlements;
-				CODE_SIGN_IDENTITY = "iPhone Developer";
-				INFOPLIST_FILE = HostApp/Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu;
-				PRODUCT_NAME = JuxuApp;
-				SDKROOT = iphoneos;
-				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Debug;
 		};
@@ -551,22 +578,22 @@
 				MTL_FAST_MATH = YES;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
-					"-lwubi_core",
+					"-ljuxu_core",
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				SWIFT_COMPILATION_MODE = wholemodule;
-				SWIFT_OBJC_BRIDGING_HEADER = "$(PROJECT_DIR)/../Core/include/wubi_core.h";
+				SWIFT_OBJC_BRIDGING_HEADER = "$(PROJECT_DIR)/../Core/include/juxu_core.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 6.0;
 			};
 			name = Release;
 		};
-		B30B10FA4EFF30E3FAAFC40F /* Release */ = {
+		9E7860865B2A91AFBDCF7FB2 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
-				CODE_SIGN_ENTITLEMENTS = KeyboardExtension/PrisWubiKeyboard.entitlements;
+				CODE_SIGN_ENTITLEMENTS = KeyboardExtension/JuxuKeyboard.entitlements;
 				INFOPLIST_FILE = KeyboardExtension/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -578,63 +605,35 @@
 				PRODUCT_NAME = JuxuKeyboard;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
-			};
-			name = Release;
-		};
-		C7FF4ED5BD586BB23A89F5D4 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				APPLICATION_EXTENSION_API_ONLY = YES;
-				CODE_SIGN_ENTITLEMENTS = KeyboardExtension/PrisWubiKeyboard.entitlements;
-				INFOPLIST_FILE = KeyboardExtension/Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@executable_path/../../Frameworks",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu.keyboard;
-				PRODUCT_NAME = JuxuKeyboard;
-				SDKROOT = iphoneos;
-				TARGETED_DEVICE_FAMILY = "1,2";
-			};
-			name = Debug;
-		};
-		DC68D879CDF2B9280F44A7A0 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				BUNDLE_LOADER = "$(TEST_HOST)";
-				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@loader_path/Frameworks",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu.uitests;
-				SDKROOT = iphoneos;
-				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_TARGET_NAME = PrisWubiApp;
 			};
 			name = Debug;
 		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		4F6F8ED2DFC8B5862E7171C2 /* Build configuration list for PBXNativeTarget "PrisWubiApp" */ = {
+		2D75925EBD9CC70F45FE5612 /* Build configuration list for PBXNativeTarget "JuxuUITests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				587AC00B8647CBB215997A53 /* Debug */,
-				1CFAA5080D3DB1CE3CDCF519 /* Release */,
+				25C2BB3C3D7BAAE2682B072E /* Debug */,
+				3583AD75346D00BB6493C77D /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		4F80DA6B85066E88C029090E /* Build configuration list for PBXNativeTarget "PrisWubiUITests" */ = {
+		44C20C44F408D3DDA885E0AF /* Build configuration list for PBXNativeTarget "JuxuKeyboard" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				DC68D879CDF2B9280F44A7A0 /* Debug */,
-				3594E8B72F4ADF1A045411D4 /* Release */,
+				9E7860865B2A91AFBDCF7FB2 /* Debug */,
+				0278E11B79A11CECDA32A9F9 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		815801164546D723092C84FF /* Build configuration list for PBXNativeTarget "JuxuApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				498405ACD238A12938AD536C /* Debug */,
+				11F67B72ED9D9EA71082F805 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
@@ -644,15 +643,6 @@
 			buildConfigurations = (
 				4E45AEA48D979B2DB9F7758A /* Debug */,
 				64790B0A7D967C1C6A7DAF07 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Debug;
-		};
-		B52E98F4BE0E1AAF3AD6DB73 /* Build configuration list for PBXNativeTarget "PrisWubiKeyboard" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				C7FF4ED5BD586BB23A89F5D4 /* Debug */,
-				B30B10FA4EFF30E3FAAFC40F /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

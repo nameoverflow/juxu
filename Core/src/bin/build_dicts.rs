@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use wubi_core::code::{PackedCode, PackedPinyin, Stem2};
-use wubi_core::format::{
+use juxu_core::code::{PackedCode, PackedPinyin, Stem2};
+use juxu_core::format::{
     pack_trigram, serialize_wbaux, serialize_wbdict, AuxBuildInput, CharMeta, DictBuildInput,
     ENTRY_FLAG_EXT_RARE, ENTRY_FLAG_SINGLE_CHAR, ENTRY_FLAG_SYMBOL,
 };
-use wubi_core::pinyin_dict::{serialize_pydict, PinyinDictBuildInput, PY_FLAG_EXT_RARE};
+use juxu_core::pinyin_dict::{serialize_pydict, PinyinDictBuildInput, PY_FLAG_EXT_RARE};
 
 fn strip_pinyin_tone(toned: &str) -> (String, Option<String>) {
     let mut primary = String::with_capacity(toned.len());

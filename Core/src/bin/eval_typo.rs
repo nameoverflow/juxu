@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use wubi_core::code::PackedCode;
-use wubi_core::config::{WubiConfig, WubiSchema};
-use wubi_core::engine::{LmWeights, WubiEngine};
-use wubi_core::format::{AuxView, DictView};
-use wubi_core::typo::KeyLayout;
+use juxu_core::code::PackedCode;
+use juxu_core::config::{JuxuConfig, InputSchema};
+use juxu_core::engine::{LmWeights, JuxuEngine};
+use juxu_core::format::{AuxView, DictView};
+use juxu_core::typo::KeyLayout;
 
 /// Deterministic xorshift64* PRNG (zero external dependencies)
 struct Rng(u64);
@@ -192,7 +192,7 @@ impl Metrics {
 }
 
 fn run_eval_with_engine(
-    engine: &mut WubiEngine,
+    engine: &mut JuxuEngine,
     sentences: &[(String, String)],
     seed: u64,
     max_per_domain: usize,
@@ -384,7 +384,7 @@ fn ios_gutter_score(dist_from_center_pt: f32, p_val: u8, has_mask_weights: bool)
 }
 
 fn eval_dynamic_hitbox(
-    engine: &mut WubiEngine,
+    engine: &mut JuxuEngine,
     sentences: &[(String, String)],
     seed: u64,
     max_per_domain: usize,
@@ -513,7 +513,7 @@ fn main() {
     let mut dicts_dir = PathBuf::from("Resources/Dicts");
     let mut aux_path: Option<PathBuf> = None;
     let mut eval_tsv: Option<PathBuf> = None;
-    let mut schema = WubiSchema::Wubi86;
+    let mut schema = InputSchema::Wubi86;
     let mut max_per_domain = 250usize;
     let mut grid_search = false;
     let mut eval_hitbox = false;
@@ -526,7 +526,7 @@ fn main() {
             "--dicts-dir" => { dicts_dir = PathBuf::from(&args[i + 1]); i += 2; }
             "--aux" => { aux_path = Some(PathBuf::from(&args[i + 1])); i += 2; }
             "--eval" => { eval_tsv = Some(PathBuf::from(&args[i + 1])); i += 2; }
-            "--schema" => { schema = WubiSchema::from_str_tag(&args[i + 1]); i += 2; }
+            "--schema" => { schema = InputSchema::from_str_tag(&args[i + 1]); i += 2; }
             "--max-per-domain" => { max_per_domain = args[i + 1].parse().unwrap(); i += 2; }
             "--grid-search" => { grid_search = true; i += 1; }
             "--eval-hitbox" => { eval_hitbox = true; i += 1; }
@@ -547,14 +547,14 @@ fn main() {
     let eval_tsv = eval_tsv.expect("--eval <tsv> required");
     let aux_file = aux_path.unwrap_or_else(|| dicts_dir.join("wubi_aux.wbaux"));
     let dict_file = match schema {
-        WubiSchema::Wubi86 => dicts_dir.join("wubi86.wbdict"),
-        WubiSchema::Wubi98 => dicts_dir.join("wubi98.wbdict"),
-        WubiSchema::Wubi06 => dicts_dir.join("wubi06.wbdict"),
-        WubiSchema::Xiaohe => dicts_dir.join("xiaohe.wbdict"),
-        WubiSchema::Cangjie3 => dicts_dir.join("cangjie3.wbdict"),
-        WubiSchema::Cangjie5 => dicts_dir.join("cangjie5.wbdict"),
-        WubiSchema::Cangjie6 => dicts_dir.join("cangjie6.wbdict"),
-        WubiSchema::Pinyin | WubiSchema::XiaoheShuangpin => dicts_dir.join("wubi86.wbdict"),
+        InputSchema::Wubi86 => dicts_dir.join("wubi86.wbdict"),
+        InputSchema::Wubi98 => dicts_dir.join("wubi98.wbdict"),
+        InputSchema::Wubi06 => dicts_dir.join("wubi06.wbdict"),
+        InputSchema::Xiaohe => dicts_dir.join("xiaohe.wbdict"),
+        InputSchema::Cangjie3 => dicts_dir.join("cangjie3.wbdict"),
+        InputSchema::Cangjie5 => dicts_dir.join("cangjie5.wbdict"),
+        InputSchema::Cangjie6 => dicts_dir.join("cangjie6.wbdict"),
+        InputSchema::Pinyin | InputSchema::XiaoheShuangpin => dicts_dir.join("wubi86.wbdict"),
     };
 
     let dict = DictView::open_mmap(&dict_file).expect("open dict");
@@ -573,13 +573,13 @@ fn main() {
     );
 
     let sentences = load_sentences(&eval_tsv);
-    let mut cfg = WubiConfig::default();
+    let mut cfg = JuxuConfig::default();
     cfg.schema = schema;
     cfg.fourth_code_auto_commit = false;
     cfg.typo.enabled = true;
     cfg.typo.touch_hitbox_adapt = false;
 
-    let mut engine = WubiEngine::new(cfg);
+    let mut engine = JuxuEngine::new(cfg);
     engine.load_dict(schema, dict);
     engine.set_aux(aux);
 

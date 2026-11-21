@@ -8,7 +8,7 @@ private final class SyntheticFingerTouch: UITouch {
     override var timestamp: TimeInterval { mockTimestamp }
 }
 
-final class PrisWubiSimulatorUITests: XCTestCase {
+final class JuxuSimulatorUITests: XCTestCase {
     @MainActor private static var midPressShot: XCUIScreenshot?
 
     @MainActor
@@ -179,7 +179,7 @@ final class PrisWubiSimulatorUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["--autofocus"]
         app.launch()
-        if app.otherElements["PrisWubiKeyCanvas"].waitForExistence(timeout: 3) {
+        if app.otherElements["JuxuKeyCanvas"].waitForExistence(timeout: 3) {
             return app
         }
 
@@ -230,7 +230,7 @@ final class PrisWubiSimulatorUITests: XCTestCase {
         }
         attachShot(name: "01-settings-keyboards-added")
 
-        // 2. Launch PrisWubiApp and focus the sandbox text field
+        // 2. Launch JuxuApp and focus the sandbox text field
         app.launch()
         Thread.sleep(forTimeInterval: 1.2)
 
@@ -253,7 +253,7 @@ final class PrisWubiSimulatorUITests: XCTestCase {
             for _ in 0..<6 {
                 globeCoord.tap()
                 Thread.sleep(forTimeInterval: 0.7)
-                if inputUI.otherElements["PrisWubiRibbon"].exists || app.otherElements["PrisWubiRibbon"].exists {
+                if inputUI.otherElements["JuxuRibbon"].exists || app.otherElements["JuxuRibbon"].exists {
                     break
                 }
             }
@@ -283,7 +283,7 @@ final class PrisWubiSimulatorUITests: XCTestCase {
         app.buttons["重置"].tap()
 
         let typingApp = openLiveKeyboard()
-        let canvas = typingApp.otherElements["PrisWubiKeyCanvas"]
+        let canvas = typingApp.otherElements["JuxuKeyCanvas"]
         XCTAssertTrue(canvas.waitForExistence(timeout: 5))
         let origin = canvas.coordinate(withNormalizedOffset: .zero)
         let layout = IOSKeyboardLayoutEngine().computeLayout(in: canvas.frame.size)
@@ -298,13 +298,13 @@ final class PrisWubiSimulatorUITests: XCTestCase {
             let key = try letter(byte)
             origin.withOffset(CGVector(dx: key.midX, dy: key.midY)).tap()
         }
-        XCTAssertEqual(typingApp.staticTexts["PrisWubiSegmentedCode"].label, "yrwu")
+        XCTAssertEqual(typingApp.staticTexts["JuxuSegmentedCode"].label, "yrwu")
         let corrected = typingApp.staticTexts["我们 trwu"].firstMatch
         XCTAssertTrue(corrected.waitForExistence(timeout: 3))
         attachShot(name: "spaceless-neighbor-key-correction")
         corrected.tap()
         XCTAssertEqual(typingApp.textFields.firstMatch.value as? String, "我们")
-        XCTAssertFalse(typingApp.staticTexts["PrisWubiSegmentedCode"].exists)
+        XCTAssertFalse(typingApp.staticTexts["JuxuSegmentedCode"].exists)
 
         Thread.sleep(forTimeInterval: 1.7) // Allow the keyboard's deferred user-data flush.
         typingApp.launchArguments = []
@@ -359,7 +359,7 @@ final class PrisWubiSimulatorUITests: XCTestCase {
         let typingApp = openSpaceless98Keyboard()
         defer { resetSpacelessTestPreferences() }
         let field = typingApp.textFields.firstMatch
-        let canvas = typingApp.otherElements["PrisWubiKeyCanvas"]
+        let canvas = typingApp.otherElements["JuxuKeyCanvas"]
         XCTAssertTrue(canvas.waitForExistence(timeout: 5))
         let origin = canvas.coordinate(withNormalizedOffset: .zero)
         let layout = IOSKeyboardLayoutEngine().computeLayout(in: canvas.frame.size)
@@ -372,7 +372,7 @@ final class PrisWubiSimulatorUITests: XCTestCase {
             try tap(.letter(letter))
         }
         XCTAssertEqual(field.value as? String, target)
-        let segmented = typingApp.staticTexts["PrisWubiSegmentedCode"]
+        let segmented = typingApp.staticTexts["JuxuSegmentedCode"]
         XCTAssertTrue(segmented.exists)
         XCTAssertTrue(segmented.label.hasSuffix("│ fcu·ktqn·kc"))
         attachShot(name: "spaceless-98-composing")
@@ -392,10 +392,10 @@ final class PrisWubiSimulatorUITests: XCTestCase {
     func testExpandedSentenceCandidatesWrapAndScroll() throws {
         let app = openSpaceless98Keyboard()
         defer { resetSpacelessTestPreferences() }
-        let canvas = app.otherElements["PrisWubiKeyCanvas"]
-        let expand = app.buttons["PrisWubiCandidateToggle"]
-        let candidates = app.scrollViews["PrisWubiExpandedCandidates"]
-        let first = app.buttons["PrisWubiExpandedCandidate0"]
+        let canvas = app.otherElements["JuxuKeyCanvas"]
+        let expand = app.buttons["JuxuCandidateToggle"]
+        let candidates = app.scrollViews["JuxuExpandedCandidates"]
+        let first = app.buttons["JuxuExpandedCandidate0"]
         func typeCodes(_ codes: String) throws {
             XCTAssertTrue(canvas.waitForExistence(timeout: 5))
             let origin = canvas.coordinate(withNormalizedOffset: .zero)
@@ -417,7 +417,7 @@ final class PrisWubiSimulatorUITests: XCTestCase {
         app.buttons["重输"].tap()
 
         try typeCodes("tvqqiepbdggtebjfddwpukwdedgxbtudcakftdgdcgwgdc")
-        let codeStrip = app.staticTexts["PrisWubiSegmentedCode"]
+        let codeStrip = app.staticTexts["JuxuSegmentedCode"]
         XCTAssertTrue(codeStrip.exists)
         XCTAssertGreaterThanOrEqual(codeStrip.frame.minX, canvas.frame.minX + 16)
         XCTAssertLessThanOrEqual(codeStrip.frame.maxX, canvas.frame.maxX - 16)
@@ -433,7 +433,7 @@ final class PrisWubiSimulatorUITests: XCTestCase {
         XCTAssertGreaterThan(first.frame.height, 45)
         attachShot(name: "expanded-wrapped-candidates")
 
-        let last = app.buttons["PrisWubiExpandedCandidate7"]
+        let last = app.buttons["JuxuExpandedCandidate7"]
         for _ in 0..<3 where !last.isHittable {
             candidates.swipeUp()
         }
@@ -446,7 +446,7 @@ final class PrisWubiSimulatorUITests: XCTestCase {
     @MainActor
     func testFourthCodeInLetterGutter() throws {
         let app = openLiveKeyboard()
-        let canvas = app.otherElements["PrisWubiKeyCanvas"]
+        let canvas = app.otherElements["JuxuKeyCanvas"]
         XCTAssertTrue(canvas.waitForExistence(timeout: 5))
         let origin = canvas.coordinate(withNormalizedOffset: .zero)
         let layout = IOSKeyboardLayoutEngine().computeLayout(in: canvas.frame.size)
@@ -707,8 +707,8 @@ final class PrisWubiSimulatorUITests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.5)
 
         let inputUI = XCUIApplication(bundleIdentifier: "com.apple.InputUI")
-        let pillInApp = app.buttons["PrisWubiClipboardPill"]
-        let pillInInput = inputUI.buttons["PrisWubiClipboardPill"]
+        let pillInApp = app.buttons["JuxuClipboardPill"]
+        let pillInInput = inputUI.buttons["JuxuClipboardPill"]
         let pill = pillInApp.waitForExistence(timeout: 2.5) ? pillInApp : pillInInput
         XCTAssertTrue(pill.waitForExistence(timeout: 2.5), "Expected centered clipboard pill to appear in idle candidate bar")
         attachShot(name: "clip-01-normal-light")
@@ -740,8 +740,8 @@ final class PrisWubiSimulatorUITests: XCTestCase {
         acceptPastePromptIfShown()
         Thread.sleep(forTimeInterval: 0.5)
 
-        let dismissInApp = app.buttons["PrisWubiClipboardDismiss"]
-        let dismissInInput = inputUI.buttons["PrisWubiClipboardDismiss"]
+        let dismissInApp = app.buttons["JuxuClipboardDismiss"]
+        let dismissInInput = inputUI.buttons["JuxuClipboardDismiss"]
         let dismissBtn = dismissInApp.waitForExistence(timeout: 2.5) ? dismissInApp : dismissInInput
         XCTAssertTrue(dismissBtn.waitForExistence(timeout: 2.5), "Expected clipboard dismiss button")
         dismissBtn.tap()
@@ -753,7 +753,7 @@ final class PrisWubiSimulatorUITests: XCTestCase {
     @MainActor
     func testChevronHitAreaAndZPinyinExpandedGrid() throws {
         let app = openLiveKeyboard()
-        let canvas = app.otherElements["PrisWubiKeyCanvas"]
+        let canvas = app.otherElements["JuxuKeyCanvas"]
         XCTAssertTrue(canvas.waitForExistence(timeout: 5))
         let origin = canvas.coordinate(withNormalizedOffset: .zero)
         let layout = IOSKeyboardLayoutEngine().computeLayout(in: canvas.frame.size)
@@ -762,7 +762,7 @@ final class PrisWubiSimulatorUITests: XCTestCase {
             origin.withOffset(CGVector(dx: key.frame.midX, dy: key.frame.midY)).tap()
         }
 
-        let expand = app.buttons["PrisWubiCandidateToggle"]
+        let expand = app.buttons["JuxuCandidateToggle"]
         XCTAssertTrue(expand.waitForExistence(timeout: 5))
         XCTAssertGreaterThanOrEqual(expand.frame.height, 50.0, "Chevron button should span full candidate bar height")
         attachShot(name: "z-pinyin-ribbon")
@@ -770,9 +770,9 @@ final class PrisWubiSimulatorUITests: XCTestCase {
         // Tap chevron button
         expand.tap()
 
-        let first = app.buttons["PrisWubiExpandedCandidate0"]
+        let first = app.buttons["JuxuExpandedCandidate0"]
         XCTAssertTrue(first.waitForExistence(timeout: 5), "Tapping upper chevron hit zone must open expanded grid")
-        let beyond36 = app.buttons["PrisWubiExpandedCandidate50"]
+        let beyond36 = app.buttons["JuxuExpandedCandidate50"]
         XCTAssertTrue(beyond36.exists, "Expanded grid must list all z-pinyin candidates beyond the old 36 cap")
         attachShot(name: "z-pinyin-expanded")
     }

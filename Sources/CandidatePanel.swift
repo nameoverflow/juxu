@@ -8,7 +8,7 @@ import SwiftUI
 /// - Clean `32pt` horizontal bar (`24pt` selection rect, `5pt` continuous corner radius, `16pt` PingFang SC Regular,
 ///   `11.5pt` guide digits, whisper-light `11.5pt` secondary code annotations without colored pills).
 public final class NativeCandidateContentView: NSView {
-    public var state: WubiActionState = .empty {
+    public var state: JuxuActionState = .empty {
         didSet {
             hoveredCandidateIndex = nil
             invalidateIntrinsicContentSize()
@@ -87,7 +87,7 @@ public final class NativeCandidateContentView: NSView {
         }
     }
 
-    private static func cleanAnnotation(for item: WubiCandidateItem) -> String {
+    private static func cleanAnnotation(for item: JuxuCandidateItem) -> String {
         guard !item.comment.isEmpty else { return "" }
         switch item.badgeKind {
         case .shortcode:
@@ -474,12 +474,12 @@ public final class NativeCandidateContentView: NSView {
 
 /// SwiftUI wrapper around `NativeCandidateContentView` + `NSVisualEffectView` solely for Settings / Retina preview rendering.
 public struct CandidateBarView: NSViewRepresentable {
-    public let state: WubiActionState
+    public let state: JuxuActionState
     public var onSelectCandidate: ((Int) -> Void)?
     public var onTurnPage: ((Int32) -> Void)?
 
     public init(
-        state: WubiActionState,
+        state: JuxuActionState,
         onSelectCandidate: ((Int) -> Void)? = nil,
         onTurnPage: ((Int32) -> Void)? = nil
     ) {
@@ -577,7 +577,7 @@ public final class CandidatePanelController {
         self.panel = p
     }
 
-    public func update(state: WubiActionState, caretRect: NSRect, clientWindowLevel: CGWindowLevel? = nil) {
+    public func update(state: JuxuActionState, caretRect: NSRect, clientWindowLevel: CGWindowLevel? = nil) {
         if state.preedit.isEmpty || (state.candidates.isEmpty && !state.segmentedCode.isEmpty) {
             hide()
             return

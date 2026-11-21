@@ -5,7 +5,7 @@
 //! - `Micro-RWKV-7` + `AuxView` N-gram + `PersonalContext` beam search
 
 use crate::code::PackedCode;
-use crate::config::WubiConfig;
+use crate::config::JuxuConfig;
 use crate::engine::{Candidate, CandidateBadge};
 use crate::format::AuxView;
 use crate::neural::{NeuralView, RwkvState};
@@ -92,7 +92,7 @@ pub struct PinyinDecoder<'a> {
     pub dict: &'a PinyinDictView,
     pub aux: Option<&'a AuxView>,
     pub model: Option<NeuralView<'a>>,
-    pub config: &'a WubiConfig,
+    pub config: &'a JuxuConfig,
     pub user: &'a UserStore,
     pub context: &'a [char],
     pub layout: &'a KeyLayout,

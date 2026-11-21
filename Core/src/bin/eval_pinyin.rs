@@ -13,13 +13,13 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
-use wubi_core::config::WubiConfig;
-use wubi_core::format::AuxView;
-use wubi_core::neural::{NeuralContextTracker, NeuralView};
-use wubi_core::pinyin::{decode_pinyin, PinyinDecoder, PinyinStream};
-use wubi_core::pinyin_dict::PinyinDictView;
-use wubi_core::typo::{KeyLayout, KeyObs};
-use wubi_core::user_data::UserStore;
+use juxu_core::config::JuxuConfig;
+use juxu_core::format::AuxView;
+use juxu_core::neural::{NeuralContextTracker, NeuralView};
+use juxu_core::pinyin::{decode_pinyin, PinyinDecoder, PinyinStream};
+use juxu_core::pinyin_dict::PinyinDictView;
+use juxu_core::typo::{KeyLayout, KeyObs};
+use juxu_core::user_data::UserStore;
 
 /// (domain, expected_chinese, exact_pinyin_keys)
 const FULL_SENTENCES: &[(&str, &str, &str)] = &[
@@ -316,7 +316,7 @@ fn main() {
     println!("=========================================================================");
 
     let layout = KeyLayout::default();
-    let config = WubiConfig::default();
+    let config = JuxuConfig::default();
     let user = UserStore::default();
     let mut bos_tracker = NeuralContextTracker::default();
     bos_tracker.init_with_model(&nv);

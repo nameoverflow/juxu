@@ -20,7 +20,7 @@ jobs:
           brew install xcodegen
           cd iOS && xcodegen generate
           xcodebuild -project PrisWubi.xcodeproj \
-            -scheme PrisWubiApp \
+            -scheme JuxuApp \
             -sdk iphonesimulator \
             -configuration Release \
             CODE_SIGNING_ALLOWED=NO \

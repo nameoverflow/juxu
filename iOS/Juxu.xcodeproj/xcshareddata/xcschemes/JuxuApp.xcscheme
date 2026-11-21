@@ -15,9 +15,9 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "FA69B631156E5F45429B66C7"
-               BuildableName = "PrisWubiApp.app"
-               BlueprintName = "PrisWubiApp"
+               BlueprintIdentifier = "2F379AA38AF35D1612DBCC25"
+               BuildableName = "JuxuApp.app"
+               BlueprintName = "JuxuApp"
                ReferencedContainer = "container:Juxu.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -29,9 +29,9 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "277C3E6AB194CA14C1D036EB"
-               BuildableName = "PrisWubiKeyboard.appex"
-               BlueprintName = "PrisWubiKeyboard"
+               BlueprintIdentifier = "69104A23A4AEA48A33FB0F48"
+               BuildableName = "JuxuKeyboard.appex"
+               BlueprintName = "JuxuKeyboard"
                ReferencedContainer = "container:Juxu.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -46,9 +46,9 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "FA69B631156E5F45429B66C7"
-            BuildableName = "PrisWubiApp.app"
-            BlueprintName = "PrisWubiApp"
+            BlueprintIdentifier = "2F379AA38AF35D1612DBCC25"
+            BuildableName = "JuxuApp.app"
+            BlueprintName = "JuxuApp"
             ReferencedContainer = "container:Juxu.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
@@ -58,9 +58,9 @@
             parallelizable = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "74C692D3A932891CF0A1F80B"
-               BuildableName = "PrisWubiUITests.xctest"
-               BlueprintName = "PrisWubiUITests"
+               BlueprintIdentifier = "498B39CF026AE72958D5E1E2"
+               BuildableName = "JuxuUITests.xctest"
+               BlueprintName = "JuxuUITests"
                ReferencedContainer = "container:Juxu.xcodeproj">
             </BuildableReference>
          </TestableReference>
@@ -82,9 +82,9 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "FA69B631156E5F45429B66C7"
-            BuildableName = "PrisWubiApp.app"
-            BlueprintName = "PrisWubiApp"
+            BlueprintIdentifier = "2F379AA38AF35D1612DBCC25"
+            BuildableName = "JuxuApp.app"
+            BlueprintName = "JuxuApp"
             ReferencedContainer = "container:Juxu.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -101,9 +101,9 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "FA69B631156E5F45429B66C7"
-            BuildableName = "PrisWubiApp.app"
-            BlueprintName = "PrisWubiApp"
+            BlueprintIdentifier = "2F379AA38AF35D1612DBCC25"
+            BuildableName = "JuxuApp.app"
+            BlueprintName = "JuxuApp"
             ReferencedContainer = "container:Juxu.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>

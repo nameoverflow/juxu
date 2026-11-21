@@ -11,22 +11,22 @@ settings:
     SWIFT_VERSION: "6.0"
     CODE_SIGN_STYLE: Automatic
     "EXCLUDED_ARCHS[sdk=iphonesimulator*]": "x86_64"
-    SWIFT_OBJC_BRIDGING_HEADER: "$(PROJECT_DIR)/../Core/include/wubi_core.h"
+    SWIFT_OBJC_BRIDGING_HEADER: "$(PROJECT_DIR)/../Core/include/juxu_core.h"
     LIBRARY_SEARCH_PATHS:
       - "$(inherited)"
       - "$(PROJECT_DIR)/build-lib"
     OTHER_LDFLAGS:
       - "$(inherited)"
-      - "-lwubi_core"
+      - "-ljuxu_core"
     ENABLE_USER_SCRIPT_SANDBOXING: NO
 
 targets:
-  PrisWubiApp:
+  JuxuApp:
     type: application
     platform: iOS
     deploymentTarget: "16.0"
     sources:
-      - path: ../Sources/WubiCoreBridge.swift
+      - path: ../Sources/JuxuCoreBridge.swift
       - path: Shared
       - path: HostApp
         excludes:
@@ -56,7 +56,7 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
     entitlements:
-      path: HostApp/PrisWubiApp.entitlements
+      path: HostApp/JuxuApp.entitlements
       properties:
         keychain-access-groups:
           - $(AppIdentifierPrefix)com.hcyue.juxu.settings
@@ -73,15 +73,15 @@ targets:
           sh "$PROJECT_DIR/Scripts/build-rust-ios.sh"
         basedOnDependencyAnalysis: false
     dependencies:
-      - target: PrisWubiKeyboard
+      - target: JuxuKeyboard
         embed: true
 
-  PrisWubiKeyboard:
+  JuxuKeyboard:
     type: app-extension
     platform: iOS
     deploymentTarget: "16.0"
     sources:
-      - path: ../Sources/WubiCoreBridge.swift
+      - path: ../Sources/JuxuCoreBridge.swift
       - path: Shared
       - path: KeyboardExtension
         excludes:
@@ -104,7 +104,7 @@ targets:
             PrimaryLanguage: zh-Hans
             RequestsOpenAccess: true
     entitlements:
-      path: KeyboardExtension/PrisWubiKeyboard.entitlements
+      path: KeyboardExtension/JuxuKeyboard.entitlements
       properties:
         keychain-access-groups:
           - $(AppIdentifierPrefix)com.hcyue.juxu.settings
@@ -121,7 +121,7 @@ targets:
           sh "$PROJECT_DIR/Scripts/build-rust-ios.sh"
         basedOnDependencyAnalysis: false
 
-  PrisWubiUITests:
+  JuxuUITests:
     type: bundle.ui-testing
     platform: iOS
     deploymentTarget: "16.0"
@@ -130,21 +130,21 @@ targets:
       - path: KeyboardExtension/IOSKeyCanvasAndCallout.swift
       - path: UITests
     dependencies:
-      - target: PrisWubiApp
+      - target: JuxuApp
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.hcyue.juxu.uitests
         GENERATE_INFOPLIST_FILE: YES
-        TEST_TARGET_NAME: PrisWubiApp
+        TEST_TARGET_NAME: JuxuApp
 
 schemes:
-  PrisWubiApp:
+  JuxuApp:
     build:
       targets:
-        PrisWubiApp: all
-        PrisWubiKeyboard: all
+        JuxuApp: all
+        JuxuKeyboard: all
     test:
       targets:
-        - PrisWubiUITests
+        - JuxuUITests
     run:
       config: Release

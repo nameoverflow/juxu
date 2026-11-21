@@ -75,7 +75,7 @@ private final class IOSClipboardPillControl: UIControl {
         layer.cornerCurve = .continuous
         isAccessibilityElement = true
         accessibilityTraits = .button
-        accessibilityIdentifier = "PrisWubiClipboardPill"
+        accessibilityIdentifier = "JuxuClipboardPill"
 
         iconView.contentMode = .scaleAspectFit
         iconView.isUserInteractionEnabled = false
@@ -361,7 +361,7 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
         clipContainer.addGestureRecognizer(pan)
 
         chevronBtn.translatesAutoresizingMaskIntoConstraints = false
-        chevronBtn.accessibilityIdentifier = "PrisWubiCandidateToggle"
+        chevronBtn.accessibilityIdentifier = "JuxuCandidateToggle"
         chevronBtn.accessibilityLabel = "展开候选"
         let cfg = UIImage.SymbolConfiguration(pointSize: 15.5, weight: .medium)
         chevronBtn.setImage(UIImage(systemName: "chevron.down", withConfiguration: cfg), for: .normal)
@@ -372,7 +372,7 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
 
         let dismissCfg = UIImage.SymbolConfiguration(pointSize: 13.0, weight: .medium)
         clipboardDismissBtn.setImage(UIImage(systemName: "xmark", withConfiguration: dismissCfg), for: .normal)
-        clipboardDismissBtn.accessibilityIdentifier = "PrisWubiClipboardDismiss"
+        clipboardDismissBtn.accessibilityIdentifier = "JuxuClipboardDismiss"
         clipboardDismissBtn.accessibilityLabel = "关闭剪贴板提示"
         clipboardDismissBtn.isHidden = true
         clipboardDismissBtn.addTarget(self, action: #selector(handleClipboardDismiss), for: .touchUpInside)
@@ -577,13 +577,13 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
         chevronBtn.accessibilityLabel = expanded ? "收起候选" : "展开候选"
     }
 
-    private var lastCandidates: [WubiCandidateItem]?
+    private var lastCandidates: [JuxuCandidateItem]?
     private var lastIdleWords: [String]?
     private var lastPreeditEmpty: Bool?
     private var lastDark: Bool?
 
     func update(
-        state: WubiActionState,
+        state: JuxuActionState,
         dark: Bool,
         clipboardSuggestion: IOSClipboardSuggestion? = nil,
         idleWords: [String]? = nil
@@ -723,7 +723,7 @@ private final class IOSCodeStripView: UIView, UIGestureRecognizerDelegate {
         isHidden = true
         isAccessibilityElement = true
         accessibilityTraits = .staticText
-        accessibilityIdentifier = "PrisWubiSegmentedCode"
+        accessibilityIdentifier = "JuxuSegmentedCode"
         viewport.clipsToBounds = true
         label.isAccessibilityElement = false
         viewport.addSubview(label)
@@ -833,14 +833,14 @@ final class IOSExpandedCandidateView: UIView {
     private let candidateFont = UIFont.systemFont(ofSize: 17.5, weight: .regular)
     private let columnSpacing: CGFloat = 6
     private let textInset: CGFloat = 10
-    private var candidates: [WubiCandidateItem] = []
+    private var candidates: [JuxuCandidateItem] = []
     private var dark = false
     private var renderedWidth: CGFloat = 0
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.accessibilityIdentifier = "PrisWubiExpandedCandidates"
+        scrollView.accessibilityIdentifier = "JuxuExpandedCandidates"
         scrollView.contentInsetAdjustmentBehavior = .never
         if #available(iOS 26.0, *) {
             scrollView.topEdgeEffect.isHidden = true
@@ -896,7 +896,7 @@ final class IOSExpandedCandidateView: UIView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func reload(candidates: [WubiCandidateItem], dark: Bool) {
+    func reload(candidates: [JuxuCandidateItem], dark: Bool) {
         self.candidates = candidates
         self.dark = dark
         renderedWidth = 0
@@ -955,7 +955,7 @@ final class IOSExpandedCandidateView: UIView {
         flushCompactRow()
     }
 
-    private static func displayHint(for item: WubiCandidateItem) -> String? {
+    private static func displayHint(for item: JuxuCandidateItem) -> String? {
         guard !item.comment.isEmpty else { return nil }
         switch item.badgeKind {
         case .pinyinLookup, .shortcode:
@@ -974,7 +974,7 @@ final class IOSExpandedCandidateView: UIView {
         button.layer.cornerCurve = .continuous
         button.isAccessibilityElement = true
         button.accessibilityLabel = text
-        button.accessibilityIdentifier = "PrisWubiExpandedCandidate\(index)"
+        button.accessibilityIdentifier = "JuxuExpandedCandidate\(index)"
         button.addAction(UIAction { [weak self] _ in self?.onSelectAbsCandidate?(index) }, for: .touchUpInside)
 
         let label = UILabel()

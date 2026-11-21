@@ -1,11 +1,11 @@
 [package]
-name = "wubi-core"
+name = "juxu-core"
 version = "0.1.0"
 edition = "2021"
 license = "WTFPL"
 
 [lib]
-name = "wubi_core"
+name = "juxu_core"
 crate-type = ["staticlib", "rlib"]
 
 [[bin]]

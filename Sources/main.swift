@@ -24,7 +24,7 @@ final class JuxuAppDelegate: NSObject, NSApplicationDelegate {
         self.imkServer = IMKServer(name: resolvedConnName, bundleIdentifier: bundleId)
 
         // Initialize shared Rust mmap core eagerly (< 1ms) so first keystroke has 0ms cold latency
-        _ = WubiBridge.shared
+        _ = JuxuBridge.shared
 
         // Allow launching standalone settings UI via `--settings`
         if CommandLine.arguments.contains("--settings") {
@@ -33,7 +33,7 @@ final class JuxuAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        WubiBridge.shared.flushUserDataIfNeeded()
+        JuxuBridge.shared.flushUserDataIfNeeded()
     }
 }
 

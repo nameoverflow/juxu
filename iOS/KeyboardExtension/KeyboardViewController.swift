@@ -3,7 +3,7 @@ import UIKit
 
 @objc(KeyboardViewController)
 public final class KeyboardViewController: UIInputViewController {
-    private lazy var bridge = WubiBridge()
+    private lazy var bridge = JuxuBridge()
     private var layoutEngine = IOSKeyboardLayoutEngine()
 
     private let glassBackdrop = UIView()
@@ -24,7 +24,7 @@ public final class KeyboardViewController: UIInputViewController {
     private var compositionBaseContext: String?
     private let clipboardStore = IOSClipboardSuggestionStore()
     private var clipboardGate = IOSClipboardVisibilityGate()
-    private let clipboardReadQueue = DispatchQueue(label: "com.priswubi.clipboard", qos: .userInitiated)
+    private let clipboardReadQueue = DispatchQueue(label: "com.hcyue.juxu.clipboard", qos: .userInitiated)
     private var activeClipboardSuggestion: IOSClipboardSuggestion?
     private var inFlightClipboardChangeCount: Int?
     private var expandedIdleWords: [String]?
@@ -231,9 +231,9 @@ public final class KeyboardViewController: UIInputViewController {
         glassBackdrop.isUserInteractionEnabled = false
 
         ribbonView.translatesAutoresizingMaskIntoConstraints = false
-        ribbonView.accessibilityIdentifier = "PrisWubiRibbon"
+        ribbonView.accessibilityIdentifier = "JuxuRibbon"
         keyCanvas.translatesAutoresizingMaskIntoConstraints = false
-        keyCanvas.accessibilityIdentifier = "PrisWubiKeyCanvas"
+        keyCanvas.accessibilityIdentifier = "JuxuKeyCanvas"
         expandedGrid.translatesAutoresizingMaskIntoConstraints = false
 
         expandedGrid.isHidden = true
@@ -530,7 +530,7 @@ public final class KeyboardViewController: UIInputViewController {
                 : predicted
             expandedIdleWords = words
             let items = words.enumerated().map { idx, text in
-                WubiCandidateItem(
+                JuxuCandidateItem(
                     index: idx + 1,
                     text: text,
                     comment: "",
@@ -808,7 +808,7 @@ public final class KeyboardViewController: UIInputViewController {
         bridge.setContext(String(before.suffix(32)))
     }
 
-    private func currentIdlePredictions(for st: WubiActionState) -> [String]? {
+    private func currentIdlePredictions(for st: JuxuActionState) -> [String]? {
         guard st.preedit.isEmpty else { return nil }
         if st.asciiMode {
             return []
@@ -847,7 +847,7 @@ public final class KeyboardViewController: UIInputViewController {
         textDocumentProxy.insertText(formatted)
     }
 
-    private func applyEngineState(_ out: WubiActionState) {
+    private func applyEngineState(_ out: JuxuActionState) {
         if !out.commitText.isEmpty {
             let base = markedCode.isEmpty ? nil : compositionBaseContext
             insertTextWithAutoSpace(out.commitText, splitInternal: true, overrideBefore: base)

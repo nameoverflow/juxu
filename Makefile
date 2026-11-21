@@ -8,13 +8,13 @@ export MACOSX_DEPLOYMENT_TARGET := 14.0
 MACOS_TARGET = -target arm64-apple-macosx14.0
 LSREGISTER = /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
-CORE_LIB = Core/target/release/libwubi_core.a
-CORE_HEADER = Core/include/wubi_core.h
+CORE_LIB = Core/target/release/libjuxu_core.a
+CORE_HEADER = Core/include/juxu_core.h
 CORE_FLAGS = -import-objc-header $(CORE_HEADER) $(CORE_LIB)
 CORE_SOURCES = Core/Cargo.toml $(wildcard Core/src/*.rs) $(wildcard Core/src/bin/*.rs)
 
 VOICE_SOURCES = Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Sources/VoiceSettingsView.swift
-UI_SOURCES = Sources/WubiCoreBridge.swift Sources/CandidatePanel.swift $(VOICE_SOURCES) Sources/SettingsWindow.swift
+UI_SOURCES = Sources/JuxuCoreBridge.swift Sources/CandidatePanel.swift $(VOICE_SOURCES) Sources/SettingsWindow.swift
 APP_SOURCES = $(UI_SOURCES) Sources/InputController.swift Sources/main.swift
 FRAMEWORKS = -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework Carbon -framework AVFoundation -framework Speech -framework Security
 
@@ -78,14 +78,14 @@ rust-test:
 
 swift-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc -O $(MACOS_TARGET) Sources/WubiCoreBridge.swift Sources/CandidatePanel.swift Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Tests/SwiftBridgeTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework AVFoundation -framework Speech -framework Security -o build/swift-bridge-tests
+	swiftc -O $(MACOS_TARGET) Sources/JuxuCoreBridge.swift Sources/CandidatePanel.swift Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Tests/SwiftBridgeTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework AVFoundation -framework Speech -framework Security -o build/swift-bridge-tests
 	build/swift-bridge-tests
 
 test: rust-test swift-test ios-test
 
 ios-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc -O $(MACOS_TARGET) Sources/WubiCoreBridge.swift iOS/Shared/IOSKeyboardLayoutEngine.swift iOS/Shared/IOSClipboardSuggestion.swift Tests/IOSKeyboardTests.swift $(CORE_FLAGS) -framework Foundation -framework CoreGraphics -o build/ios-keyboard-tests
+	swiftc -O $(MACOS_TARGET) Sources/JuxuCoreBridge.swift iOS/Shared/IOSKeyboardLayoutEngine.swift iOS/Shared/IOSClipboardSuggestion.swift Tests/IOSKeyboardTests.swift $(CORE_FLAGS) -framework Foundation -framework CoreGraphics -o build/ios-keyboard-tests
 	build/ios-keyboard-tests
 
 previews: $(CORE_LIB)
@@ -95,7 +95,7 @@ previews: $(CORE_LIB)
 
 ios-previews: $(CORE_LIB)
 	mkdir -p build/ios-previews
-	swiftc -O $(MACOS_TARGET) Sources/WubiCoreBridge.swift iOS/Shared/IOSKeyboardLayoutEngine.swift iOS/HostApp/HostAppViews.swift Scripts/RenderIOSPreviews.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -o build/render-ios-previews
+	swiftc -O $(MACOS_TARGET) Sources/JuxuCoreBridge.swift iOS/Shared/IOSKeyboardLayoutEngine.swift iOS/HostApp/HostAppViews.swift Scripts/RenderIOSPreviews.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -o build/render-ios-previews
 	build/render-ios-previews build/ios-previews
 
 ios-project:

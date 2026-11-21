@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::time::Instant;
-use wubi_core::code::PackedCode;
-use wubi_core::config::{WubiConfig, WubiSchema};
-use wubi_core::engine::{WubiEngine, KEY_SPACE};
-use wubi_core::format::{AuxView, DictView};
-use wubi_core::typo::KeyLayout;
+use juxu_core::code::PackedCode;
+use juxu_core::config::{JuxuConfig, InputSchema};
+use juxu_core::engine::{JuxuEngine, KEY_SPACE};
+use juxu_core::format::{AuxView, DictView};
+use juxu_core::typo::KeyLayout;
 
 /// Realistic modern Chinese evaluation sentences across daily IM, work/tech, life, and formal prose.
 const SENTENCES: &[&str] = &[
@@ -176,7 +176,7 @@ fn segment_sentence(dict: &DictView, sent: &str, single_char_mode: bool) -> Vec<
     tokens
 }
 
-fn type_code_and_space(engine: &mut WubiEngine, code: &str, need_space: bool, ts: &mut u64) -> String {
+fn type_code_and_space(engine: &mut JuxuEngine, code: &str, need_space: bool, ts: &mut u64) -> String {
     let mut committed = String::new();
     for b in code.bytes() {
         *ts += 60;
@@ -219,11 +219,11 @@ impl BucketStat {
     }
 }
 
-fn eval_schema(schema: WubiSchema, dict_path: &PathBuf, aux_path: &PathBuf, enabled: bool, verbose: bool) {
+fn eval_schema(schema: InputSchema, dict_path: &PathBuf, aux_path: &PathBuf, enabled: bool, verbose: bool) {
     let dict = DictView::open_mmap(dict_path).expect("open dict");
     let aux = AuxView::open_mmap(aux_path).expect("open aux");
 
-    let mut cfg = WubiConfig::default();
+    let mut cfg = JuxuConfig::default();
     cfg.schema = schema;
     cfg.fourth_code_auto_commit = true;
     cfg.fifth_code_push_commit = true;
@@ -231,7 +231,7 @@ fn eval_schema(schema: WubiSchema, dict_path: &PathBuf, aux_path: &PathBuf, enab
     cfg.typo.missed_space_correction = enabled;
     cfg.typo.touch_hitbox_adapt = false;
 
-    let mut engine = WubiEngine::new(cfg);
+    let mut engine = JuxuEngine::new(cfg);
     engine.load_dict(schema, dict);
     engine.set_aux(aux);
 
@@ -496,12 +496,12 @@ fn neighbor_keys(layout: &KeyLayout, ch: u8) -> Vec<u8> {
     out
 }
 
-fn eval_typo_regression(schema: WubiSchema, dict_path: &PathBuf, aux_path: &PathBuf, enabled: bool) {
+fn eval_typo_regression(schema: InputSchema, dict_path: &PathBuf, aux_path: &PathBuf, enabled: bool) {
     let dict = DictView::open_mmap(dict_path).expect("open dict");
     let aux = AuxView::open_mmap(aux_path).expect("open aux");
     let layout = KeyLayout::default();
 
-    let mut cfg = WubiConfig::default();
+    let mut cfg = JuxuConfig::default();
     cfg.schema = schema;
     cfg.fourth_code_auto_commit = false;
     cfg.fifth_code_push_commit = true;
@@ -509,7 +509,7 @@ fn eval_typo_regression(schema: WubiSchema, dict_path: &PathBuf, aux_path: &Path
     cfg.typo.missed_space_correction = enabled;
     cfg.typo.touch_hitbox_adapt = false;
 
-    let mut engine = WubiEngine::new(cfg);
+    let mut engine = JuxuEngine::new(cfg);
     engine.load_dict(schema, dict);
     engine.set_aux(aux);
 
@@ -640,9 +640,9 @@ fn main() {
     let verbose = std::env::args().any(|a| a == "--verbose");
 
     for (schema, fname) in [
-        (WubiSchema::Wubi86, "wubi86.wbdict"),
-        (WubiSchema::Wubi98, "wubi98.wbdict"),
-        (WubiSchema::Wubi06, "wubi06.wbdict"),
+        (InputSchema::Wubi86, "wubi86.wbdict"),
+        (InputSchema::Wubi98, "wubi98.wbdict"),
+        (InputSchema::Wubi06, "wubi06.wbdict"),
     ] {
         let dp = dir.join(fname);
         if !dp.exists() {

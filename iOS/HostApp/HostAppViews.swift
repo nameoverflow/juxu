@@ -31,7 +31,7 @@ public enum IOSHostTab: Int, CaseIterable, Identifiable {
 }
 
 public struct IOSHostRootView: View {
-    @ObservedObject public var bridge: WubiBridge
+    @ObservedObject public var bridge: JuxuBridge
     @State public var selectedTab: IOSHostTab
     @State private var sandboxText: String = ""
     @FocusState private var sandboxFocused: Bool
@@ -39,7 +39,7 @@ public struct IOSHostRootView: View {
     @FocusState private var newWordFocused: Bool
     @State private var wordFeedback: String = ""
 
-    public init(bridge: WubiBridge, initialTab: IOSHostTab = .home) {
+    public init(bridge: JuxuBridge, initialTab: IOSHostTab = .home) {
         self.bridge = bridge
         self._selectedTab = State(initialValue: initialTab)
     }
@@ -185,7 +185,7 @@ public struct IOSHostRootView: View {
                                 }
                                 .font(.system(size: 13.5, weight: .semibold))
                                 .foregroundStyle(Color.accentColor)
-                                .accessibilityIdentifier("PrisWubiSandboxDone")
+                                .accessibilityIdentifier("JuxuSandboxDone")
                             }
                         }
                         TextField("点此弹出键盘试打汉字、长按空格滑动移光标…", text: $sandboxText)
@@ -662,7 +662,7 @@ public struct IOSHostRootView: View {
         }
     }
 
-    private func binding<T>(_ kp: WritableKeyPath<WubiPreferences, T>) -> Binding<T> {
+    private func binding<T>(_ kp: WritableKeyPath<JuxuPreferences, T>) -> Binding<T> {
         Binding(
             get: { bridge.prefs[keyPath: kp] },
             set: { v in

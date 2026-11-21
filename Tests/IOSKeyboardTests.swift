@@ -80,10 +80,10 @@ struct IOSKeyboardTests {
         assert(trackpad.update(x: 189.0) == -1)
         trackpad.end()
 
-        // 6. Test end-to-end iOS 26 view coordinates -> Rust wubi-core touch slip rescue & drift learning!
+        // 6. Test end-to-end iOS 26 view coordinates -> Rust juxu-core touch slip rescue & drift learning!
         let dictsURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("Resources/Dicts", isDirectory: true)
-        let bridge = WubiBridge(customDictsDir: dictsURL, inMemoryOnly: true)
+        let bridge = JuxuBridge(customDictsDir: dictsURL, inMemoryOnly: true)
         bridge.setKeyLayout(
             centers52: snap.centers52,
             originX: snap.originX,
@@ -265,14 +265,14 @@ struct IOSKeyboardTests {
         assert(sAfterConsume == nil && readCalls == 2)
 
         // Preference TOML round-trip
-        var prefs = WubiPreferences()
+        var prefs = JuxuPreferences()
         assert(prefs.clipboardSuggestion == true)
         assert(prefs.autoSpaceZhEn == true)
         assert(prefs.autoSpaceDigits == true)
         prefs.clipboardSuggestion = false
         prefs.autoSpaceZhEn = false
         prefs.autoSpaceDigits = false
-        let parsedPrefs = WubiPreferences.fromTOML(prefs.toTOML())
+        let parsedPrefs = JuxuPreferences.fromTOML(prefs.toTOML())
         assert(parsedPrefs.clipboardSuggestion == false)
         assert(parsedPrefs.autoSpaceZhEn == false)
         assert(parsedPrefs.autoSpaceDigits == false)
@@ -424,10 +424,10 @@ struct IOSKeyboardTests {
         cjLayout.cangjieKeycapRadicals = false
         let cjOffSnap = cjLayout.computeLayout(in: CGSize(width: 440, height: 220))
         assert(cjOffSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "q")
-        var cjPrefs = WubiPreferences()
+        var cjPrefs = JuxuPreferences()
         assert(cjPrefs.cangjieKeycapRadicals == true)
         cjPrefs.cangjieKeycapRadicals = false
-        assert(WubiPreferences.fromTOML(cjPrefs.toTOML()).cangjieKeycapRadicals == false)
+        assert(JuxuPreferences.fromTOML(cjPrefs.toTOML()).cangjieKeycapRadicals == false)
 
         // 18. Wubi radical keycaps option (86 / 98 / 06 version-specific tables + ASCII/Shift fallback)
         var wbLayout = IOSKeyboardLayoutEngine()
@@ -447,10 +447,10 @@ struct IOSKeyboardTests {
         wbLayout.asciiMode = true
         let wbAsciiSnap = wbLayout.computeLayout(in: CGSize(width: 440, height: 220))
         assert(wbAsciiSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "g")) })?.keycapRadicals == nil)
-        var wbPrefs = WubiPreferences()
+        var wbPrefs = JuxuPreferences()
         assert(wbPrefs.wubiKeycapRadicals == false)
         wbPrefs.wubiKeycapRadicals = true
-        assert(WubiPreferences.fromTOML(wbPrefs.toTOML()).wubiKeycapRadicals == true)
+        assert(JuxuPreferences.fromTOML(wbPrefs.toTOML()).wubiKeycapRadicals == true)
 
         print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie & Wubi keycaps & idle prediction tests passed!")
     }

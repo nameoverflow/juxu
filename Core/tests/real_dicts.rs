@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
-use wubi_core::config::{WubiConfig, WubiSchema};
-use wubi_core::engine::{CandidateBadge, WubiEngine, KEY_BACKSPACE, KEY_RETURN, KEY_SPACE};
-use wubi_core::format::{AuxView, DictView};
-use wubi_core::user_data::UserStore;
+use juxu_core::config::{JuxuConfig, InputSchema};
+use juxu_core::engine::{CandidateBadge, JuxuEngine, KEY_BACKSPACE, KEY_RETURN, KEY_SPACE};
+use juxu_core::format::{AuxView, DictView};
+use juxu_core::user_data::UserStore;
 
 fn dicts_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -18,18 +18,18 @@ fn spaceless_personal_context_generalizes_beyond_the_shared_suffix() {
     if !dir.join("wubi86.wbdict").exists() {
         return;
     }
-    let config = WubiConfig {
+    let config = JuxuConfig {
         spaceless: true,
         auto_phrase: false,
-        ..WubiConfig::default()
+        ..JuxuConfig::default()
     };
-    let mut engine = WubiEngine::new(config.clone());
+    let mut engine = JuxuEngine::new(config.clone());
     engine.load_dict(
-        WubiSchema::Wubi86,
+        InputSchema::Wubi86,
         DictView::open_mmap(dir.join("wubi86.wbdict")).unwrap(),
     );
     engine.set_aux(AuxView::open_mmap(dir.join("wubi_aux.wbaux")).unwrap());
-    let enter = |engine: &mut WubiEngine, context: &str, code: &str| {
+    let enter = |engine: &mut JuxuEngine, context: &str, code: &str| {
         engine.clear_composition();
         engine.set_recent_context(context);
         for (i, ch) in code.chars().enumerate() {
@@ -95,9 +95,9 @@ fn spaceless_touch_correction_learns_confirmed_code() {
     if !dir.join("wubi86.wbdict").exists() {
         return;
     }
-    let mut config = WubiConfig { spaceless: true, ..WubiConfig::default() };
-    let mut engine = WubiEngine::new(config.clone());
-    engine.load_dict(WubiSchema::Wubi86, DictView::open_mmap(dir.join("wubi86.wbdict")).unwrap());
+    let mut config = JuxuConfig { spaceless: true, ..JuxuConfig::default() };
+    let mut engine = JuxuEngine::new(config.clone());
+    engine.load_dict(InputSchema::Wubi86, DictView::open_mmap(dir.join("wubi86.wbdict")).unwrap());
     engine.set_aux(AuxView::open_mmap(dir.join("wubi_aux.wbaux")).unwrap());
     let taps = [
         (b'y', 4.54, 0.03),
@@ -106,7 +106,7 @@ fn spaceless_touch_correction_learns_confirmed_code() {
         (b'u', 5.98, 0.01),
         (b'j', 6.5, 1.0),
     ];
-    let type_taps = |engine: &mut WubiEngine| {
+    let type_taps = |engine: &mut JuxuEngine| {
         for (i, &(letter, x, y)) in taps.iter().enumerate() {
             engine.push_touch_letter(letter, x, y, false, 100 + i as u64 * 70);
         }
@@ -174,7 +174,7 @@ fn real_dicts_latency_schemas_and_typo_correction() {
     // Verify exact INT8 numerical parity against Python QAT reference ("今天天气真" -> 好/热 vs 油/突)
     {
         let nv = aux.neural_view().expect("neural_view");
-        let mut tracker = wubi_core::neural::NeuralContextTracker::default();
+        let mut tracker = juxu_core::neural::NeuralContextTracker::default();
         tracker.init_with_model(&nv);
         tracker.commit_cjk_str(&nv, "今天天气真");
         let s_hao = nv.score_next_char(&tracker.active, '好');
@@ -208,10 +208,10 @@ fn real_dicts_latency_schemas_and_typo_correction() {
         code_86_jsj, code_98_jsj, code_06_jsj
     );
 
-    let mut engine = WubiEngine::new(WubiConfig::default());
-    engine.load_dict(WubiSchema::Wubi86, d86);
-    engine.load_dict(WubiSchema::Wubi98, d98);
-    engine.load_dict(WubiSchema::Wubi06, d06);
+    let mut engine = JuxuEngine::new(JuxuConfig::default());
+    engine.load_dict(InputSchema::Wubi86, d86);
+    engine.load_dict(InputSchema::Wubi98, d98);
+    engine.load_dict(InputSchema::Wubi06, d06);
     engine.set_aux(aux);
 
     // Benchmark 1000 full 4-keystroke sequences WITH statistical typo-correction enabled!
@@ -250,19 +250,19 @@ fn real_dicts_latency_schemas_and_typo_correction() {
     engine.clear_composition();
 
     // Switch to 98 and 06 and verify instant lookup
-    engine.set_schema(WubiSchema::Wubi98);
+    engine.set_schema(InputSchema::Wubi98);
     let _ = engine.handle_key_event(0, Some('q'), false, 500);
     assert_eq!(engine.page_candidates()[0].text, "我");
     engine.clear_composition();
 
-    engine.set_schema(WubiSchema::Wubi06);
+    engine.set_schema(InputSchema::Wubi06);
     let _ = engine.handle_key_event(0, Some('q'), false, 600);
     assert_eq!(engine.page_candidates()[0].text, "我");
     engine.clear_composition();
 
     // Verify high-frequency exact homocode protection in Wubi98:
     // "还能" + wdwx must prefer "优化" (weight 61M) over "拿破仑" (weight 2.3M)
-    engine.set_schema(WubiSchema::Wubi98);
+    engine.set_schema(InputSchema::Wubi98);
     engine.set_recent_context("还能");
     for (i, ch) in "wdwx".chars().enumerate() {
         let _ = engine.handle_key_event(0, Some(ch), false, 3000 + i as u64 * 60);
@@ -273,7 +273,7 @@ fn real_dicts_latency_schemas_and_typo_correction() {
     engine.clear_composition();
 
     // Test lightweight N-gram idle next-word prediction & latency
-    engine.set_schema(WubiSchema::Wubi86);
+    engine.set_schema(InputSchema::Wubi86);
     let samples = [
         "",
         "我",
@@ -328,7 +328,7 @@ fn real_dicts_latency_schemas_and_typo_correction() {
         got.push_str(&out.commit_text);
     }
     if engine.is_composing() {
-        let out = engine.handle_key_event(wubi_core::engine::KEY_SPACE, Some(' '), false, 2500);
+        let out = engine.handle_key_event(juxu_core::engine::KEY_SPACE, Some(' '), false, 2500);
         got.push_str(&out.commit_text);
     }
     assert_eq!(got, "去爬山", "expected empty-collision missed-space rescue '去爬山', got '{}'", got);
@@ -343,7 +343,7 @@ fn real_dicts_latency_schemas_and_typo_correction() {
         got2.push_str(&out.commit_text);
     }
     if engine.is_composing() {
-        let out = engine.handle_key_event(wubi_core::engine::KEY_SPACE, Some(' '), false, 3600);
+        let out = engine.handle_key_event(juxu_core::engine::KEY_SPACE, Some(' '), false, 3600);
         got2.push_str(&out.commit_text);
     }
     assert_eq!(got2, "去吃饭", "expected colliding missed-space rescue '去吃饭', got '{}'", got2);
@@ -356,14 +356,14 @@ fn real_dicts_latency_schemas_and_typo_correction() {
         let out = engine.handle_key_event(0, Some(ch), false, 4000 + i as u64 * 60);
         got3.push_str(&out.commit_text);
     }
-    let out3_sp = engine.handle_key_event(wubi_core::engine::KEY_SPACE, Some(' '), false, 4300);
+    let out3_sp = engine.handle_key_event(juxu_core::engine::KEY_SPACE, Some(' '), false, 4300);
     got3.push_str(&out3_sp.commit_text);
     assert_eq!(got3, "店的", "expected 3+1 missed-space rescue '店的', got '{}'", got3);
 }
 
 #[test]
 fn real_dicts_full_pinyin_and_xiaohe_sentence_and_typo() {
-    use wubi_core::pinyin_dict::PinyinDictView;
+    use juxu_core::pinyin_dict::PinyinDictView;
 
     let base = dicts_dir();
     let pdict = PinyinDictView::from_file(base.join("pinyin.pydict")).expect("open pinyin.pydict");
@@ -375,9 +375,9 @@ fn real_dicts_full_pinyin_and_xiaohe_sentence_and_typo() {
     assert!(syl_cnt > 390 && char_cnt > 8000 && phrase_cnt > 100_000);
 
     // 1. Full Pinyin real-dict sentence + abbr + apostrophe + touch typo + latency
-    let mut cfg = WubiConfig::default();
-    cfg.schema = WubiSchema::Pinyin;
-    let mut engine = WubiEngine::new(cfg);
+    let mut cfg = JuxuConfig::default();
+    cfg.schema = InputSchema::Pinyin;
+    let mut engine = JuxuEngine::new(cfg);
     engine.load_pinyin_dict(pdict);
     engine.set_aux(aux);
 
@@ -495,11 +495,11 @@ fn real_dicts_full_pinyin_and_xiaohe_sentence_and_typo() {
     );
 
     // 2. Xiaohe YinXing real-dict lookup + 'z' typo rescue + spaceless sentence
-    let mut cfg_xh = WubiConfig::default();
-    cfg_xh.schema = WubiSchema::Xiaohe;
+    let mut cfg_xh = JuxuConfig::default();
+    cfg_xh.schema = InputSchema::Xiaohe;
     cfg_xh.spaceless = false;
     engine.set_config(cfg_xh);
-    engine.load_dict(WubiSchema::Xiaohe, xh_dict);
+    engine.load_dict(InputSchema::Xiaohe, xh_dict);
 
     for ch in "uuip".chars() {
         let _ = engine.handle_key_event(0, Some(ch), false, 3000);
@@ -515,7 +515,7 @@ fn real_dicts_full_pinyin_and_xiaohe_sentence_and_typo() {
 
 #[test]
 fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
-    use wubi_core::pinyin_dict::PinyinDictView;
+    use juxu_core::pinyin_dict::PinyinDictView;
 
     let base = dicts_dir();
     if !base.join("pinyin.pydict").exists() || !base.join("wubi86.wbdict").exists() {
@@ -526,13 +526,13 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
     let xh = DictView::open_mmap(base.join("xiaohe.wbdict")).expect("open xiaohe.wbdict");
     let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
 
-    let mut cfg = WubiConfig::default();
-    cfg.schema = WubiSchema::Pinyin;
+    let mut cfg = JuxuConfig::default();
+    cfg.schema = InputSchema::Pinyin;
     cfg.auto_phrase = true;
     cfg.auto_phrase_threshold = 2;
-    let mut engine = WubiEngine::new(cfg.clone());
-    engine.load_dict(WubiSchema::Wubi86, d86);
-    engine.load_dict(WubiSchema::Xiaohe, xh);
+    let mut engine = JuxuEngine::new(cfg.clone());
+    engine.load_dict(InputSchema::Wubi86, d86);
+    engine.load_dict(InputSchema::Xiaohe, xh);
     engine.load_pinyin_dict(pdict);
     engine.set_aux(aux);
 
@@ -547,7 +547,7 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
 
     // 2. RWKV-driven next_key_priors in Spaceless Wubi86: after "大模", 'g' (型 = gaej) must be boosted (> 100)
     let mut cfg_sp = cfg.clone();
-    cfg_sp.schema = WubiSchema::Wubi86;
+    cfg_sp.schema = InputSchema::Wubi86;
     cfg_sp.spaceless = true;
     engine.set_config(cfg_sp);
     engine.set_recent_context("大模");
@@ -558,7 +558,7 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
 
     // 3. RWKV-driven next_key_priors in Xiaohe: after "大模", 'x' (型 = xk..) must be boosted (> 110)
     let mut cfg_xh = cfg.clone();
-    cfg_xh.schema = WubiSchema::Xiaohe;
+    cfg_xh.schema = InputSchema::Xiaohe;
     cfg_xh.spaceless = false;
     engine.set_config(cfg_xh);
     engine.set_recent_context("大模");
@@ -568,13 +568,13 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
     assert!(p_x > 110, "expected RWKV Xiaohe prior for 'x' (型) > 110, got {}", p_x);
 
     // 4. Cross-mode dynamic phrase: a phrase added via Wubi86/UserStore is immediately retrievable in Full Pinyin!
-    engine.set_schema(WubiSchema::Wubi86);
+    engine.set_schema(InputSchema::Wubi86);
     {
-        let d = engine.dicts[WubiSchema::Wubi86.slot_index()].as_ref();
+        let d = engine.dicts[InputSchema::Wubi86.slot_index()].as_ref();
         let pd = engine.pinyin_dict.as_ref();
         let _ = engine.user.add_phrase_with_pinyin("句序", false, d, pd);
     }
-    engine.set_schema(WubiSchema::Pinyin);
+    engine.set_schema(InputSchema::Pinyin);
     engine.clear_context();
     for (i, ch) in "juxu".chars().enumerate() {
         let _ = engine.handle_key_event(0, Some(ch), false, 4000 + i as u64 * 40);
@@ -586,7 +586,7 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
     // 5. Surprisal-driven auto-phrase: low-surprisal pair "我的" must NOT pollute user phrases,
     //    while high-surprisal OOV pair "星锚" promotes quickly on repeat!
     engine.clear_composition();
-    engine.set_schema(WubiSchema::Wubi86);
+    engine.set_schema(InputSchema::Wubi86);
     for round in 0..3u64 {
         engine.clear_context();
         let base_t = 5000 + round * 1000;
@@ -644,7 +644,7 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
     }
     assert_eq!(promoted.as_deref(), Some("星锚"));
     // Verify it is immediately indexed and retrievable in Full Pinyin!
-    engine.set_schema(WubiSchema::Pinyin);
+    engine.set_schema(InputSchema::Pinyin);
     engine.clear_context();
     for (i, ch) in "xingmao".chars().enumerate() {
         let _ = engine.handle_key_event(0, Some(ch), false, 9500 + i as u64 * 40);
@@ -678,7 +678,7 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
     // 7. Softened validNextMask after a boundary-slip Key #1 in Wubi86:
     //    Touching near t(4.0)/y(5.0) border -> reported 'y', mask must still allow 'r' (from 'tr..' = 我们)
     let mut cfg_wb = cfg.clone();
-    cfg_wb.schema = WubiSchema::Wubi86;
+    cfg_wb.schema = InputSchema::Wubi86;
     cfg_wb.spaceless = false;
     engine.set_config(cfg_wb);
     engine.clear_composition();
@@ -689,7 +689,7 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
 
     // 8. Full-Pinyin tiered candidate list: cap long full sentences at <= 3, then surface high-confidence
     //    multi-character prefix words (e.g. `试试`/`事实`/`实时`) BEFORE single characters!
-    engine.set_schema(WubiSchema::Pinyin);
+    engine.set_schema(InputSchema::Pinyin);
     engine.clear_composition();
     engine.clear_context();
     for (i, ch) in "shishijiuss".chars().enumerate() {
@@ -738,7 +738,7 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
     // 10. High-cohesion modern word missing from Wubi86 ("微信" = tmg + wy -> tmwy):
     //     Must be auto-composed into user phrase `tmwy` instead of rejected by low RWKV surprisal!
     let mut cfg_wb_auto = cfg.clone();
-    cfg_wb_auto.schema = WubiSchema::Wubi86;
+    cfg_wb_auto.schema = InputSchema::Wubi86;
     cfg_wb_auto.spaceless = true;
     cfg_wb_auto.auto_phrase = true;
     cfg_wb_auto.auto_phrase_threshold = 2;
@@ -756,7 +756,7 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
     );
     // Switch to standard Wubi86 and verify `tmwy` now directly yields "微信"!
     let mut cfg_wb_std = cfg.clone();
-    cfg_wb_std.schema = WubiSchema::Wubi86;
+    cfg_wb_std.schema = InputSchema::Wubi86;
     cfg_wb_std.spaceless = false;
     engine.set_config(cfg_wb_std);
     engine.clear_composition();
@@ -820,7 +820,7 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
     );
     // Verify 4-code Wubi lookup (`kaoy` or encoded code) AND Full Pinyin (`hajimi`) both hit "哈基米"!
     let hjm_code = engine.dicts[0].as_ref().unwrap().encode_phrase("哈基米").unwrap().as_string();
-    engine.set_schema(WubiSchema::Wubi86);
+    engine.set_schema(InputSchema::Wubi86);
     engine.clear_composition();
     let mut hjm_committed = String::new();
     for (i, ch) in hjm_code.chars().enumerate() {
@@ -833,7 +833,7 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
         hjm_code,
         hjm_committed
     );
-    engine.set_schema(WubiSchema::Pinyin);
+    engine.set_schema(InputSchema::Pinyin);
     engine.clear_composition();
     for (i, ch) in "hajimi".chars().enumerate() {
         let _ = engine.handle_key_event(0, Some(ch), false, 19_500 + i as u64 * 40);
@@ -847,15 +847,15 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
 
 #[test]
 fn real_dicts_xiaohe_shuangpin_sentence_and_priors() {
-    use wubi_core::pinyin_dict::PinyinDictView;
+    use juxu_core::pinyin_dict::PinyinDictView;
 
     let base = dicts_dir();
     let pdict = PinyinDictView::from_file(base.join("pinyin.pydict")).expect("open pinyin.pydict");
     let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
 
-    let mut cfg = WubiConfig::default();
-    cfg.schema = WubiSchema::XiaoheShuangpin;
-    let mut engine = WubiEngine::new(cfg);
+    let mut cfg = JuxuConfig::default();
+    cfg.schema = InputSchema::XiaoheShuangpin;
+    let mut engine = JuxuEngine::new(cfg);
     engine.load_pinyin_dict(pdict);
     engine.set_aux(aux);
 
@@ -895,12 +895,12 @@ fn real_dicts_cangjie_3_5_6_input_and_five_code_rules() {
     let cj6 = DictView::open_mmap(base.join("cangjie6.wbdict")).expect("open cangjie6.wbdict");
     let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
 
-    let mut cfg = WubiConfig::default();
-    cfg.schema = WubiSchema::Cangjie5;
-    let mut engine = WubiEngine::new(cfg);
-    engine.load_dict(WubiSchema::Cangjie3, cj3);
-    engine.load_dict(WubiSchema::Cangjie5, cj5);
-    engine.load_dict(WubiSchema::Cangjie6, cj6);
+    let mut cfg = JuxuConfig::default();
+    cfg.schema = InputSchema::Cangjie5;
+    let mut engine = JuxuEngine::new(cfg);
+    engine.load_dict(InputSchema::Cangjie3, cj3);
+    engine.load_dict(InputSchema::Cangjie5, cj5);
+    engine.load_dict(InputSchema::Cangjie6, cj6);
     engine.set_aux(aux);
 
     // 1. Verify Cangjie 5 radical preedit and basic characters
@@ -929,7 +929,7 @@ fn real_dicts_cangjie_3_5_6_input_and_five_code_rules() {
     assert_eq!(out5.commit_text, "頡", "expected 5th-code unique auto-commit '頡', got '{}'", out5.commit_text);
 
     // 3. Verify Cangjie 3 and Cangjie 6 switching and lookup
-    engine.set_schema(WubiSchema::Cangjie3);
+    engine.set_schema(InputSchema::Cangjie3);
     for ch in "hqi".chars() {
         let _ = engine.handle_key_event(0, Some(ch), false, 400);
     }
@@ -940,7 +940,7 @@ fn real_dicts_cangjie_3_5_6_input_and_five_code_rules() {
     );
     engine.clear_composition();
 
-    engine.set_schema(WubiSchema::Cangjie6);
+    engine.set_schema(InputSchema::Cangjie6);
     for ch in "a".chars() {
         let _ = engine.handle_key_event(0, Some(ch), false, 500);
     }
@@ -950,7 +950,7 @@ fn real_dicts_cangjie_3_5_6_input_and_five_code_rules() {
 
     // 4. Verify authentic differences across Cangjie 3, 5, and 6:
     // "面": Cangjie 3 = "mwyl" (一田卜中), Cangjie 5 = "mwsl" (一田尸中), Cangjie 6 = "mws" (一田尸)
-    engine.set_schema(WubiSchema::Cangjie3);
+    engine.set_schema(InputSchema::Cangjie3);
     for ch in "mwyl".chars() {
         let _ = engine.handle_key_event(0, Some(ch), false, 600);
     }
@@ -960,7 +960,7 @@ fn real_dicts_cangjie_3_5_6_input_and_five_code_rules() {
     );
     engine.clear_composition();
 
-    engine.set_schema(WubiSchema::Cangjie5);
+    engine.set_schema(InputSchema::Cangjie5);
     for ch in "mwsl".chars() {
         let _ = engine.handle_key_event(0, Some(ch), false, 700);
     }
@@ -970,7 +970,7 @@ fn real_dicts_cangjie_3_5_6_input_and_five_code_rules() {
     );
     engine.clear_composition();
 
-    engine.set_schema(WubiSchema::Cangjie6);
+    engine.set_schema(InputSchema::Cangjie6);
     for ch in "mws".chars() {
         let _ = engine.handle_key_event(0, Some(ch), false, 800);
     }

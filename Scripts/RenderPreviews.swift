@@ -22,7 +22,7 @@ struct RenderPreviews {
 
         let dictsURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("Resources/Dicts", isDirectory: true)
-        let bridge = WubiBridge(customDictsDir: dictsURL, inMemoryOnly: true)
+        let bridge = JuxuBridge(customDictsDir: dictsURL, inMemoryOnly: true)
         _ = bridge.addUserPhrase("棱五笔", persist: false)
 
         // Generate real engine states from the live Rust core + 86/98/06 dicts!
@@ -45,7 +45,7 @@ struct RenderPreviews {
             _ = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 500)
         }
         var pinyinVerticalState = bridge.state
-        pinyinVerticalState = WubiActionState(
+        pinyinVerticalState = JuxuActionState(
             consumed: pinyinVerticalState.consumed,
             bell: false,
             asciiMode: false,
@@ -194,7 +194,7 @@ struct InlineEditorLineMock: View {
     let isDark: Bool
     let committedPrefix: String
     let markedPreedit: String
-    let candidateState: WubiActionState
+    let candidateState: JuxuActionState
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -231,9 +231,9 @@ struct InlineEditorLineMock: View {
 
 struct CandidateShowcaseCanvas: View {
     let isDark: Bool
-    let typoState: WubiActionState
-    let shortcodeState: WubiActionState
-    let verticalPinyinState: WubiActionState
+    let typoState: JuxuActionState
+    let shortcodeState: JuxuActionState
+    let verticalPinyinState: JuxuActionState
 
     var body: some View {
         ZStack(alignment: .topLeading) {

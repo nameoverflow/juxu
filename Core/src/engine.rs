@@ -1,5 +1,5 @@
 use crate::code::{cangjie_radicals_str, expand_wildcards, PackedCode};
-use crate::config::{FourthEmptyBehavior, ShiftToggleMode, WubiConfig, WubiSchema};
+use crate::config::{FourthEmptyBehavior, ShiftToggleMode, JuxuConfig, InputSchema};
 use crate::format::{AuxView, DictView, ENTRY_FLAG_SYMBOL};
 use crate::neural::{NeuralContextTracker, NeuralView, RwkvState};
 use crate::personalization::Context as PersonalContext;
@@ -116,11 +116,11 @@ impl Default for LmWeights {
     }
 }
 
-pub struct WubiEngine {
+pub struct JuxuEngine {
     pub dicts: [Option<DictView>; 9],
     pub pinyin_dict: Option<PinyinDictView>,
     pub aux: Option<AuxView>,
-    pub config: WubiConfig,
+    pub config: JuxuConfig,
     pub user: UserStore,
     pub key_layout: KeyLayout,
     pub lm_weights: LmWeights,
@@ -151,14 +151,14 @@ pub struct WubiEngine {
     top_typo_spatial_logp: Option<f32>,
 }
 
-impl Default for WubiEngine {
+impl Default for JuxuEngine {
     fn default() -> Self {
-        Self::new(WubiConfig::default())
+        Self::new(JuxuConfig::default())
     }
 }
 
-impl WubiEngine {
-    pub fn new(config: WubiConfig) -> Self {
+impl JuxuEngine {
+    pub fn new(config: JuxuConfig) -> Self {
         Self {
             dicts: [None, None, None, None, None, None, None, None, None],
             pinyin_dict: None,
@@ -676,7 +676,7 @@ impl WubiEngine {
         result
     }
 
-    pub fn load_dict(&mut self, schema: WubiSchema, dict: DictView) {
+    pub fn load_dict(&mut self, schema: InputSchema, dict: DictView) {
         let slot = schema.slot_index();
         if slot >= self.dicts.len() {
             return;
@@ -694,7 +694,7 @@ impl WubiEngine {
 
     /// Release all loaded dictionaries except the one required by `schema` (e.g. unmapping the
     /// 67 MB `pinyin.pydict` on iOS when switching back to Wubi/Cangjie).
-    pub fn retain_only_schema_dict(&mut self, schema: WubiSchema) {
+    pub fn retain_only_schema_dict(&mut self, schema: InputSchema) {
         if schema.is_pinyin() {
             for slot in &mut self.dicts {
                 *slot = None;
@@ -740,7 +740,7 @@ impl WubiEngine {
         self.dicts.get(slot).and_then(|d| d.as_ref())
     }
 
-    pub fn set_config(&mut self, new_config: WubiConfig) {
+    pub fn set_config(&mut self, new_config: JuxuConfig) {
         let schema_changed = self.config.schema != new_config.schema;
         let mode_changed = self.config.spaceless != new_config.spaceless;
         self.config = new_config;
@@ -757,7 +757,7 @@ impl WubiEngine {
         }
     }
 
-    pub fn set_schema(&mut self, schema: WubiSchema) {
+    pub fn set_schema(&mut self, schema: InputSchema) {
         if self.config.schema != schema {
             self.config.schema = schema;
             let slot = self.config.schema.slot_index();
@@ -1338,7 +1338,7 @@ impl WubiEngine {
         // Case 1: Key #1 (`raw_code` is empty) — use `Micro-RWKV-7` first-key priors for ALL schemas!
         if bytes.is_empty() {
             if self.neural_tracker.is_ready() {
-                if self.config.schema == WubiSchema::Wubi86 {
+                if self.config.schema == InputSchema::Wubi86 {
                     for idx in 0..25usize {
                         let lp = self.neural_tracker.active.key1_logp[idx];
                         let delta = lp - (-3.2189f32);
@@ -3177,7 +3177,7 @@ impl WubiEngine {
             let key_idx = (key_byte - b'a') as usize;
             let c2_lp = exact_c2.as_ref().map(|x| x.1).unwrap_or(-13.5);
             let pref_lp = if let (Some(nv), Some(st)) = (nv, state) {
-                if self.config.schema == WubiSchema::Wubi86 {
+                if self.config.schema == InputSchema::Wubi86 {
                     let k1 = st.key1_logp[key_idx].clamp(-9.0, -0.05);
                     k1.max(c2_lp).min(-0.05)
                 } else {

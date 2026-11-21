@@ -1,5 +1,5 @@
 use crate::code::PackedCode;
-use crate::config::WubiConfig;
+use crate::config::JuxuConfig;
 use crate::format::{AuxView, DictView};
 use crate::neural::{NeuralView, RwkvState};
 use crate::personalization::Context as PersonalContext;
@@ -19,7 +19,7 @@ pub(crate) struct Decoder<'a> {
     pub dict: &'a DictView,
     pub aux: &'a AuxView,
     pub model: NeuralView<'a>,
-    pub config: &'a WubiConfig,
+    pub config: &'a JuxuConfig,
     pub user: &'a UserStore,
     pub context: &'a [char],
     pub layout: &'a KeyLayout,
@@ -186,7 +186,7 @@ impl Stream {
         code: &str,
         dict: &DictView,
         user: &UserStore,
-        config: &WubiConfig,
+        config: &JuxuConfig,
     ) -> Option<StablePrefix> {
         let limit = code.len().checked_sub(COMMIT_DELAY)?;
         let best = self.paths().first()?;

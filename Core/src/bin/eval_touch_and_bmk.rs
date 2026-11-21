@@ -1,6 +1,6 @@
 //! Comprehensive Touch-Typo 2D Gaussian Simulator, Regression Gold Set, and Large-Scale Held-Out Benchmark.
 //!
-//! Evaluates through real `WubiEngine::push_touch_letter` & `handle_key_event`:
+//! Evaluates through real `JuxuEngine::push_touch_letter` & `handle_key_event`:
 //! 1. Regression Gold Set (user-reported high-priority pinyin/shuangpin/typo/context cases)
 //! 2. 2D Continuous Touchscreen Typo Simulator (Full Pinyin & Xiaohe Shuangpin):
 //!    - Clean Border Taps (FP / over-correction gate)
@@ -13,12 +13,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use wubi_core::config::{WubiConfig, WubiSchema};
-use wubi_core::engine::WubiEngine;
-use wubi_core::format::AuxView;
-use wubi_core::pinyin_dict::PinyinDictView;
-use wubi_core::typo::KeyLayout;
-use wubi_core::user_data::TouchProfile;
+use juxu_core::config::{JuxuConfig, InputSchema};
+use juxu_core::engine::JuxuEngine;
+use juxu_core::format::AuxView;
+use juxu_core::pinyin_dict::PinyinDictView;
+use juxu_core::typo::KeyLayout;
+use juxu_core::user_data::TouchProfile;
 
 /// Deterministic xorshift64* PRNG with Box-Muller Gaussian sampling.
 struct Rng(u64);
@@ -144,13 +144,13 @@ fn horizontal_neighbor(layout: &KeyLayout, ch: u8) -> Option<u8> {
     best.map(|b| b.1)
 }
 
-fn make_engine(schema: WubiSchema, aux_path: &PathBuf, typo_enabled: bool, adapt: bool) -> WubiEngine {
-    let mut cfg = WubiConfig::default();
+fn make_engine(schema: InputSchema, aux_path: &PathBuf, typo_enabled: bool, adapt: bool) -> JuxuEngine {
+    let mut cfg = JuxuConfig::default();
     cfg.schema = schema;
     cfg.typo.enabled = typo_enabled;
     cfg.typo.touch_hitbox_adapt = adapt;
     cfg.dynamic_word_freq = false;
-    let mut engine = WubiEngine::new(cfg);
+    let mut engine = JuxuEngine::new(cfg);
     let dir = PathBuf::from("Resources/Dicts");
     let pydict = PinyinDictView::from_file(dir.join("pinyin.pydict")).expect("load pinyin.pydict");
     let aux = AuxView::open_mmap(aux_path).expect("load wbaux");
@@ -212,7 +212,7 @@ fn main() {
     // -------------------------------------------------------------------------
     // 1. Regression Gold Set
     // -------------------------------------------------------------------------
-    let mut eng = make_engine(WubiSchema::Pinyin, &aux_path, true, true);
+    let mut eng = make_engine(InputSchema::Pinyin, &aux_path, true, true);
     let mut gold_pass = 0usize;
     let mut gold_fails = Vec::new();
     for &(ctx, keys, exp, must_top1) in GOLD_CASES {
@@ -250,7 +250,7 @@ fn main() {
 
     // 2a. Clean Border Taps (offset 0.38 toward neighbor, still inside intended key -> measure FP)
     {
-        let mut e = make_engine(WubiSchema::Pinyin, &aux_path, true, true);
+        let mut e = make_engine(InputSchema::Pinyin, &aux_path, true, true);
         let mut t1 = 0usize;
         let mut ch_h = 0usize;
         let mut ch_t = 0usize;
@@ -290,7 +290,7 @@ fn main() {
     // 2b. Boundary Slip (1 slip per sentence: 0.58 toward neighbor = 0.08 across border)
     // Compare physical key (no touch coords) vs continuous 2D touch coords
     for (mode_name, use_touch_coords) in [("Boundary Slip (physical key only) ", false), ("Boundary Slip (2D touch + gutter) ", true)] {
-        let mut e = make_engine(WubiSchema::Pinyin, &aux_path, true, true);
+        let mut e = make_engine(InputSchema::Pinyin, &aux_path, true, true);
         let mut t1 = 0usize;
         let mut ch_h = 0usize;
         let mut ch_t = 0usize;
@@ -338,7 +338,7 @@ fn main() {
     for (label, sigma) in [("2D Gaussian Mild     (σ=0.24)", 0.24f32), ("2D Gaussian Moderate (σ=0.32)", 0.32f32)] {
         for (typo_on, tag) in [(false, "Typo=OFF"), (true, "Typo=ON ")] {
             let mut rng = Rng::new(261121);
-            let mut e = make_engine(WubiSchema::Pinyin, &aux_path, typo_on, typo_on);
+            let mut e = make_engine(InputSchema::Pinyin, &aux_path, typo_on, typo_on);
             let mut t1 = 0usize;
             let mut ch_h = 0usize;
             let mut ch_t = 0usize;
@@ -378,7 +378,7 @@ fn main() {
     // 2d. Systematic Thumb Bias (+0.22, +0.12) + sigma=0.22 Online Adaptation Curve
     {
         let mut rng = Rng::new(987654);
-        let mut e = make_engine(WubiSchema::Pinyin, &aux_path, true, true);
+        let mut e = make_engine(InputSchema::Pinyin, &aux_path, true, true);
         let mut first_h = 0usize;
         let mut first_t = 0usize;
         let mut last_h = 0usize;
@@ -422,7 +422,7 @@ fn main() {
     // 4. Public P2C Benchmark TSV (`domain\tchinese\tpinyin` exact gold pairs)
     // -------------------------------------------------------------------------
     if let Some(ref pub_path) = public_tsv {
-        let mut e = make_engine(WubiSchema::Pinyin, &aux_path, true, false);
+        let mut e = make_engine(InputSchema::Pinyin, &aux_path, true, false);
         #[derive(Default)]
         struct PStat { n: usize, t1: usize, t3: usize, ch_h: usize, ch_t: usize }
         let mut stats: BTreeMap<String, PStat> = BTreeMap::new();
@@ -481,7 +481,7 @@ fn main() {
     if let Some(ref dir) = tsv_dir {
         let pydict = PinyinDictView::from_file("Resources/Dicts/pinyin.pydict").expect("load pydict");
         let c2p = build_char_to_pinyin(&pydict);
-        let mut e = make_engine(WubiSchema::Pinyin, &aux_path, true, false);
+        let mut e = make_engine(InputSchema::Pinyin, &aux_path, true, false);
 
         #[derive(Default)]
         struct DStat { n: usize, t1: usize, t3: usize, ch_h: usize, ch_t: usize }

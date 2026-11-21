@@ -2,8 +2,8 @@
 import SwiftUI
 
 @main
-struct PrisWubiIOSApp: App {
-    @StateObject private var bridge = WubiBridge.shared
+struct JuxuIOSApp: App {
+    @StateObject private var bridge = JuxuBridge.shared
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {

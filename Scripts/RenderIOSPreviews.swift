@@ -17,7 +17,7 @@ struct RenderIOSPreviews {
 
         let dictsURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("Resources/Dicts", isDirectory: true)
-        let bridge = WubiBridge(customDictsDir: dictsURL, inMemoryOnly: true)
+        let bridge = JuxuBridge(customDictsDir: dictsURL, inMemoryOnly: true)
 
         // Exact 440pt iPhone Pro Max iOS 26 keyboard dimensions (`440 x 225` key area + `52pt` candidate bar + `69pt` bottom safe bar)
         let kbEngine = IOSKeyboardLayoutEngine()
@@ -169,9 +169,9 @@ struct RenderIOSPreviews {
 struct IOS26KeyboardSheetPreview: View {
     let isDark: Bool
     let snapshot: IOSKeyboardLayoutEngine.LayoutSnapshot
-    let state: WubiActionState
+    let state: JuxuActionState
     let pressedKey: IOSKeySpec?
-    let expandedCandidates: [WubiCandidateItem]?
+    let expandedCandidates: [JuxuCandidateItem]?
 
     private static let starterWords = ["我", "海南", "不是", "怎么", "你", "在", "这", "不"]
 
@@ -400,7 +400,7 @@ struct IOS26KeyCanvasPreview: View {
 }
 
 struct IOS26ExpandedGridPreview: View {
-    let candidates: [WubiCandidateItem]
+    let candidates: [JuxuCandidateItem]
     let isDark: Bool
 
     var body: some View {

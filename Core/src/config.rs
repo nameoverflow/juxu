@@ -4,7 +4,7 @@ use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
-pub enum WubiSchema {
+pub enum InputSchema {
     Wubi86 = 86,
     Wubi98 = 98,
     Wubi06 = 6,
@@ -16,9 +16,8 @@ pub enum WubiSchema {
     Cangjie6 = 36,
 }
 
-pub type InputSchema = WubiSchema;
 
-impl WubiSchema {
+impl InputSchema {
     pub fn from_id(id: u32) -> Self {
         match id {
             98 => Self::Wubi98,
@@ -226,8 +225,8 @@ impl Default for TypoConfig {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct WubiConfig {
-    pub schema: WubiSchema,
+pub struct JuxuConfig {
+    pub schema: InputSchema,
     /// 四码唯一自动上屏
     pub fourth_code_auto_commit: bool,
     /// 第五码自动顶字上屏（四码重码时敲第 5 码将首选上屏并开启新一轮首码）
@@ -274,10 +273,10 @@ pub struct WubiConfig {
     pub typo: TypoConfig,
 }
 
-impl Default for WubiConfig {
+impl Default for JuxuConfig {
     fn default() -> Self {
         Self {
-            schema: WubiSchema::Wubi86,
+            schema: InputSchema::Wubi86,
             fourth_code_auto_commit: true,
             fifth_code_push_commit: true,
             fourth_empty_behavior: FourthEmptyBehavior::Block,
@@ -304,7 +303,7 @@ impl Default for WubiConfig {
     }
 }
 
-impl WubiConfig {
+impl JuxuConfig {
     pub fn to_toml_string(&self) -> String {
         format!(
             concat!(
@@ -401,7 +400,7 @@ impl WubiConfig {
             let parse_bool = |v: &str| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes");
 
             match (section.as_str(), key) {
-                (_, "schema") => cfg.schema = WubiSchema::from_str_tag(val),
+                (_, "schema") => cfg.schema = InputSchema::from_str_tag(val),
                 (_, "page_size") => {
                     if let Ok(n) = val.parse::<u8>() {
                         cfg.page_size = n.clamp(3, 9);

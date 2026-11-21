@@ -44,7 +44,7 @@ private enum IOSSharedSettings {
 #endif
 import Foundation
 
-public struct WubiCandidateItem: Codable, Identifiable, Equatable, Sendable {
+public struct JuxuCandidateItem: Codable, Identifiable, Equatable, Sendable {
     public let index: Int
     public let text: String
     public let comment: String
@@ -83,7 +83,7 @@ public struct TouchKeyCalibrationItem: Codable, Identifiable, Equatable, Sendabl
     public var id: String { key }
 }
 
-public struct WubiActionState: Codable, Equatable, Sendable {
+public struct JuxuActionState: Codable, Equatable, Sendable {
     public let consumed: Bool
     public let bell: Bool
     public let asciiMode: Bool
@@ -101,7 +101,7 @@ public struct WubiActionState: Codable, Equatable, Sendable {
     public let validNextMask: UInt32
     public let nextKeyPriors: [UInt8]
     public let touchOffsets: [Float]
-    public let candidates: [WubiCandidateItem]
+    public let candidates: [JuxuCandidateItem]
 
     #if os(macOS)
     var macOSPreedit: String {
@@ -131,7 +131,7 @@ public struct WubiActionState: Codable, Equatable, Sendable {
         validNextMask: UInt32 = 0x03FF_FFFF,
         nextKeyPriors: [UInt8] = Array(repeating: 100, count: 26),
         touchOffsets: [Float] = Array(repeating: 0, count: 52),
-        candidates: [WubiCandidateItem]
+        candidates: [JuxuCandidateItem]
     ) {
         self.consumed = consumed
         self.bell = bell
@@ -178,10 +178,10 @@ public struct WubiActionState: Codable, Equatable, Sendable {
         self.validNextMask = try c.decodeIfPresent(UInt32.self, forKey: .validNextMask) ?? 0x03FF_FFFF
         self.nextKeyPriors = try c.decodeIfPresent([UInt8].self, forKey: .nextKeyPriors) ?? Array(repeating: 100, count: 26)
         self.touchOffsets = try c.decodeIfPresent([Float].self, forKey: .touchOffsets) ?? Array(repeating: 0, count: 52)
-        self.candidates = try c.decode([WubiCandidateItem].self, forKey: .candidates)
+        self.candidates = try c.decode([JuxuCandidateItem].self, forKey: .candidates)
     }
 
-    public static let empty = WubiActionState(
+    public static let empty = JuxuActionState(
         consumed: false,
         bell: false,
         asciiMode: false,
@@ -273,7 +273,7 @@ public struct InputSchemaOption: Identifiable, Equatable, Sendable {
     }
 }
 
-public struct WubiPreferences: Equatable, Sendable {
+public struct JuxuPreferences: Equatable, Sendable {
     public static let appGroupIdentifier = "group.com.hcyue.juxu.shared"
 
     public var schemaId: UInt32 = 86
@@ -384,8 +384,8 @@ public struct WubiPreferences: Equatable, Sendable {
         """
     }
 
-    public static func fromTOML(_ toml: String) -> WubiPreferences {
-        var p = WubiPreferences()
+    public static func fromTOML(_ toml: String) -> JuxuPreferences {
+        var p = JuxuPreferences()
         var section = ""
         for rawLine in toml.split(separator: "\n", omittingEmptySubsequences: false) {
             let clean = rawLine.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""
@@ -483,8 +483,8 @@ public struct WubiPreferences: Equatable, Sendable {
 }
 
 @MainActor
-public final class WubiBridge: ObservableObject {
-    public static let shared = WubiBridge()
+public final class JuxuBridge: ObservableObject {
+    public static let shared = JuxuBridge()
 
     nonisolated(unsafe) private var handle: OpaquePointer?
     private let decoder = JSONDecoder()
@@ -498,8 +498,8 @@ public final class WubiBridge: ObservableObject {
     private var lastSharedTouchProfile: [TouchKeyCalibrationItem]?
     #endif
 
-    @Published public private(set) var state: WubiActionState = .empty
-    @Published public var prefs: WubiPreferences = WubiPreferences()
+    @Published public private(set) var state: JuxuActionState = .empty
+    @Published public var prefs: JuxuPreferences = JuxuPreferences()
     @Published public private(set) var userPhrases: [UserPhraseRecord] = []
     @Published public private(set) var touchCalibrations: [TouchKeyCalibrationItem] = []
 
@@ -545,7 +545,7 @@ public final class WubiBridge: ObservableObject {
         self.hasSharedContainerAccess = true
         #else
         if let groupURL = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: WubiPreferences.appGroupIdentifier
+            forSecurityApplicationGroupIdentifier: JuxuPreferences.appGroupIdentifier
         ) {
             self.configURL = groupURL.appendingPathComponent("config.toml")
             self.userDataURL = groupURL.appendingPathComponent("user_data.tsv")
@@ -559,7 +559,7 @@ public final class WubiBridge: ObservableObject {
         }
         #endif
 
-        self.handle = wubi_engine_new()
+        self.handle = juxu_engine_new()
         loadDictionaries(overrideDir: customDictsDir)
         if !inMemoryOnly {
             loadConfigAndUser()
@@ -572,7 +572,7 @@ public final class WubiBridge: ObservableObject {
 
     deinit {
         if let h = handle {
-            wubi_engine_free(h)
+            juxu_engine_free(h)
         }
     }
 
@@ -598,7 +598,7 @@ public final class WubiBridge: ObservableObject {
                 resolvedDictsDir = dir
                 if !auxDictLoaded {
                     let pAux = dir.appendingPathComponent("wubi_aux.wbaux").path
-                    if pAux.withCString({ wubi_engine_load_aux_mmap(h, $0) }) {
+                    if pAux.withCString({ juxu_engine_load_aux_mmap(h, $0) }) {
                         auxDictLoaded = true
                     }
                 }
@@ -617,20 +617,20 @@ public final class WubiBridge: ObservableObject {
         guard let h = handle, let dir = resolvedDictsDir else { return }
         if !auxDictLoaded {
             let pAux = dir.appendingPathComponent("wubi_aux.wbaux").path
-            if pAux.withCString({ wubi_engine_load_aux_mmap(h, $0) }) {
+            if pAux.withCString({ juxu_engine_load_aux_mmap(h, $0) }) {
                 auxDictLoaded = true
             }
         }
         if schemaId == 20 || schemaId == 21 {
             if !pinyinDictLoaded {
                 let pPy = dir.appendingPathComponent("pinyin.pydict").path
-                if pPy.withCString({ wubi_engine_load_pinyin_dict_mmap(h, $0) }) {
+                if pPy.withCString({ juxu_engine_load_pinyin_dict_mmap(h, $0) }) {
                     pinyinDictLoaded = true
                 }
             }
             #if os(iOS)
             if !loadedDictSchemas.isEmpty {
-                wubi_engine_retain_only_schema_dict(h, schemaId)
+                juxu_engine_retain_only_schema_dict(h, schemaId)
                 loadedDictSchemas.removeAll()
             }
             #endif
@@ -648,13 +648,13 @@ public final class WubiBridge: ObservableObject {
             default: fileName = "wubi86.wbdict"
             }
             let path = dir.appendingPathComponent(fileName).path
-            if path.withCString({ wubi_engine_load_dict_mmap(h, schemaId, $0) }) {
+            if path.withCString({ juxu_engine_load_dict_mmap(h, schemaId, $0) }) {
                 loadedDictSchemas.insert(schemaId)
             }
         }
         #if os(iOS)
         if pinyinDictLoaded || loadedDictSchemas.count > 1 {
-            wubi_engine_retain_only_schema_dict(h, schemaId)
+            juxu_engine_retain_only_schema_dict(h, schemaId)
             pinyinDictLoaded = false
             loadedDictSchemas = loadedDictSchemas.contains(schemaId) ? [schemaId] : []
         }
@@ -665,23 +665,23 @@ public final class WubiBridge: ObservableObject {
         guard let h = handle else { return }
         var uiPrefsSourceTOML: String? = nil
         if FileManager.default.fileExists(atPath: configURL.path) {
-            _ = configURL.path.withCString { wubi_engine_load_config(h, $0) }
+            _ = configURL.path.withCString { juxu_engine_load_config(h, $0) }
             uiPrefsSourceTOML = try? String(contentsOf: configURL, encoding: .utf8)
         } else {
-            _ = configURL.path.withCString { wubi_engine_save_config(h, $0) }
+            _ = configURL.path.withCString { juxu_engine_save_config(h, $0) }
         }
         #if os(iOS)
         if let data = IOSSharedSettings.read(account: IOSSharedSettings.preferencesAccount),
            let shared = String(data: data, encoding: .utf8) {
-            shared.withCString { wubi_engine_set_config_toml(h, $0) }
+            shared.withCString { juxu_engine_set_config_toml(h, $0) }
             uiPrefsSourceTOML = shared
         }
         loadSharedTouchProfile()
         #endif
-        let toml = takeString(wubi_engine_get_config_toml(h))
-        var loaded = WubiPreferences.fromTOML(toml)
+        let toml = takeString(juxu_engine_get_config_toml(h))
+        var loaded = JuxuPreferences.fromTOML(toml)
         if let uiTOML = uiPrefsSourceTOML {
-            let uiPrefs = WubiPreferences.fromTOML(uiTOML)
+            let uiPrefs = JuxuPreferences.fromTOML(uiTOML)
             loaded.clipboardSuggestion = uiPrefs.clipboardSuggestion
             loaded.cangjieKeycapRadicals = uiPrefs.cangjieKeycapRadicals
             loaded.wubiKeycapRadicals = uiPrefs.wubiKeycapRadicals
@@ -691,7 +691,7 @@ public final class WubiBridge: ObservableObject {
         if FileManager.default.fileExists(atPath: userDataURL.path) {
             let mtime = (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
             if lastLoadedUserDataMtime == nil || mtime == nil || mtime != lastLoadedUserDataMtime {
-                if userDataURL.path.withCString({ wubi_engine_load_user_data(h, $0) }) {
+                if userDataURL.path.withCString({ juxu_engine_load_user_data(h, $0) }) {
                     lastLoadedUserDataMtime = mtime
                 }
             }
@@ -703,17 +703,17 @@ public final class WubiBridge: ObservableObject {
         }
     }
 
-    public func applyAndSavePreferences(_ newPrefs: WubiPreferences, persist: Bool = true) {
+    public func applyAndSavePreferences(_ newPrefs: JuxuPreferences, persist: Bool = true) {
         guard let h = handle else { return }
         self.prefs = newPrefs
         ensureDictionaryLoaded(for: newPrefs.schemaId)
         let toml = newPrefs.toTOML()
-        toml.withCString { wubi_engine_set_config_toml(h, $0) }
+        toml.withCString { juxu_engine_set_config_toml(h, $0) }
         if persist {
             #if os(iOS)
             IOSSharedSettings.write(Data(toml.utf8), account: IOSSharedSettings.preferencesAccount)
             #endif
-            _ = configURL.path.withCString { wubi_engine_save_config(h, $0) }
+            _ = configURL.path.withCString { juxu_engine_save_config(h, $0) }
             try? toml.write(to: configURL, atomically: true, encoding: .utf8)
         }
         refreshState()
@@ -735,17 +735,17 @@ public final class WubiBridge: ObservableObject {
     ) {
         guard let h = handle, centers52.count == 52 else { return }
         centers52.withUnsafeBufferPointer { buf in
-            wubi_engine_set_key_layout(h, buf.baseAddress, originX, originY, pitchX, pitchY)
+            juxu_engine_set_key_layout(h, buf.baseAddress, originX, originY, pitchX, pitchY)
         }
     }
 
     public func flushUserDataIfNeeded(refreshPublishedLists: Bool = true) {
         guard let h = handle else { return }
-        if wubi_engine_is_user_dirty(h) {
+        if juxu_engine_is_user_dirty(h) {
             #if os(iOS)
             publishTouchProfile()
             #endif
-            _ = userDataURL.path.withCString { wubi_engine_save_user_data(h, $0) }
+            _ = userDataURL.path.withCString { juxu_engine_save_user_data(h, $0) }
             lastLoadedUserDataMtime = (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
             if refreshPublishedLists {
                 refreshUserPhrases()
@@ -759,9 +759,9 @@ public final class WubiBridge: ObservableObject {
         scalar: UInt32,
         hasCmdOrCtrl: Bool,
         timestampMs: UInt64
-    ) -> WubiActionState {
+    ) -> JuxuActionState {
         guard let h = handle else { return .empty }
-        let json = takeString(wubi_engine_handle_key_json(h, keyCode, scalar, hasCmdOrCtrl, timestampMs))
+        let json = takeString(juxu_engine_handle_key_json(h, keyCode, scalar, hasCmdOrCtrl, timestampMs))
         let decoded = decodeState(json)
         self.state = decoded
         return decoded
@@ -773,51 +773,51 @@ public final class WubiBridge: ObservableObject {
         y: Float,
         isNormalized: Bool,
         timestampMs: UInt64
-    ) -> WubiActionState {
+    ) -> JuxuActionState {
         guard let h = handle else { return .empty }
-        let json = takeString(wubi_engine_push_touch_json(h, reportedAscii, x, y, isNormalized, timestampMs))
+        let json = takeString(juxu_engine_push_touch_json(h, reportedAscii, x, y, isNormalized, timestampMs))
         let decoded = decodeState(json)
         self.state = decoded
         return decoded
     }
 
-    public func selectCandidate(pageRelIndex: Int, timestampMs: UInt64) -> WubiActionState {
+    public func selectCandidate(pageRelIndex: Int, timestampMs: UInt64) -> JuxuActionState {
         guard let h = handle else { return .empty }
-        let json = takeString(wubi_engine_select_candidate_json(h, UInt32(max(0, pageRelIndex)), timestampMs))
+        let json = takeString(juxu_engine_select_candidate_json(h, UInt32(max(0, pageRelIndex)), timestampMs))
         let decoded = decodeState(json)
         self.state = decoded
         return decoded
     }
 
-    public func selectAbsCandidate(absIndex: Int, timestampMs: UInt64) -> WubiActionState {
+    public func selectAbsCandidate(absIndex: Int, timestampMs: UInt64) -> JuxuActionState {
         guard let h = handle else { return .empty }
-        let json = takeString(wubi_engine_select_abs_candidate_json(h, UInt32(max(0, absIndex)), timestampMs))
+        let json = takeString(juxu_engine_select_abs_candidate_json(h, UInt32(max(0, absIndex)), timestampMs))
         let decoded = decodeState(json)
         self.state = decoded
         return decoded
     }
 
-    public func allCandidates(maxCount: Int = 60) -> [WubiCandidateItem] {
+    public func allCandidates(maxCount: Int = 60) -> [JuxuCandidateItem] {
         guard let h = handle else { return [] }
-        let json = takeString(wubi_engine_all_candidates_json(h, UInt32(max(1, maxCount))))
+        let json = takeString(juxu_engine_all_candidates_json(h, UInt32(max(1, maxCount))))
         if let data = json.data(using: .utf8),
-           let list = try? decoder.decode([WubiCandidateItem].self, from: data) {
+           let list = try? decoder.decode([JuxuCandidateItem].self, from: data) {
             return list
         }
         return []
     }
 
-    public func turnPage(delta: Int32) -> WubiActionState {
+    public func turnPage(delta: Int32) -> JuxuActionState {
         guard let h = handle else { return .empty }
-        let json = takeString(wubi_engine_page_turn_json(h, delta))
+        let json = takeString(juxu_engine_page_turn_json(h, delta))
         let decoded = decodeState(json)
         self.state = decoded
         return decoded
     }
 
-    public func toggleAsciiMode() -> WubiActionState {
+    public func toggleAsciiMode() -> JuxuActionState {
         guard let h = handle else { return .empty }
-        let json = takeString(wubi_engine_toggle_ascii_json(h))
+        let json = takeString(juxu_engine_toggle_ascii_json(h))
         let decoded = decodeState(json)
         self.state = decoded
         return decoded
@@ -825,23 +825,23 @@ public final class WubiBridge: ObservableObject {
 
     public func clearComposition() {
         guard let h = handle else { return }
-        wubi_engine_clear(h)
+        juxu_engine_clear(h)
         refreshState()
     }
 
     public func setContext(_ text: String) {
         guard let h = handle else { return }
-        text.withCString { wubi_engine_set_context(h, $0) }
+        text.withCString { juxu_engine_set_context(h, $0) }
     }
 
     public func acceptPrediction(_ text: String, timestampMs: UInt64) {
         guard let h = handle else { return }
-        text.withCString { wubi_engine_accept_prediction(h, $0, timestampMs) }
+        text.withCString { juxu_engine_accept_prediction(h, $0, timestampMs) }
     }
 
     public func predictNextWords(maxCount: Int = 8) -> [String] {
         guard let h = handle else { return [] }
-        let json = takeString(wubi_engine_predict_next_json(h, UInt32(max(1, maxCount))))
+        let json = takeString(juxu_engine_predict_next_json(h, UInt32(max(1, maxCount))))
         if let data = json.data(using: .utf8),
            let list = try? decoder.decode([String].self, from: data) {
             return list
@@ -854,7 +854,7 @@ public final class WubiBridge: ObservableObject {
         guard let h = handle else { return "" }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2 else { return "" }
-        let code = trimmed.withCString { takeString(wubi_engine_add_user_phrase(h, $0)) }
+        let code = trimmed.withCString { takeString(juxu_engine_add_user_phrase(h, $0)) }
         if !code.isEmpty && persist {
             flushUserDataIfNeeded()
         }
@@ -865,7 +865,7 @@ public final class WubiBridge: ObservableObject {
 
     public func removeUserPhrase(_ text: String, persist: Bool = true) {
         guard let h = handle else { return }
-        _ = text.withCString { wubi_engine_remove_user_phrase(h, $0) }
+        _ = text.withCString { juxu_engine_remove_user_phrase(h, $0) }
         if persist {
             flushUserDataIfNeeded()
         }
@@ -875,7 +875,7 @@ public final class WubiBridge: ObservableObject {
 
     public func resetTouchCalibration(persist: Bool = true) {
         guard let h = handle else { return }
-        wubi_engine_reset_touch_profile(h)
+        juxu_engine_reset_touch_profile(h)
         if persist {
             #if os(iOS)
             publishTouchProfile(isReset: true)
@@ -888,7 +888,7 @@ public final class WubiBridge: ObservableObject {
 
     public func refreshUserPhrases() {
         guard let h = handle else { return }
-        let json = takeString(wubi_engine_list_user_phrases_json(h))
+        let json = takeString(juxu_engine_list_user_phrases_json(h))
         if let data = json.data(using: .utf8),
            let list = try? decoder.decode([UserPhraseRecord].self, from: data) {
             self.userPhrases = list
@@ -901,7 +901,7 @@ public final class WubiBridge: ObservableObject {
 
     private func readTouchProfile() -> [TouchKeyCalibrationItem] {
         guard let h = handle else { return [] }
-        let json = takeString(wubi_engine_touch_profile_json(h))
+        let json = takeString(juxu_engine_touch_profile_json(h))
         return (try? decoder.decode([TouchKeyCalibrationItem].self, from: Data(json.utf8))) ?? []
     }
 
@@ -935,7 +935,7 @@ public final class WubiBridge: ObservableObject {
         let counts = profile.map(\.samples)
         offsets.withUnsafeBufferPointer { xy in
             counts.withUnsafeBufferPointer { samples in
-                wubi_engine_set_touch_profile(h, xy.baseAddress, samples.baseAddress)
+                juxu_engine_set_touch_profile(h, xy.baseAddress, samples.baseAddress)
             }
         }
     }
@@ -961,13 +961,13 @@ public final class WubiBridge: ObservableObject {
 
     public func refreshState() {
         guard let h = handle else { return }
-        let json = takeString(wubi_engine_state_json(h))
+        let json = takeString(juxu_engine_state_json(h))
         self.state = decodeState(json)
     }
 
-    private func decodeState(_ json: String) -> WubiActionState {
+    private func decodeState(_ json: String) -> JuxuActionState {
         guard let data = json.data(using: .utf8),
-              let s = try? decoder.decode(WubiActionState.self, from: data) else {
+              let s = try? decoder.decode(JuxuActionState.self, from: data) else {
             return .empty
         }
         return s
@@ -975,7 +975,7 @@ public final class WubiBridge: ObservableObject {
 
     private func takeString(_ ptr: UnsafeMutablePointer<CChar>?) -> String {
         guard let p = ptr else { return "" }
-        defer { wubi_string_free(p) }
+        defer { juxu_string_free(p) }
         return String(cString: p)
     }
 }
@@ -991,7 +991,7 @@ public struct AutoSpaceOptions: Equatable, Sendable {
         self.spaceDigits = spaceDigits
     }
 
-    public init(prefs: WubiPreferences) {
+    public init(prefs: JuxuPreferences) {
         self.enabled = prefs.autoSpaceZhEn
         self.spaceDigits = prefs.autoSpaceDigits
     }

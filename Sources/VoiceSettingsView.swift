@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 public struct VoiceSettingsView: View {
-    @ObservedObject public var bridge: WubiBridge
+    @ObservedObject public var bridge: JuxuBridge
     @ObservedObject public var voiceStore: VoicePreferencesStore
 
     @State private var primaryKeyDraft: String = ""
@@ -12,7 +12,7 @@ public struct VoiceSettingsView: View {
     @State private var testOK: Bool = true
     @State private var isTesting: Bool = false
 
-    public init(bridge: WubiBridge, voiceStore: VoicePreferencesStore) {
+    public init(bridge: JuxuBridge, voiceStore: VoicePreferencesStore) {
         self.bridge = bridge
         self.voiceStore = voiceStore
     }
