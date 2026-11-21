@@ -318,6 +318,13 @@ public struct IOSHostRootView: View {
                                     isOn: binding(\.cangjieKeycapRadicals)
                                 )
                                 Divider()
+                            } else if bridge.prefs.isWubiFamily {
+                                iosToggleRow(
+                                    "键盘键帽显示五笔字根",
+                                    sub: "在字母键下方显示当前五笔版本（86 / 98 / 新世纪）的核心字根，切英文或大写时自动隐藏",
+                                    isOn: binding(\.wubiKeycapRadicals)
+                                )
+                                Divider()
                             }
                             iosToggleRow("\(maxCodeLabel)码唯一自动上屏", sub: "精确\(maxCodeLabel)码唯一匹配时直接上屏", isOn: binding(\.fourthCodeAutoCommit))
                             Divider()

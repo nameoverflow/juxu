@@ -38,6 +38,7 @@ public final class KeyboardViewController: UIInputViewController {
         let asciiMode: Bool
         let schemaId: UInt32
         let cangjieKeycapRadicals: Bool
+        let wubiKeycapRadicals: Bool
         let showInlineGlobeKey: Bool
         let returnRole: IOSReturnKeyRole
         let isTrackpadActive: Bool
@@ -882,6 +883,7 @@ public final class KeyboardViewController: UIInputViewController {
         layoutEngine.asciiMode = st.asciiMode
         layoutEngine.schemaId = st.schemaId
         layoutEngine.cangjieKeycapRadicals = bridge.prefs.cangjieKeycapRadicals
+        layoutEngine.wubiKeycapRadicals = bridge.prefs.wubiKeycapRadicals
         layoutEngine.isComposing = !st.preedit.isEmpty
         layoutEngine.validNextMask = st.validNextMask
         layoutEngine.nextKeyPriors = st.nextKeyPriors
@@ -925,6 +927,7 @@ public final class KeyboardViewController: UIInputViewController {
             asciiMode: layoutEngine.asciiMode,
             schemaId: layoutEngine.schemaId,
             cangjieKeycapRadicals: layoutEngine.cangjieKeycapRadicals,
+            wubiKeycapRadicals: layoutEngine.wubiKeycapRadicals,
             showInlineGlobeKey: layoutEngine.showInlineGlobeKey,
             returnRole: layoutEngine.returnRole,
             isTrackpadActive: layoutEngine.isTrackpadActive,

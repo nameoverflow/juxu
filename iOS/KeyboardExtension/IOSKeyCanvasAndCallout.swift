@@ -136,6 +136,7 @@ final class IOSKeyboardFeedbackController {
 @MainActor
 private final class IOSKeycapNodeView: UIView {
     private let primaryLabel = UILabel()
+    private let radicalLabel = UILabel()
     private let symbolView = UIImageView()
     private let subscriptLabel = UILabel()
 
@@ -155,6 +156,12 @@ private final class IOSKeycapNodeView: UIView {
         primaryLabel.textAlignment = .center
         primaryLabel.isUserInteractionEnabled = false
 
+        radicalLabel.textAlignment = .center
+        radicalLabel.numberOfLines = 2
+        radicalLabel.lineBreakMode = .byClipping
+        radicalLabel.isUserInteractionEnabled = false
+        radicalLabel.isHidden = true
+
         symbolView.contentMode = .center
         symbolView.isUserInteractionEnabled = false
 
@@ -163,6 +170,7 @@ private final class IOSKeycapNodeView: UIView {
         subscriptLabel.isUserInteractionEnabled = false
 
         addSubview(primaryLabel)
+        addSubview(radicalLabel)
         addSubview(symbolView)
         addSubview(subscriptLabel)
     }
@@ -203,6 +211,19 @@ private final class IOSKeycapNodeView: UIView {
 
     private func layoutSublayersOfKeycap(spec: IOSKeySpec) {
         let b = bounds
+        if let rad = spec.keycapRadicals, !rad.isEmpty {
+            let letterH = max(13.0, round(b.height * 0.34))
+            primaryLabel.frame = CGRect(x: 0, y: 2.0, width: b.width, height: letterH)
+            radicalLabel.frame = CGRect(
+                x: 1.0,
+                y: 2.0 + letterH - 0.5,
+                width: max(0, b.width - 2.0),
+                height: max(0, b.height - letterH - 3.5)
+            )
+            symbolView.frame = b
+            subscriptLabel.frame = CGRect(x: b.width - 30.0, y: b.height - 20.0, width: 24.0, height: 15.0)
+            return
+        }
         let yNudge: CGFloat
         switch spec.kind {
         case .letter:
@@ -218,6 +239,7 @@ private final class IOSKeycapNodeView: UIView {
             yNudge = 0.0
         }
         primaryLabel.frame = b.offsetBy(dx: 0, dy: yNudge)
+        radicalLabel.frame = .zero
         symbolView.frame = b
         subscriptLabel.frame = CGRect(x: b.width - 30.0, y: b.height - 20.0, width: 24.0, height: 15.0)
     }
@@ -233,6 +255,7 @@ private final class IOSKeycapNodeView: UIView {
 
         if let symName = spec.systemSymbol {
             primaryLabel.isHidden = true
+            radicalLabel.isHidden = true
             symbolView.isHidden = false
             let cacheKey = symName
             let template: UIImage?
@@ -267,7 +290,30 @@ private final class IOSKeycapNodeView: UIView {
                     )
                 )
                 primaryLabel.attributedText = attr
+            } else if let rad = spec.keycapRadicals, !rad.isEmpty {
+                primaryLabel.attributedText = nil
+                primaryLabel.font = .systemFont(ofSize: 12.5, weight: .semibold)
+                primaryLabel.textColor = fgColor
+                primaryLabel.text = spec.primaryLabel.uppercased()
+
+                let radColor: UIColor = dark
+                    ? UIColor(white: 1.0, alpha: 0.74)
+                    : UIColor(white: 0.0, alpha: 0.64)
+                let para = NSMutableParagraphStyle()
+                para.alignment = .center
+                para.lineHeightMultiple = 1.02
+                para.lineSpacing = 0.5
+                radicalLabel.attributedText = NSAttributedString(
+                    string: rad,
+                    attributes: [
+                        .font: UIFont.systemFont(ofSize: 9.0, weight: .regular),
+                        .foregroundColor: radColor,
+                        .paragraphStyle: para,
+                    ]
+                )
+                radicalLabel.isHidden = false
             } else {
+                radicalLabel.isHidden = true
                 primaryLabel.attributedText = nil
                 let fontSize: CGFloat
                 let weight: UIFont.Weight
@@ -297,6 +343,7 @@ private final class IOSKeycapNodeView: UIView {
             }
         } else {
             primaryLabel.isHidden = true
+            radicalLabel.isHidden = true
             symbolView.isHidden = true
         }
 
@@ -335,6 +382,7 @@ private final class IOSKeycapNodeView: UIView {
             self.backgroundColor = targetBg
             self.transform = targetTransform
             self.primaryLabel.alpha = contentAlpha
+            self.radicalLabel.alpha = contentAlpha
         }
 
         if animatedRelease {

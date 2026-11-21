@@ -286,6 +286,7 @@ public struct WubiPreferences: Equatable, Sendable {
     public var autoSpaceDigits: Bool = true
     public var clipboardSuggestion: Bool = true
     public var cangjieKeycapRadicals: Bool = true
+    public var wubiKeycapRadicals: Bool = false
 
     public var fourthCodeAutoCommit: Bool = true
     public var fifthCodePushCommit: Bool = true
@@ -355,6 +356,7 @@ public struct WubiPreferences: Equatable, Sendable {
         auto_space_digits = \(autoSpaceDigits)
         clipboard_suggestion = \(clipboardSuggestion)
         cangjie_keycap_radicals = \(cangjieKeycapRadicals)
+        wubi_keycap_radicals = \(wubiKeycapRadicals)
 
         [typing]
         fourth_code_auto_commit = \(fourthCodeAutoCommit)
@@ -430,6 +432,8 @@ public struct WubiPreferences: Equatable, Sendable {
                 p.clipboardSuggestion = boolVal
             case (_, "cangjie_keycap_radicals"):
                 p.cangjieKeycapRadicals = boolVal
+            case (_, "wubi_keycap_radicals"):
+                p.wubiKeycapRadicals = boolVal
             case (_, "fourth_code_auto_commit"):
                 p.fourthCodeAutoCommit = boolVal
             case (_, "fifth_code_push_commit"):

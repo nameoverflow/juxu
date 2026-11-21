@@ -429,6 +429,29 @@ struct IOSKeyboardTests {
         cjPrefs.cangjieKeycapRadicals = false
         assert(WubiPreferences.fromTOML(cjPrefs.toTOML()).cangjieKeycapRadicals == false)
 
-        print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie keycaps & idle prediction tests passed!")
+        // 18. Wubi radical keycaps option (86 / 98 / 06 version-specific tables + ASCII/Shift fallback)
+        var wbLayout = IOSKeyboardLayoutEngine()
+        wbLayout.schemaId = 86
+        wbLayout.wubiKeycapRadicals = true
+        let wb86Snap = wbLayout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(wb86Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "g")) })?.keycapRadicals == "王戋\n五一")
+        assert(wb86Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "m")) })?.keycapRadicals?.contains("几") == true)
+        assert(wb86Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "z")) })?.keycapRadicals == "万能")
+        wbLayout.schemaId = 98
+        let wb98Snap = wbLayout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(wb98Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "w")) })?.keycapRadicals?.contains("几") == true)
+        assert(wb98Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "b")) })?.keycapRadicals?.contains("皮") == true)
+        wbLayout.schemaId = 6
+        let wb06Snap = wbLayout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(wb06Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "y")) })?.keycapRadicals?.contains("六") == true)
+        wbLayout.asciiMode = true
+        let wbAsciiSnap = wbLayout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(wbAsciiSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "g")) })?.keycapRadicals == nil)
+        var wbPrefs = WubiPreferences()
+        assert(wbPrefs.wubiKeycapRadicals == false)
+        wbPrefs.wubiKeycapRadicals = true
+        assert(WubiPreferences.fromTOML(wbPrefs.toTOML()).wubiKeycapRadicals == true)
+
+        print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie & Wubi keycaps & idle prediction tests passed!")
     }
 }

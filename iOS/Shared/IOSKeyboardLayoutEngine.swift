@@ -66,6 +66,8 @@ public struct IOSKeySpec: Identifiable, Equatable {
     public let secondaryInlineLabel: String?
     /// Corner subscript label (e.g. `"五"` in bottom-right of iOS 26 native Wubi spacebar).
     public let cornerSubscript: String?
+    /// Compact 1–2 line radical mnemonic block drawn beneath the letter on Wubi radical keycaps.
+    public let keycapRadicals: String?
     public let systemSymbol: String?
     public let isBlueAccent: Bool
 
@@ -76,6 +78,7 @@ public struct IOSKeySpec: Identifiable, Equatable {
         primaryLabel: String,
         secondaryInlineLabel: String? = nil,
         cornerSubscript: String? = nil,
+        keycapRadicals: String? = nil,
         systemSymbol: String? = nil,
         isBlueAccent: Bool = false
     ) {
@@ -85,6 +88,7 @@ public struct IOSKeySpec: Identifiable, Equatable {
         self.primaryLabel = primaryLabel
         self.secondaryInlineLabel = secondaryInlineLabel
         self.cornerSubscript = cornerSubscript
+        self.keycapRadicals = keycapRadicals
         self.systemSymbol = systemSymbol
         self.isBlueAccent = isBlueAccent
     }
@@ -107,6 +111,7 @@ public struct IOSKeyboardLayoutEngine: Equatable {
     public var asciiMode: Bool = false
     public var schemaId: UInt32 = 86
     public var cangjieKeycapRadicals: Bool = true
+    public var wubiKeycapRadicals: Bool = false
     /// True only on Home-button devices where system does not draw its own bottom Globe bar.
     public var showInlineGlobeKey: Bool = false
     public var returnRole: IOSReturnKeyRole = .normal
@@ -230,7 +235,8 @@ public struct IOSKeyboardLayoutEngine: Equatable {
                         id: "L_\(b)",
                         kind: .letter(b),
                         frame: CGRect(x: x, y: rowY[0], width: stdKeyW, height: keyH),
-                        primaryLabel: formatLetter(b)
+                        primaryLabel: formatLetter(b),
+                        keycapRadicals: formatWubiRadicals(b)
                     )
                 )
             }
@@ -242,7 +248,8 @@ public struct IOSKeyboardLayoutEngine: Equatable {
                         id: "L_\(b)",
                         kind: .letter(b),
                         frame: CGRect(x: colRow1X[c], y: rowY[1], width: stdKeyW, height: keyH),
-                        primaryLabel: formatLetter(b)
+                        primaryLabel: formatLetter(b),
+                        keycapRadicals: formatWubiRadicals(b)
                     )
                 )
             }
@@ -271,7 +278,8 @@ public struct IOSKeyboardLayoutEngine: Equatable {
                         id: "L_\(b)",
                         kind: .letter(b),
                         frame: CGRect(x: colRow1X[c + 1], y: rowY[2], width: stdKeyW, height: keyH),
-                        primaryLabel: formatLetter(b)
+                        primaryLabel: formatLetter(b),
+                        keycapRadicals: formatWubiRadicals(b)
                     )
                 )
             }
@@ -683,6 +691,124 @@ public struct IOSKeyboardLayoutEngine: Equatable {
             && !asciiMode
             && !shiftState.isUppercase
             && (schemaId == 33 || schemaId == 35 || schemaId == 36)
+    }
+
+    public static let wubi86RadicalTable: [String] = [
+        "工戈艹\n匚七廿", // a
+        "子耳了\n也阝",   // b
+        "又巴马\n厶予",   // c
+        "大犬三\n古石厂", // d
+        "月彡乃\n用豕",   // e
+        "土士二\n干十寸", // f
+        "王戋\n五一",     // g
+        "目上止\n卜皮",   // h
+        "水氵小\n氺",     // i
+        "日早虫\n曰刂",   // j
+        "口川",           // k
+        "田甲四\n车力囗", // l
+        "山由贝\n骨几",   // m
+        "已己尸\n心羽",   // n
+        "火灬米\n业",     // o
+        "之宀冖\n辶礻",   // p
+        "金钅勹\n夕儿",   // q
+        "白手扌\n斤丘",   // r
+        "木丁西",         // s
+        "禾竹彳\n攵夂",   // t
+        "立辛六\n门疒",   // u
+        "女刀九\n臼彐",   // v
+        "人亻八",         // w
+        "纟幺弓\n匕母",   // x
+        "言讠文\n方广",   // y
+        "万能",           // z
+    ]
+
+    public static let wubi98RadicalTable: [String] = [
+        "工戈艹\n匚七廿", // a
+        "子耳了\n也皮",   // b
+        "又巴马\n厶予",   // c
+        "大犬三\n古石厂", // d
+        "月彡用\n力且",   // e
+        "土士二\n干十寸", // f
+        "王戋\n五一",     // g
+        "目上止\n卜具",   // h
+        "水氵小\n氺",     // i
+        "日早虫\n曰刂",   // j
+        "口川",           // k
+        "田甲四\n车囗皿", // l
+        "山由贝\n骨冂",   // m
+        "已己尸\n心羽",   // n
+        "火灬米\n业广",   // o
+        "之宀冖\n辶礻",   // p
+        "金钅勹\n夕儿",   // q
+        "白手扌\n斤气",   // r
+        "木丁西",         // s
+        "禾竹彳\n攵夂",   // t
+        "立辛六\n门疒",   // u
+        "女刀九\n彐巛",   // v
+        "人亻八\n几",     // w
+        "纟幺弓\n匕母",   // x
+        "言讠文\n方主",   // y
+        "万能",           // z
+    ]
+
+    public static let wubi06RadicalTable: [String] = [
+        "工戈艹\n匚七廿", // a
+        "子耳了\n也阝",   // b
+        "又巴马\n厶予",   // c
+        "大犬三\n古石厂", // d
+        "月彡用\n力且",   // e
+        "土士二\n干十寸", // f
+        "王五一\n青",     // g
+        "目上止\n卜皮",   // h
+        "水氵小\n氺",     // i
+        "日早虫\n曰刂",   // j
+        "口川",           // k
+        "田甲四\n车囗皿", // l
+        "山由贝\n骨冂",   // m
+        "已己尸\n心羽",   // n
+        "火灬米\n业广",   // o
+        "之宀冖\n辶礻",   // p
+        "金钅勹\n夕儿",   // q
+        "白手扌\n斤气",   // r
+        "木丁西",         // s
+        "禾竹彳\n攵夂",   // t
+        "立辛门\n疒丬",   // u
+        "女刀九\n彐巛",   // v
+        "人亻八\n几",     // w
+        "纟幺弓\n匕母",   // x
+        "言讠文\n方六",   // y
+        "万能",           // z
+    ]
+
+    public static func wubiRadicals(for ascii: UInt8, schemaId: UInt32) -> String? {
+        let idx: Int
+        if ascii >= UInt8(ascii: "a") && ascii <= UInt8(ascii: "z") {
+            idx = Int(ascii - UInt8(ascii: "a"))
+        } else if ascii >= UInt8(ascii: "A") && ascii <= UInt8(ascii: "Z") {
+            idx = Int(ascii - UInt8(ascii: "A"))
+        } else {
+            return nil
+        }
+        switch schemaId {
+        case 86: return wubi86RadicalTable[idx]
+        case 98: return wubi98RadicalTable[idx]
+        case 6: return wubi06RadicalTable[idx]
+        default: return nil
+        }
+    }
+
+    public var showsWubiRadicals: Bool {
+        wubiKeycapRadicals
+            && !asciiMode
+            && !shiftState.isUppercase
+            && (schemaId == 86 || schemaId == 98 || schemaId == 6)
+    }
+
+    private func formatWubiRadicals(_ ascii: UInt8) -> String? {
+        if isTrackpadActive || !showsWubiRadicals {
+            return nil
+        }
+        return Self.wubiRadicals(for: ascii, schemaId: schemaId)
     }
 
     private func formatLetter(_ ascii: UInt8) -> String {
