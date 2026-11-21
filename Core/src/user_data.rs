@@ -520,29 +520,11 @@ impl UserStore {
         if self.phrases.contains_key(phrase) {
             return None;
         }
-        // Surprisal-guided gating when Micro-RWKV-7 is active:
-        // - Low surprisal (< 2.8 nats, P > 6%): RWKV already predicts this naturally -> don't pollute phrases!
-        // - High surprisal (>= 6.5 nats): true OOV name/jargon/coined term -> accelerate promotion (+2)!
-        // - Without RWKV: fall back to static stop-glue filter.
-        let bump: u8 = if let Some(surp) = mean_surprisal {
-            if surp < 2.8 {
-                return None;
-            }
-            if surp >= 6.5 {
-                2
-            } else {
-                if phrase.chars().any(is_stop_glue_char) {
-                    return None;
-                }
-                1
-            }
-        } else {
-            if phrase.chars().any(is_stop_glue_char) {
-                return None;
-            }
-            1
-        };
-
+        // Always filter functional particle glue chars (的/了/着/过/吗/呢/吧/啊/呀/哦)
+        // so pairs like "我的" or "去了" never pollute personal phrases.
+        if phrase.chars().any(is_stop_glue_char) {
+            return None;
+        }
         if let Some(d) = dict {
             let Some(code) = d.encode_phrase(phrase) else {
                 return None;
@@ -555,6 +537,21 @@ impl UserStore {
                 return None;
             }
         }
+        // Surprisal-guided promotion when Micro-RWKV-7 is active (after dict-absence & glue checks):
+        // - High RWKV cohesion (`surp < 4.0`, i.e. P(c2|c1) > ~1.8%, e.g. "微信" missing from Wubi86 dict)
+        //   on content chars: strong evidence of a real missing modern word -> accelerate promotion (+2)!
+        // - Otherwise (including high-surprisal rare terms or accidental cross-word pairs like "这微"):
+        //   standard +1 so it must be repeated `threshold` times before promotion!
+        let has_common_clause_glue = phrase.chars().any(is_clause_glue_char);
+        let bump: u8 = if let Some(surp) = mean_surprisal {
+            if surp < 4.0 && !has_common_clause_glue {
+                2
+            } else {
+                1
+            }
+        } else {
+            1
+        };
         let cnt = self.pending_ngrams.entry(phrase.to_string()).or_insert(0);
         *cnt = cnt.saturating_add(bump);
         if *cnt >= threshold.max(1) {
@@ -782,5 +779,14 @@ fn is_stop_glue_char(ch: char) -> bool {
     matches!(
         ch,
         '的' | '了' | '着' | '过' | '吗' | '呢' | '吧' | '啊' | '呀' | '哦'
+    )
+}
+
+#[inline]
+fn is_clause_glue_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '我' | '你' | '他' | '她' | '它' | '是' | '在' | '有' | '不' | '也' | '都' | '就' | '很'
+            | '这' | '那'
     )
 }

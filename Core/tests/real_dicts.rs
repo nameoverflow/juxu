@@ -604,27 +604,32 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
         "low-surprisal glue pair '我的' must not be promoted into user phrases"
     );
 
-    // High-surprisal coined term "星锚" (surprisal = 8.5 nats) promotes in 1 burst (bump=2 >= threshold=2)!
-    let _ = engine.user.record_commit_with_surprisal(
-        "",
-        "星",
-        9000,
-        true,
-        2,
-        engine.dicts[0].as_ref(),
-        engine.pinyin_dict.as_ref(),
-        Some(5.0),
-    );
-    let promoted = engine.user.record_commit_with_surprisal(
-        "星",
-        "锚",
-        9200,
-        true,
-        2,
-        engine.dicts[0].as_ref(),
-        engine.pinyin_dict.as_ref(),
-        Some(8.5),
-    );
+    // Rare coined term "星锚" (high surprisal = 8.5 nats) requires repeat (2 bursts) so accidental
+    // cross-word pairs don't pollute phrases, then immediately indexes into Full Pinyin!
+    let mut promoted = None;
+    for round in 0..2u64 {
+        let base_t = 9000 + round * 1000;
+        let _ = engine.user.record_commit_with_surprisal(
+            "",
+            "星",
+            base_t,
+            true,
+            2,
+            engine.dicts[0].as_ref(),
+            engine.pinyin_dict.as_ref(),
+            Some(5.0),
+        );
+        promoted = engine.user.record_commit_with_surprisal(
+            "星",
+            "锚",
+            base_t + 200,
+            true,
+            2,
+            engine.dicts[0].as_ref(),
+            engine.pinyin_dict.as_ref(),
+            Some(8.5),
+        );
+    }
     assert_eq!(promoted.as_deref(), Some("星锚"));
     // Verify it is immediately indexed and retrievable in Full Pinyin!
     engine.set_schema(WubiSchema::Pinyin);
@@ -717,6 +722,40 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
         engine.preedit()
     );
     assert_eq!(engine.preedit(), "个键盘");
+
+    // 10. High-cohesion modern word missing from Wubi86 ("微信" = tmg + wy -> tmwy):
+    //     Must be auto-composed into user phrase `tmwy` instead of rejected by low RWKV surprisal!
+    let mut cfg_wb_auto = cfg.clone();
+    cfg_wb_auto.schema = WubiSchema::Wubi86;
+    cfg_wb_auto.spaceless = true;
+    cfg_wb_auto.auto_phrase = true;
+    cfg_wb_auto.auto_phrase_threshold = 2;
+    engine.set_config(cfg_wb_auto);
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "tmgwy".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 14_000 + i as u64 * 50);
+    }
+    let out_wx = engine.handle_key_event(KEY_SPACE, Some(' '), false, 14_350);
+    assert_eq!(out_wx.commit_text, "微信");
+    assert!(
+        engine.user.phrases.contains_key("微信"),
+        "expected missing high-cohesion word '微信' to be auto-composed into user phrases"
+    );
+    // Switch to standard Wubi86 and verify `tmwy` now directly yields "微信"!
+    let mut cfg_wb_std = cfg.clone();
+    cfg_wb_std.schema = WubiSchema::Wubi86;
+    cfg_wb_std.spaceless = false;
+    engine.set_config(cfg_wb_std);
+    engine.clear_composition();
+    for (i, ch) in "tmwy".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 15_000 + i as u64 * 50);
+    }
+    assert!(
+        engine.all_candidates().iter().any(|c| c.text == "微信"),
+        "expected 'tmwy' to match auto-composed '微信', got {:?}",
+        engine.page_candidates().iter().map(|c| &c.text).collect::<Vec<_>>()
+    );
 }
 
 #[test]

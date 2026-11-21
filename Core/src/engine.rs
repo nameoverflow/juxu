@@ -244,6 +244,8 @@ impl WubiEngine {
     pub fn clear_context(&mut self) {
         self.recent_context.clear();
         self.last_committed.clear();
+        self.user.break_single_burst();
+        self.pinyin_stream.clear();
         let nv = self.aux.as_ref().and_then(|a| a.neural_view());
         self.neural_tracker.reset_to_bos(nv.as_ref());
     }
