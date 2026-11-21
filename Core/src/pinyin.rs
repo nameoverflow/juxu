@@ -230,7 +230,7 @@ fn build_lattice(
                     let mut with_g = exact_str.clone();
                     with_g.push('g');
                     if decoder.dict.lookup_syllable_id(&with_g).is_some() {
-                        hyps.push((with_g, exact_lp, CorrectionKind::NeighborKey, -2.5));
+                        hyps.push((with_g, exact_lp, CorrectionKind::NeighborKey, -2.0));
                     }
                 }
                 // 2) Missing 1 letter anywhere inside a syllable (e.g. zhog->zhong, xio->xiao)
@@ -595,22 +595,35 @@ fn extend_pinyin_layer(
             let Some(first) = chars.next() else { continue };
             let second = chars.next();
             let n_chars = 1 + usize::from(second.is_some()) + chars.count();
-            let freq_prior = if n_chars == 1 {
-                0.25 * (((weight as f32) + 1.0).ln() - 15.0)
+            let base_freq_cold = if n_chars == 1 {
+                0.24 * (((weight as f32) + 1.0).ln() - 15.0)
             } else {
                 0.42 * (((weight as f32) + 1.0).ln() - 8.5)
             };
-            let phrase_bonus = if n_chars >= 2 { 1.45 * ((n_chars - 1) as f32) } else { 0.0 };
-            let mut base_bias = syl_score + freq_prior + phrase_bonus;
+            let base_freq_ctx = if n_chars == 1 {
+                0.18 * (((weight as f32) + 1.0).ln() - 15.0)
+            } else {
+                0.28 * (((weight as f32) + 1.0).ln() - 8.5)
+            };
+            let phrase_bonus_cold = if n_chars >= 2 { 1.35 * ((n_chars - 1) as f32) } else { 0.0 };
+            let phrase_bonus_ctx = if n_chars >= 2 { 0.95 * ((n_chars - 1) as f32) } else { 0.0 };
+            let mut shared_bias = syl_score;
             if let (Some(aux), Some(sec)) = (decoder.aux, second) {
-                base_bias += 0.04 * aux.bigram_boost(first, sec);
+                shared_bias += 0.04 * aux.bigram_boost(first, sec);
             }
 
             if decoder.config.dynamic_word_freq {
-                base_bias += 1.6 * decoder.user.unigram_boost(&text);
+                shared_bias += 1.6 * decoder.user.unigram_boost(&text);
             }
             for parent in parents {
-                let mut contextual_bias = base_bias;
+                let in_sentence = !parent.text.is_empty();
+                let neural_w = if in_sentence { 0.95 } else { 0.72 };
+                let mut contextual_bias = shared_bias
+                    + if in_sentence {
+                        base_freq_ctx + phrase_bonus_ctx
+                    } else {
+                        base_freq_cold + phrase_bonus_cold
+                    };
                 if let Some(aux) = decoder.aux {
                     let mut preceding = parent
                         .text
@@ -618,9 +631,9 @@ fn extend_pinyin_layer(
                         .rev()
                         .chain(decoder.context.iter().rev().copied());
                     if let Some(prev) = preceding.next() {
-                        contextual_bias += 0.18 * aux.bigram_boost(prev, first);
+                        contextual_bias += 0.14 * aux.bigram_boost(prev, first);
                         if let Some(prev2) = preceding.next() {
-                            contextual_bias += 0.16 * aux.trigram_boost(prev2, prev, first);
+                            contextual_bias += 0.12 * aux.trigram_boost(prev2, prev, first);
                         }
                     }
                 }
@@ -629,10 +642,17 @@ fn extend_pinyin_layer(
                 }
                 let neural_est = if let Some(nv) = &decoder.model {
                     if n_chars == 1 {
-                        0.72 * nv.score_next_char(&parent.state, first)
+                        neural_w * nv.score_next_char(&parent.state, first)
+                    } else if n_chars == 2 {
+                        neural_w * nv.score_phrase_fast(&parent.state, &text) * 2.0f32.powf(0.65)
                     } else {
-                        0.72 * nv.score_phrase_fast(&parent.state, &text)
-                            * (n_chars.min(4) as f32).powf(0.65)
+                        // Avoid penalizing 3-4 char phrases in coarse pruning with unconditioned uni_bias:
+                        // estimate first 2 chars via MTP-2 and remaining in-word chars via mild continuation prior.
+                        let prefix2: String = text.chars().take(2).collect();
+                        let lp12 = neural_w
+                            * nv.score_phrase_fast(&parent.state, &prefix2)
+                            * 2.0f32.powf(0.65);
+                        lp12 - 2.1 * ((n_chars - 2) as f32)
                     }
                 } else {
                     0.0
@@ -661,9 +681,11 @@ fn extend_pinyin_layer(
         let mut state = step.parent.state.clone();
         let mut score = step.parent.score + step.bias;
         let mut personal_context = step.parent.personal_context;
+        let in_sentence = !step.parent.text.is_empty();
+        let neural_w = if in_sentence { 0.95 } else { 0.72 };
         if let Some(nv) = &decoder.model {
             for ch in step.text.chars() {
-                score += 0.72 * nv.score_next_char(&state, ch);
+                score += neural_w * nv.score_next_char(&state, ch);
                 if use_personal_states {
                     score += personal.state_bonus(personal_context, ch, &state);
                 }

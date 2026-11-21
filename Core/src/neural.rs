@@ -77,6 +77,144 @@ pub fn quantize_act_i8(x: &[f32], out_q: &mut [i8]) -> f32 {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sdot_i8x16(
+    mut acc: core::arch::aarch64::int32x4_t,
+    a: core::arch::aarch64::int8x16_t,
+    b: core::arch::aarch64::int8x16_t,
+) -> core::arch::aarch64::int32x4_t {
+    core::arch::asm!(
+        "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+        acc = inout(vreg) acc,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(pure, nomem, nostack)
+    );
+    acc
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn int8_matvec_sdot(
+    w_u8: &[u8],
+    scales_bytes: &[u8],
+    bias_bytes: Option<&[u8]>,
+    x_q: &[i8],
+    x_scale: f32,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    use core::arch::aarch64::*;
+    let w_ptr = w_u8.as_ptr() as *const i8;
+    let x_ptr = x_q.as_ptr();
+    let mut r = 0usize;
+    while r + 4 <= rows {
+        let rp0 = w_ptr.add(r * cols);
+        let rp1 = w_ptr.add((r + 1) * cols);
+        let rp2 = w_ptr.add((r + 2) * cols);
+        let rp3 = w_ptr.add((r + 3) * cols);
+        let mut a0 = vdupq_n_s32(0);
+        let mut a1 = vdupq_n_s32(0);
+        let mut a2 = vdupq_n_s32(0);
+        let mut a3 = vdupq_n_s32(0);
+        let mut c = 0usize;
+        while c + 32 <= cols {
+            let xb0 = vld1q_s8(x_ptr.add(c));
+            let xb1 = vld1q_s8(x_ptr.add(c + 16));
+            a0 = sdot_i8x16(a0, vld1q_s8(rp0.add(c)), xb0);
+            a1 = sdot_i8x16(a1, vld1q_s8(rp1.add(c)), xb0);
+            a2 = sdot_i8x16(a2, vld1q_s8(rp2.add(c)), xb0);
+            a3 = sdot_i8x16(a3, vld1q_s8(rp3.add(c)), xb0);
+            a0 = sdot_i8x16(a0, vld1q_s8(rp0.add(c + 16)), xb1);
+            a1 = sdot_i8x16(a1, vld1q_s8(rp1.add(c + 16)), xb1);
+            a2 = sdot_i8x16(a2, vld1q_s8(rp2.add(c + 16)), xb1);
+            a3 = sdot_i8x16(a3, vld1q_s8(rp3.add(c + 16)), xb1);
+            c += 32;
+        }
+        while c + 16 <= cols {
+            let xb = vld1q_s8(x_ptr.add(c));
+            a0 = sdot_i8x16(a0, vld1q_s8(rp0.add(c)), xb);
+            a1 = sdot_i8x16(a1, vld1q_s8(rp1.add(c)), xb);
+            a2 = sdot_i8x16(a2, vld1q_s8(rp2.add(c)), xb);
+            a3 = sdot_i8x16(a3, vld1q_s8(rp3.add(c)), xb);
+            c += 16;
+        }
+        let mut s0 = vaddvq_s32(a0);
+        let mut s1 = vaddvq_s32(a1);
+        let mut s2 = vaddvq_s32(a2);
+        let mut s3 = vaddvq_s32(a3);
+        while c < cols {
+            let xv = *x_ptr.add(c) as i32;
+            s0 += (*rp0.add(c) as i32) * xv;
+            s1 += (*rp1.add(c) as i32) * xv;
+            s2 += (*rp2.add(c) as i32) * xv;
+            s3 += (*rp3.add(c) as i32) * xv;
+            c += 1;
+        }
+        let sums = [s0, s1, s2, s3];
+        for k in 0..4 {
+            let rr = r + k;
+            let w_sc = read_f32(scales_bytes, rr * 4);
+            let b = bias_bytes.map(|bb| read_f32(bb, rr * 4)).unwrap_or(0.0);
+            *out.get_unchecked_mut(rr) = (sums[k] as f32) * w_sc * x_scale + b;
+        }
+        r += 4;
+    }
+    while r < rows {
+        let row_ptr = w_ptr.add(r * cols);
+        let mut a0 = vdupq_n_s32(0);
+        let mut a1 = vdupq_n_s32(0);
+        let mut c = 0usize;
+        while c + 32 <= cols {
+            a0 = sdot_i8x16(a0, vld1q_s8(row_ptr.add(c)), vld1q_s8(x_ptr.add(c)));
+            a1 = sdot_i8x16(a1, vld1q_s8(row_ptr.add(c + 16)), vld1q_s8(x_ptr.add(c + 16)));
+            c += 32;
+        }
+        while c + 16 <= cols {
+            a0 = sdot_i8x16(a0, vld1q_s8(row_ptr.add(c)), vld1q_s8(x_ptr.add(c)));
+            c += 16;
+        }
+        let mut acc = vaddvq_s32(vaddq_s32(a0, a1));
+        while c < cols {
+            acc += (*row_ptr.add(c) as i32) * (*x_ptr.add(c) as i32);
+            c += 1;
+        }
+        let w_sc = read_f32(scales_bytes, r * 4);
+        let b = bias_bytes.map(|bb| read_f32(bb, r * 4)).unwrap_or(0.0);
+        *out.get_unchecked_mut(r) = (acc as f32) * w_sc * x_scale + b;
+        r += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn int8_dot_row_sdot(row_u8: &[u8], row_scale: f32, x_q: &[i8], x_scale: f32) -> f32 {
+    use core::arch::aarch64::*;
+    let rp = row_u8.as_ptr() as *const i8;
+    let xp = x_q.as_ptr();
+    let n = x_q.len();
+    let mut a0 = vdupq_n_s32(0);
+    let mut a1 = vdupq_n_s32(0);
+    let mut c = 0usize;
+    while c + 32 <= n {
+        a0 = sdot_i8x16(a0, vld1q_s8(rp.add(c)), vld1q_s8(xp.add(c)));
+        a1 = sdot_i8x16(a1, vld1q_s8(rp.add(c + 16)), vld1q_s8(xp.add(c + 16)));
+        c += 32;
+    }
+    while c + 16 <= n {
+        a0 = sdot_i8x16(a0, vld1q_s8(rp.add(c)), vld1q_s8(xp.add(c)));
+        c += 16;
+    }
+    let mut acc = vaddvq_s32(vaddq_s32(a0, a1));
+    while c < n {
+        acc += (*rp.add(c) as i32) * (*xp.add(c) as i32);
+        c += 1;
+    }
+    (acc as f32) * row_scale * x_scale
+}
+
+#[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn int8_matvec_neon(
     w_u8: &[u8],
@@ -128,6 +266,9 @@ fn int8_matvec(
 ) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return int8_matvec_sdot(w_u8, scales_bytes, bias_bytes, x_q, x_scale, rows, cols, out);
+        }
         return int8_matvec_neon(w_u8, scales_bytes, bias_bytes, x_q, x_scale, rows, cols, out);
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -149,6 +290,9 @@ fn int8_matvec(
 fn int8_dot_row(row_u8: &[u8], row_scale: f32, x_q: &[i8], x_scale: f32) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            return int8_dot_row_sdot(row_u8, row_scale, x_q, x_scale);
+        }
         use core::arch::aarch64::*;
         let rp = row_u8.as_ptr() as *const i8;
         let xp = x_q.as_ptr();
@@ -700,6 +844,27 @@ impl<'a> NeuralView<'a> {
         let tok = self.char_to_token(ch);
         let (e_row, e_sc, ub) = self.emb_row(tok);
         int8_dot_row(e_row, e_sc, &state.p1_q, state.p1_scale) + ub
+    }
+
+    /// Compute `(self_norm_score, log_z)` over the full vocabulary for calibration & exact-NLL evaluation.
+    /// Exact log-probability is `self_norm_score - log_z`. Not used on the hot typing path.
+    pub fn eval_next_char_calibration(&self, state: &RwkvState, ch: char) -> (f32, f32) {
+        let s = &self.offs.summary;
+        let v = s.vocab_size;
+        let r = s.rank;
+        let emb_w = &self.blob[self.offs.emb_w_off..self.offs.emb_w_off + v * r];
+        let emb_sc = &self.blob[self.offs.emb_sc_off..self.offs.emb_sc_off + v * 4];
+        let uni_b = &self.blob[self.offs.uni_bias_off..self.offs.uni_bias_off + v * 4];
+        let mut scores = vec![f32::NEG_INFINITY; v];
+        int8_matvec(emb_w, emb_sc, Some(uni_b), &state.p1_q[..r], state.p1_scale, v, r, &mut scores);
+        let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum_exp = 0.0f64;
+        for &sc in &scores {
+            sum_exp += ((sc - max_s) as f64).exp();
+        }
+        let log_z = max_s + (sum_exp.ln() as f32);
+        let tok = self.char_to_token(ch);
+        (scores[tok], log_z)
     }
 
     /// Retrieve top-K highest-probability next CJK characters `(ch, log_prob)` from cached `p1_q` (`~40 µs`).
