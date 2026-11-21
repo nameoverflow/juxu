@@ -488,6 +488,10 @@ public final class WubiBridge: ObservableObject {
 
     nonisolated(unsafe) private var handle: OpaquePointer?
     private let decoder = JSONDecoder()
+    private var resolvedDictsDir: URL?
+    private var loadedDictSchemas: Set<UInt32> = []
+    private var pinyinDictLoaded: Bool = false
+    private var auxDictLoaded: Bool = false
     #if os(iOS)
     private let inMemoryOnly: Bool
     private var lastSharedTouchProfile: [TouchKeyCalibrationItem]?
@@ -559,6 +563,7 @@ public final class WubiBridge: ObservableObject {
         if !inMemoryOnly {
             loadConfigAndUser()
         } else {
+            ensureDictionaryLoaded(for: prefs.schemaId)
             refreshState()
             refreshTouchProfile()
         }
@@ -583,47 +588,90 @@ public final class WubiBridge: ObservableObject {
         for dir in candidateDirs {
             let p86 = dir.appendingPathComponent("wubi86.wbdict").path
             if FileManager.default.fileExists(atPath: p86) {
-                _ = p86.withCString { wubi_engine_load_dict_mmap(h, 86, $0) }
-                let p98 = dir.appendingPathComponent("wubi98.wbdict").path
-                _ = p98.withCString { wubi_engine_load_dict_mmap(h, 98, $0) }
-                let p06 = dir.appendingPathComponent("wubi06.wbdict").path
-                _ = p06.withCString { wubi_engine_load_dict_mmap(h, 6, $0) }
-                let pXh = dir.appendingPathComponent("xiaohe.wbdict").path
-                _ = pXh.withCString { wubi_engine_load_dict_mmap(h, 10, $0) }
-                let pCj3 = dir.appendingPathComponent("cangjie3.wbdict").path
-                _ = pCj3.withCString { wubi_engine_load_dict_mmap(h, 33, $0) }
-                let pCj5 = dir.appendingPathComponent("cangjie5.wbdict").path
-                _ = pCj5.withCString { wubi_engine_load_dict_mmap(h, 35, $0) }
-                let pCj6 = dir.appendingPathComponent("cangjie6.wbdict").path
-                _ = pCj6.withCString { wubi_engine_load_dict_mmap(h, 36, $0) }
-                let pPy = dir.appendingPathComponent("pinyin.pydict").path
-                _ = pPy.withCString { wubi_engine_load_pinyin_dict_mmap(h, $0) }
-                let pAux = dir.appendingPathComponent("wubi_aux.wbaux").path
-                _ = pAux.withCString { wubi_engine_load_aux_mmap(h, $0) }
+                resolvedDictsDir = dir
+                if !auxDictLoaded {
+                    let pAux = dir.appendingPathComponent("wubi_aux.wbaux").path
+                    if pAux.withCString({ wubi_engine_load_aux_mmap(h, $0) }) {
+                        auxDictLoaded = true
+                    }
+                }
+                #if os(macOS)
+                for sid: UInt32 in [86, 98, 6, 10, 33, 35, 36] {
+                    ensureDictionaryLoaded(for: sid)
+                }
+                ensureDictionaryLoaded(for: 20)
+                #endif
                 break
             }
         }
     }
 
+    public func ensureDictionaryLoaded(for schemaId: UInt32) {
+        guard let h = handle, let dir = resolvedDictsDir else { return }
+        if !auxDictLoaded {
+            let pAux = dir.appendingPathComponent("wubi_aux.wbaux").path
+            if pAux.withCString({ wubi_engine_load_aux_mmap(h, $0) }) {
+                auxDictLoaded = true
+            }
+        }
+        if schemaId == 20 || schemaId == 21 {
+            if !pinyinDictLoaded {
+                let pPy = dir.appendingPathComponent("pinyin.pydict").path
+                if pPy.withCString({ wubi_engine_load_pinyin_dict_mmap(h, $0) }) {
+                    pinyinDictLoaded = true
+                }
+            }
+            return
+        }
+        if loadedDictSchemas.contains(schemaId) {
+            return
+        }
+        let fileName: String
+        switch schemaId {
+        case 98: fileName = "wubi98.wbdict"
+        case 6: fileName = "wubi06.wbdict"
+        case 10: fileName = "xiaohe.wbdict"
+        case 33: fileName = "cangjie3.wbdict"
+        case 35: fileName = "cangjie5.wbdict"
+        case 36: fileName = "cangjie6.wbdict"
+        default: fileName = "wubi86.wbdict"
+        }
+        let path = dir.appendingPathComponent(fileName).path
+        if path.withCString({ wubi_engine_load_dict_mmap(h, schemaId, $0) }) {
+            loadedDictSchemas.insert(schemaId)
+        }
+    }
+
     public func loadConfigAndUser() {
         guard let h = handle else { return }
+        var uiPrefsSourceTOML: String? = nil
         if FileManager.default.fileExists(atPath: configURL.path) {
             _ = configURL.path.withCString { wubi_engine_load_config(h, $0) }
+            uiPrefsSourceTOML = try? String(contentsOf: configURL, encoding: .utf8)
         } else {
             _ = configURL.path.withCString { wubi_engine_save_config(h, $0) }
-        }
-        if FileManager.default.fileExists(atPath: userDataURL.path) {
-            _ = userDataURL.path.withCString { wubi_engine_load_user_data(h, $0) }
         }
         #if os(iOS)
         if let data = IOSSharedSettings.read(account: IOSSharedSettings.preferencesAccount),
            let shared = String(data: data, encoding: .utf8) {
             shared.withCString { wubi_engine_set_config_toml(h, $0) }
+            uiPrefsSourceTOML = shared
         }
         loadSharedTouchProfile()
         #endif
         let toml = takeString(wubi_engine_get_config_toml(h))
-        self.prefs = WubiPreferences.fromTOML(toml)
+        var loaded = WubiPreferences.fromTOML(toml)
+        if let uiTOML = uiPrefsSourceTOML {
+            let uiPrefs = WubiPreferences.fromTOML(uiTOML)
+            loaded.clipboardSuggestion = uiPrefs.clipboardSuggestion
+            loaded.cangjieKeycapRadicals = uiPrefs.cangjieKeycapRadicals
+            loaded.wubiKeycapRadicals = uiPrefs.wubiKeycapRadicals
+        }
+        self.prefs = loaded
+        ensureDictionaryLoaded(for: loaded.schemaId)
+        if FileManager.default.fileExists(atPath: userDataURL.path) {
+            _ = userDataURL.path.withCString { wubi_engine_load_user_data(h, $0) }
+        }
         refreshState()
         refreshUserPhrases()
         refreshTouchProfile()
@@ -632,6 +680,7 @@ public final class WubiBridge: ObservableObject {
     public func applyAndSavePreferences(_ newPrefs: WubiPreferences, persist: Bool = true) {
         guard let h = handle else { return }
         self.prefs = newPrefs
+        ensureDictionaryLoaded(for: newPrefs.schemaId)
         let toml = newPrefs.toTOML()
         toml.withCString { wubi_engine_set_config_toml(h, $0) }
         if persist {
@@ -639,6 +688,7 @@ public final class WubiBridge: ObservableObject {
             IOSSharedSettings.write(Data(toml.utf8), account: IOSSharedSettings.preferencesAccount)
             #endif
             _ = configURL.path.withCString { wubi_engine_save_config(h, $0) }
+            try? toml.write(to: configURL, atomically: true, encoding: .utf8)
         }
         refreshState()
         refreshUserPhrases()
