@@ -243,6 +243,10 @@ public struct WubiPreferences: Equatable, Sendable {
     public var suppressAutoCommitOnCorrection: Bool = true
     public var missedSpaceCorrection: Bool = true
 
+    public var isPinyinFamily: Bool {
+        schemaId == 20 || schemaId == 21
+    }
+
     public init() {}
 
     public func toTOML() -> String {
@@ -252,6 +256,7 @@ public struct WubiPreferences: Equatable, Sendable {
         case 6: schemaTag = "06"
         case 10: schemaTag = "xiaohe"
         case 20: schemaTag = "pinyin"
+        case 21: schemaTag = "xiaohe_sp"
         default: schemaTag = "86"
         }
         return """
@@ -320,6 +325,7 @@ public struct WubiPreferences: Equatable, Sendable {
                 else if lower == "06" || lower == "2006" { p.schemaId = 6 }
                 else if lower == "xiaohe" || lower == "flypy" || lower == "10" { p.schemaId = 10 }
                 else if lower == "pinyin" || lower == "quanpin" || lower == "20" { p.schemaId = 20 }
+                else if lower == "xiaohe_sp" || lower == "shuangpin" || lower == "sp" || lower == "flypy_sp" || lower == "xhsp" || lower == "21" { p.schemaId = 21 }
                 else { p.schemaId = 86 }
             case (_, "page_size"):
                 p.pageSize = min(9, max(3, Int(val) ?? 5))

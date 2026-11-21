@@ -4,7 +4,8 @@ use crate::format::{AuxView, DictView, ENTRY_FLAG_SYMBOL};
 use crate::neural::{NeuralContextTracker, NeuralView, RwkvState};
 use crate::personalization::Context as PersonalContext;
 use crate::pinyin::{
-    pinyin_next_key_priors, PinyinCandidate, PinyinDecoder, PinyinPath, PinyinStream,
+    pinyin_next_key_priors, shuangpin_next_key_priors, PinyinCandidate, PinyinDecoder, PinyinPath,
+    PinyinStream,
 };
 use crate::pinyin_dict::PinyinDictView;
 use crate::spaceless::{Decoder, Segment, Stream};
@@ -1106,7 +1107,11 @@ impl WubiEngine {
         }
         if self.is_pinyin_mode() {
             if let Some(ref pdict) = self.pinyin_dict {
-                let (mask, _) = pinyin_next_key_priors(&self.raw_code, pdict, None);
+                let (mask, _) = if self.config.schema.is_shuangpin() {
+                    shuangpin_next_key_priors(&self.raw_code, pdict, None)
+                } else {
+                    pinyin_next_key_priors(&self.raw_code, pdict, None)
+                };
                 return if mask == 0 { ALL_26 } else { mask };
             }
             return ALL_26;
@@ -1274,8 +1279,11 @@ impl WubiEngine {
         if self.is_pinyin_mode() {
             if let Some(ref pdict) = self.pinyin_dict {
                 let rwkv_starts = self.rwkv_pinyin_start_priors(pdict);
-                let (_, priors) =
-                    pinyin_next_key_priors(&self.raw_code, pdict, rwkv_starts.as_ref());
+                let (_, priors) = if self.config.schema.is_shuangpin() {
+                    shuangpin_next_key_priors(&self.raw_code, pdict, rwkv_starts.as_ref())
+                } else {
+                    pinyin_next_key_priors(&self.raw_code, pdict, rwkv_starts.as_ref())
+                };
                 return priors;
             }
             return out;

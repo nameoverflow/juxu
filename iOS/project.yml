@@ -43,6 +43,10 @@ targets:
         CFBundleDisplayName: 句序
         CFBundleShortVersionString: "0.1.0"
         CFBundleVersion: "8"
+        CFBundleURLTypes:
+          - CFBundleURLName: com.hcyue.juxu
+            CFBundleURLSchemes:
+              - juxu
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false

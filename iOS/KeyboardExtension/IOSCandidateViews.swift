@@ -9,18 +9,21 @@ private final class IOSRibbonSlotControl: UIControl {
     private(set) var slotWidth: CGFloat = 0
     private let label = UILabel()
 
+    private static let idleHitBacking = UIColor.systemBackground.withAlphaComponent(0.02)
+
     override var isHighlighted: Bool {
         didSet {
             backgroundColor = isHighlighted
                 ? UIColor.label.withAlphaComponent(0.10)
-                : .clear
+                : Self.idleHitBacking
         }
     }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         isOpaque = false
-        backgroundColor = .clear
+        // Non-zero alpha backing prevents iOS cross-process CALayerHost hit-testing from skipping transparent pixels.
+        backgroundColor = Self.idleHitBacking
         layer.cornerRadius = 8.0
         layer.cornerCurve = .continuous
 
@@ -185,6 +188,36 @@ private final class IOSClipboardPillControl: UIControl {
     }
 }
 
+/// Cross-process hit-test safe chevron toggle button with generous expanded touch bounds.
+@MainActor
+private final class IOSRibbonChevronButton: UIButton {
+    private static let idleHitBacking = UIColor.systemBackground.withAlphaComponent(0.02)
+
+    override var isHighlighted: Bool {
+        didSet {
+            backgroundColor = isHighlighted
+                ? UIColor.label.withAlphaComponent(0.10)
+                : Self.idleHitBacking
+        }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isOpaque = false
+        backgroundColor = Self.idleHitBacking
+        layer.cornerRadius = 8.0
+        layer.cornerCurve = .continuous
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        bounds.inset(by: UIEdgeInsets(top: -4, left: -16, bottom: -6, right: -4)).contains(point)
+    }
+}
+
 /// iOS 26 Native Airy Unboxed Candidate Bar (`44pt` height):
 /// - Pure `UIView` horizontal track (`clipContainer` + `contentTrack` + horizontal `UIPanGestureRecognizer`)
 ///   with ZERO `UIScrollView`, completely eliminating iOS 26's `_UIScrollPocket` / `UIScrollEdgeEffect`
@@ -201,7 +234,7 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
     private let clipContainer = UIView()
     private let contentTrack = UIView()
     private let edgeFadeMask = CAGradientLayer()
-    private let chevronBtn = UIButton(type: .system)
+    private let chevronBtn = IOSRibbonChevronButton(type: .system)
     private let clipboardPill = IOSClipboardPillControl()
     private let clipboardDismissBtn = UIButton(type: .system)
     private var slotControls: [IOSRibbonSlotControl] = []
@@ -226,14 +259,25 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
         fatalError("init(coder:) has not been implemented")
     }
 
+    private func isInsideChevronHitZone(_ point: CGPoint) -> Bool {
+        guard !chevronBtn.isHidden else { return false }
+        let expanded = CGRect(
+            x: chevronBtn.frame.minX - 16.0,
+            y: -4.0,
+            width: bounds.width - (chevronBtn.frame.minX - 16.0) + 4.0,
+            height: bounds.height + 10.0
+        )
+        return expanded.contains(point)
+    }
+
     /// Pass touches in the bottom `8pt` strip (below candidate glyphs) and in the lower half
     /// of unoccupied trailing candidate-bar space straight through to Row 0 (`q..p`),
     /// while preserving full hit area on `chevronBtn`, centered clipboard pill, and eliminating inter-slot dead gaps.
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        guard bounds.contains(point) else { return false }
-        if !chevronBtn.isHidden && point.x >= chevronBtn.frame.minX - 8.0 {
+        if isInsideChevronHitZone(point) {
             return true
         }
+        guard bounds.contains(point) else { return false }
         if point.y > bounds.height - 8.0 {
             return false
         }
@@ -263,10 +307,11 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
     }
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        guard let hit = super.hitTest(point, with: event) else { return nil }
-        if !chevronBtn.isHidden && bounds.contains(point) && point.x >= chevronBtn.frame.minX - 14.0 {
+        guard !isHidden, alpha >= 0.01, isUserInteractionEnabled else { return nil }
+        if isInsideChevronHitZone(point) {
             return chevronBtn
         }
+        guard let hit = super.hitTest(point, with: event) else { return nil }
         if !clipboardPill.isHidden {
             if !clipboardDismissBtn.isHidden && clipboardDismissBtn.frame.insetBy(dx: -6.0, dy: -4.0).contains(point) {
                 return clipboardDismissBtn
@@ -348,10 +393,10 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
             candidatesTop,
             clipContainer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -5),
 
-            chevronBtn.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
+            chevronBtn.trailingAnchor.constraint(equalTo: trailingAnchor),
             chevronBtn.topAnchor.constraint(equalTo: topAnchor),
-            chevronBtn.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
-            chevronBtn.widthAnchor.constraint(equalToConstant: 52),
+            chevronBtn.bottomAnchor.constraint(equalTo: bottomAnchor),
+            chevronBtn.widthAnchor.constraint(equalToConstant: 56),
         ])
 
         ensureSlotCapacity(10)
@@ -412,7 +457,7 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
         if candidatesTop.constant != codeHeight {
             candidatesTop.constant = codeHeight
         }
-        let targetInsets = UIEdgeInsets(top: codeHeight, left: 0, bottom: 0, right: 0)
+        let targetInsets = UIEdgeInsets(top: max(0, codeHeight - 4), left: 0, bottom: 0, right: 0)
         if chevronBtn.imageEdgeInsets != targetInsets {
             chevronBtn.imageEdgeInsets = targetInsets
         }
@@ -779,6 +824,7 @@ final class IOSExpandedCandidateView: UIView {
     var onCollapse: (() -> Void)?
     var onBackspace: (() -> Void)?
     var onClear: (() -> Void)?
+    var onOpenSettings: (() -> Void)?
 
     private let scrollView = UIScrollView()
     private let gridStack = UIStackView()
@@ -836,9 +882,13 @@ final class IOSExpandedCandidateView: UIView {
         let collapseBtn = makeRailButton(title: nil, symbol: "chevron.up") { [weak self] in self?.onCollapse?() }
         let delBtn = makeRailButton(title: nil, symbol: "delete.backward") { [weak self] in self?.onBackspace?() }
         let clrBtn = makeRailButton(title: "重输", symbol: nil) { [weak self] in self?.onClear?() }
+        let settingsBtn = makeRailButton(title: nil, symbol: "gearshape") { [weak self] in self?.onOpenSettings?() }
+        settingsBtn.accessibilityIdentifier = "PrisWubiOpenSettings"
+        settingsBtn.accessibilityLabel = "打开句序设置"
         railStack.addArrangedSubview(collapseBtn)
         railStack.addArrangedSubview(delBtn)
         railStack.addArrangedSubview(clrBtn)
+        railStack.addArrangedSubview(settingsBtn)
     }
 
     required init?(coder: NSCoder) {

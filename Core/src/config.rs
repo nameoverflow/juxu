@@ -10,6 +10,7 @@ pub enum WubiSchema {
     Wubi06 = 6,
     Xiaohe = 10,
     Pinyin = 20,
+    XiaoheShuangpin = 21,
 }
 
 pub type InputSchema = WubiSchema;
@@ -21,6 +22,7 @@ impl WubiSchema {
             6 | 2006 => Self::Wubi06,
             10 => Self::Xiaohe,
             20 => Self::Pinyin,
+            21 => Self::XiaoheShuangpin,
             _ => Self::Wubi86,
         }
     }
@@ -31,6 +33,7 @@ impl WubiSchema {
             "06" | "2006" | "wubi06" | "new_century" | "xinshiji" => Self::Wubi06,
             "10" | "xiaohe" | "flypy" | "xh" => Self::Xiaohe,
             "20" | "pinyin" | "quanpin" | "qp" => Self::Pinyin,
+            "21" | "xiaohe_sp" | "shuangpin" | "sp" | "flypy_sp" | "xhsp" => Self::XiaoheShuangpin,
             _ => Self::Wubi86,
         }
     }
@@ -42,6 +45,7 @@ impl WubiSchema {
             Self::Wubi06 => "06",
             Self::Xiaohe => "xiaohe",
             Self::Pinyin => "pinyin",
+            Self::XiaoheShuangpin => "xiaohe_sp",
         }
     }
 
@@ -52,6 +56,7 @@ impl WubiSchema {
             Self::Wubi06 => "新世纪五笔",
             Self::Xiaohe => "小鹤音形",
             Self::Pinyin => "全拼",
+            Self::XiaoheShuangpin => "小鹤双拼",
         }
     }
 
@@ -62,6 +67,7 @@ impl WubiSchema {
             Self::Wubi06 => 2,
             Self::Xiaohe => 3,
             Self::Pinyin => 4,
+            Self::XiaoheShuangpin => 5,
         }
     }
 
@@ -77,7 +83,12 @@ impl WubiSchema {
 
     #[inline]
     pub fn is_pinyin(self) -> bool {
-        matches!(self, Self::Pinyin)
+        matches!(self, Self::Pinyin | Self::XiaoheShuangpin)
+    }
+
+    #[inline]
+    pub fn is_shuangpin(self) -> bool {
+        matches!(self, Self::XiaoheShuangpin)
     }
 
     #[inline]
@@ -272,7 +283,7 @@ impl WubiConfig {
                 "# 句序 (Juxu) 配置文件 — macOS 与 iOS 通用内核\n",
                 "# 修改保存后将实时生效\n\n",
                 "[general]\n",
-                "# 输入方案: \"86\" | \"98\" | \"06\" (新世纪) | \"xiaohe\" (小鹤音形) | \"pinyin\" (全拼)\n",
+                "# 输入方案: \"86\" | \"98\" | \"06\" (新世纪) | \"xiaohe\" (小鹤音形) | \"pinyin\" (全拼) | \"xiaohe_sp\" (小鹤双拼)\n",
                 "schema = \"{}\"\n",
                 "page_size = {}\n",
                 "# 候选栏方向: \"horizontal\" | \"vertical\"\n",

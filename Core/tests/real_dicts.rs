@@ -670,3 +670,45 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
     let r_bit = 1u32 << (b'r' - b'a');
     assert_ne!(mask & r_bit, 0, "softened validNextMask should keep 'r' valid after t/y border slip");
 }
+
+#[test]
+fn real_dicts_xiaohe_shuangpin_sentence_and_priors() {
+    use wubi_core::pinyin_dict::PinyinDictView;
+
+    let base = dicts_dir();
+    let pdict = PinyinDictView::from_file(base.join("pinyin.pydict")).expect("open pinyin.pydict");
+    let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
+
+    let mut cfg = WubiConfig::default();
+    cfg.schema = WubiSchema::XiaoheShuangpin;
+    let mut engine = WubiEngine::new(cfg);
+    engine.load_pinyin_dict(pdict);
+    engine.set_aux(aux);
+
+    let cases = [
+        ("jbtmtmqivfhc", "今天天气真好"),
+        ("womfuurufa", "我们输入法"),
+        ("vsgorfmb", "中国人民"),
+        ("xnheulpb", "小鹤双拼"),
+        ("xian", "西安"),
+    ];
+    for (keys, expected) in cases {
+        engine.clear_composition();
+        for (i, ch) in keys.chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 3000 + i as u64 * 40);
+        }
+        let top = engine.page_candidates().first().map(|c| c.text.as_str()).unwrap_or("");
+        println!("XiaoheSP {:<16} -> top='{}' (seg='{}')", keys, top, engine.segmented_code());
+        assert_eq!(top, expected, "xiaohe_sp {} failed: got '{}'", keys, top);
+    }
+
+    // Zero-initial `an`/`ang`/`er` check
+    engine.clear_composition();
+    for ch in "ah".chars() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 4000);
+    }
+    assert!(
+        engine.all_candidates().iter().any(|c| c.text == "昂"),
+        "expected '昂' for zero-initial 'ah' (ang)"
+    );
+}

@@ -137,16 +137,17 @@ public struct SettingsRootView: View {
         VStack(alignment: .leading, spacing: 16) {
             sectionHeader(
                 title: "输入方案与编码规则",
-                subtitle: "内置全拼、小鹤音形与 86 / 98 / 新世纪五笔零拷贝词典，共用 RWKV-7 整句模型与触点纠错"
+                subtitle: "内置全拼、小鹤双拼、小鹤音形与 86 / 98 / 新世纪五笔零拷贝词典，共用 RWKV-7 整句模型与触点纠错"
             )
 
             settingsCard {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("拼音 / 音形方案")
+                    Text("拼音 / 双拼 / 音形方案")
                         .font(.system(size: 13, weight: .medium))
 
                     HStack(spacing: 10) {
                         schemaOptionCard(id: 20, title: "全拼", desc: "整句连打 · 声母简拼 · 触点纠错")
+                        schemaOptionCard(id: 21, title: "小鹤双拼", desc: "小鹤双拼键位 · 整句连打 · 触点纠错")
                         schemaOptionCard(id: 10, title: "小鹤音形", desc: "双拼 + 鹤形辅助码 · 定长/整句")
                     }
 
@@ -162,7 +163,7 @@ public struct SettingsRootView: View {
                 }
             }
 
-            if bridge.prefs.schemaId != 20 {
+            if !bridge.prefs.isPinyinFamily {
                 settingsCard {
                     VStack(spacing: 11) {
                         toggleRow(
@@ -199,10 +200,12 @@ public struct SettingsRootView: View {
 
             settingsCard {
                 VStack(spacing: 11) {
-                    if bridge.prefs.schemaId == 20 {
+                    if bridge.prefs.isPinyinFamily {
                         toggleRow(
                             title: "声母简拼",
-                            subtitle: "支持首字母简拼与全简混拼（如 srf / shurf → 输入法）",
+                            subtitle: bridge.prefs.schemaId == 21
+                                ? "支持单键声母简拼（如 u/i/v 分别对应 sh/ch/zh，urf → 输入法）"
+                                : "支持首字母简拼与全简混拼（如 srf / shurf → 输入法）",
                             isOn: binding(\.pinyinInitialAbbr)
                         )
                         Divider()

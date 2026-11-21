@@ -153,7 +153,7 @@ public struct IOSKeyboardLayoutEngine: Equatable {
         }
     }
 
-    /// Subtle bottom-right subscript on the spacebar matching iOS 26 native Wubi (`"五"`).
+    /// Subtle bottom-right subscript on the spacebar reflecting active input schema.
     public var spaceCornerTag: String? {
         if isTrackpadActive {
             return nil
@@ -161,7 +161,12 @@ public struct IOSKeyboardLayoutEngine: Equatable {
         if asciiMode {
             return "EN"
         }
-        return "五"
+        switch schemaId {
+        case 20: return "拼"
+        case 21: return "双"
+        case 10: return "鹤"
+        default: return "五"
+        }
     }
 
     public struct LayoutSnapshot {

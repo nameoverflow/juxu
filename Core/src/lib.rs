@@ -728,4 +728,76 @@ mod tests {
         }
         assert_eq!(engine.page_candidates()[0].text, "我们");
     }
+
+    #[test]
+    fn xiaohe_shuangpin_sentence_zero_initial_and_typo() {
+        use crate::pinyin_dict::{serialize_pydict, PinyinDictBuildInput, PinyinDictView};
+        let py_bytes = serialize_pydict(PinyinDictBuildInput {
+            chars: vec![
+                ("wo".into(), "我".into(), 10000, 0),
+                ("men".into(), "们".into(), 9000, 0),
+                ("shu".into(), "输".into(), 8000, 0),
+                ("ru".into(), "入".into(), 8500, 0),
+                ("fa".into(), "法".into(), 9500, 0),
+                ("xi".into(), "西".into(), 8000, 0),
+                ("an".into(), "安".into(), 8200, 0),
+                ("xian".into(), "先".into(), 9000, 0),
+                ("zhong".into(), "中".into(), 9800, 0),
+                ("guo".into(), "国".into(), 9700, 0),
+            ],
+            phrases: vec![
+                (vec!["wo".into(), "men".into()], "我们".into(), 50000, 0),
+                (vec!["shu".into(), "ru".into(), "fa".into()], "输入法".into(), 45000, 0),
+                (vec!["xi".into(), "an".into()], "西安".into(), 30000, 0),
+                (vec!["zhong".into(), "guo".into()], "中国".into(), 48000, 0),
+            ],
+        });
+        let pdict = PinyinDictView::from_bytes(py_bytes).unwrap();
+        let mut cfg = WubiConfig::default();
+        cfg.schema = WubiSchema::XiaoheShuangpin;
+        let mut engine = WubiEngine::new(cfg);
+        engine.load_pinyin_dict(pdict);
+
+        // 1. Full Shuangpin sentence: wo + mf(men) + uu(shu) + ru + fa -> "我们输入法"
+        for ch in "womfuurufa".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 100);
+        }
+        assert_eq!(engine.page_candidates()[0].text, "我们输入法");
+        assert_eq!(engine.segmented_code(), "wo'men'shu'ru'fa");
+        engine.clear_composition();
+
+        // 2. Zero-initial + consonant-initial: xi + an -> "西安", xm -> "先"
+        for ch in "xian".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 200);
+        }
+        assert_eq!(engine.page_candidates()[0].text, "西安");
+        engine.clear_composition();
+
+        for ch in "xm".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 250);
+        }
+        assert_eq!(engine.page_candidates()[0].text, "先");
+        engine.clear_composition();
+
+        // 3. Digraph initial v=zh + s=ong, g + o=uo: "vsgo" -> "中国"
+        for ch in "vsgo".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 300);
+        }
+        assert_eq!(engine.page_candidates()[0].text, "中国");
+        engine.clear_composition();
+
+        // 4. Touch typo rescue: "wpmf" (o->p near border) -> "我们"
+        let _ = engine.push_touch_letter(b'w', 1.0, 0.0, true, 400);
+        let _ = engine.push_touch_letter(b'p', 8.55, 0.0, true, 450);
+        for ch in "mf".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 500);
+        }
+        assert_eq!(engine.page_candidates()[0].text, "我们");
+        engine.clear_composition();
+
+        // 5. Shuangpin valid_next_mask after 'v' (zh): 's' (ong) is valid
+        let _ = engine.handle_key_event(0, Some('v'), false, 600);
+        let mask = engine.valid_next_mask();
+        assert_ne!(mask & (1u32 << (b's' - b'a')), 0);
+    }
 }

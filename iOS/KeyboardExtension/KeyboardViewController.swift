@@ -35,6 +35,7 @@ public final class KeyboardViewController: UIInputViewController {
         let plane: IOSKeyPlane
         let shiftState: IOSShiftState
         let asciiMode: Bool
+        let schemaId: UInt32
         let showInlineGlobeKey: Bool
         let returnRole: IOSReturnKeyRole
         let isTrackpadActive: Bool
@@ -490,6 +491,31 @@ public final class KeyboardViewController: UIInputViewController {
             self?.ribbonView.setExpanded(false)
             self?.syncEngineToUI()
         }
+
+        expandedGrid.onOpenSettings = { [weak self] in
+            guard let self else { return }
+            self.feedback.fireSoftStep(playClick: true)
+            self.expandedGrid.isHidden = true
+            self.keyCanvas.isHidden = false
+            self.ribbonView.setExpanded(false)
+            self.openHostAppSettings()
+        }
+    }
+
+    private func openHostAppSettings() {
+        guard let url = URL(string: "juxu://settings") else { return }
+        let selector = NSSelectorFromString("openURL:options:completionHandler:")
+        var responder: UIResponder? = self
+        while let current = responder {
+            if current.responds(to: selector) {
+                typealias OpenURLFunc = @convention(c) (AnyObject, Selector, NSURL, NSDictionary, AnyObject?) -> Void
+                let imp = current.method(for: selector)
+                let openFn = unsafeBitCast(imp, to: OpenURLFunc.self)
+                openFn(current, selector, url as NSURL, NSDictionary(), nil)
+                return
+            }
+            responder = current.next
+        }
     }
 
     private func handleKeyRelease(spec: IOSKeySpec, pointInCanvas: CGPoint) {
@@ -856,6 +882,7 @@ public final class KeyboardViewController: UIInputViewController {
             plane: layoutEngine.plane,
             shiftState: layoutEngine.shiftState,
             asciiMode: layoutEngine.asciiMode,
+            schemaId: layoutEngine.schemaId,
             showInlineGlobeKey: layoutEngine.showInlineGlobeKey,
             returnRole: layoutEngine.returnRole,
             isTrackpadActive: layoutEngine.isTrackpadActive,

@@ -98,10 +98,310 @@ pub struct PinyinDecoder<'a> {
     pub layout: &'a KeyLayout,
 }
 
+/// Decode a 2-key Xiaohe Shuangpin pair `(k1, k2)` into matching full-pinyin syllable(s) present in `dict`.
+pub fn xiaohe_sp_decode_pair(k1: u8, k2: u8, dict: &PinyinDictView) -> Vec<(u16, String)> {
+    let mut out = Vec::new();
+    if !k1.is_ascii_lowercase() || !k2.is_ascii_lowercase() {
+        return out;
+    }
+    // 1. Zero-initial syllables (`a`, `e`, `o` leading key)
+    let zero_syl: Option<&'static str> = match (k1, k2) {
+        (b'a', b'a') => Some("a"),
+        (b'a', b'i') => Some("ai"),
+        (b'a', b'n') => Some("an"),
+        (b'a', b'h') => Some("ang"),
+        (b'a', b'o') => Some("ao"),
+        (b'e', b'e') => Some("e"),
+        (b'e', b'i') => Some("ei"),
+        (b'e', b'n') => Some("en"),
+        (b'e', b'g') => Some("eng"),
+        (b'e', b'r') => Some("er"),
+        (b'o', b'o') => Some("o"),
+        (b'o', b'u') => Some("ou"),
+        _ => None,
+    };
+    if let Some(syl) = zero_syl {
+        if let Some(sid) = dict.lookup_syllable_id(syl) {
+            out.push((sid, syl.to_owned()));
+        }
+        return out;
+    }
+
+    // 2. Consonant-initial syllables
+    let initial: &str = match k1 {
+        b'u' => "sh",
+        b'i' => "ch",
+        b'v' => "zh",
+        b'a' | b'e' | b'o' => return out,
+        _ => std::str::from_utf8(std::slice::from_ref(&k1)).unwrap_or(""),
+    };
+
+    let finals: &[&str] = match k2 {
+        b'a' => &["a"],
+        b'b' => &["in"],
+        b'c' => &["ao"],
+        b'd' => &["ai"],
+        b'e' => &["e"],
+        b'f' => &["en"],
+        b'g' => &["eng"],
+        b'h' => &["ang"],
+        b'i' => &["i"],
+        b'j' => &["an"],
+        b'k' => &["ing", "uai"],
+        b'l' => &["iang", "uang"],
+        b'm' => &["ian"],
+        b'n' => &["iao"],
+        b'o' => {
+            if matches!(k1, b'b' | b'p' | b'm' | b'f' | b'w' | b'y') {
+                &["o"]
+            } else {
+                &["uo", "o"]
+            }
+        }
+        b'p' => &["ie"],
+        b'q' => &["iu"],
+        b'r' => &["uan"],
+        b's' => &["ong", "iong"],
+        b't' => &["ue", "ve"],
+        b'u' => &["u"],
+        b'v' => &["ui", "v"],
+        b'w' => &["ei"],
+        b'x' => &["ia", "ua"],
+        b'y' => &["un"],
+        b'z' => &["ou"],
+        _ => &[],
+    };
+
+    for &fin in finals {
+        let mut s = String::with_capacity(initial.len() + fin.len());
+        s.push_str(initial);
+        s.push_str(fin);
+        if let Some(sid) = dict.lookup_syllable_id(&s) {
+            out.push((sid, s));
+        }
+    }
+    out
+}
+
+fn xiaohe_sp_initial_for_key(k: u8) -> Option<(&'static str, bool)> {
+    match k {
+        b'u' => Some(("sh", true)),
+        b'i' => Some(("ch", true)),
+        b'v' => Some(("zh", true)),
+        b'b' => Some(("b", false)),
+        b'p' => Some(("p", false)),
+        b'm' => Some(("m", false)),
+        b'f' => Some(("f", false)),
+        b'd' => Some(("d", false)),
+        b't' => Some(("t", false)),
+        b'n' => Some(("n", false)),
+        b'l' => Some(("l", false)),
+        b'g' => Some(("g", false)),
+        b'k' => Some(("k", false)),
+        b'h' => Some(("h", false)),
+        b'j' => Some(("j", false)),
+        b'q' => Some(("q", false)),
+        b'x' => Some(("x", false)),
+        b'r' => Some(("r", false)),
+        b'z' => Some(("z", false)),
+        b'c' => Some(("c", false)),
+        b's' => Some(("s", false)),
+        b'y' => Some(("y", false)),
+        b'w' => Some(("w", false)),
+        _ => None,
+    }
+}
+
+fn build_shuangpin_lattice(
+    observations: &[KeyObs],
+    decoder: &PinyinDecoder<'_>,
+) -> Vec<Vec<LatticeEdge>> {
+    let n = observations.len();
+    let mut edges_by_end = vec![Vec::<LatticeEdge>::new(); n + 1];
+    if n == 0 {
+        return edges_by_end;
+    }
+
+    let per_pos_choices: Vec<Vec<(u8, f32, bool, bool)>> = observations
+        .iter()
+        .map(|obs| {
+            if obs.ch == b'\'' {
+                Vec::new()
+            } else {
+                key_choices_for_obs(obs, decoder.layout, &decoder.user.touch_profile, &decoder.config.typo, true)
+            }
+        })
+        .collect();
+
+    for start in 0..n {
+        if observations[start].ch == b'\'' {
+            continue;
+        }
+        let k1 = observations[start].ch;
+        let lp1_exact = per_pos_choices[start]
+            .iter()
+            .find(|c| c.2)
+            .map_or(0.0, |c| c.1);
+
+        // 1-key edge: initial abbreviation (or trailing partial key at end of buffer)
+        let end1 = start + 1;
+        let actual_end1 = if end1 < n && observations[end1].ch == b'\'' {
+            end1 + 1
+        } else {
+            end1
+        };
+        if decoder.config.pinyin_initial_abbr || actual_end1 == n {
+            let mut single_hyps: Vec<(u8, f32, CorrectionKind)> = vec![(k1, lp1_exact, CorrectionKind::Exact)];
+            if decoder.config.typo.enabled && actual_end1 == n {
+                for &(d, lp, is_exact, is_boundary) in &per_pos_choices[start] {
+                    if !is_exact && is_boundary {
+                        single_hyps.push((b'a' + d - 1, lp, CorrectionKind::TouchBoundary));
+                    }
+                }
+            }
+            for (ch, sp_lp, corr) in single_hyps {
+                let typo_cost = match corr {
+                    CorrectionKind::Exact => 0.0,
+                    CorrectionKind::TouchBoundary => -1.8,
+                    CorrectionKind::NeighborKey => -4.8,
+                    CorrectionKind::Transposition => -3.6,
+                };
+                if let Some((init_str, is_digraph)) = xiaohe_sp_initial_for_key(ch) {
+                    let init_id = base_initial_id(init_str);
+                    if init_id > 0 {
+                        let pen = if actual_end1 == n { -2.2 } else { -3.4 };
+                        edges_by_end[actual_end1].push(LatticeEdge {
+                            start,
+                            end: actual_end1,
+                            syl: SylMatch::Initial(init_id, is_digraph),
+                            spatial_logp: sp_lp,
+                            kind_cost: typo_cost + pen,
+                            correction: corr,
+                            display_syl: init_str.to_owned(),
+                        });
+                    }
+                } else if actual_end1 == n && matches!(ch, b'a' | b'e' | b'o') {
+                    let s = (ch as char).to_string();
+                    if !decoder.dict.syllables_with_prefix(&s).is_empty() {
+                        edges_by_end[actual_end1].push(LatticeEdge {
+                            start,
+                            end: actual_end1,
+                            syl: SylMatch::Prefix(s.clone()),
+                            spatial_logp: sp_lp,
+                            kind_cost: typo_cost - 3.2,
+                            correction: corr,
+                            display_syl: s,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 2-key full Shuangpin syllable edge
+        if start + 1 < n && observations[start + 1].ch != b'\'' {
+            let end2 = start + 2;
+            let actual_end2 = if end2 < n && observations[end2].ch == b'\'' {
+                end2 + 1
+            } else {
+                end2
+            };
+            let k2 = observations[start + 1].ch;
+            let lp2_exact = per_pos_choices[start + 1]
+                .iter()
+                .find(|c| c.2)
+                .map_or(0.0, |c| c.1);
+
+            let mut pair_hyps: Vec<(u8, u8, f32, CorrectionKind)> =
+                vec![(k1, k2, lp1_exact + lp2_exact, CorrectionKind::Exact)];
+
+            if decoder.config.typo.enabled {
+                for &(d, lp, is_exact, is_boundary) in &per_pos_choices[start] {
+                    if !is_exact {
+                        let kind = if is_boundary {
+                            CorrectionKind::TouchBoundary
+                        } else {
+                            CorrectionKind::NeighborKey
+                        };
+                        pair_hyps.push((b'a' + d - 1, k2, lp + lp2_exact, kind));
+                    }
+                }
+                for &(d, lp, is_exact, is_boundary) in &per_pos_choices[start + 1] {
+                    if !is_exact {
+                        let kind = if is_boundary {
+                            CorrectionKind::TouchBoundary
+                        } else {
+                            CorrectionKind::NeighborKey
+                        };
+                        pair_hyps.push((k1, b'a' + d - 1, lp1_exact + lp, kind));
+                    }
+                }
+                if k1 != k2 {
+                    let dt = observations[start + 1]
+                        .timestamp_ms
+                        .saturating_sub(observations[start].timestamp_ms);
+                    let trans_lp = if observations[start + 1].timestamp_ms > 0 && dt <= 65 {
+                        -2.45
+                    } else {
+                        -3.45
+                    };
+                    pair_hyps.push((k2, k1, trans_lp, CorrectionKind::Transposition));
+                }
+            }
+
+            for (c1, c2, sp_lp, corr) in pair_hyps {
+                let matches = xiaohe_sp_decode_pair(c1, c2, decoder.dict);
+                let kind_cost = match corr {
+                    CorrectionKind::Exact => 2.7,
+                    CorrectionKind::TouchBoundary => -1.8,
+                    CorrectionKind::NeighborKey => -4.8,
+                    CorrectionKind::Transposition => -3.6,
+                };
+                for (sid, syl_str) in matches {
+                    edges_by_end[actual_end2].push(LatticeEdge {
+                        start,
+                        end: actual_end2,
+                        syl: SylMatch::Full(sid),
+                        spatial_logp: sp_lp,
+                        kind_cost,
+                        correction: corr,
+                        display_syl: syl_str,
+                    });
+                }
+            }
+        }
+    }
+
+    for list in &mut edges_by_end {
+        list.sort_by(|a, b| {
+            (b.spatial_logp + b.kind_cost)
+                .partial_cmp(&(a.spatial_logp + a.kind_cost))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut deduped: Vec<LatticeEdge> = Vec::with_capacity(24);
+        for edge in list.drain(..) {
+            if !deduped
+                .iter()
+                .any(|e| e.start == edge.start && e.syl == edge.syl)
+            {
+                deduped.push(edge);
+                if deduped.len() >= 24 {
+                    break;
+                }
+            }
+        }
+        *list = deduped;
+    }
+
+    edges_by_end
+}
+
 fn build_lattice(
     observations: &[KeyObs],
     decoder: &PinyinDecoder<'_>,
 ) -> Vec<Vec<LatticeEdge>> {
+    if decoder.config.schema.is_shuangpin() {
+        return build_shuangpin_lattice(observations, decoder);
+    }
     let n = observations.len();
     let mut edges_by_end = vec![Vec::<LatticeEdge>::new(); n + 1];
     if n == 0 {
@@ -1094,6 +1394,54 @@ fn build_pinyin_candidates(
     let _ = raw_code;
     let _ = &mut raw_scores;
     (out, full_paths.to_vec())
+}
+
+/// Compute 26-bit `validNextMask` and 26-key `nextKeyPriors` for Xiaohe Shuangpin touch-keyboard键缝裁决.
+pub fn shuangpin_next_key_priors(
+    raw_code: &str,
+    dict: &PinyinDictView,
+    rwkv_start_priors: Option<&[f32; 26]>,
+) -> (u32, [u8; 26]) {
+    let mut mask = 0u32;
+    let mut scores = [0.0f32; 26];
+    let tail = raw_code.rsplit('\'').next().unwrap_or(raw_code);
+    let expect_final = tail.len() % 2 == 1;
+
+    if expect_final {
+        let prev = tail.as_bytes()[tail.len() - 1];
+        for b in b'a'..=b'z' {
+            if !xiaohe_sp_decode_pair(prev, b, dict).is_empty() {
+                let idx = (b - b'a') as usize;
+                mask |= 1u32 << idx;
+                scores[idx] += 2.0;
+            }
+        }
+    }
+    if !expect_final || mask == 0 {
+        for b in b'a'..=b'z' {
+            let idx = (b - b'a') as usize;
+            mask |= 1u32 << idx;
+            let rwkv_w = rwkv_start_priors.map_or(0.0, |p| match b {
+                b'u' => p[(b's' - b'a') as usize] * 0.65,
+                b'i' => p[(b'c' - b'a') as usize] * 0.65,
+                b'v' => p[(b'z' - b'a') as usize] * 0.65,
+                _ => p[idx],
+            });
+            scores[idx] += 1.0 + 4.5 * rwkv_w;
+        }
+    }
+
+    let max_s = scores.iter().copied().fold(0.0f32, f32::max);
+    let mut priors = [0u8; 26];
+    if max_s > 0.0 {
+        for i in 0..26 {
+            if (mask & (1u32 << i)) != 0 {
+                let norm = (scores[i] / max_s).clamp(0.0, 1.0);
+                priors[i] = (65.0 + 115.0 * norm).round().clamp(54.0, 180.0) as u8;
+            }
+        }
+    }
+    (mask, priors)
 }
 
 /// Compute 26-bit `validNextMask` and 26-key `nextKeyPriors` for Pinyin touch-keyboard键缝裁决.

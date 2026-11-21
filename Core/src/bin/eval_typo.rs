@@ -551,7 +551,7 @@ fn main() {
         WubiSchema::Wubi98 => dicts_dir.join("wubi98.wbdict"),
         WubiSchema::Wubi06 => dicts_dir.join("wubi06.wbdict"),
         WubiSchema::Xiaohe => dicts_dir.join("xiaohe.wbdict"),
-        WubiSchema::Pinyin => dicts_dir.join("wubi86.wbdict"),
+        WubiSchema::Pinyin | WubiSchema::XiaoheShuangpin => dicts_dir.join("wubi86.wbdict"),
     };
 
     let dict = DictView::open_mmap(&dict_file).expect("open dict");

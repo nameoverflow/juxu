@@ -36,6 +36,7 @@ public struct IOSHostRootView: View {
     @State private var sandboxText: String = ""
     @FocusState private var sandboxFocused: Bool
     @State private var newWord: String = ""
+    @FocusState private var newWordFocused: Bool
     @State private var wordFeedback: String = ""
 
     public init(bridge: WubiBridge, initialTab: IOSHostTab = .home) {
@@ -62,6 +63,9 @@ public struct IOSHostRootView: View {
             lexiconTab
                 .tabItem { Label(IOSHostTab.lexicon.title, systemImage: IOSHostTab.lexicon.icon) }
                 .tag(IOSHostTab.lexicon)
+        }
+        .onOpenURL { url in
+            handleDeepLink(url)
         }
         #else
         VStack(spacing: 0) {
@@ -164,11 +168,33 @@ public struct IOSHostRootView: View {
 
                     // Live Typing Test Box (placed near top so focusing never scrolls hero under status bar)
                     VStack(alignment: .leading, spacing: 8) {
-                        Label("键盘实时试手区", systemImage: "character.cursor.ibeam")
-                            .font(.system(size: 14, weight: .semibold))
+                        HStack {
+                            Label("键盘实时试手区", systemImage: "character.cursor.ibeam")
+                                .font(.system(size: 14, weight: .semibold))
+                            Spacer()
+                            if !sandboxText.isEmpty {
+                                Button("清空") {
+                                    sandboxText = ""
+                                }
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                            }
+                            if sandboxFocused {
+                                Button("完成") {
+                                    dismissKeyboard()
+                                }
+                                .font(.system(size: 13.5, weight: .semibold))
+                                .foregroundStyle(Color.accentColor)
+                                .accessibilityIdentifier("PrisWubiSandboxDone")
+                            }
+                        }
                         TextField("点此弹出键盘试打汉字、长按空格滑动移光标…", text: $sandboxText)
                             .textFieldStyle(.roundedBorder)
                             .focused($sandboxFocused)
+                            .submitLabel(.done)
+                            .onSubmit {
+                                dismissKeyboard()
+                            }
                     }
                     .padding(14)
                     .background(iosCardBackground)
@@ -213,6 +239,14 @@ public struct IOSHostRootView: View {
                 }
                 .padding(16)
             }
+            #if os(iOS)
+            .scrollDismissesKeyboard(.interactively)
+            .onTapGesture {
+                if sandboxFocused {
+                    dismissKeyboard()
+                }
+            }
+            #endif
             .onAppear {
                 if ProcessInfo.processInfo.arguments.contains("--autofocus") {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -237,6 +271,7 @@ public struct IOSHostRootView: View {
 
                         HStack(spacing: 8) {
                             compactSchemaButton(id: 20, name: "全拼", tag: "整句简拼")
+                            compactSchemaButton(id: 21, name: "小鹤双拼", tag: "双拼整句")
                             compactSchemaButton(id: 10, name: "小鹤音形", tag: "双拼+鹤形")
                         }
 
@@ -249,7 +284,7 @@ public struct IOSHostRootView: View {
                     .padding(14)
                     .background(iosCardBackground)
 
-                    if bridge.prefs.schemaId != 20 {
+                    if !bridge.prefs.isPinyinFamily {
                         VStack(spacing: 12) {
                             iosToggleRow("四码唯一自动上屏", sub: "精确四码唯一匹配时直接上屏", isOn: binding(\.fourthCodeAutoCommit))
                             Divider()
@@ -276,8 +311,14 @@ public struct IOSHostRootView: View {
                     }
 
                     VStack(spacing: 12) {
-                        if bridge.prefs.schemaId == 20 {
-                            iosToggleRow("声母简拼", sub: "支持首字母简拼及混拼（如 srf / shurf → 输入法）", isOn: binding(\.pinyinInitialAbbr))
+                        if bridge.prefs.isPinyinFamily {
+                            iosToggleRow(
+                                "声母简拼",
+                                sub: bridge.prefs.schemaId == 21
+                                    ? "支持单键声母简拼（u/i/v 对应 sh/ch/zh，如 urf → 输入法）"
+                                    : "支持首字母简拼及混拼（如 srf / shurf → 输入法）",
+                                isOn: binding(\.pinyinInitialAbbr)
+                            )
                             Divider()
                         } else {
                             iosToggleRow("流式无空格连打（实验）", sub: "连续输入词组和简码。标点确认中文，回车输入原始字母", isOn: binding(\.spaceless))
@@ -392,11 +433,17 @@ public struct IOSHostRootView: View {
                         HStack(spacing: 8) {
                             TextField("输入新词条，如：句序", text: $newWord)
                                 .textFieldStyle(.roundedBorder)
+                                .focused($newWordFocused)
+                                .submitLabel(.done)
+                                .onSubmit {
+                                    dismissKeyboard()
+                                }
                             Button("添加") {
                                 let code = bridge.addUserPhrase(newWord)
                                 if !code.isEmpty {
                                     wordFeedback = "✓ 已添加「\(newWord)」(\(code))"
                                     newWord = ""
+                                    dismissKeyboard()
                                 }
                             }
                             .buttonStyle(.borderedProminent)
@@ -432,6 +479,14 @@ public struct IOSHostRootView: View {
                 }
                 .padding(16)
             }
+            #if os(iOS)
+            .scrollDismissesKeyboard(.interactively)
+            .onTapGesture {
+                if newWordFocused {
+                    dismissKeyboard()
+                }
+            }
+            #endif
         }
     }
 
@@ -547,6 +602,32 @@ public struct IOSHostRootView: View {
                 bridge.applyAndSavePreferences(copy)
             }
         )
+    }
+
+    private func dismissKeyboard() {
+        sandboxFocused = false
+        newWordFocused = false
+        #if os(iOS)
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        #endif
+    }
+
+    private func handleDeepLink(_ url: URL) {
+        guard url.scheme?.lowercased() == "juxu" else { return }
+        dismissKeyboard()
+        let dest = (url.host ?? url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))).lowercased()
+        switch dest {
+        case "settings", "typing", "schema":
+            selectedTab = .typing
+        case "typo", "hitbox":
+            selectedTab = .typo
+        case "lexicon", "phrases":
+            selectedTab = .lexicon
+        case "home", "sandbox":
+            selectedTab = .home
+        default:
+            selectedTab = .typing
+        }
     }
 
     private func openSystemKeyboardSettings() {
