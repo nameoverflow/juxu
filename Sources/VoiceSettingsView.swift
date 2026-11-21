@@ -518,9 +518,9 @@ private struct LocalVoiceConfigCard: View {
             // 2. Local Polish Section
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("本地口语整理引擎")
+                    Text("本地 LLM 整理引擎")
                         .font(.system(size: 13, weight: .semibold))
-                    Text("默认零下载规则整理；如需完整 AI 整理可一键下载 Qwen2.5-1.5B")
+                    Text("一键下载 Qwen2.5-1.5B（llama.cpp Metal 加速），或接入已有本地 LLM 服务")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                 }

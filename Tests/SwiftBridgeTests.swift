@@ -295,11 +295,11 @@ struct SwiftBridgeTests {
         assert(!VoiceHUDPanelController.isLoaded, "Disabling voice must unload VoiceHUDPanelController")
         assert(!VoiceLocalInstaller.isLoaded, "Disabling voice must unload VoiceLocalInstaller")
 
-        // Verify local rule-based polisher
-        let polished = VoiceLocalRulePolisher.polish("嗯，那个，今天下午三点，嗯，开个短会。")
-        assert(polished == "今天下午三点，开个短会。", "Unexpected local polish output: \(polished)")
-        let polishedEn = VoiceLocalRulePolisher.polish("Um, hello, uh, world.")
-        assert(polishedEn == "hello, world.", "Unexpected EN polish output: \(polishedEn)")
+        // Verify legacy "rule_based" config migrates cleanly to local LLM (.qwen15B)
+        let defaultVoiceLLM = VoicePreferences()
+        assert(defaultVoiceLLM.localLLMPreset == .qwen15B)
+        let migrated = try! JSONDecoder().decode(VoiceLocalLLMPreset.self, from: Data("\"rule_based\"".utf8))
+        assert(migrated == .qwen15B, "Legacy rule_based must migrate to .qwen15B")
 
         // Verify app-aware tone & Speak-to-Edit prompt builder
         assert(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.tencent.xinWeChat").contains("即时聊天"))

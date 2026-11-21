@@ -135,7 +135,6 @@ public enum VoiceLocalASRModelPreset: String, Codable, CaseIterable, Identifiabl
 }
 
 public enum VoiceLocalLLMPreset: String, Codable, CaseIterable, Identifiable, Sendable {
-    case ruleBased = "rule_based"
     case qwen15B = "qwen_1_5b"
     case ollamaHTTP = "ollama_http"
     case none = "none"
@@ -144,24 +143,23 @@ public enum VoiceLocalLLMPreset: String, Codable, CaseIterable, Identifiable, Se
 
     public var displayName: String {
         switch self {
-        case .ruleBased: return "轻量规则整理（免下载）"
         case .qwen15B: return "本地 Qwen2.5-1.5B（AI 整理）"
         case .ollamaHTTP: return "已有本地服务（Ollama 等）"
-        case .none: return "仅原始转写，不整理"
+        case .none: return "不整理（原话直出）"
         }
     }
 
     public var modelFilename: String? {
         switch self {
         case .qwen15B: return "qwen2.5-1.5b-instruct-q4_k_m.gguf"
-        case .ruleBased, .ollamaHTTP, .none: return nil
+        case .ollamaHTTP, .none: return nil
         }
     }
 
     public var approximateSizeLabel: String {
         switch self {
         case .qwen15B: return "1.0 GB"
-        case .ruleBased, .ollamaHTTP, .none: return "0 MB"
+        case .ollamaHTTP, .none: return "0 MB"
         }
     }
 
@@ -171,6 +169,11 @@ public enum VoiceLocalLLMPreset: String, Codable, CaseIterable, Identifiable, Se
             URL(string: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/\(filename)")!,
             URL(string: "https://hf-mirror.com/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/\(filename)")!,
         ]
+    }
+
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = VoiceLocalLLMPreset(rawValue: raw) ?? .qwen15B
     }
 }
 
@@ -265,7 +268,7 @@ public struct VoicePreferences: Codable, Equatable, Sendable {
     public var localHTTPASRBaseURL: String = "http://127.0.0.1:8080/v1"
     public var localHTTPASRModel: String = "whisper-1"
 
-    public var localLLMPreset: VoiceLocalLLMPreset = .ruleBased
+    public var localLLMPreset: VoiceLocalLLMPreset = .qwen15B
     public var localHTTPLLMBaseURL: String = "http://127.0.0.1:11434/v1"
     public var localHTTPLLMModel: String = "qwen2.5:3b"
 

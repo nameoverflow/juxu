@@ -222,7 +222,7 @@ public final class VoiceSessionController {
                 case .qwen15B:
                     let llmStatus = VoiceLocalInstaller.llmStatus(for: .qwen15B)
                     if !llmStatus.isReady {
-                        return (false, "识别引擎已就绪，但本地整理模型尚未下载（可点击一键安装或改用轻量规则整理）")
+                        return (false, "识别引擎已就绪，但本地整理模型尚未下载（请点击上方「一键下载并安装」）")
                     }
                     return (true, "本地识别与 Qwen2.5-1.5B AI 整理均已就绪")
                 case .ollamaHTTP:
@@ -240,8 +240,6 @@ public final class VoiceSessionController {
                     } catch {
                         return (false, "本地 LLM 服务不可达：\(error.localizedDescription)")
                     }
-                case .ruleBased:
-                    return (true, "本地语音识别（\(prefs.localASRPreset.displayName)）与轻量规则整理已就绪")
                 case .none:
                     return (true, "本地语音识别（\(prefs.localASRPreset.displayName)）已就绪")
                 }
@@ -486,7 +484,7 @@ public final class VoiceSessionController {
                 return rawTranscript
             }
             guard !llmKey.isEmpty else {
-                return VoiceLocalRulePolisher.polish(rawTranscript)
+                throw VoiceEngineError.missingAPIKey("云端整理 LLM")
             }
             return try await client.polishOpenAICompatible(
                 baseURL: prefs.effectiveCloudLLMBaseURL,
@@ -500,12 +498,10 @@ public final class VoiceSessionController {
             switch prefs.localLLMPreset {
             case .none:
                 return rawTranscript
-            case .ruleBased:
-                return VoiceLocalRulePolisher.polish(rawTranscript)
             case .qwen15B:
                 let status = VoiceLocalInstaller.llmStatus(for: .qwen15B)
                 guard let bin = status.dependencyPath, let modelPath = status.modelPath, status.isReady else {
-                    return VoiceLocalRulePolisher.polish(rawTranscript)
+                    throw VoiceEngineError.cliFailed("尚未安装本地整理模型，请在「句序偏好设置 → 语音输入」中点击一键下载并安装")
                 }
                 return try await client.polishLocalLlamaCLI(
                     binaryPath: bin,

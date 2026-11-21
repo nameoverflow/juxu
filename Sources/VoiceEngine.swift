@@ -187,56 +187,6 @@ public enum VoicePromptBuilder {
     }
 }
 
-// MARK: - Zero-Memory Local Rule-Based Polisher
-
-public enum VoiceLocalRulePolisher {
-    private static let leadingFillers = [
-        "嗯，", "嗯,", "嗯 ", "啊，", "啊,", "呃，", "呃,", "那个，", "那个,",
-        "就是说，", "就是说,", "然后那个，", "um, ", "uh, ", "um ", "uh ",
-    ]
-
-    public static func polish(_ raw: String) -> String {
-        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty else { return "" }
-
-        // 1. Strip standalone Chinese filler clusters surrounded by punctuation/spaces
-        let inlinePatterns: [(String, String)] = [
-            ("(?<=[，,。！？\\s])(?:嗯+|呃+|啊+|那个|就是说)(?=[，,。！？\\s])", ""),
-            ("(?i)\\b(?:um+|uh+|erm+)\\b[,.]?\\s*", ""),
-            ("([，,]){2,}", "$1"),
-            ("([。]){2,}", "。"),
-            ("\\s+([，。！？；：、])", "$1"),
-            (" {2,}", " "),
-        ]
-        for (pattern, template) in inlinePatterns {
-            if let regex = try? NSRegularExpression(pattern: pattern) {
-                let range = NSRange(s.startIndex..<s.endIndex, in: s)
-                s = regex.stringByReplacingMatches(in: s, range: range, withTemplate: template)
-            }
-        }
-
-        // 2. Strip leading fillers repeatedly
-        var changed = true
-        while changed {
-            changed = false
-            for prefix in leadingFillers {
-                if s.lowercased().hasPrefix(prefix.lowercased()) {
-                    s = String(s.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
-                    changed = true
-                }
-            }
-        }
-
-        // 3. Clean dangling leading comma
-        while let first = s.first, first == "，" || first == "," {
-            s.removeFirst()
-            s = s.trimmingCharacters(in: .whitespaces)
-        }
-
-        return s.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-}
-
 // MARK: - WAV Encoder & Multipart Form Builder (16kHz Mono PCM16)
 
 public enum VoiceWAVEncoder {
