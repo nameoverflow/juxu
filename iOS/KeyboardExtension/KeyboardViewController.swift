@@ -546,18 +546,15 @@ public final class KeyboardViewController: UIInputViewController {
 
     private func openHostAppSettings() {
         guard let url = URL(string: "juxu://settings") else { return }
-        let selector = NSSelectorFromString("openURL:options:completionHandler:")
         var responder: UIResponder? = self
         while let current = responder {
-            if current.responds(to: selector) {
-                typealias OpenURLFunc = @convention(c) (AnyObject, Selector, NSURL, NSDictionary, AnyObject?) -> Void
-                let imp = current.method(for: selector)
-                let openFn = unsafeBitCast(imp, to: OpenURLFunc.self)
-                openFn(current, selector, url as NSURL, NSDictionary(), nil)
+            if let app = current as? UIApplication {
+                app.open(url, options: [:], completionHandler: nil)
                 return
             }
             responder = current.next
         }
+        extensionContext?.open(url, completionHandler: nil)
     }
 
     private func handleKeyRelease(spec: IOSKeySpec, pointInCanvas: CGPoint) {
