@@ -5,6 +5,7 @@ public enum SettingsSection: String, CaseIterable, Identifiable {
     case schema = "方案与输入"
     case typo = "误触与热区"
     case lexicon = "组词与词库"
+    case voice = "语音输入"
     case appearance = "外观与标点"
 
     public var id: String { rawValue }
@@ -14,6 +15,7 @@ public enum SettingsSection: String, CaseIterable, Identifiable {
         case .schema: return "keyboard"
         case .typo: return "hand.tap"
         case .lexicon: return "character.book.closed"
+        case .voice: return "waveform"
         case .appearance: return "sparkles.rectangle.stack"
         }
     }
@@ -120,6 +122,8 @@ public struct SettingsRootView: View {
                         typoSectionView
                     case .lexicon:
                         lexiconSectionView
+                    case .voice:
+                        VoiceSettingsView(bridge: bridge, voiceStore: VoicePreferencesStore.shared)
                     case .appearance:
                         appearanceSectionView
                     }

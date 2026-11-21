@@ -253,6 +253,76 @@ struct SwiftBridgeTests {
         candidateView.state = narrowState
         assert(narrowState.macOSPreedit == "g")
 
-        print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar & Bayesian typo tests passed!")
+        // 6. Verify macOS Voice MVP: strict lazy-loading, preferences persistence, WAV/multipart, prompts & local polisher
+        assert(VoicePreferences().enabled == false, "Voice entry must be disabled by default")
+        assert(!VoiceSessionController.isLoaded, "VoiceSessionController must NOT be loaded before voice is enabled")
+        assert(!VoiceHUDPanelController.isLoaded, "VoiceHUDPanelController must NOT be loaded before voice is enabled")
+
+        let tempVoiceURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("juxu-voice-test-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: tempVoiceURL) }
+        let voiceStore = VoicePreferencesStore(fileURL: tempVoiceURL, inMemoryOnly: false)
+        assert(!voiceStore.prefs.enabled)
+        voiceStore.update {
+            $0.enabled = true
+            $0.providerMode = .local
+            $0.localASRKind = .cli
+            $0.localPolishKind = .ruleBased
+            $0.customVocabulary = "句序, Juxu，RWKV-7\nTypeless"
+        }
+        let reloadedStore = VoicePreferencesStore(fileURL: tempVoiceURL, inMemoryOnly: false)
+        assert(reloadedStore.prefs.enabled == true)
+        assert(reloadedStore.prefs.providerMode == .local)
+        assert(reloadedStore.prefs.localASRKind == .cli)
+        assert(reloadedStore.prefs.parsedCustomVocabulary == ["句序", "Juxu", "RWKV-7", "Typeless"])
+
+        // Trigger lazy load and verify disabling voice unloads both session and HUD controllers
+        _ = VoiceSessionController.shared
+        assert(VoiceSessionController.isLoaded)
+        reloadedStore.update { $0.enabled = false }
+        assert(!VoiceSessionController.isLoaded, "Disabling voice must unload VoiceSessionController")
+        assert(!VoiceHUDPanelController.isLoaded, "Disabling voice must unload VoiceHUDPanelController")
+
+        // Verify local rule-based polisher
+        let polished = VoiceLocalRulePolisher.polish("嗯，那个，今天下午三点，嗯，开个短会。")
+        assert(polished == "今天下午三点，开个短会。", "Unexpected local polish output: \(polished)")
+        let polishedEn = VoiceLocalRulePolisher.polish("Um, hello, uh, world.")
+        assert(polishedEn == "hello, world.", "Unexpected EN polish output: \(polishedEn)")
+
+        // Verify app-aware tone & Speak-to-Edit prompt builder
+        assert(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.tencent.xinWeChat").contains("即时聊天"))
+        assert(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.apple.dt.Xcode").contains("技术术语"))
+        let normalMsgs = VoicePromptBuilder.polishMessages(
+            rawTranscript: "测试一下",
+            toneMode: .autoByApp,
+            context: VoiceContext(bundleIdentifier: "com.apple.mail", personalVocabulary: ["句序", "句序", "Juxu"])
+        )
+        assert(normalMsgs.count == 2)
+        assert(normalMsgs[0]["content"]?.contains("句序、Juxu") == true)
+        let editMsgs = VoicePromptBuilder.polishMessages(
+            rawTranscript: "翻成英文",
+            toneMode: .professional,
+            context: VoiceContext(selectedText: "你好世界")
+        )
+        assert(editMsgs[1]["content"]?.contains("你好世界") == true && editMsgs[1]["content"]?.contains("翻成英文") == true)
+
+        // Verify WAV header & multipart form builder
+        let wav = VoiceWAVEncoder.encodePCM16Mono(samples: [0, 1000, -1000, 32767], sampleRate: 16_000)
+        assert(wav.count == 44 + 8)
+        assert(String(data: wav.prefix(4), encoding: .ascii) == "RIFF")
+        assert(String(data: wav.subdata(in: 8..<12), encoding: .ascii) == "WAVE")
+        let multipart = VoiceMultipartBuilder.buildAudioTranscriptionBody(
+            boundary: "TESTBOUNDARY",
+            wavData: wav,
+            model: "whisper-large-v3-turbo",
+            language: "zh",
+            prompt: "句序"
+        )
+        let multipartPrefix = String(decoding: multipart.prefix(320), as: UTF8.self)
+        assert(multipartPrefix.contains("--TESTBOUNDARY"))
+        assert(multipartPrefix.contains("whisper-large-v3-turbo"))
+        assert(multipartPrefix.contains("speech.wav"))
+
+        print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Bayesian typo & macOS Voice MVP tests passed!")
     }
 }

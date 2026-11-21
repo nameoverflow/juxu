@@ -32,6 +32,10 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>句序仅在你开启语音输入并触发录音时使用麦克风进行语音识别。</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>句序仅在你选择 Apple 本地语音识别时使用系统语音识别能力。</string>
     <key>InputMethodConnectionName</key>
     <string>com.hcyue.juxu.inputmethod.Connection</string>
     <key>InputMethodServerControllerClass</key>

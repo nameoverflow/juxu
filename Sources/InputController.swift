@@ -49,6 +49,7 @@ public final class JuxuInputController: IMKInputController {
     }
 
     public override func deactivateServer(_ sender: Any!) {
+        VoiceSessionController.sharedIfLoaded?.handleDeactivate()
         commitPendingAndHide(sender)
         WubiBridge.shared.flushUserDataIfNeeded()
         autoSpaceTracker.invalidate()
@@ -80,6 +81,31 @@ public final class JuxuInputController: IMKInputController {
         guard let event else { return false }
         let clientObj = (sender as? (any IMKTextInput & NSObjectProtocol)) ?? activeClient
         self.activeClient = clientObj
+
+        // Strictly on-demand voice entry: when disabled, zero voice controllers or panels are loaded.
+        if VoicePreferencesStore.shared.prefs.enabled {
+            let consumedByVoice = VoiceSessionController.shared.handleEvent(
+                event,
+                caretRectProvider: { [weak self, weak clientObj] in
+                    guard let self else {
+                        let mouse = NSEvent.mouseLocation
+                        return NSRect(x: mouse.x, y: mouse.y, width: 1, height: 20)
+                    }
+                    return self.queryCaretRect(client: clientObj)
+                },
+                windowLevel: clientObj?.windowLevel(),
+                contextProvider: { [weak self, weak clientObj] in
+                    self?.buildVoiceContext(client: clientObj) ?? VoiceContext()
+                },
+                onCommit: { [weak self, weak clientObj] text, replaceSelection in
+                    self?.commitVoiceText(text, replaceSelection: replaceSelection, client: clientObj)
+                }
+            )
+            if consumedByVoice {
+                shiftKeyDownAlone = false
+                return true
+            }
+        }
 
         // Bare Shift tap detection for seamless Chinese / English toggle
         if event.type == .flagsChanged {
@@ -277,6 +303,29 @@ public final class JuxuInputController: IMKInputController {
         autoSpaceItem.state = WubiBridge.shared.prefs.autoSpaceZhEn ? .on : .off
         m.addItem(autoSpaceItem)
 
+        // Only expose voice quick controls in menu after voice entry is enabled
+        if VoicePreferencesStore.shared.prefs.enabled {
+            m.addItem(.separator())
+            let voicePrefs = VoicePreferencesStore.shared.prefs
+            let providerTitle = "语音方案：\(voicePrefs.providerMode.displayName)（点击切换）"
+            let providerItem = NSMenuItem(
+                title: providerTitle,
+                action: #selector(toggleVoiceProviderMode(_:)),
+                keyEquivalent: ""
+            )
+            providerItem.target = self
+            m.addItem(providerItem)
+
+            let polishItem = NSMenuItem(
+                title: "语音智能整理",
+                action: #selector(toggleVoiceSmartPolish(_:)),
+                keyEquivalent: ""
+            )
+            polishItem.target = self
+            polishItem.state = (voicePrefs.outputMode == .smartPolish) ? .on : .off
+            m.addItem(polishItem)
+        }
+
         m.addItem(.separator())
 
         let prefsItem = NSMenuItem(
@@ -325,6 +374,65 @@ public final class JuxuInputController: IMKInputController {
         var p = WubiBridge.shared.prefs
         p.autoSpaceZhEn.toggle()
         WubiBridge.shared.applyAndSavePreferences(p)
+    }
+
+    @objc private func toggleVoiceProviderMode(_ sender: Any?) {
+        VoicePreferencesStore.shared.update { prefs in
+            prefs.providerMode = (prefs.providerMode == .cloudBYOK) ? .local : .cloudBYOK
+        }
+    }
+
+    @objc private func toggleVoiceSmartPolish(_ sender: Any?) {
+        VoicePreferencesStore.shared.update { prefs in
+            prefs.outputMode = (prefs.outputMode == .smartPolish) ? .rawDictation : .smartPolish
+        }
+    }
+
+    private func buildVoiceContext(client: (any IMKTextInput & NSObjectProtocol)?) -> VoiceContext {
+        let voicePrefs = VoicePreferencesStore.shared.prefs
+        var selectedText: String? = nil
+        if voicePrefs.speakToEditSelection, let client {
+            let sel = client.selectedRange()
+            if sel.location != NSNotFound && sel.length > 0 && sel.length <= 4000 {
+                selectedText = client.attributedSubstring(from: sel)?.string
+            }
+        }
+        let beforeContext = readHostContextBefore(client: client)
+        var vocab = voicePrefs.parsedCustomVocabulary
+        if voicePrefs.syncJuxuLexicon {
+            vocab.append(contentsOf: WubiBridge.shared.userPhrases.prefix(40).map(\.text))
+        }
+        return VoiceContext(
+            bundleIdentifier: client?.bundleIdentifier(),
+            selectedText: selectedText,
+            beforeContext: beforeContext,
+            personalVocabulary: vocab
+        )
+    }
+
+    private func commitVoiceText(
+        _ text: String,
+        replaceSelection: Bool,
+        client: (any IMKTextInput & NSObjectProtocol)?
+    ) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let targetClient = client ?? activeClient
+        if replaceSelection, let targetClient {
+            let sel = targetClient.selectedRange()
+            if sel.location != NSNotFound && sel.length > 0 {
+                targetClient.insertText(trimmed, replacementRange: sel)
+                autoSpaceTracker.invalidate()
+                lastExpectedAnchor = nil
+                return
+            }
+        }
+        let formatted = formatTextForCommit(trimmed, splitInternal: false, client: targetClient)
+        targetClient?.insertText(
+            formatted,
+            replacementRange: NSRange(location: NSNotFound, length: NSNotFound)
+        )
+        advanceExpectedAnchor(by: formatted.utf16.count)
     }
 
     public override func showPreferences(_ sender: Any!) {

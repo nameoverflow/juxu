@@ -106,6 +106,22 @@ struct RenderPreviews {
             to: outDir.appendingPathComponent("settings-typo-dark.png")
         )
 
+        // 3. Render macOS Voice Settings (Cloud BYOK enabled preview in Light mode)
+        VoicePreferencesStore.shared.update({
+            $0.enabled = true
+            $0.providerMode = .cloudBYOK
+        }, persist: false)
+        try renderSwiftUIView(
+            WindowChromeMock(title: "句序 (Juxu) 偏好设置", isDark: false) {
+                SettingsRootView(bridge: bridge, initialSection: .voice)
+            },
+            width: 740,
+            height: 760,
+            isDark: false,
+            to: outDir.appendingPathComponent("settings-voice-light.png")
+        )
+        VoicePreferencesStore.shared.update({ $0.enabled = false }, persist: false)
+
         print("Rendered 2x Retina previews in \(outDir.path)")
     }
 

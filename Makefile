@@ -13,9 +13,10 @@ CORE_HEADER = Core/include/wubi_core.h
 CORE_FLAGS = -import-objc-header $(CORE_HEADER) $(CORE_LIB)
 CORE_SOURCES = Core/Cargo.toml $(wildcard Core/src/*.rs) $(wildcard Core/src/bin/*.rs)
 
-UI_SOURCES = Sources/WubiCoreBridge.swift Sources/CandidatePanel.swift Sources/SettingsWindow.swift
+VOICE_SOURCES = Sources/VoicePreferences.swift Sources/VoiceEngine.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Sources/VoiceSettingsView.swift
+UI_SOURCES = Sources/WubiCoreBridge.swift Sources/CandidatePanel.swift $(VOICE_SOURCES) Sources/SettingsWindow.swift
 APP_SOURCES = $(UI_SOURCES) Sources/InputController.swift Sources/main.swift
-FRAMEWORKS = -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework Carbon
+FRAMEWORKS = -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework Carbon -framework AVFoundation -framework Speech -framework Security
 
 all: build/Juxu
 
@@ -77,7 +78,7 @@ rust-test:
 
 swift-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc -O $(MACOS_TARGET) Sources/WubiCoreBridge.swift Sources/CandidatePanel.swift Tests/SwiftBridgeTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -o build/swift-bridge-tests
+	swiftc -O $(MACOS_TARGET) Sources/WubiCoreBridge.swift Sources/CandidatePanel.swift Sources/VoicePreferences.swift Sources/VoiceEngine.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Tests/SwiftBridgeTests.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework AVFoundation -framework Speech -framework Security -o build/swift-bridge-tests
 	build/swift-bridge-tests
 
 test: rust-test swift-test ios-test
@@ -89,7 +90,7 @@ ios-test: $(CORE_LIB)
 
 previews: $(CORE_LIB)
 	mkdir -p build/previews
-	swiftc -O $(MACOS_TARGET) $(UI_SOURCES) Scripts/RenderPreviews.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -o build/render-previews
+	swiftc -O $(MACOS_TARGET) $(UI_SOURCES) Scripts/RenderPreviews.swift $(CORE_FLAGS) $(FRAMEWORKS) -o build/render-previews
 	build/render-previews build/previews
 
 ios-previews: $(CORE_LIB)
