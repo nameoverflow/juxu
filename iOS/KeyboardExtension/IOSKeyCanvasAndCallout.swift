@@ -206,8 +206,10 @@ private final class IOSKeycapNodeView: UIView {
         let yNudge: CGFloat
         switch spec.kind {
         case .letter:
-            let isUpper = spec.primaryLabel.first?.isUppercase ?? false
-            yNudge = isUpper ? -0.3 : -2.2
+            let first = spec.primaryLabel.first
+            let isNonASCII = !(first?.isASCII ?? true)
+            let isUpper = first?.isUppercase ?? false
+            yNudge = isNonASCII ? -0.5 : (isUpper ? -0.3 : -2.2)
         case .symbol, .planeSwitch:
             yNudge = -0.8
         case .modeToggle:
@@ -271,8 +273,10 @@ private final class IOSKeycapNodeView: UIView {
                 let weight: UIFont.Weight
                 switch spec.kind {
                 case .letter:
-                    let isUpper = spec.primaryLabel.first?.isUppercase ?? false
-                    fontSize = isUpper ? 22.5 : 24.5
+                    let first = spec.primaryLabel.first
+                    let isNonASCII = !(first?.isASCII ?? true)
+                    let isUpper = first?.isUppercase ?? false
+                    fontSize = isNonASCII ? 20.5 : (isUpper ? 22.5 : 24.5)
                     weight = .regular
                 case .symbol(let s):
                     fontSize = s.count > 1 ? 16.5 : 21.5

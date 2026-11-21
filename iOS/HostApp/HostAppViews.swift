@@ -311,6 +311,14 @@ public struct IOSHostRootView: View {
 
                     if !bridge.prefs.isPinyinFamily {
                         VStack(spacing: 12) {
+                            if isCangjie {
+                                iosToggleRow(
+                                    "键盘键帽显示仓颉码",
+                                    sub: "将字母键替换为仓颉字根（日月金木水火土…），切英文或大写时自动恢复字母",
+                                    isOn: binding(\.cangjieKeycapRadicals)
+                                )
+                                Divider()
+                            }
                             iosToggleRow("\(maxCodeLabel)码唯一自动上屏", sub: "精确\(maxCodeLabel)码唯一匹配时直接上屏", isOn: binding(\.fourthCodeAutoCommit))
                             Divider()
                             iosToggleRow("第\(pushCodeLabel)码自动顶字", sub: "\(maxCodeLabel)码重码时敲第 \(isCangjie ? "6" : "5") 码将首选词顶上屏", isOn: binding(\.fifthCodePushCommit))

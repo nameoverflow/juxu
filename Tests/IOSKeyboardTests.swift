@@ -408,6 +408,27 @@ struct IOSKeyboardTests {
         let row1Comp = IOSKeyboardLayoutEngine.compensatedLetterPoint(CGPoint(x: f220.frame.midX, y: f220.frame.midY), in: snap220)
         assert(abs((f220.frame.midY - row1Comp.y) - IOSKeyboardLayoutEngine.ergonomicThumbYBias) < 0.01)
 
-        print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard & idle prediction tests passed!")
+        // 17. Cangjie radical keycaps option + automatic fallback on ASCII/Shift/disabled
+        var cjLayout = IOSKeyboardLayoutEngine()
+        cjLayout.schemaId = 35
+        cjLayout.cangjieKeycapRadicals = true
+        let cjSnap = cjLayout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(cjSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "手")
+        assert(cjSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "a")) })?.primaryLabel == "日")
+        assert(cjSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "z")) })?.primaryLabel == "重")
+        assert(cjSnap.keys.first(where: { $0.kind == .space })?.cornerSubscript == "仓")
+        cjLayout.asciiMode = true
+        let cjAsciiSnap = cjLayout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(cjAsciiSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "q")
+        cjLayout.asciiMode = false
+        cjLayout.cangjieKeycapRadicals = false
+        let cjOffSnap = cjLayout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(cjOffSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "q")
+        var cjPrefs = WubiPreferences()
+        assert(cjPrefs.cangjieKeycapRadicals == true)
+        cjPrefs.cangjieKeycapRadicals = false
+        assert(WubiPreferences.fromTOML(cjPrefs.toTOML()).cangjieKeycapRadicals == false)
+
+        print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie keycaps & idle prediction tests passed!")
     }
 }

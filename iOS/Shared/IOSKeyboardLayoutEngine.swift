@@ -106,6 +106,7 @@ public struct IOSKeyboardLayoutEngine: Equatable {
     public var shiftState: IOSShiftState = .lower
     public var asciiMode: Bool = false
     public var schemaId: UInt32 = 86
+    public var cangjieKeycapRadicals: Bool = true
     /// True only on Home-button devices where system does not draw its own bottom Globe bar.
     public var showInlineGlobeKey: Bool = false
     public var returnRole: IOSReturnKeyRole = .normal
@@ -660,9 +661,36 @@ public struct IOSKeyboardLayoutEngine: Equatable {
         }
     }
 
+    public static let cangjieRadicalTable: [String] = [
+        "日", "月", "金", "木", "水", "火", "土", "竹", "戈", "十", "大", "中", "一",
+        "弓", "人", "心", "手", "口", "尸", "廿", "山", "女", "田", "難", "卜", "重",
+    ]
+
+    public static func cangjieRadical(for ascii: UInt8) -> String? {
+        let idx: Int
+        if ascii >= UInt8(ascii: "a") && ascii <= UInt8(ascii: "z") {
+            idx = Int(ascii - UInt8(ascii: "a"))
+        } else if ascii >= UInt8(ascii: "A") && ascii <= UInt8(ascii: "Z") {
+            idx = Int(ascii - UInt8(ascii: "A"))
+        } else {
+            return nil
+        }
+        return cangjieRadicalTable[idx]
+    }
+
+    public var showsCangjieRadicals: Bool {
+        cangjieKeycapRadicals
+            && !asciiMode
+            && !shiftState.isUppercase
+            && (schemaId == 33 || schemaId == 35 || schemaId == 36)
+    }
+
     private func formatLetter(_ ascii: UInt8) -> String {
         if isTrackpadActive {
             return ""
+        }
+        if showsCangjieRadicals, let rad = Self.cangjieRadical(for: ascii) {
+            return rad
         }
         let s = String(UnicodeScalar(ascii))
         return shiftState.isUppercase ? s.uppercased() : s.lowercased()
