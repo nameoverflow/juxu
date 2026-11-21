@@ -253,10 +253,18 @@ struct SwiftBridgeTests {
         candidateView.state = narrowState
         assert(narrowState.macOSPreedit == "g")
 
-        // 6. Verify macOS Voice MVP: strict lazy-loading, preferences persistence, WAV/multipart, prompts & local polisher
+        // 6. Verify macOS Voice MVP: strict lazy-loading, preset resolution, preferences persistence, WAV/multipart, prompts & local polisher
         assert(VoicePreferences().enabled == false, "Voice entry must be disabled by default")
         assert(!VoiceSessionController.isLoaded, "VoiceSessionController must NOT be loaded before voice is enabled")
         assert(!VoiceHUDPanelController.isLoaded, "VoiceHUDPanelController must NOT be loaded before voice is enabled")
+        assert(!VoiceLocalInstaller.isLoaded, "VoiceLocalInstaller must NOT be loaded before voice is enabled")
+
+        let defaultVoice = VoicePreferences()
+        assert(defaultVoice.cloudPreset == .groq)
+        assert(defaultVoice.effectiveCloudASRBaseURL == "https://api.groq.com/openai/v1")
+        assert(defaultVoice.effectiveCloudASRModel == "whisper-large-v3-turbo")
+        assert(defaultVoice.effectiveCloudLLMModel == "llama-3.3-70b-versatile")
+        assert(defaultVoice.effectiveCloudASRKeyAccount == defaultVoice.effectiveCloudLLMKeyAccount)
 
         let tempVoiceURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("juxu-voice-test-\(UUID().uuidString).json")
@@ -266,22 +274,26 @@ struct SwiftBridgeTests {
         voiceStore.update {
             $0.enabled = true
             $0.providerMode = .local
-            $0.localASRKind = .cli
-            $0.localPolishKind = .ruleBased
+            $0.localASRPreset = .whisperTurbo
+            $0.localLLMPreset = .qwen15B
             $0.customVocabulary = "句序, Juxu，RWKV-7\nTypeless"
         }
         let reloadedStore = VoicePreferencesStore(fileURL: tempVoiceURL, inMemoryOnly: false)
         assert(reloadedStore.prefs.enabled == true)
         assert(reloadedStore.prefs.providerMode == .local)
-        assert(reloadedStore.prefs.localASRKind == .cli)
+        assert(reloadedStore.prefs.localASRPreset == .whisperTurbo)
+        assert(reloadedStore.prefs.localLLMPreset == .qwen15B)
         assert(reloadedStore.prefs.parsedCustomVocabulary == ["句序", "Juxu", "RWKV-7", "Typeless"])
 
-        // Trigger lazy load and verify disabling voice unloads both session and HUD controllers
+        // Trigger lazy load and verify disabling voice unloads session, HUD, and local installer
         _ = VoiceSessionController.shared
+        _ = VoiceLocalInstaller.shared
         assert(VoiceSessionController.isLoaded)
+        assert(VoiceLocalInstaller.isLoaded)
         reloadedStore.update { $0.enabled = false }
         assert(!VoiceSessionController.isLoaded, "Disabling voice must unload VoiceSessionController")
         assert(!VoiceHUDPanelController.isLoaded, "Disabling voice must unload VoiceHUDPanelController")
+        assert(!VoiceLocalInstaller.isLoaded, "Disabling voice must unload VoiceLocalInstaller")
 
         // Verify local rule-based polisher
         let polished = VoiceLocalRulePolisher.polish("嗯，那个，今天下午三点，嗯，开个短会。")

@@ -16,9 +16,161 @@ public enum VoiceProviderMode: String, Codable, CaseIterable, Identifiable, Send
 
     public var summary: String {
         switch self {
-        case .cloudBYOK: return "自备 API Key（OpenAI / Groq / DeepSeek / 通义 / Gemini 等兼容接口）"
-        case .local: return "完全本机运行（Apple 端侧语音 / 本地 Whisper CLI / Ollama 等）"
+        case .cloudBYOK: return "预设服务填 Key 即用，或自定义 URL"
+        case .local: return "一键下载本机依赖与模型，离线按需运行"
         }
+    }
+}
+
+public enum VoiceCloudPreset: String, Codable, CaseIterable, Identifiable, Sendable {
+    case groq = "groq"
+    case openai = "openai"
+    case siliconflow = "siliconflow"
+    case custom = "custom"
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .groq: return "Groq（推荐 · 极速）"
+        case .openai: return "OpenAI"
+        case .siliconflow: return "硅基流动（国内直连）"
+        case .custom: return "自定义（OpenAI 兼容）"
+        }
+    }
+
+    public var defaultBaseURL: String {
+        switch self {
+        case .groq: return "https://api.groq.com/openai/v1"
+        case .openai: return "https://api.openai.com/v1"
+        case .siliconflow: return "https://api.siliconflow.cn/v1"
+        case .custom: return "https://api.openai.com/v1"
+        }
+    }
+
+    public var defaultASRModel: String {
+        switch self {
+        case .groq: return "whisper-large-v3-turbo"
+        case .openai: return "gpt-4o-mini-transcribe"
+        case .siliconflow: return "FunAudioLLM/SenseVoiceSmall"
+        case .custom: return "whisper-1"
+        }
+    }
+
+    public var defaultLLMModel: String {
+        switch self {
+        case .groq: return "llama-3.3-70b-versatile"
+        case .openai: return "gpt-4o-mini"
+        case .siliconflow: return "Qwen/Qwen2.5-7B-Instruct"
+        case .custom: return "gpt-4o-mini"
+        }
+    }
+
+    public var keyPlaceholder: String {
+        switch self {
+        case .groq: return "gsk_..."
+        case .openai, .siliconflow, .custom: return "sk-..."
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .groq: return "单个 Key 同时驱动 Whisper v3 Turbo 识别 + Llama 3.3 极速整理"
+        case .openai: return "单个 Key 同时驱动 gpt-4o-mini-transcribe + gpt-4o-mini 整理"
+        case .siliconflow: return "国内直连，单个 Key 同时驱动 SenseVoice 识别 + Qwen2.5 整理"
+        case .custom: return "自由填写 OpenAI 兼容 Base URL、模型名与 API Key"
+        }
+    }
+
+    public var keychainAccount: VoiceKeychainAccount {
+        switch self {
+        case .groq: return .cloudGroqAPIKey
+        case .openai: return .cloudOpenAIAPIKey
+        case .siliconflow: return .cloudSiliconFlowAPIKey
+        case .custom: return .cloudCustomASRAPIKey
+        }
+    }
+}
+
+public enum VoiceLocalASRModelPreset: String, Codable, CaseIterable, Identifiable, Sendable {
+    case whisperTurbo = "whisper_turbo"
+    case whisperBase = "whisper_base"
+    case appleSpeech = "apple_speech"
+    case customHTTP = "custom_http"
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .whisperTurbo: return "Whisper v3 Turbo（推荐）"
+        case .whisperBase: return "Whisper Base（轻量极速）"
+        case .appleSpeech: return "Apple 端侧语音（免下载）"
+        case .customHTTP: return "已有本地 HTTP 服务"
+        }
+    }
+
+    public var modelFilename: String? {
+        switch self {
+        case .whisperTurbo: return "ggml-large-v3-turbo-q5_0.bin"
+        case .whisperBase: return "ggml-base.bin"
+        case .appleSpeech, .customHTTP: return nil
+        }
+    }
+
+    public var approximateSizeLabel: String {
+        switch self {
+        case .whisperTurbo: return "547 MB"
+        case .whisperBase: return "142 MB"
+        case .appleSpeech, .customHTTP: return "0 MB"
+        }
+    }
+
+    public var downloadURLs: [URL] {
+        guard let filename = modelFilename else { return [] }
+        return [
+            URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(filename)")!,
+            URL(string: "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/\(filename)")!,
+        ]
+    }
+}
+
+public enum VoiceLocalLLMPreset: String, Codable, CaseIterable, Identifiable, Sendable {
+    case ruleBased = "rule_based"
+    case qwen15B = "qwen_1_5b"
+    case ollamaHTTP = "ollama_http"
+    case none = "none"
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .ruleBased: return "轻量规则整理（免下载）"
+        case .qwen15B: return "本地 Qwen2.5-1.5B（AI 整理）"
+        case .ollamaHTTP: return "已有本地服务（Ollama 等）"
+        case .none: return "仅原始转写，不整理"
+        }
+    }
+
+    public var modelFilename: String? {
+        switch self {
+        case .qwen15B: return "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+        case .ruleBased, .ollamaHTTP, .none: return nil
+        }
+    }
+
+    public var approximateSizeLabel: String {
+        switch self {
+        case .qwen15B: return "1.0 GB"
+        case .ruleBased, .ollamaHTTP, .none: return "0 MB"
+        }
+    }
+
+    public var downloadURLs: [URL] {
+        guard let filename = modelFilename else { return [] }
+        return [
+            URL(string: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/\(filename)")!,
+            URL(string: "https://hf-mirror.com/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/\(filename)")!,
+        ]
     }
 }
 
@@ -85,38 +237,6 @@ public enum VoiceToneMode: String, Codable, CaseIterable, Identifiable, Sendable
     }
 }
 
-public enum VoiceLocalASRKind: String, Codable, CaseIterable, Identifiable, Sendable {
-    case appleSpeech = "apple_speech"
-    case cli = "cli"
-    case http = "http"
-
-    public var id: String { rawValue }
-
-    public var displayName: String {
-        switch self {
-        case .appleSpeech: return "Apple 端侧语音识别（零配置）"
-        case .cli: return "本地 Whisper CLI（按需拉起）"
-        case .http: return "本地 HTTP 接口（whisper-server / MLX）"
-        }
-    }
-}
-
-public enum VoiceLocalPolishKind: String, Codable, CaseIterable, Identifiable, Sendable {
-    case ruleBased = "rule_based"
-    case http = "http"
-    case none = "none"
-
-    public var id: String { rawValue }
-
-    public var displayName: String {
-        switch self {
-        case .ruleBased: return "轻量本地规则整理（零内存）"
-        case .http: return "本地 LLM 服务（Ollama / LM Studio / MLX）"
-        case .none: return "仅原始转写，不整理"
-        }
-    }
-}
-
 public struct VoicePreferences: Codable, Equatable, Sendable {
     /// Master switch: defaults to false so zero voice resources are loaded unless explicitly enabled.
     public var enabled: Bool = false
@@ -129,28 +249,57 @@ public struct VoicePreferences: Codable, Equatable, Sendable {
     public var syncJuxuLexicon: Bool = true
     public var customVocabulary: String = ""
 
-    // Cloud BYOK (OpenAI-compatible ASR + Chat Completions)
-    public var cloudASRBaseURL: String = "https://api.groq.com/openai/v1"
-    public var cloudASRModel: String = "whisper-large-v3-turbo"
+    // Cloud BYOK
+    public var cloudPreset: VoiceCloudPreset = .groq
     public var cloudPolishEnabled: Bool = true
-    public var cloudLLMBaseURL: String = "https://api.openai.com/v1"
-    public var cloudLLMModel: String = "gpt-4o-mini"
-    public var cloudReuseASRKeyForLLM: Bool = false
+    public var customBaseURL: String = "https://api.openai.com/v1"
+    public var customASRModel: String = "whisper-1"
+    public var customLLMModel: String = "gpt-4o-mini"
+    public var customSplitLLM: Bool = false
+    public var customLLMBaseURL: String = "https://api.deepseek.com/v1"
 
-    // Local models (on-demand)
-    public var localASRKind: VoiceLocalASRKind = .appleSpeech
+    // Local models (one-click download + on-demand execution)
+    public var localASRPreset: VoiceLocalASRModelPreset = .whisperTurbo
     public var localAppleLocale: String = "zh-CN"
     public var localAppleRequireOnDevice: Bool = true
-    public var localCLIBinaryPath: String = ""
-    public var localCLIModelPath: String = ""
     public var localHTTPASRBaseURL: String = "http://127.0.0.1:8080/v1"
     public var localHTTPASRModel: String = "whisper-1"
 
-    public var localPolishKind: VoiceLocalPolishKind = .ruleBased
+    public var localLLMPreset: VoiceLocalLLMPreset = .ruleBased
     public var localHTTPLLMBaseURL: String = "http://127.0.0.1:11434/v1"
-    public var localHTTPLLMModel: String = "qwen3:4b"
+    public var localHTTPLLMModel: String = "qwen2.5:3b"
 
     public init() {}
+
+    public var effectiveCloudASRBaseURL: String {
+        cloudPreset == .custom ? customBaseURL : cloudPreset.defaultBaseURL
+    }
+
+    public var effectiveCloudASRModel: String {
+        cloudPreset == .custom ? customASRModel : cloudPreset.defaultASRModel
+    }
+
+    public var effectiveCloudLLMBaseURL: String {
+        if cloudPreset == .custom {
+            return customSplitLLM ? customLLMBaseURL : customBaseURL
+        }
+        return cloudPreset.defaultBaseURL
+    }
+
+    public var effectiveCloudLLMModel: String {
+        cloudPreset == .custom ? customLLMModel : cloudPreset.defaultLLMModel
+    }
+
+    public var effectiveCloudASRKeyAccount: VoiceKeychainAccount {
+        cloudPreset.keychainAccount
+    }
+
+    public var effectiveCloudLLMKeyAccount: VoiceKeychainAccount {
+        if cloudPreset == .custom && customSplitLLM {
+            return .cloudCustomLLMAPIKey
+        }
+        return cloudPreset.keychainAccount
+    }
 
     public var parsedCustomVocabulary: [String] {
         let separators = CharacterSet(charactersIn: ",，\n;；")
@@ -162,8 +311,11 @@ public struct VoicePreferences: Codable, Equatable, Sendable {
 }
 
 public enum VoiceKeychainAccount: String, Sendable {
-    case cloudASRAPIKey = "cloud-asr-api-key"
-    case cloudLLMAPIKey = "cloud-llm-api-key"
+    case cloudGroqAPIKey = "cloud-key-groq"
+    case cloudOpenAIAPIKey = "cloud-key-openai"
+    case cloudSiliconFlowAPIKey = "cloud-key-siliconflow"
+    case cloudCustomASRAPIKey = "cloud-key-custom-asr"
+    case cloudCustomLLMAPIKey = "cloud-key-custom-llm"
 }
 
 public enum VoiceKeychainStore {
@@ -258,6 +410,7 @@ public final class VoicePreferencesStore: ObservableObject {
         }
         if wasEnabled && !newPrefs.enabled {
             VoiceSessionController.unload()
+            VoiceLocalInstaller.unload()
         }
     }
 

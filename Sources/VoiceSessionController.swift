@@ -72,13 +72,11 @@ public final class VoiceSessionController {
             return false
         }
 
-        // Esc cancels recording or in-flight transcription/polishing immediately
         if event.type == .keyDown && event.keyCode == 0x35 && phase != .idle {
             cancelCurrentSession(showNotice: true)
             return true
         }
 
-        // Toggle mode: Option + Space
         if prefs.triggerKey == .optionSpace {
             if event.type == .keyDown {
                 let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -103,11 +101,9 @@ public final class VoiceSessionController {
             return false
         }
 
-        // Hold-to-talk modifier mode (Right Option / Right Command / Fn)
         guard let targetKeyCode = prefs.triggerKey.modifierKeyCode else { return false }
 
         if event.type == .keyDown {
-            // Any regular key pressed while waiting for hold threshold cancels voice trigger so shortcuts work normally
             if pendingHoldKeyCode != nil {
                 cancelPendingHold()
             }
@@ -153,7 +149,6 @@ public final class VoiceSessionController {
                 return false
             }
         } else if pendingHoldKeyCode != nil {
-            // Another modifier was pressed concurrently -> abort hold trigger
             cancelPendingHold()
         }
 
@@ -167,7 +162,7 @@ public final class VoiceSessionController {
         }
     }
 
-    /// Runs a quick non-recording connectivity / config check for Settings UI.
+    /// Runs a quick non-recording connectivity / readiness check for Settings UI.
     public func testCurrentConfiguration() async -> (ok: Bool, message: String) {
         let prefs = VoicePreferencesStore.shared.prefs
         guard prefs.enabled else {
@@ -175,56 +170,62 @@ public final class VoiceSessionController {
         }
         switch prefs.providerMode {
         case .cloudBYOK:
-            let asrKey = VoiceKeychainStore.read(.cloudASRAPIKey)
+            let asrKey = VoiceKeychainStore.read(prefs.effectiveCloudASRKeyAccount)
             if asrKey.isEmpty {
-                return (false, "未配置云端 ASR API Key")
+                return (false, "请先填写 \(prefs.cloudPreset.displayName) 的 API Key")
             }
             if prefs.outputMode == .smartPolish && prefs.cloudPolishEnabled {
-                let llmKey = prefs.cloudReuseASRKeyForLLM ? asrKey : VoiceKeychainStore.read(.cloudLLMAPIKey)
+                let llmKey = VoiceKeychainStore.read(prefs.effectiveCloudLLMKeyAccount)
                 if llmKey.isEmpty {
-                    return (false, "已开启云端整理，但未配置 LLM API Key（或勾选「复用 ASR Key」）")
+                    return (false, "未配置整理模型 API Key")
                 }
                 do {
                     let client = ensurePipelineClient()
                     let polished = try await client.polishOpenAICompatible(
-                        baseURL: prefs.cloudLLMBaseURL,
+                        baseURL: prefs.effectiveCloudLLMBaseURL,
                         apiKey: llmKey,
-                        model: prefs.cloudLLMModel,
+                        model: prefs.effectiveCloudLLMModel,
                         rawTranscript: "嗯，那个，测试一下语音整理功能，明天，不对，后天下午三点开会。",
                         toneMode: prefs.toneMode,
                         context: VoiceContext(personalVocabulary: prefs.parsedCustomVocabulary)
                     )
-                    return (true, "云端整理连通正常：\(polished)")
+                    return (true, "连通正常（\(prefs.cloudPreset.displayName)）：\(polished)")
                 } catch {
                     return (false, error.localizedDescription)
                 }
             }
-            return (true, "云端 ASR 配置就绪（模型：\(prefs.cloudASRModel)）")
+            return (true, "云端识别配置就绪（\(prefs.effectiveCloudASRModel)）")
 
         case .local:
-            switch prefs.localASRKind {
+            switch prefs.localASRPreset {
+            case .whisperTurbo, .whisperBase:
+                let status = VoiceLocalInstaller.asrStatus(for: prefs.localASRPreset)
+                if !status.isReady {
+                    return (false, "尚未安装 \(prefs.localASRPreset.displayName)，请点击上方「一键下载并安装」")
+                }
             case .appleSpeech:
                 let locale = Locale(identifier: prefs.localAppleLocale.isEmpty ? "zh-CN" : prefs.localAppleLocale)
                 guard let rec = SFSpeechRecognizer(locale: locale) else {
                     return (false, "系统不支持语言 \(locale.identifier)")
                 }
                 if prefs.localAppleRequireOnDevice && !rec.supportsOnDeviceRecognition {
-                    return (false, "未检测到 \(locale.identifier) 离线语音模型，请在系统设置 → 键盘 → 听写中下载，或关闭「仅离线」")
+                    return (false, "未检测到 \(locale.identifier) 离线语音模型，请在系统设置 → 键盘 → 听写中下载，或取消勾选「纯离线」")
                 }
-                return (true, "Apple 语音识别就绪（\(locale.identifier)\(rec.supportsOnDeviceRecognition ? " · 支持离线" : " · 在线辅助")）")
-            case .cli:
-                let bin = prefs.localCLIBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? (VoiceLocalCLIDiscovery.detectInstalledBinary() ?? "")
-                    : prefs.localCLIBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
-                if bin.isEmpty || !FileManager.default.isExecutableFile(atPath: bin) {
-                    return (false, "未找到可执行命令：\(bin.isEmpty ? "whisper-cli / whisper" : bin)")
-                }
-                return (true, "已检测到本地 CLI：\(bin)")
-            case .http:
+            case .customHTTP:
                 if URL(string: prefs.localHTTPASRBaseURL) == nil {
-                    return (false, "本地 ASR 地址无效")
+                    return (false, "本地 HTTP ASR 地址无效")
                 }
-                if prefs.outputMode == .smartPolish && prefs.localPolishKind == .http {
+            }
+
+            if prefs.outputMode == .smartPolish {
+                switch prefs.localLLMPreset {
+                case .qwen15B:
+                    let llmStatus = VoiceLocalInstaller.llmStatus(for: .qwen15B)
+                    if !llmStatus.isReady {
+                        return (false, "识别引擎已就绪，但本地整理模型尚未下载（可点击一键安装或改用轻量规则整理）")
+                    }
+                    return (true, "本地识别与 Qwen2.5-1.5B AI 整理均已就绪")
+                case .ollamaHTTP:
                     do {
                         let client = ensurePipelineClient()
                         let polished = try await client.polishOpenAICompatible(
@@ -235,13 +236,17 @@ public final class VoiceSessionController {
                             toneMode: prefs.toneMode,
                             context: VoiceContext()
                         )
-                        return (true, "本地 LLM 整理连通正常：\(polished)")
+                        return (true, "本地模型就绪，LLM 整理正常：\(polished)")
                     } catch {
-                        return (false, "本地 LLM 整理不可达：\(error.localizedDescription)")
+                        return (false, "本地 LLM 服务不可达：\(error.localizedDescription)")
                     }
+                case .ruleBased:
+                    return (true, "本地语音识别（\(prefs.localASRPreset.displayName)）与轻量规则整理已就绪")
+                case .none:
+                    return (true, "本地语音识别（\(prefs.localASRPreset.displayName)）已就绪")
                 }
-                return (true, "本地 HTTP ASR 地址已配置：\(prefs.localHTTPASRBaseURL)")
             }
+            return (true, "本地语音识别（\(prefs.localASRPreset.displayName)）已就绪")
         }
     }
 
@@ -269,7 +274,7 @@ public final class VoiceSessionController {
         onCommit: @escaping (_ text: String, _ replaceSelection: Bool) -> Void
     ) {
         let prefs = VoicePreferencesStore.shared.prefs
-        let useAppleSpeech = (prefs.providerMode == .local && prefs.localASRKind == .appleSpeech)
+        let useAppleSpeech = (prefs.providerMode == .local && prefs.localASRPreset == .appleSpeech)
 
         activeCaretRect = caretRect
         activeWindowLevel = windowLevel
@@ -331,8 +336,10 @@ public final class VoiceSessionController {
         phase = .processing
 
         let prefs = VoicePreferencesStore.shared.prefs
-        let modeLabel = prefs.providerMode.displayName
-        let useAppleSpeech = (prefs.providerMode == .local && prefs.localASRKind == .appleSpeech)
+        let modeLabel = prefs.providerMode == .cloudBYOK
+            ? prefs.cloudPreset.displayName
+            : "本地"
+        let useAppleSpeech = (prefs.providerMode == .local && prefs.localASRPreset == .appleSpeech)
         let context = activeContext
         let commitHandler = activeCommitHandler
         let replaceSelection = prefs.speakToEditSelection
@@ -353,8 +360,8 @@ public final class VoiceSessionController {
         )
 
         let client = ensurePipelineClient()
-        let asrKey = VoiceKeychainStore.read(.cloudASRAPIKey)
-        let llmKey = prefs.cloudReuseASRKeyForLLM ? asrKey : VoiceKeychainStore.read(.cloudLLMAPIKey)
+        let asrKey = VoiceKeychainStore.read(prefs.effectiveCloudASRKeyAccount)
+        let llmKey = VoiceKeychainStore.read(prefs.effectiveCloudLLMKeyAccount)
 
         activeTask?.cancel()
         activeTask = Task { @MainActor [weak self] in
@@ -428,28 +435,32 @@ public final class VoiceSessionController {
         switch prefs.providerMode {
         case .cloudBYOK:
             guard !asrKey.isEmpty else {
-                throw VoiceEngineError.missingAPIKey("云端 ASR")
+                throw VoiceEngineError.missingAPIKey(prefs.cloudPreset.displayName)
             }
             return try await client.transcribeOpenAICompatible(
-                baseURL: prefs.cloudASRBaseURL,
+                baseURL: prefs.effectiveCloudASRBaseURL,
                 apiKey: asrKey,
-                model: prefs.cloudASRModel,
+                model: prefs.effectiveCloudASRModel,
                 language: prefs.language,
                 prompt: prompt,
                 wavData: wavData
             )
         case .local:
-            switch prefs.localASRKind {
+            switch prefs.localASRPreset {
             case .appleSpeech:
                 return ""
-            case .cli:
+            case .whisperTurbo, .whisperBase:
+                let status = VoiceLocalInstaller.asrStatus(for: prefs.localASRPreset)
+                guard let bin = status.dependencyPath, let modelPath = status.modelPath, status.isReady else {
+                    throw VoiceEngineError.cliFailed("尚未安装本地语音模型，请在「句序偏好设置 → 语音输入」中点击一键下载并安装")
+                }
                 return try await client.transcribeLocalCLI(
-                    binaryPath: prefs.localCLIBinaryPath,
-                    modelPath: prefs.localCLIModelPath,
+                    binaryPath: bin,
+                    modelPath: modelPath,
                     language: prefs.language,
                     wavData: wavData
                 )
-            case .http:
+            case .customHTTP:
                 return try await client.transcribeOpenAICompatible(
                     baseURL: prefs.localHTTPASRBaseURL,
                     apiKey: nil,
@@ -475,24 +486,35 @@ public final class VoiceSessionController {
                 return rawTranscript
             }
             guard !llmKey.isEmpty else {
-                // Fall back to lightweight rule cleanup rather than losing the user's speech
                 return VoiceLocalRulePolisher.polish(rawTranscript)
             }
             return try await client.polishOpenAICompatible(
-                baseURL: prefs.cloudLLMBaseURL,
+                baseURL: prefs.effectiveCloudLLMBaseURL,
                 apiKey: llmKey,
-                model: prefs.cloudLLMModel,
+                model: prefs.effectiveCloudLLMModel,
                 rawTranscript: rawTranscript,
                 toneMode: prefs.toneMode,
                 context: context
             )
         case .local:
-            switch prefs.localPolishKind {
+            switch prefs.localLLMPreset {
             case .none:
                 return rawTranscript
             case .ruleBased:
                 return VoiceLocalRulePolisher.polish(rawTranscript)
-            case .http:
+            case .qwen15B:
+                let status = VoiceLocalInstaller.llmStatus(for: .qwen15B)
+                guard let bin = status.dependencyPath, let modelPath = status.modelPath, status.isReady else {
+                    return VoiceLocalRulePolisher.polish(rawTranscript)
+                }
+                return try await client.polishLocalLlamaCLI(
+                    binaryPath: bin,
+                    modelPath: modelPath,
+                    rawTranscript: rawTranscript,
+                    toneMode: prefs.toneMode,
+                    context: context
+                )
+            case .ollamaHTTP:
                 return try await client.polishOpenAICompatible(
                     baseURL: prefs.localHTTPLLMBaseURL,
                     apiKey: nil,
@@ -551,7 +573,9 @@ public final class VoiceSessionController {
     private func refreshRecordingHUD() {
         guard phase == .recording else { return }
         let elapsed = Date().timeIntervalSince(recordingStartTime ?? Date())
-        let modeLabel = VoicePreferencesStore.shared.prefs.providerMode.displayName
+        let modeLabel = VoicePreferencesStore.shared.prefs.providerMode == .cloudBYOK
+            ? VoicePreferencesStore.shared.prefs.cloudPreset.displayName
+            : "本地"
         VoiceHUDPanelController.shared.show(
             state: .recording(
                 level: latestLevel,

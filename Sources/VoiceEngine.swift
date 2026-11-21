@@ -770,6 +770,72 @@ public final class VoicePipelineClient: Sendable {
         }
     }
 
+    public func polishLocalLlamaCLI(
+        binaryPath: String,
+        modelPath: String,
+        rawTranscript: String,
+        toneMode: VoiceToneMode,
+        context: VoiceContext
+    ) async throws -> String {
+        guard FileManager.default.isExecutableFile(atPath: binaryPath) else {
+            throw VoiceEngineError.cliNotFound(binaryPath)
+        }
+        guard FileManager.default.fileExists(atPath: modelPath) else {
+            throw VoiceEngineError.cliFailed("未找到本地整理模型文件，请在设置中点击「一键下载并安装」")
+        }
+
+        let messages = VoicePromptBuilder.polishMessages(
+            rawTranscript: rawTranscript,
+            toneMode: toneMode,
+            context: context
+        )
+        let systemPrompt = messages.first?["content"] ?? ""
+        let userPrompt = messages.last?["content"] ?? rawTranscript
+        let chatML = "<|im_start|>system\n\(systemPrompt)<|im_end|>\n<|im_start|>user\n\(userPrompt)<|im_end|>\n<|im_start|>assistant\n"
+
+        return try await withCheckedThrowingContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: binaryPath)
+                proc.arguments = [
+                    "-m", modelPath,
+                    "-ngl", "99",
+                    "-c", "2048",
+                    "-n", "512",
+                    "--temp", "0.1",
+                    "--no-display-prompt",
+                    "-no-cnv",
+                    "-p", chatML,
+                ]
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                proc.standardOutput = stdoutPipe
+                proc.standardError = stderrPipe
+
+                do {
+                    try proc.run()
+                    proc.waitUntilExit()
+                    let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                    if proc.terminationStatus != 0 {
+                        let errMsg = String(data: errData, encoding: .utf8)?
+                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "退出码 \(proc.terminationStatus)"
+                        cont.resume(throwing: VoiceEngineError.cliFailed(String(errMsg.suffix(160))))
+                        return
+                    }
+                    var outText = String(data: outData, encoding: .utf8) ?? ""
+                    for marker in ["<|im_end|>", "[end of text]", "<|endoftext|>"] {
+                        outText = outText.replacingOccurrences(of: marker, with: "")
+                    }
+                    let cleaned = outText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    cont.resume(returning: cleaned.isEmpty ? rawTranscript : cleaned)
+                } catch {
+                    cont.resume(throwing: VoiceEngineError.cliFailed(error.localizedDescription))
+                }
+            }
+        }
+    }
+
     private func validateHTTP(response: URLResponse, data: Data) throws {
         guard let http = response as? HTTPURLResponse else {
             throw VoiceEngineError.networkError("无效的 HTTP 响应")

@@ -106,10 +106,11 @@ struct RenderPreviews {
             to: outDir.appendingPathComponent("settings-typo-dark.png")
         )
 
-        // 3. Render macOS Voice Settings (Cloud BYOK enabled preview in Light mode)
+        // 3. Render macOS Voice Settings (Cloud BYOK preset + Local one-click installer previews)
         VoicePreferencesStore.shared.update({
             $0.enabled = true
             $0.providerMode = .cloudBYOK
+            $0.cloudPreset = .groq
         }, persist: false)
         try renderSwiftUIView(
             WindowChromeMock(title: "句序 (Juxu) 偏好设置", isDark: false) {
@@ -118,7 +119,22 @@ struct RenderPreviews {
             width: 740,
             height: 760,
             isDark: false,
-            to: outDir.appendingPathComponent("settings-voice-light.png")
+            to: outDir.appendingPathComponent("settings-voice-cloud.png")
+        )
+        VoicePreferencesStore.shared.update({
+            $0.enabled = true
+            $0.providerMode = .local
+            $0.localASRPreset = .whisperTurbo
+            $0.localLLMPreset = .qwen15B
+        }, persist: false)
+        try renderSwiftUIView(
+            WindowChromeMock(title: "句序 (Juxu) 偏好设置", isDark: false) {
+                SettingsRootView(bridge: bridge, initialSection: .voice)
+            },
+            width: 740,
+            height: 760,
+            isDark: false,
+            to: outDir.appendingPathComponent("settings-voice-local.png")
         )
         VoicePreferencesStore.shared.update({ $0.enabled = false }, persist: false)
 
