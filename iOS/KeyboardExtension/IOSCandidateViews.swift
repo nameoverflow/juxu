@@ -248,7 +248,7 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
     private var activeClipboardSuggestion: IOSClipboardSuggestion?
     private var lastClipboardCompactLayout: Bool?
 
-    private static let starterWords = ["我", "我们", "不是", "怎么", "你", "在", "这", "可以"]
+    static let starterWords = ["我", "我们", "不是", "怎么", "你", "在", "这", "可以"]
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -608,10 +608,11 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
         let subtleCol: UIColor = dark ? UIColor(white: 0.64, alpha: 1.0) : UIColor(white: 0.44, alpha: 1.0)
         codeStrip.update(text: state.segmentedCode, dark: dark)
         candidatesTop.constant = codeBandHeight
+        let hideChevron = (effectiveClipboard != nil)
         chevronBtn.tintColor = textCol
-        chevronBtn.isHidden = isEmpty
-        clipTrailingToChevron.isActive = !isEmpty
-        clipTrailingToFull.isActive = isEmpty
+        chevronBtn.isHidden = hideChevron
+        clipTrailingToChevron.isActive = !hideChevron
+        clipTrailingToFull.isActive = hideChevron
 
         UIView.performWithoutAnimation {
             if let clip = effectiveClipboard {

@@ -27,6 +27,7 @@ public final class KeyboardViewController: UIInputViewController {
     private let clipboardReadQueue = DispatchQueue(label: "com.priswubi.clipboard", qos: .userInitiated)
     private var activeClipboardSuggestion: IOSClipboardSuggestion?
     private var inFlightClipboardChangeCount: Int?
+    private var expandedIdleWords: [String]?
     private var hasAppeared = false
 
     private lazy var feedback = IOSKeyboardFeedbackController(attachingTo: keyCanvas)
@@ -439,12 +440,13 @@ public final class KeyboardViewController: UIInputViewController {
             guard let self else { return }
             self.keyCanvas.flushPendingTouches()
             self.feedback.fireSoftStep(playClick: true)
-            guard !self.bridge.state.preedit.isEmpty else { return }
             self.expandedGrid.isHidden.toggle()
             let isExp = !self.expandedGrid.isHidden
             self.keyCanvas.isHidden = isExp
             if isExp {
-                self.expandedGrid.reload(candidates: self.bridge.allCandidates(maxCount: 300), dark: self.isDarkAppearance)
+                self.reloadExpandedGrid()
+            } else {
+                self.expandedIdleWords = nil
             }
             self.ribbonView.setExpanded(isExp)
         }
@@ -453,30 +455,44 @@ public final class KeyboardViewController: UIInputViewController {
             guard let self else { return }
             self.feedback.fireSoftStep(playClick: true)
             self.markUserTypedForClipboard()
+            let idleWords = self.expandedIdleWords
+            self.expandedIdleWords = nil
             self.expandedGrid.isHidden = true
             self.keyCanvas.isHidden = false
             self.ribbonView.setExpanded(false)
-            let out = self.bridge.selectAbsCandidate(absIndex: absIdx, timestampMs: Self.nowMs())
-            self.applyEngineState(out)
+            if let idleWords, absIdx < idleWords.count {
+                let word = idleWords[absIdx]
+                self.insertTextWithAutoSpace(word, splitInternal: true)
+                self.bridge.acceptPrediction(word, timestampMs: Self.nowMs())
+                self.scheduleUserDataFlush()
+                self.syncEngineToUI()
+            } else {
+                let out = self.bridge.selectAbsCandidate(absIndex: absIdx, timestampMs: Self.nowMs())
+                self.applyEngineState(out)
+            }
         }
 
         expandedGrid.onCollapse = { [weak self] in
             self?.feedback.fireSoftStep(playClick: true)
+            self?.expandedIdleWords = nil
             self?.expandedGrid.isHidden = true
             self?.keyCanvas.isHidden = false
             self?.ribbonView.setExpanded(false)
         }
 
         expandedGrid.onBackspace = { [weak self] in
-            self?.feedback.fireKeyDown()
-            self?.performBackspace()
-            if let self, !self.expandedGrid.isHidden {
-                if self.bridge.state.preedit.isEmpty {
+            guard let self else { return }
+            let wasComposing = !self.bridge.state.preedit.isEmpty
+            self.feedback.fireKeyDown()
+            self.performBackspace()
+            if !self.expandedGrid.isHidden {
+                if wasComposing && self.bridge.state.preedit.isEmpty {
+                    self.expandedIdleWords = nil
                     self.expandedGrid.isHidden = true
                     self.keyCanvas.isHidden = false
                     self.ribbonView.setExpanded(false)
                 } else {
-                    self.expandedGrid.reload(candidates: self.bridge.allCandidates(maxCount: 300), dark: self.isDarkAppearance)
+                    self.reloadExpandedGrid()
                 }
             }
         }
@@ -486,6 +502,7 @@ public final class KeyboardViewController: UIInputViewController {
             self?.compositionBaseContext = nil
             self?.cancelMarkedCode()
             self?.bridge.clearComposition()
+            self?.expandedIdleWords = nil
             self?.expandedGrid.isHidden = true
             self?.keyCanvas.isHidden = false
             self?.ribbonView.setExpanded(false)
@@ -495,10 +512,35 @@ public final class KeyboardViewController: UIInputViewController {
         expandedGrid.onOpenSettings = { [weak self] in
             guard let self else { return }
             self.feedback.fireSoftStep(playClick: true)
+            self.expandedIdleWords = nil
             self.expandedGrid.isHidden = true
             self.keyCanvas.isHidden = false
             self.ribbonView.setExpanded(false)
             self.openHostAppSettings()
+        }
+    }
+
+    private func reloadExpandedGrid() {
+        if bridge.state.preedit.isEmpty {
+            let predicted = bridge.state.asciiMode ? [] : bridge.predictNextWords(maxCount: 24)
+            let words = predicted.isEmpty && !bridge.state.asciiMode
+                ? IOSCandidateRibbonView.starterWords
+                : predicted
+            expandedIdleWords = words
+            let items = words.enumerated().map { idx, text in
+                WubiCandidateItem(
+                    index: idx + 1,
+                    text: text,
+                    comment: "",
+                    badge: 0,
+                    confidence: 1.0,
+                    isExact: true
+                )
+            }
+            expandedGrid.reload(candidates: items, dark: isDarkAppearance)
+        } else {
+            expandedIdleWords = nil
+            expandedGrid.reload(candidates: bridge.allCandidates(maxCount: 300), dark: isDarkAppearance)
         }
     }
 
