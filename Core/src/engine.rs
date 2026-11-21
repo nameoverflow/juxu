@@ -197,13 +197,13 @@ impl WubiEngine {
             }
         }
         if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
-            // Feed the full active clause (up to 32 chars!) into Micro-RWKV-7 before truncating trigram window
-            let clause: String = self
-                .recent_context
+            // Feed up to 64 chars (including cross-clause punctuation for V2 models) into Micro-RWKV-7.
+            let chars: Vec<char> = text.chars().collect();
+            let neural_ctx: String = chars
                 .iter()
-                .skip(self.recent_context.len().saturating_sub(32))
+                .skip(chars.len().saturating_sub(64))
                 .collect();
-            self.neural_tracker.set_context_str(&nv, &clause);
+            self.neural_tracker.set_context_str(&nv, &neural_ctx);
         }
         if self.recent_context.len() > 8 {
             let drain_n = self.recent_context.len() - 8;
@@ -215,19 +215,17 @@ impl WubiEngine {
         }
     }
 
-    /// Incrementally append committed CJK text to rolling context (O(len(text)) instead of O(sentence)).
+    /// Incrementally append committed CJK/punctuation text to rolling context (O(len(text)) instead of O(sentence)).
     pub fn append_recent_context(&mut self, text: &str) {
-        let mut all_cjk = !text.is_empty();
         for ch in text.chars() {
             if is_cjk_char(ch) {
                 self.recent_context.push(ch);
             } else {
                 self.recent_context.clear();
-                all_cjk = false;
             }
         }
         if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
-            if all_cjk {
+            if !text.is_empty() {
                 self.neural_tracker.commit_cjk_str(&nv, text);
             } else {
                 self.neural_tracker.reset_to_bos(Some(&nv));
@@ -265,17 +263,15 @@ impl WubiEngine {
             self.dicts[dict_idx].as_ref(),
         );
         self.last_committed = text.to_string();
-        let mut all_cjk = !text.is_empty();
         for ch in text.chars() {
             if is_cjk_char(ch) {
                 self.recent_context.push(ch);
             } else {
                 self.recent_context.clear();
-                all_cjk = false;
             }
         }
         if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
-            if all_cjk {
+            if !text.is_empty() {
                 self.neural_tracker.commit_cjk_str(&nv, text);
             } else {
                 self.neural_tracker.reset_to_bos(Some(&nv));
@@ -447,7 +443,7 @@ impl WubiEngine {
                 let mut is_tri_comp = false;
                 let mut is_bi_comp = false;
                 let mut comp_bonus = 0.0f32;
-                let strong_rwkv_comp = rwkv_lp1.map(|lp| lp > -1.35).unwrap_or(false);
+                let strong_rwkv_comp = rwkv_lp1.map(|lp| lp > -1.75).unwrap_or(false);
                 if let Some(prev2) = p2 {
                     let mut s3 = String::with_capacity(12);
                     s3.push(prev2);
@@ -923,17 +919,15 @@ impl WubiEngine {
                 }
             }
             self.last_committed = commit_text.clone();
-            let mut all_cjk = !commit_text.is_empty();
             for ch in commit_text.chars() {
                 if is_cjk_char(ch) {
                     self.recent_context.push(ch);
                 } else {
                     self.recent_context.clear();
-                    all_cjk = false;
                 }
             }
             if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
-                if all_cjk {
+                if !commit_text.is_empty() {
                     self.neural_tracker.commit_cjk_str(&nv, &commit_text);
                 } else {
                     self.neural_tracker.reset_to_bos(Some(&nv));
@@ -1427,10 +1421,11 @@ impl WubiEngine {
             } else {
                 None
             };
+            let punct_str = punctuation.unwrap_or_else(|| c.to_string());
             let mut out = self.finish_spaceless(timestamp_ms);
-            out.commit_text.push_str(&punctuation.unwrap_or_else(|| c.to_string()));
+            out.commit_text.push_str(&punct_str);
             self.user.break_single_burst();
-            self.clear_context();
+            self.append_recent_context(&punct_str);
             return out;
         }
 
@@ -1447,7 +1442,7 @@ impl WubiEngine {
                     self.clear_composition();
                 }
                 self.user.break_single_burst();
-                self.clear_context();
+                self.append_recent_context(&mapped);
                 text.push_str(&mapped);
                 return EngineOutput {
                     consumed: true,
@@ -1875,17 +1870,15 @@ impl WubiEngine {
             }
         }
         self.last_committed = text.to_string();
-        let mut all_cjk = !text.is_empty();
         for ch in text.chars() {
             if is_cjk_char(ch) {
                 self.recent_context.push(ch);
             } else {
                 self.recent_context.clear();
-                all_cjk = false;
             }
         }
         if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
-            if all_cjk {
+            if !text.is_empty() {
                 self.neural_tracker.commit_cjk_str(&nv, text);
             } else {
                 self.neural_tracker.reset_to_bos(Some(&nv));

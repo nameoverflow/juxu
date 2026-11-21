@@ -576,6 +576,55 @@ mod tests {
     }
 
     #[test]
+    fn v2_neural_cross_clause_punctuation_context() {
+        let aux_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../Resources/Dicts/wubi_aux.wbaux");
+        let Ok(aux) = AuxView::open_mmap(&aux_path) else {
+            return;
+        };
+        let nv = aux.neural_view().expect("wubi_aux.wbaux should embed WBLM0001");
+        let s = nv.offs.summary;
+        assert_eq!((s.vocab_size, s.rank, s.d_model, s.n_heads, s.n_layers, s.ffn_dim), (8192, 160, 256, 8, 6, 768));
+        assert!(nv.offs.has_punct_tokens, "V2 model must expose comma/period tokens");
+        assert_eq!(nv.punct_to_token('，'), Some(crate::neural::TOK_COMMA));
+        assert_eq!(nv.punct_to_token('。'), Some(crate::neural::TOK_PERIOD));
+
+        // Parity check against V2 export parity.json ("今天天气真" -> 好/热)
+        let mut tracker = crate::neural::NeuralContextTracker::default();
+        tracker.set_context_str(&nv, "今天天气真");
+        let sc_hao = nv.score_next_char(&tracker.active, '好');
+        let sc_re = nv.score_next_char(&tracker.active, '热');
+        assert!((sc_hao - (-0.255945)).abs() < 1e-3, "unexpected score_hao={sc_hao}");
+        assert!(sc_hao > sc_re);
+
+        // Cross-clause state must survive comma & period, and differ from a reset clause
+        let mut t_cross = crate::neural::NeuralContextTracker::default();
+        t_cross.set_context_str(&nv, "今天下雨了，我");
+        let mut t_short = crate::neural::NeuralContextTracker::default();
+        t_short.set_context_str(&nv, "我");
+        let sc_dai_cross = nv.score_next_char(&t_cross.active, '带');
+        let sc_dai_short = nv.score_next_char(&t_short.active, '带');
+        assert!(
+            sc_dai_cross > sc_dai_short + 0.5,
+            "cross-clause comma context should boost '带' after '今天下雨了，我': cross={sc_dai_cross}, short={sc_dai_short}"
+        );
+
+        // Incremental commit of punctuation preserves state identically to set_context_str
+        let mut t_inc = crate::neural::NeuralContextTracker::default();
+        t_inc.commit_cjk_str(&nv, "今天下雨了");
+        t_inc.commit_cjk_str(&nv, "，");
+        t_inc.commit_cjk_str(&nv, "我");
+        let sc_dai_inc = nv.score_next_char(&t_inc.active, '带');
+        assert!((sc_dai_inc - sc_dai_cross).abs() < 1e-5);
+
+        // Non-mapped boundary (newline) resets to BOS
+        let mut t_nl = crate::neural::NeuralContextTracker::default();
+        t_nl.set_context_str(&nv, "今天下雨了\n我");
+        let sc_dai_nl = nv.score_next_char(&t_nl.active, '带');
+        assert!((sc_dai_nl - sc_dai_short).abs() < 1e-5);
+    }
+
+    #[test]
     fn xiaohe_z_code_and_touch_typo_rescue() {
         let entries = vec![
             (

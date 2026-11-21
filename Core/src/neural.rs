@@ -11,6 +11,10 @@
 use std::io;
 
 pub const WBLM_MAGIC: &[u8; 8] = b"WBLM0001";
+pub const TOK_BOS: usize = 0;
+pub const TOK_UNK: usize = 1;
+pub const TOK_COMMA: usize = 2;
+pub const TOK_PERIOD: usize = 3;
 pub const CJK_LUT_BASE: u32 = 0x3400;
 pub const CJK_LUT_LEN: usize = 0xA000 - 0x3400; // 27,648 BMP CJK codepoints (0x3400..=0x9FFF)
 const HEADER_LEN: usize = 64;
@@ -214,6 +218,7 @@ pub struct NeuralLmSummary {
 pub struct NeuralOffsets {
     pub summary: NeuralLmSummary,
     pub tok_to_char: Vec<char>,
+    pub has_punct_tokens: bool,
     pub(crate) profile_id: u64,
     lut_off: usize,
     emb_w_off: usize,
@@ -333,6 +338,10 @@ impl NeuralOffsets {
             }
         }
 
+        let has_punct_tokens = vocab_size > TOK_PERIOD
+            && tok_to_char[TOK_COMMA] == '\0'
+            && tok_to_char[TOK_PERIOD] == '\0';
+
         Ok(Self {
             summary: NeuralLmSummary {
                 vocab_size,
@@ -343,6 +352,7 @@ impl NeuralOffsets {
                 ffn_dim,
             },
             tok_to_char,
+            has_punct_tokens,
             profile_id: blob.iter().step_by((blob.len() / 64).max(1)).fold(
                 blob.len() as u64,
                 |hash, &byte| (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3),
@@ -455,7 +465,27 @@ impl NeuralContextTracker {
         }
     }
 
-    /// Push a committed word/character sequence, saving pre-commit state in the 8-step rollback ring.
+    fn step_context_str(&mut self, nv: &NeuralView<'_>, text: &str) {
+        let mut prev_punct: Option<usize> = None;
+        for ch in text.chars() {
+            let u = ch as u32;
+            if (CJK_LUT_BASE..0xA000).contains(&u) {
+                let tok = nv.char_to_token(ch);
+                nv.step_token(tok, &mut self.active);
+                prev_punct = None;
+            } else if let Some(ptok) = nv.punct_to_token(ch) {
+                if prev_punct != Some(ptok) {
+                    nv.step_token(ptok, &mut self.active);
+                    prev_punct = Some(ptok);
+                }
+            } else {
+                self.reset_to_bos(Some(nv));
+                prev_punct = None;
+            }
+        }
+    }
+
+    /// Push a committed word/character/punctuation sequence, saving pre-commit state in the 8-step rollback ring.
     pub fn commit_cjk_str(&mut self, nv: &NeuralView<'_>, text: &str) {
         if !self.is_ready() {
             self.init_with_model(nv);
@@ -464,15 +494,7 @@ impl NeuralContextTracker {
             self.ring.remove(0);
         }
         self.ring.push(self.active.clone());
-        for ch in text.chars() {
-            let u = ch as u32;
-            if (CJK_LUT_BASE..0xA000).contains(&u) {
-                let tok = nv.char_to_token(ch);
-                nv.step_token(tok, &mut self.active);
-            } else {
-                self.reset_to_bos(Some(nv));
-            }
-        }
+        self.step_context_str(nv, text);
     }
 
     /// Roll back one committed unit on empty-preedit Backspace (or reset to BOS if history exhausted).
@@ -491,19 +513,23 @@ impl NeuralContextTracker {
         } else {
             self.reset_to_bos(Some(nv));
         }
-        for ch in text.chars() {
-            let u = ch as u32;
-            if (CJK_LUT_BASE..0xA000).contains(&u) {
-                let tok = nv.char_to_token(ch);
-                nv.step_token(tok, &mut self.active);
-            } else {
-                self.reset_to_bos(Some(nv));
-            }
-        }
+        self.step_context_str(nv, text);
     }
 }
 
 impl<'a> NeuralView<'a> {
+    #[inline]
+    pub fn punct_to_token(&self, ch: char) -> Option<usize> {
+        if !self.offs.has_punct_tokens {
+            return None;
+        }
+        match ch {
+            '，' | '、' | '；' | '：' | '—' | ',' | ';' | ':' => Some(TOK_COMMA),
+            '。' | '？' | '！' | '.' | '?' | '!' => Some(TOK_PERIOD),
+            _ => None,
+        }
+    }
+
     #[inline]
     pub fn char_to_token(&self, ch: char) -> usize {
         let u = ch as u32;
