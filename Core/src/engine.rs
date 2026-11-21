@@ -692,6 +692,27 @@ impl WubiEngine {
         }
     }
 
+    /// Release all loaded dictionaries except the one required by `schema` (e.g. unmapping the
+    /// 67 MB `pinyin.pydict` on iOS when switching back to Wubi/Cangjie).
+    pub fn retain_only_schema_dict(&mut self, schema: WubiSchema) {
+        if schema.is_pinyin() {
+            for slot in &mut self.dicts {
+                *slot = None;
+            }
+        } else {
+            self.pinyin_dict = None;
+            self.pinyin_stream.clear();
+            self.pinyin_paths.clear();
+            self.pinyin_candidates.clear();
+            let keep = schema.slot_index();
+            for (idx, slot) in self.dicts.iter_mut().enumerate() {
+                if idx != keep {
+                    *slot = None;
+                }
+            }
+        }
+    }
+
     pub fn load_pinyin_dict(&mut self, dict: PinyinDictView) {
         self.user.reindex_pinyin_phrases(&dict);
         self.pinyin_dict = Some(dict);
@@ -1273,26 +1294,28 @@ impl WubiEngine {
         Some(out)
     }
 
-    /// 26-element continuous touch hitbox weight vector (`0` = dead key, `100` = neutral valid key,
-    /// `54..=180` = `Micro-RWKV-7` context-weighted valid key).
-    /// Powers Key #1 predictive gutter bias AND Keys #2..#4 valid-vs-valid gutter disambiguation
-    /// across Wubi86/98/06, Xiaohe, Spaceless, and Full Pinyin!
-    pub fn next_key_priors(&self) -> [u8; 26] {
+    /// Compute both `valid_next_mask` and `next_key_priors` in a single pass so FFI serialization
+    /// never scans the dictionary or Pinyin lattice twice per keystroke.
+    pub fn next_key_mask_and_priors(&self) -> (u32, [u8; 26]) {
+        const ALL_26: u32 = 0x03FF_FFFF;
         let mut out = [100u8; 26];
-        if self.ascii_mode || !self.config.typo.enabled {
-            return out;
+        if self.ascii_mode {
+            return (ALL_26, out);
+        }
+        if !self.config.typo.enabled {
+            return (self.valid_next_mask(), out);
         }
         if self.is_pinyin_mode() {
             if let Some(ref pdict) = self.pinyin_dict {
                 let rwkv_starts = self.rwkv_pinyin_start_priors(pdict);
-                let (_, priors) = if self.config.schema.is_shuangpin() {
+                let (mask, priors) = if self.config.schema.is_shuangpin() {
                     shuangpin_next_key_priors(&self.raw_code, pdict, rwkv_starts.as_ref())
                 } else {
                     pinyin_next_key_priors(&self.raw_code, pdict, rwkv_starts.as_ref())
                 };
-                return priors;
+                return (if mask == 0 { ALL_26 } else { mask }, priors);
             }
-            return out;
+            return (ALL_26, out);
         }
         if self.uses_spaceless() {
             if let Some(dict) = self.active_dict() {
@@ -1301,22 +1324,21 @@ impl WubiEngine {
                     .best_state()
                     .unwrap_or(&self.neural_tracker.active);
                 if let Some(priors) = self.rwkv_dict_first_key_priors(state, dict) {
-                    return priors;
+                    return (ALL_26, priors);
                 }
             }
-            return out;
+            return (ALL_26, out);
         }
         let bytes = self.raw_code.as_bytes();
         let max_len = self.config.schema.max_code_len();
         if bytes.len() >= max_len || (self.config.schema.is_wubi() && bytes.contains(&b'z')) {
-            return out;
+            return (ALL_26, out);
         }
 
         // Case 1: Key #1 (`raw_code` is empty) — use `Micro-RWKV-7` first-key priors for ALL schemas!
         if bytes.is_empty() {
             if self.neural_tracker.is_ready() {
                 if self.config.schema == WubiSchema::Wubi86 {
-                    // Uniform log-prob across 25 Wubi keys ('a'..'y') is ln(1/25) = -3.2189
                     for idx in 0..25usize {
                         let lp = self.neural_tracker.active.key1_logp[idx];
                         let delta = lp - (-3.2189f32);
@@ -1326,17 +1348,17 @@ impl WubiEngine {
                     if let Some(priors) =
                         self.rwkv_dict_first_key_priors(&self.neural_tracker.active, dict)
                     {
-                        return priors;
+                        return (ALL_26, priors);
                     }
                 }
             }
-            return out;
+            return (ALL_26, out);
         }
 
-        // Case 2: Keys #2..#4 (`1 <= len <= 3`) — combine dictionary validity with RWKV context priors!
+        // Case 2: Keys #2..max_len — compute `valid_next_mask` ONCE and combine with RWKV context priors!
         let mask = self.valid_next_mask();
-        if mask == 0x03FF_FFFF || mask == 0 {
-            return out;
+        if mask == ALL_26 || mask == 0 {
+            return (if mask == 0 { ALL_26 } else { mask }, out);
         }
         for idx in 0..26usize {
             if (mask & (1u32 << idx)) == 0 {
@@ -1385,7 +1407,13 @@ impl WubiEngine {
                 }
             }
         }
-        out
+        (mask, out)
+    }
+
+    /// 26-element continuous touch hitbox weight vector (`0` = dead key, `100` = neutral valid key,
+    /// `54..=180` = `Micro-RWKV-7` context-weighted valid key).
+    pub fn next_key_priors(&self) -> [u8; 26] {
+        self.next_key_mask_and_priors().1
     }
 
     /// Push a touchscreen letter tap with view/normalized coordinates `(x, y)` (used by iOS keyboard & touch tests).

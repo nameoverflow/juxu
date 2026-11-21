@@ -87,9 +87,6 @@ targets:
         excludes:
           - "*.plist"
           - "*.entitlements"
-      - path: ../Resources/Dicts
-        type: folder
-        buildPhase: resources
     info:
       path: KeyboardExtension/Info.plist
       properties:

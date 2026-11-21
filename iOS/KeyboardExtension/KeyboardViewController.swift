@@ -69,7 +69,7 @@ public final class KeyboardViewController: UIInputViewController {
     public override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         feedback.prepare()
-        bridge.loadConfigAndUser()
+        bridge.loadConfigAndUser(refreshPublishedLists: false)
         autoSpaceTracker.invalidate()
         compositionBaseContext = nil
         clipboardGate.resetForKeyboardAppearance()

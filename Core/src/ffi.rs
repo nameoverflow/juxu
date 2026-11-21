@@ -81,13 +81,13 @@ fn serialize_action_and_state(engine: &WubiEngine, act: Option<&EngineOutput>) -
         .iter()
         .filter(|k| k.samples > 0)
         .count();
+    let (valid_mask, priors) = engine.next_key_mask_and_priors();
     j.push_str(&format!(
         ",\"userPhraseCount\":{},\"calibratedKeyCount\":{},\"validNextMask\":{},\"nextKeyPriors\":[",
         engine.user.phrases.len(),
         calibrated_keys,
-        engine.valid_next_mask()
+        valid_mask
     ));
-    let priors = engine.next_key_priors();
     for (pi, &pv) in priors.iter().enumerate() {
         if pi > 0 {
             j.push(',');
@@ -209,6 +209,16 @@ pub extern "C" fn wubi_engine_load_pinyin_dict_mmap(
             true
         }
         Err(_) => false,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wubi_engine_retain_only_schema_dict(
+    handle: *mut WubiEngineHandle,
+    schema_id: u32,
+) {
+    if let Some(h) = unsafe { handle.as_mut() } {
+        h.inner.retain_only_schema_dict(WubiSchema::from_id(schema_id));
     }
 }
 

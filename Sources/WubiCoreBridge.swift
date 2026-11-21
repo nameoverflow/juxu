@@ -492,6 +492,7 @@ public final class WubiBridge: ObservableObject {
     private var loadedDictSchemas: Set<UInt32> = []
     private var pinyinDictLoaded: Bool = false
     private var auxDictLoaded: Bool = false
+    private var lastLoadedUserDataMtime: Date?
     #if os(iOS)
     private let inMemoryOnly: Bool
     private var lastSharedTouchProfile: [TouchKeyCalibrationItem]?
@@ -580,6 +581,12 @@ public final class WubiBridge: ObservableObject {
         let candidateDirs: [URL] = [
             overrideDir,
             Bundle.main.resourceURL?.appendingPathComponent("Dicts", isDirectory: true),
+            // Allow iOS App Extensions (`JuxuApp.app/PlugIns/JuxuKeyboard.appex`) to share
+            // the containing app's single `JuxuApp.app/Dicts` copy without duplicating 99 MB!
+            Bundle.main.bundleURL
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Dicts", isDirectory: true),
             Bundle.main.resourceURL,
             URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
                 .appendingPathComponent("Resources/Dicts", isDirectory: true),
@@ -621,28 +628,40 @@ public final class WubiBridge: ObservableObject {
                     pinyinDictLoaded = true
                 }
             }
+            #if os(iOS)
+            if !loadedDictSchemas.isEmpty {
+                wubi_engine_retain_only_schema_dict(h, schemaId)
+                loadedDictSchemas.removeAll()
+            }
+            #endif
             return
         }
-        if loadedDictSchemas.contains(schemaId) {
-            return
+        if !loadedDictSchemas.contains(schemaId) {
+            let fileName: String
+            switch schemaId {
+            case 98: fileName = "wubi98.wbdict"
+            case 6: fileName = "wubi06.wbdict"
+            case 10: fileName = "xiaohe.wbdict"
+            case 33: fileName = "cangjie3.wbdict"
+            case 35: fileName = "cangjie5.wbdict"
+            case 36: fileName = "cangjie6.wbdict"
+            default: fileName = "wubi86.wbdict"
+            }
+            let path = dir.appendingPathComponent(fileName).path
+            if path.withCString({ wubi_engine_load_dict_mmap(h, schemaId, $0) }) {
+                loadedDictSchemas.insert(schemaId)
+            }
         }
-        let fileName: String
-        switch schemaId {
-        case 98: fileName = "wubi98.wbdict"
-        case 6: fileName = "wubi06.wbdict"
-        case 10: fileName = "xiaohe.wbdict"
-        case 33: fileName = "cangjie3.wbdict"
-        case 35: fileName = "cangjie5.wbdict"
-        case 36: fileName = "cangjie6.wbdict"
-        default: fileName = "wubi86.wbdict"
+        #if os(iOS)
+        if pinyinDictLoaded || loadedDictSchemas.count > 1 {
+            wubi_engine_retain_only_schema_dict(h, schemaId)
+            pinyinDictLoaded = false
+            loadedDictSchemas = loadedDictSchemas.contains(schemaId) ? [schemaId] : []
         }
-        let path = dir.appendingPathComponent(fileName).path
-        if path.withCString({ wubi_engine_load_dict_mmap(h, schemaId, $0) }) {
-            loadedDictSchemas.insert(schemaId)
-        }
+        #endif
     }
 
-    public func loadConfigAndUser() {
+    public func loadConfigAndUser(refreshPublishedLists: Bool = true) {
         guard let h = handle else { return }
         var uiPrefsSourceTOML: String? = nil
         if FileManager.default.fileExists(atPath: configURL.path) {
@@ -670,11 +689,18 @@ public final class WubiBridge: ObservableObject {
         self.prefs = loaded
         ensureDictionaryLoaded(for: loaded.schemaId)
         if FileManager.default.fileExists(atPath: userDataURL.path) {
-            _ = userDataURL.path.withCString { wubi_engine_load_user_data(h, $0) }
+            let mtime = (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
+            if lastLoadedUserDataMtime == nil || mtime == nil || mtime != lastLoadedUserDataMtime {
+                if userDataURL.path.withCString({ wubi_engine_load_user_data(h, $0) }) {
+                    lastLoadedUserDataMtime = mtime
+                }
+            }
         }
         refreshState()
-        refreshUserPhrases()
-        refreshTouchProfile()
+        if refreshPublishedLists {
+            refreshUserPhrases()
+            refreshTouchProfile()
+        }
     }
 
     public func applyAndSavePreferences(_ newPrefs: WubiPreferences, persist: Bool = true) {
@@ -720,6 +746,7 @@ public final class WubiBridge: ObservableObject {
             publishTouchProfile()
             #endif
             _ = userDataURL.path.withCString { wubi_engine_save_user_data(h, $0) }
+            lastLoadedUserDataMtime = (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
             if refreshPublishedLists {
                 refreshUserPhrases()
                 refreshTouchProfile()
