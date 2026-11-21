@@ -2582,7 +2582,10 @@ impl WubiEngine {
             } else if allow_dyn {
                 let dyn_bonus = ((ctx + n_fast * 0.5) as f64) * 1800.0
                     + (self.user.unigram_boost(entry.text) as f64) * 1200.0;
-                let base_rank_score = 900_000.0 - (rank as f64) * 1500.0;
+                // Preserve real log-frequency gap between exact homocode words (e.g. 26x freq 优化 vs 拿破仑)
+                // while still allowing strong contextual evidence (or close-frequency pairs) to reorder freely.
+                let freq_score = ((entry.weight as f64) + 50.0).ln() * 900.0;
+                let base_rank_score = 900_000.0 + freq_score - (rank as f64) * 1200.0;
                 (1u8, base_rank_score + dyn_bonus)
             } else {
                 (1u8, 900_000.0 - (rank as f64) * 1500.0)

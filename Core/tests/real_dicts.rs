@@ -260,6 +260,18 @@ fn real_dicts_latency_schemas_and_typo_correction() {
     assert_eq!(engine.page_candidates()[0].text, "我");
     engine.clear_composition();
 
+    // Verify high-frequency exact homocode protection in Wubi98:
+    // "还能" + wdwx must prefer "优化" (weight 61M) over "拿破仑" (weight 2.3M)
+    engine.set_schema(WubiSchema::Wubi98);
+    engine.set_recent_context("还能");
+    for (i, ch) in "wdwx".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 3000 + i as u64 * 60);
+    }
+    let wdwx_cands: Vec<String> = engine.page_candidates().iter().map(|c| c.text.clone()).collect();
+    println!("Wubi98 '还能' + wdwx -> {:?}", wdwx_cands);
+    assert_eq!(wdwx_cands[0], "优化", "expected 优化 over 拿破仑 after 还能");
+    engine.clear_composition();
+
     // Test lightweight N-gram idle next-word prediction & latency
     engine.set_schema(WubiSchema::Wubi86);
     let samples = [
