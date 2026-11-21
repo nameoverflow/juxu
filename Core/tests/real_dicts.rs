@@ -756,6 +756,81 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
         "expected 'tmwy' to match auto-composed '微信', got {:?}",
         engine.page_candidates().iter().map(|c| &c.text).collect::<Vec<_>>()
     );
+
+    // 11. 3-char coined phrase ("哈基米"): must NOT be short-circuited by 2-char tail "基米",
+    //     and must compose across both single-char bursts AND mixed 2+1 bursts ("哈基" + "米")!
+    engine.clear_composition();
+    engine.clear_context();
+    for round in 0..2u64 {
+        let base_t = 16_000 + round * 1000;
+        engine.user.break_single_burst();
+        if round == 0 {
+            for (i, ch) in ["哈", "基", "米"].iter().enumerate() {
+                let _ = engine.user.record_commit_with_surprisal(
+                    "",
+                    ch,
+                    base_t + i as u64 * 150,
+                    true,
+                    2,
+                    engine.dicts[0].as_ref(),
+                    engine.pinyin_dict.as_ref(),
+                    Some(5.5),
+                );
+            }
+        } else {
+            // Mixed 2-char + 1-char burst ("哈基" + "米")
+            let _ = engine.user.record_commit_with_surprisal(
+                "",
+                "哈基",
+                base_t,
+                true,
+                2,
+                engine.dicts[0].as_ref(),
+                engine.pinyin_dict.as_ref(),
+                Some(5.5),
+            );
+            let _ = engine.user.record_commit_with_surprisal(
+                "哈基",
+                "米",
+                base_t + 150,
+                true,
+                2,
+                engine.dicts[0].as_ref(),
+                engine.pinyin_dict.as_ref(),
+                Some(5.5),
+            );
+        }
+    }
+    assert!(
+        engine.user.phrases.contains_key("哈基米"),
+        "expected 3-char '哈基米' to auto-compose across bursts, got {:?}",
+        engine.user.phrases.keys().collect::<Vec<_>>()
+    );
+    // Verify 4-code Wubi lookup (`kaoy` or encoded code) AND Full Pinyin (`hajimi`) both hit "哈基米"!
+    let hjm_code = engine.dicts[0].as_ref().unwrap().encode_phrase("哈基米").unwrap().as_string();
+    engine.set_schema(WubiSchema::Wubi86);
+    engine.clear_composition();
+    let mut hjm_committed = String::new();
+    for (i, ch) in hjm_code.chars().enumerate() {
+        let out = engine.handle_key_event(0, Some(ch), false, 19_000 + i as u64 * 40);
+        hjm_committed.push_str(&out.commit_text);
+    }
+    assert!(
+        hjm_committed == "哈基米" || engine.all_candidates().iter().any(|c| c.text == "哈基米"),
+        "expected Wubi code '{}' to commit or match '哈基米', got commit='{}'",
+        hjm_code,
+        hjm_committed
+    );
+    engine.set_schema(WubiSchema::Pinyin);
+    engine.clear_composition();
+    for (i, ch) in "hajimi".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 19_500 + i as u64 * 40);
+    }
+    assert_eq!(
+        engine.page_candidates().first().map(|c| c.text.as_str()),
+        Some("哈基米"),
+        "expected Full Pinyin 'hajimi' to rank '哈基米' at #1"
+    );
 }
 
 #[test]

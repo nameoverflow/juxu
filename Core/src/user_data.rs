@@ -90,8 +90,9 @@ pub struct UserStore {
     pub char_bigrams: HashMap<(char, char), u32>,
     pub(crate) continuations: PersonalContinuations,
     pub touch_profile: TouchProfile,
-    /// Rolling buffer of recent consecutive single-char commits `(ch, timestamp_ms, rwkv_surprisal)`
-    recent_singles: Vec<(char, u64, Option<f32>)>,
+    /// Rolling buffer of recent consecutive CJK characters `(ch, timestamp_ms, rwkv_surprisal, commit_id)`
+    /// across both single-char and multi-char commits so 3-4 char words (e.g. "哈基" + "米" -> "哈基米") compose cleanly!
+    recent_singles: Vec<(char, u64, Option<f32>, u64)>,
     /// Candidate consecutive n-grams waiting to reach `auto_phrase_threshold`
     pending_ngrams: HashMap<String, u8>,
     pub dirty: bool,
@@ -443,53 +444,71 @@ impl UserStore {
             }
         }
 
-        // Consecutive single-character burst tracking for auto-phrase!
-        let mut chars = committed.chars();
-        let first_ch = chars.next()?;
-        let is_single_cjk = chars.next().is_none() && is_cjk_ideograph(first_ch);
-
-        if !is_single_cjk {
+        // Rolling CJK burst tracking for auto-phrase (supports 2..=4 char phrases across
+        // single-char bursts AND mixed word+char bursts like "哈基" + "米" -> "哈基米"!).
+        let committed_chars: Vec<char> = committed.chars().collect();
+        if committed_chars.is_empty()
+            || committed_chars.len() > 3
+            || !committed_chars.iter().all(|&c| is_cjk_ideograph(c))
+        {
             self.recent_singles.clear();
             return None;
         }
 
-        if let Some(&(_, last_ts, _)) = self.recent_singles.last() {
+        if let Some(&(_, last_ts, _, _)) = self.recent_singles.last() {
             if timestamp_ms > 0 && last_ts > 0 && timestamp_ms.saturating_sub(last_ts) > 5000 {
                 self.recent_singles.clear();
             }
         }
-        self.recent_singles.push((first_ch, timestamp_ms, surprisal));
-        if self.recent_singles.len() > 4 {
-            self.recent_singles.remove(0);
+        for &ch in &committed_chars {
+            self.recent_singles.push((ch, timestamp_ms, surprisal, seq));
+        }
+        if self.recent_singles.len() > 6 {
+            let drain_n = self.recent_singles.len() - 6;
+            self.recent_singles.drain(..drain_n);
         }
 
         if !auto_phrase || self.recent_singles.len() < 2 {
             return None;
         }
 
-        // Check 2-char suffix (and 3-char suffix if available)
+        // Check longest suffix FIRST (4 -> 3 -> 2 chars) so a 3-char word like "哈基米" is NEVER
+        // short-circuited by its 2-char tail "基米", and require spanning >= 2 distinct commits!
         let n = self.recent_singles.len();
-        let cand2: String = self.recent_singles[n - 2..n].iter().map(|x| x.0).collect();
-        let surp2 = self.recent_singles[n - 1].2;
-        let promoted = self.bump_pending_ngram(&cand2, auto_threshold, dict, pdict, surp2);
-        if promoted.is_some() {
-            return promoted;
+        let mut promoted: Option<String> = None;
+        for cand_len in [4usize, 3usize, 2usize] {
+            if n < cand_len {
+                continue;
+            }
+            let slice = &self.recent_singles[n - cand_len..n];
+            let first_cid = slice[0].3;
+            let last_cid = slice[cand_len - 1].3;
+            if first_cid == last_cid {
+                // Entire suffix came from a single already-committed word; skip.
+                continue;
+            }
+            let cand: String = slice.iter().map(|x| x.0).collect();
+            let mut sum_s = 0.0f32;
+            let mut cnt_s = 0usize;
+            for item in &slice[1..] {
+                if let Some(s) = item.2 {
+                    sum_s += s;
+                    cnt_s += 1;
+                }
+            }
+            let mean_surp = (cnt_s > 0).then(|| sum_s / (cnt_s as f32));
+            if let Some(word) = self.bump_pending_ngram(&cand, auto_threshold, dict, pdict, mean_surp)
+            {
+                promoted = Some(word);
+                // If a longer 3-4 char phrase just promoted, stop so we don't also pollute with its shorter tail!
+                break;
+            }
         }
-        if n >= 3 {
-            let cand3: String = self.recent_singles[n - 3..n].iter().map(|x| x.0).collect();
-            let surp3 = match (self.recent_singles[n - 2].2, self.recent_singles[n - 1].2) {
-                (Some(a), Some(b)) => Some(0.5 * (a + b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            return self.bump_pending_ngram(&cand3, auto_threshold, dict, pdict, surp3);
-        }
-        None
+        promoted
     }
 
     /// Promote a multi-character phrase assembled by the user (e.g. from Pinyin multi-segment selection)
-    /// when it is surprising to RWKV and not already in the dictionary.
+    /// when it is not already in the dictionary.
     pub fn record_assembled_phrase(
         &mut self,
         phrase: &str,
@@ -520,11 +539,6 @@ impl UserStore {
         if self.phrases.contains_key(phrase) {
             return None;
         }
-        // Always filter functional particle glue chars (的/了/着/过/吗/呢/吧/啊/呀/哦)
-        // so pairs like "我的" or "去了" never pollute personal phrases.
-        if phrase.chars().any(is_stop_glue_char) {
-            return None;
-        }
         if let Some(d) = dict {
             let Some(code) = d.encode_phrase(phrase) else {
                 return None;
@@ -537,14 +551,13 @@ impl UserStore {
                 return None;
             }
         }
-        // Surprisal-guided promotion when Micro-RWKV-7 is active (after dict-absence & glue checks):
-        // - High RWKV cohesion (`surp < 4.0`, i.e. P(c2|c1) > ~1.8%, e.g. "微信" missing from Wubi86 dict)
-        //   on content chars: strong evidence of a real missing modern word -> accelerate promotion (+2)!
-        // - Otherwise (including high-surprisal rare terms or accidental cross-word pairs like "这微"):
-        //   standard +1 so it must be repeated `threshold` times before promotion!
-        let has_common_clause_glue = phrase.chars().any(is_clause_glue_char);
+        // Pure probability + repeat gating (no hardcoded function-word blacklist!):
+        // - High RWKV cohesion (`surp < 4.0`, e.g. "微信" missing from Wubi86 dict):
+        //   strong evidence of a real missing modern word -> accelerate promotion (+2)!
+        // - Otherwise (e.g. coined terms like "哈基米" / "星锚" or accidental pairs):
+        //   standard +1 so it promotes cleanly once repeated `threshold` times!
         let bump: u8 = if let Some(surp) = mean_surprisal {
-            if surp < 4.0 && !has_common_clause_glue {
+            if surp < 4.0 {
                 2
             } else {
                 1
@@ -772,21 +785,4 @@ fn escape_tab(s: &str) -> String {
 fn is_cjk_ideograph(ch: char) -> bool {
     let u = ch as u32;
     (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u)
-}
-
-#[inline]
-fn is_stop_glue_char(ch: char) -> bool {
-    matches!(
-        ch,
-        '的' | '了' | '着' | '过' | '吗' | '呢' | '吧' | '啊' | '呀' | '哦'
-    )
-}
-
-#[inline]
-fn is_clause_glue_char(ch: char) -> bool {
-    matches!(
-        ch,
-        '我' | '你' | '他' | '她' | '它' | '是' | '在' | '有' | '不' | '也' | '都' | '就' | '很'
-            | '这' | '那'
-    )
 }
