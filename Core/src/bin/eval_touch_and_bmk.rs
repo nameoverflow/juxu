@@ -187,6 +187,11 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--tsv-dir")
         .map(|w| PathBuf::from(&w[1]));
+    let public_tsv = args
+        .windows(2)
+        .find(|w| w[0] == "--public-tsv")
+        .map(|w| PathBuf::from(&w[1]));
+    let skip_touch = args.iter().any(|a| a == "--skip-touch");
     let max_per_domain: usize = args
         .windows(2)
         .find(|w| w[0] == "--max-per-domain")
@@ -240,6 +245,7 @@ fn main() {
     let layout = KeyLayout::default();
     let empty_prof = TouchProfile::default();
 
+    if !skip_touch {
     println!("\n[2] Continuous 2D Touchscreen Typo Simulator ({} sentences, Full Pinyin)", TOUCH_SENTENCES.len());
 
     // 2a. Clean Border Taps (offset 0.38 toward neighbor, still inside intended key -> measure FP)
@@ -408,6 +414,64 @@ fn main() {
             "  Systematic Bias (+0.22,+0.12) Adapt   | First12: Top-1={:>2}/12 CharAcc={:5.2}% -> Last12: Top-1={:>2}/12 CharAcc={:5.2}%",
             first_t1, 100.0 * first_h as f64 / first_t.max(1) as f64,
             last_t1, 100.0 * last_h as f64 / last_t.max(1) as f64
+        );
+    }
+    } // end if !skip_touch
+
+    // -------------------------------------------------------------------------
+    // 4. Public P2C Benchmark TSV (`domain\tchinese\tpinyin` exact gold pairs)
+    // -------------------------------------------------------------------------
+    if let Some(ref pub_path) = public_tsv {
+        let mut e = make_engine(WubiSchema::Pinyin, &aux_path, true, false);
+        #[derive(Default)]
+        struct PStat { n: usize, t1: usize, t3: usize, ch_h: usize, ch_t: usize }
+        let mut stats: BTreeMap<String, PStat> = BTreeMap::new();
+        let content = fs::read_to_string(pub_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {}", pub_path.display(), err));
+        for line in content.lines() {
+            if line.is_empty() || line.starts_with('#') { continue; }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 3 { continue; }
+            let dom = parts[0].trim().to_owned();
+            let target = parts[1].trim();
+            let py = parts[2].trim();
+            let st = stats.entry(dom).or_default();
+            if st.n >= max_per_domain { continue; }
+            e.clear_composition();
+            e.set_recent_context("");
+            for (i, ch) in py.chars().enumerate() {
+                let _ = e.handle_key_event(0, Some(ch), false, 1000 + i as u64 * 60);
+            }
+            let cands = e.all_candidates();
+            let got = cands.first().map(|c| c.text.as_str()).unwrap_or("");
+            let r = cands.iter().position(|c| c.text == target);
+            st.n += 1;
+            if r == Some(0) { st.t1 += 1; }
+            if r.is_some_and(|x| x < 3) { st.t3 += 1; }
+            let (h, t) = char_acc(target, got);
+            st.ch_h += h; st.ch_t += t;
+        }
+        println!("\n[4] Public P2C Benchmark: {}", pub_path.display());
+        println!("  {:<22} {:>5} {:>8} {:>8} {:>8} {:>7}", "Suite", "N", "Top-1", "Top-3", "CharAcc", "CER");
+        let mut tot = PStat::default();
+        for (dom, st) in &stats {
+            tot.n += st.n; tot.t1 += st.t1; tot.t3 += st.t3; tot.ch_h += st.ch_h; tot.ch_t += st.ch_t;
+            let acc = 100.0 * st.ch_h as f64 / st.ch_t.max(1) as f64;
+            println!(
+                "  {:<22} {:>5} {:>7.1}% {:>7.1}% {:>7.2}% {:>6.2}%",
+                dom, st.n,
+                100.0 * st.t1 as f64 / st.n.max(1) as f64,
+                100.0 * st.t3 as f64 / st.n.max(1) as f64,
+                acc, 100.0 - acc
+            );
+        }
+        let acc = 100.0 * tot.ch_h as f64 / tot.ch_t.max(1) as f64;
+        println!(
+            "  {:<22} {:>5} {:>7.1}% {:>7.1}% {:>7.2}% {:>6.2}%",
+            "TOTAL", tot.n,
+            100.0 * tot.t1 as f64 / tot.n.max(1) as f64,
+            100.0 * tot.t3 as f64 / tot.n.max(1) as f64,
+            acc, 100.0 - acc
         );
     }
 
