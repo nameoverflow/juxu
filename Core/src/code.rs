@@ -1,17 +1,18 @@
-/// Base-27 positional encoding for 1..=4 lowercase ASCII letters ('a'..='z').
+/// Base-27 positional encoding for 1..=5 lowercase ASCII letters ('a'..='z').
 ///
 /// Each slot holds 0 (empty) or 1..=26 ('a'..='z'):
-/// `packed = d0 * 27^3 + d1 * 27^2 + d2 * 27 + d3`
+/// `packed = d0 * 27^4 + d1 * 27^3 + d2 * 27^2 + d3 * 27 + d4`
 ///
 /// Key property: integer `<` matches exact ASCII lexicographical order, and
 /// any prefix `p` spans a contiguous integer range `[min, max]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct PackedCode(pub u32);
 
-pub const B0: u32 = 27 * 27 * 27; // 19683
-pub const B1: u32 = 27 * 27;      // 729
-pub const B2: u32 = 27;
-pub const MAX_PACKED_CODE: u32 = 26 * B0 + 26 * B1 + 26 * B2 + 26; // 531,440
+pub const B0: u32 = 27 * 27 * 27 * 27; // 531,441
+pub const B1: u32 = 27 * 27 * 27;      // 19,683
+pub const B2: u32 = 27 * 27;           // 729
+pub const B3: u32 = 27;
+pub const MAX_PACKED_CODE: u32 = 26 * B0 + 26 * B1 + 26 * B2 + 26 * B3 + 26; // 14,348,906
 
 impl PackedCode {
     pub const EMPTY: Self = Self(0);
@@ -23,11 +24,11 @@ impl PackedCode {
 
     #[inline]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.is_empty() || bytes.len() > 4 {
+        if bytes.is_empty() || bytes.len() > 5 {
             return None;
         }
         let mut acc = 0u32;
-        let weights = [B0, B1, B2, 1];
+        let weights = [B0, B1, B2, B3, 1];
         for (i, &b) in bytes.iter().enumerate() {
             let d = match b {
                 b'a'..=b'z' => (b - b'a' + 1) as u32,
@@ -45,15 +46,17 @@ impl PackedCode {
     }
 
     #[inline]
-    pub fn digits(self) -> [u8; 4] {
+    pub fn digits(self) -> [u8; 5] {
         let v = self.0;
         let d0 = (v / B0) as u8;
         let r0 = v % B0;
         let d1 = (r0 / B1) as u8;
         let r1 = r0 % B1;
         let d2 = (r1 / B2) as u8;
-        let d3 = (r1 % B2) as u8;
-        [d0, d1, d2, d3]
+        let r2 = r1 % B2;
+        let d3 = (r2 / B3) as u8;
+        let d4 = (r2 % B3) as u8;
+        [d0, d1, d2, d3, d4]
     }
 
     #[inline]
@@ -67,15 +70,17 @@ impl PackedCode {
             2
         } else if d[3] == 0 {
             3
-        } else {
+        } else if d[4] == 0 {
             4
+        } else {
+            5
         }
     }
 
     #[inline]
-    pub fn to_bytes_buf(self) -> ([u8; 4], usize) {
+    pub fn to_bytes_buf(self) -> ([u8; 5], usize) {
         let d = self.digits();
-        let mut out = [0u8; 4];
+        let mut out = [0u8; 5];
         let mut n = 0;
         for slot in d {
             if slot == 0 {
@@ -98,13 +103,44 @@ impl PackedCode {
         let n = self.len();
         let hi_tail = match n {
             0 => MAX_PACKED_CODE,
-            1 => 26 * B1 + 26 * B2 + 26,
-            2 => 26 * B2 + 26,
-            3 => 26,
+            1 => 26 * B1 + 26 * B2 + 26 * B3 + 26,
+            2 => 26 * B2 + 26 * B3 + 26,
+            3 => 26 * B3 + 26,
+            4 => 26,
             _ => 0,
         };
         (self, Self(self.0 + hi_tail))
     }
+}
+
+/// Standard Cangjie radical glyph for ASCII letters `'a'..='z'`.
+#[inline]
+pub fn cangjie_radical_char(b: u8) -> Option<char> {
+    const RADICALS: [char; 26] = [
+        '日', '月', '金', '木', '水', '火', '土', '竹', '戈', '十', '大', '中', '一',
+        '弓', '人', '心', '手', '口', '尸', '廿', '山', '女', '田', '難', '卜', '重',
+    ];
+    let idx = match b {
+        b'a'..=b'z' => (b - b'a') as usize,
+        b'A'..=b'Z' => (b - b'A') as usize,
+        _ => return None,
+    };
+    Some(RADICALS[idx])
+}
+
+/// Convert an ASCII Cangjie code string into Cangjie radical glyphs (e.g. `"oi"` -> `"人戈"`).
+pub fn cangjie_radicals_str(code: &str) -> String {
+    let mut out = String::with_capacity(code.len() * 3);
+    for ch in code.chars() {
+        if ch.is_ascii() {
+            if let Some(rad) = cangjie_radical_char(ch as u8) {
+                out.push(rad);
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Compact 2-letter character stem (`AaAb`) used by Wubi phrase encoding rules:
@@ -183,7 +219,7 @@ pub fn compose_phrase_code(stems: &[Stem2]) -> Option<PackedCode> {
     let raw = (digits[0] as u32) * B0
         + (digits[1] as u32) * B1
         + (digits[2] as u32) * B2
-        + (digits[3] as u32);
+        + (digits[3] as u32) * B3;
     Some(PackedCode(raw))
 }
 

@@ -1,4 +1,4 @@
-use crate::code::{PackedCode, B0, B1, B2};
+use crate::code::{PackedCode, B0, B1, B2, B3};
 use crate::config::TypoConfig;
 use crate::user_data::TouchProfile;
 
@@ -250,7 +250,7 @@ pub fn generate_hypotheses_with_options(
     cfg: &TypoConfig,
     allow_z: bool,
 ) -> Vec<CodeHypothesis> {
-    if observations.is_empty() || observations.len() > 4 {
+    if observations.is_empty() || observations.len() > 5 {
         return Vec::new();
     }
     let raw_bytes: Vec<u8> = observations.iter().map(|o| o.ch).collect();
@@ -281,9 +281,9 @@ pub fn generate_hypotheses_with_options(
     }
 
     // Step 2: Beam search across positions 0..len
-    // Tuple: `(digits: [u8; 4], len: usize, cum_logp: f32, all_exact: bool, any_boundary: bool, edits: u8)`
-    let mut beam: Vec<([u8; 4], usize, f32, bool, bool, u8)> =
-        vec![([0u8; 4], 0, 0.0, true, false, 0)];
+    // Tuple: `(digits: [u8; 5], len: usize, cum_logp: f32, all_exact: bool, any_boundary: bool, edits: u8)`
+    let mut beam: Vec<([u8; 5], usize, f32, bool, bool, u8)> =
+        vec![([0u8; 5], 0, 0.0, true, false, 0)];
 
     for choices in &step_choices {
         let mut next_beam = Vec::with_capacity(beam.len() * choices.len());
@@ -316,7 +316,7 @@ pub fn generate_hypotheses_with_options(
         beam = next_beam;
     }
 
-    let weights = [B0, B1, B2, 1];
+    let weights = [B0, B1, B2, B3, 1];
     let mut out = Vec::<CodeHypothesis>::with_capacity(beam.len() + 3);
     for (digits, len, lp, all_exact, any_boundary, _) in beam {
         let mut raw = 0u32;

@@ -493,7 +493,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "Usage: build-dicts <raw-tables-dir> <output-dicts-dir> [--corpus-lm <dir>] [--aux-only]"
+            "Usage: build-dicts <raw-tables-dir> <output-dicts-dir> [--corpus-lm <dir>] [--aux-only] [--wbdict-only]"
         );
         std::process::exit(1);
     }
@@ -504,6 +504,7 @@ fn main() {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     let mut aux_only = false;
+    let mut wbdict_only = false;
 
     let mut i = 3;
     while i < args.len() {
@@ -514,6 +515,10 @@ fn main() {
             }
             "--aux-only" => {
                 aux_only = true;
+                i += 1;
+            }
+            "--wbdict-only" => {
+                wbdict_only = true;
                 i += 1;
             }
             other => {
@@ -580,16 +585,62 @@ fn main() {
             );
         }
 
-        let ice_dir = raw_dir.join("pinyin_ice");
-        if ice_dir.exists() {
-            let py_blob = build_pinyin_dict(&ice_dir, &tghz_set);
-            let out_path = out_dir.join("pinyin.pydict");
-            fs::write(&out_path, &py_blob).expect("failed to write pinyin.pydict");
-            println!(
-                "Built pinyin.pydict ({:.2} MB)",
-                py_blob.len() as f64 / (1024.0 * 1024.0)
-            );
+        let cj_specs: &[(u32, &str, &[&str], bool, &str)] = &[
+            (
+                33,
+                "cangjie3",
+                &["cangjie.3-base.dict.yaml", "cangjie.3-base-dups.dict.yaml"],
+                true, // columns: code \t text
+                "cangjie3.wbdict",
+            ),
+            (
+                35,
+                "cangjie5",
+                &["cangjie5.base.dict.yaml", "cangjie5.extended.dict.yaml"],
+                false, // columns: text \t code
+                "cangjie5.wbdict",
+            ),
+            (
+                36,
+                "cangjie6",
+                &["cangjie6.dict.yaml"],
+                false, // columns: text \t code \t weight \t stem
+                "cangjie6.wbdict",
+            ),
+        ];
+        for &(schema_id, sub_dir, files, code_first, out_name) in cj_specs {
+            let cj_dir = raw_dir.join(sub_dir);
+            if cj_dir.exists() {
+                let (cj_blob, entry_cnt, char_cnt) =
+                    build_cangjie_dict(&cj_dir, schema_id, files, code_first, &tghz_set, &global_char_weights);
+                let out_path = out_dir.join(out_name);
+                fs::write(&out_path, &cj_blob).expect("failed to write cangjie wbdict");
+                println!(
+                    "Built {} ({:.2} MB): {} entries, {} chars",
+                    out_name,
+                    cj_blob.len() as f64 / (1024.0 * 1024.0),
+                    entry_cnt,
+                    char_cnt
+                );
+            }
         }
+
+        if !wbdict_only {
+            let ice_dir = raw_dir.join("pinyin_ice");
+            if ice_dir.exists() {
+                let py_blob = build_pinyin_dict(&ice_dir, &tghz_set);
+                let out_path = out_dir.join("pinyin.pydict");
+                fs::write(&out_path, &py_blob).expect("failed to write pinyin.pydict");
+                println!(
+                    "Built pinyin.pydict ({:.2} MB)",
+                    py_blob.len() as f64 / (1024.0 * 1024.0)
+                );
+            }
+        }
+    }
+
+    if wbdict_only {
+        return;
     }
 
     let aux_input = build_aux_data(
@@ -733,6 +784,162 @@ fn build_xiaohe_dict(
         entries,
         char_metas,
     })
+}
+
+fn build_cangjie_dict(
+    cj_dir: &Path,
+    schema_id: u32,
+    files: &[&str],
+    code_first: bool,
+    tghz_set: &HashSet<u32>,
+    global_char_weights: &HashMap<u32, u64>,
+) -> (Vec<u8>, usize, usize) {
+    let mut entries: Vec<(PackedCode, String, u32, u16)> = Vec::new();
+    let mut char_shortest: HashMap<u32, (PackedCode, u32)> = HashMap::new();
+    let mut char_full: HashMap<u32, (PackedCode, u32)> = HashMap::new();
+    let mut per_code_seen: HashMap<PackedCode, u32> = HashMap::new();
+
+    for (file_idx, &fname) in files.iter().enumerate() {
+        let path = cj_dir.join(fname);
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut in_body = false;
+        let file_base_wt: u32 = if file_idx == 0 {
+            1_000_000_000
+        } else {
+            200_000_000
+        };
+
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if !in_body {
+                if line == "..." {
+                    in_body = true;
+                }
+                continue;
+            }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let (text, code_str) = if code_first {
+                (parts[1].trim(), parts[0].trim())
+            } else {
+                (parts[0].trim(), parts[1].trim())
+            };
+            if text.is_empty() || code_str.is_empty() || code_str.len() > 5 {
+                continue;
+            }
+            if !code_str.bytes().all(|b| b.is_ascii_lowercase()) {
+                continue;
+            }
+            let Some(pcode) = PackedCode::from_ascii(code_str) else {
+                continue;
+            };
+
+            let explicit_wt: Option<u64> = if !code_first {
+                parts
+                    .get(2)
+                    .and_then(|s| s.trim().trim_end_matches('%').parse::<u64>().ok())
+            } else {
+                None
+            };
+
+            let seen_idx = per_code_seen.entry(pcode).or_insert(0);
+            let order_tie = 500_000u32.saturating_sub((*seen_idx).saturating_mul(10));
+            *seen_idx += 1;
+
+            let mut chars_it = text.chars();
+            let first_ch = chars_it.next().unwrap();
+            let is_single = chars_it.next().is_none();
+
+            let mut flags = 0u16;
+            if is_single {
+                flags |= ENTRY_FLAG_SINGLE_CHAR;
+                let cp = first_ch as u32;
+                // Keep all BMP CJK characters (both Traditional and Simplified) in standard charset;
+                // mark non-BMP extension characters (Ext B-I) outside TGHZ as rare.
+                if cp > 0xFFFF && !tghz_set.contains(&cp) {
+                    flags |= ENTRY_FLAG_EXT_RARE;
+                }
+            }
+
+            let final_wt: u32 = if let Some(ew) = explicit_wt {
+                // Cangjie 6 provides explicit relative weights (0, 1, 2, ...):
+                // prioritize explicit weight first, then preserve file order.
+                file_base_wt
+                    .saturating_add((ew.min(10_000) as u32).saturating_mul(1_000_000))
+                    .saturating_add(order_tie)
+            } else if is_single && (flags & ENTRY_FLAG_EXT_RARE) == 0 {
+                // Preserve exact canonical file order for Cangjie 3/5, with gentle frequency nudge only for ties
+                let freq_nudge = global_char_weights
+                    .get(&(first_ch as u32))
+                    .map(|&gw| (gw / 10_000_000).min(9) as u32)
+                    .unwrap_or(0);
+                file_base_wt.saturating_add(order_tie).saturating_add(freq_nudge)
+            } else {
+                order_tie
+            };
+
+            if is_single {
+                let cp = first_ch as u32;
+                char_shortest
+                    .entry(cp)
+                    .and_modify(|prev| {
+                        if code_str.len() < prev.0.len()
+                            || (code_str.len() == prev.0.len() && final_wt > prev.1)
+                        {
+                            *prev = (pcode, final_wt);
+                        }
+                    })
+                    .or_insert((pcode, final_wt));
+                char_full
+                    .entry(cp)
+                    .and_modify(|prev| {
+                        if code_str.len() > prev.0.len()
+                            || (code_str.len() == prev.0.len() && final_wt > prev.1)
+                        {
+                            *prev = (pcode, final_wt);
+                        }
+                    })
+                    .or_insert((pcode, final_wt));
+            }
+            entries.push((pcode, text.to_string(), final_wt, flags));
+        }
+    }
+
+    let mut char_metas = Vec::with_capacity(char_full.len());
+    for (cp, (full_code, _)) in &char_full {
+        let shortest_code = char_shortest.get(cp).map(|x| x.0).unwrap_or(*full_code);
+        let (buf, n) = full_code.to_bytes_buf();
+        let stem2 = Stem2::from_bytes(&buf[..n.min(2)]).unwrap_or_default();
+        let flags = if *cp > 0xFFFF && !tghz_set.contains(cp) {
+            ENTRY_FLAG_EXT_RARE
+        } else {
+            0
+        };
+        char_metas.push(CharMeta {
+            codepoint: *cp,
+            stem2,
+            flags,
+            shortest_code,
+            primary_short_code: PackedCode::EMPTY,
+            full_code: *full_code,
+        });
+    }
+
+    let entry_cnt = entries.len();
+    let char_cnt = char_metas.len();
+    let blob = serialize_wbdict(DictBuildInput {
+        schema_id,
+        entries,
+        char_metas,
+    });
+    (blob, entry_cnt, char_cnt)
 }
 
 fn build_pinyin_dict(ice_dir: &Path, tghz_set: &HashSet<u32>) -> Vec<u8> {

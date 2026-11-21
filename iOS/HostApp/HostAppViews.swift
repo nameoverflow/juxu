@@ -260,25 +260,50 @@ public struct IOSHostRootView: View {
     // MARK: - Tab 2: Typing & Schema Rules
 
     private var typingTab: some View {
-        iosScreenContainer(title: "输入设置") {
+        let activeCategory = bridge.prefs.schemaCategory
+        let isCangjie = bridge.prefs.isCangjieFamily
+        let maxCodeLabel = isCangjie ? "五" : "四"
+        let pushCodeLabel = isCangjie ? "六" : "五"
+        return iosScreenContainer(title: "输入设置") {
             ScrollView {
                 VStack(spacing: 14) {
-                    // 1-Tap Schema Switcher Cards
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("输入方案快速切换")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.secondary)
+                    // 2-Level Schema Switcher: Category (拼音/五笔/仓颉) -> Version
+                    VStack(alignment: .leading, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("方案大类")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(bridge.state.schemaName)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(Color.accentColor)
+                            }
 
-                        HStack(spacing: 8) {
-                            compactSchemaButton(id: 20, name: "全拼", tag: "整句简拼")
-                            compactSchemaButton(id: 21, name: "小鹤双拼", tag: "双拼整句")
-                            compactSchemaButton(id: 10, name: "小鹤音形", tag: "双拼+鹤形")
+                            HStack(spacing: 6) {
+                                ForEach(InputSchemaCategory.allCases) { category in
+                                    compactCategoryButton(category)
+                                }
+                            }
+                            .padding(3)
+                            .background(
+                                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                    .fill(Color.primary.opacity(0.06))
+                            )
                         }
 
-                        HStack(spacing: 8) {
-                            compactSchemaButton(id: 86, name: "86 版", tag: "经典五笔")
-                            compactSchemaButton(id: 98, name: "98 版", tag: "规范码元")
-                            compactSchemaButton(id: 6, name: "新世纪", tag: "06 国标")
+                        Divider()
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("\(activeCategory.rawValue)方案版本")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(.secondary)
+
+                            HStack(spacing: 8) {
+                                ForEach(InputSchemaOption.options(for: activeCategory)) { option in
+                                    compactSchemaButton(id: option.id, name: option.shortTitle, tag: option.tag)
+                                }
+                            }
                         }
                     }
                     .padding(14)
@@ -286,13 +311,13 @@ public struct IOSHostRootView: View {
 
                     if !bridge.prefs.isPinyinFamily {
                         VStack(spacing: 12) {
-                            iosToggleRow("四码唯一自动上屏", sub: "精确四码唯一匹配时直接上屏", isOn: binding(\.fourthCodeAutoCommit))
+                            iosToggleRow("\(maxCodeLabel)码唯一自动上屏", sub: "精确\(maxCodeLabel)码唯一匹配时直接上屏", isOn: binding(\.fourthCodeAutoCommit))
                             Divider()
-                            iosToggleRow("第五码自动顶字", sub: "四码重码时敲第 5 码将首选词顶上屏", isOn: binding(\.fifthCodePushCommit))
+                            iosToggleRow("第\(pushCodeLabel)码自动顶字", sub: "\(maxCodeLabel)码重码时敲第 \(isCangjie ? "6" : "5") 码将首选词顶上屏", isOn: binding(\.fifthCodePushCommit))
                             Divider()
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text("四码空码行为")
+                                    Text("\(maxCodeLabel)码空码行为")
                                         .font(.system(size: 15))
                                     Text("无匹配且无高置信度纠错时的动作")
                                         .font(.system(size: 12))
@@ -300,7 +325,7 @@ public struct IOSHostRootView: View {
                                 }
                                 Spacer()
                                 Picker("", selection: binding(\.fourthEmptyBehavior)) {
-                                    Text("阻断第4码").tag("block")
+                                    Text("阻断第\(isCangjie ? "5" : "4")码").tag("block")
                                     Text("清空重输").tag("clear")
                                 }
                                 .labelsHidden()
@@ -323,7 +348,11 @@ public struct IOSHostRootView: View {
                         } else {
                             iosToggleRow("流式无空格连打（实验）", sub: "连续输入词组和简码。标点确认中文，回车输入原始字母", isOn: binding(\.spaceless))
                             Divider()
-                            iosToggleRow("最短编码（简码）优先", sub: "1–3 码简码始终排在补全项之前", isOn: binding(\.shortestCodeFirst))
+                            iosToggleRow(
+                                "最短编码（简码）优先",
+                                sub: isCangjie ? "1–4 码精确匹配始终排在补全项之前" : "1–3 码简码始终排在补全项之前",
+                                isOn: binding(\.shortestCodeFirst)
+                            )
                             Divider()
                             iosToggleRow("全码显示 ⚡ 简码提示", sub: "打全码时提示更短简码", isOn: binding(\.showShortcodeHint))
                             Divider()
@@ -331,10 +360,10 @@ public struct IOSHostRootView: View {
                                 "出简不出全",
                                 sub: bridge.prefs.spaceless
                                     ? "优先按首选简码切分单字，较长的编码仍可出字"
-                                    : "有首选简码的单字在四码全码时后置",
+                                    : "有首选简码的单字在\(maxCodeLabel)码全码时后置",
                                 isOn: binding(\.strictShortcode)
                             )
-                            if bridge.prefs.schemaId != 10 {
+                            if bridge.prefs.isWubiFamily {
                                 Divider()
                                 iosToggleRow("z 键通配与拼音反查", sub: "z 查码 + 输拼音反查五笔拆码", isOn: binding(\.zOmnipotent))
                             }
@@ -521,6 +550,31 @@ public struct IOSHostRootView: View {
     private var iosCardBackground: some View {
         RoundedRectangle(cornerRadius: 13, style: .continuous)
             .fill(Color.primary.opacity(0.055))
+    }
+
+    private func compactCategoryButton(_ category: InputSchemaCategory) -> some View {
+        let active = bridge.prefs.schemaCategory == category
+        return Button {
+            if !active {
+                bridge.switchSchema(category.defaultSchemaId)
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: category.symbolName)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(category.rawValue)
+                    .font(.system(size: 14, weight: .semibold))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 8.5, style: .continuous)
+                    .fill(active ? Color.accentColor : Color.clear)
+            )
+            .foregroundStyle(active ? Color.white : Color.primary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private func compactSchemaButton(id: UInt32, name: String, tag: String) -> some View {

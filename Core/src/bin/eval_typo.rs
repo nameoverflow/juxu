@@ -551,6 +551,9 @@ fn main() {
         WubiSchema::Wubi98 => dicts_dir.join("wubi98.wbdict"),
         WubiSchema::Wubi06 => dicts_dir.join("wubi06.wbdict"),
         WubiSchema::Xiaohe => dicts_dir.join("xiaohe.wbdict"),
+        WubiSchema::Cangjie3 => dicts_dir.join("cangjie3.wbdict"),
+        WubiSchema::Cangjie5 => dicts_dir.join("cangjie5.wbdict"),
+        WubiSchema::Cangjie6 => dicts_dir.join("cangjie6.wbdict"),
         WubiSchema::Pinyin | WubiSchema::XiaoheShuangpin => dicts_dir.join("wubi86.wbdict"),
     };
 

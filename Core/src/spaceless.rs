@@ -10,7 +10,7 @@ use crate::user_data::UserStore;
 use std::collections::{HashMap, VecDeque};
 
 const BEAM_WIDTH: usize = 8;
-const MAX_CODE_LEN: usize = 4;
+const MAX_CODE_LEN: usize = 5;
 const RETAINED_LAYERS: usize = 8;
 const COMMIT_DELAY: usize = 8;
 const COMMIT_SCORE_MARGIN: f32 = 5.0;
@@ -196,7 +196,8 @@ impl Stream {
             .copied()
             .take_while(|b| b.keys <= limit)
             .collect();
-        for tail_len in 0..MAX_CODE_LEN {
+        let max_code_len = config.schema.max_code_len();
+        for tail_len in 0..max_code_len {
             if cuts.is_empty() {
                 return None;
             }
@@ -281,7 +282,8 @@ impl Stream {
         let personal = &decoder.user.continuations;
         let personalize = decoder.config.dynamic_word_freq && !personal.is_empty();
         let use_personal_states = personalize && personal.matches_model(&decoder.model);
-        for len in 1..=end.min(MAX_CODE_LEN) {
+        let max_code_len = decoder.config.schema.max_code_len();
+        for len in 1..=end.min(max_code_len) {
             let parent_pos = end - len;
             let parents = self.layer(parent_pos);
             if parents.is_empty() {

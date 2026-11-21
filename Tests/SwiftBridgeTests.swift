@@ -323,6 +323,29 @@ struct SwiftBridgeTests {
         assert(multipartPrefix.contains("whisper-large-v3-turbo"))
         assert(multipartPrefix.contains("speech.wav"))
 
-        print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Bayesian typo & macOS Voice MVP tests passed!")
+        // 7. Verify Cangjie 3 / 5 / 6 schema switching, categories, TOML round-trip, and 5-code input
+        for (sid, expectedName, expectedTag) in [(UInt32(33), "仓颉三代", "cangjie3"), (UInt32(35), "仓颉五代", "cangjie5"), (UInt32(36), "仓颉六代", "cangjie6")] {
+            bridge.switchSchema(sid, persist: false)
+            assert(bridge.state.schemaId == sid)
+            assert(bridge.state.schemaName == expectedName, "Expected \(expectedName), got \(bridge.state.schemaName)")
+            assert(bridge.prefs.schemaCategory == .cangjie)
+            assert(bridge.prefs.isCangjieFamily)
+            let toml = bridge.prefs.toTOML()
+            assert(toml.contains("schema = \"\(expectedTag)\""))
+            assert(WubiPreferences.fromTOML(toml).schemaId == sid)
+        }
+        bridge.switchSchema(35, persist: false)
+        var cjPrefs = bridge.prefs
+        cjPrefs.spaceless = false
+        bridge.applyAndSavePreferences(cjPrefs, persist: false)
+        for ch in "grmb".unicodeScalars {
+            let s = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 700)
+            assert(s.commitText.isEmpty)
+        }
+        assert(bridge.state.preedit == "土口一月", "Expected Cangjie radicals 土口一月, got \(bridge.state.preedit)")
+        let cj5Out = bridge.handleKey(keyCode: 0, scalar: UnicodeScalar("c").value, hasCmdOrCtrl: false, timestampMs: 720)
+        assert(cj5Out.commitText == "頡", "Expected Cangjie 5-code auto-commit 頡, got \(cj5Out.commitText)")
+
+        print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Cangjie, Bayesian typo & macOS Voice MVP tests passed!")
     }
 }

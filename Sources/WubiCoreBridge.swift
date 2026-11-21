@@ -208,6 +208,71 @@ public struct UserPhraseRecord: Codable, Identifiable, Equatable, Sendable {
     public var id: String { text }
 }
 
+public enum InputSchemaCategory: String, CaseIterable, Identifiable, Sendable {
+    case pinyin = "拼音"
+    case wubi = "五笔"
+    case cangjie = "仓颉"
+
+    public var id: String { rawValue }
+
+    public var subtitle: String {
+        switch self {
+        case .pinyin: return "全拼 · 小鹤双拼 · 小鹤音形"
+        case .wubi: return "86 版 · 98 版 · 新世纪"
+        case .cangjie: return "仓颉三代 · 五代 · 六代"
+        }
+    }
+
+    public var symbolName: String {
+        switch self {
+        case .pinyin: return "character.phonetic"
+        case .wubi: return "square.grid.2x2"
+        case .cangjie: return "character.book.closed"
+        }
+    }
+
+    public var defaultSchemaId: UInt32 {
+        switch self {
+        case .pinyin: return 20
+        case .wubi: return 86
+        case .cangjie: return 35
+        }
+    }
+
+    public static func category(for schemaId: UInt32) -> InputSchemaCategory {
+        switch schemaId {
+        case 20, 21, 10: return .pinyin
+        case 33, 35, 36: return .cangjie
+        default: return .wubi
+        }
+    }
+}
+
+public struct InputSchemaOption: Identifiable, Equatable, Sendable {
+    public let id: UInt32
+    public let category: InputSchemaCategory
+    public let title: String
+    public let shortTitle: String
+    public let tag: String
+    public let desc: String
+
+    public static let all: [InputSchemaOption] = [
+        InputSchemaOption(id: 20, category: .pinyin, title: "全拼", shortTitle: "全拼", tag: "整句简拼", desc: "整句连打 · 声母简拼 · 触点纠错"),
+        InputSchemaOption(id: 21, category: .pinyin, title: "小鹤双拼", shortTitle: "小鹤双拼", tag: "双拼整句", desc: "小鹤双拼键位 · 整句连打 · 触点纠错"),
+        InputSchemaOption(id: 10, category: .pinyin, title: "小鹤音形", shortTitle: "小鹤音形", tag: "双拼+鹤形", desc: "双拼 + 鹤形辅助码 · 定长/整句"),
+        InputSchemaOption(id: 86, category: .wubi, title: "86 版五笔", shortTitle: "86 版", tag: "经典五笔", desc: "王永民经典版 · 通用度最广"),
+        InputSchemaOption(id: 98, category: .wubi, title: "98 版五笔", shortTitle: "98 版", tag: "规范码元", desc: "码元规范化 · 拆分更科学"),
+        InputSchemaOption(id: 6, category: .wubi, title: "新世纪五笔", shortTitle: "新世纪", tag: "06 国标", desc: "2006 第三代国家规范码表"),
+        InputSchemaOption(id: 33, category: .cangjie, title: "仓颉三代", shortTitle: "三代", tag: "经典三代", desc: "传统三代码表 · 港澳台经典通用"),
+        InputSchemaOption(id: 35, category: .cangjie, title: "仓颉五代", shortTitle: "五代", tag: "标准五代", desc: "朱邦复第五代标准 · 完整字集"),
+        InputSchemaOption(id: 36, category: .cangjie, title: "仓颉六代", shortTitle: "六代", tag: "苍颉六代", desc: "第六代苍颉检字法 · 扩展全字集"),
+    ]
+
+    public static func options(for category: InputSchemaCategory) -> [InputSchemaOption] {
+        all.filter { $0.category == category }
+    }
+}
+
 public struct WubiPreferences: Equatable, Sendable {
     public static let appGroupIdentifier = "group.com.hcyue.juxu.shared"
 
@@ -247,6 +312,18 @@ public struct WubiPreferences: Equatable, Sendable {
         schemaId == 20 || schemaId == 21
     }
 
+    public var isCangjieFamily: Bool {
+        schemaId == 33 || schemaId == 35 || schemaId == 36
+    }
+
+    public var isWubiFamily: Bool {
+        schemaId == 86 || schemaId == 98 || schemaId == 6
+    }
+
+    public var schemaCategory: InputSchemaCategory {
+        InputSchemaCategory.category(for: schemaId)
+    }
+
     public init() {}
 
     public func toTOML() -> String {
@@ -257,6 +334,9 @@ public struct WubiPreferences: Equatable, Sendable {
         case 10: schemaTag = "xiaohe"
         case 20: schemaTag = "pinyin"
         case 21: schemaTag = "xiaohe_sp"
+        case 33: schemaTag = "cangjie3"
+        case 35: schemaTag = "cangjie5"
+        case 36: schemaTag = "cangjie6"
         default: schemaTag = "86"
         }
         return """
@@ -326,6 +406,9 @@ public struct WubiPreferences: Equatable, Sendable {
                 else if lower == "xiaohe" || lower == "flypy" || lower == "10" { p.schemaId = 10 }
                 else if lower == "pinyin" || lower == "quanpin" || lower == "20" { p.schemaId = 20 }
                 else if lower == "xiaohe_sp" || lower == "shuangpin" || lower == "sp" || lower == "flypy_sp" || lower == "xhsp" || lower == "21" { p.schemaId = 21 }
+                else if lower == "cangjie3" || lower == "cangjie_3" || lower == "cj3" || lower == "33" { p.schemaId = 33 }
+                else if lower == "cangjie5" || lower == "cangjie_5" || lower == "cj5" || lower == "cangjie" || lower == "cj" || lower == "35" { p.schemaId = 35 }
+                else if lower == "cangjie6" || lower == "cangjie_6" || lower == "cj6" || lower == "36" { p.schemaId = 36 }
                 else { p.schemaId = 86 }
             case (_, "page_size"):
                 p.pageSize = min(9, max(3, Int(val) ?? 5))
@@ -499,6 +582,12 @@ public final class WubiBridge: ObservableObject {
                 _ = p06.withCString { wubi_engine_load_dict_mmap(h, 6, $0) }
                 let pXh = dir.appendingPathComponent("xiaohe.wbdict").path
                 _ = pXh.withCString { wubi_engine_load_dict_mmap(h, 10, $0) }
+                let pCj3 = dir.appendingPathComponent("cangjie3.wbdict").path
+                _ = pCj3.withCString { wubi_engine_load_dict_mmap(h, 33, $0) }
+                let pCj5 = dir.appendingPathComponent("cangjie5.wbdict").path
+                _ = pCj5.withCString { wubi_engine_load_dict_mmap(h, 35, $0) }
+                let pCj6 = dir.appendingPathComponent("cangjie6.wbdict").path
+                _ = pCj6.withCString { wubi_engine_load_dict_mmap(h, 36, $0) }
                 let pPy = dir.appendingPathComponent("pinyin.pydict").path
                 _ = pPy.withCString { wubi_engine_load_pinyin_dict_mmap(h, $0) }
                 let pAux = dir.appendingPathComponent("wubi_aux.wbaux").path

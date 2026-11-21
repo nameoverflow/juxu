@@ -139,7 +139,7 @@ impl UserStore {
     }
 
     pub fn valid_next_letters_mask(&self, prefix_bytes: &[u8]) -> u32 {
-        if prefix_bytes.is_empty() || prefix_bytes.len() >= 4 || self.code_index.is_empty() {
+        if prefix_bytes.is_empty() || prefix_bytes.len() >= 5 || self.code_index.is_empty() {
             return 0;
         }
         let Some(pref) = PackedCode::from_bytes(prefix_bytes) else {

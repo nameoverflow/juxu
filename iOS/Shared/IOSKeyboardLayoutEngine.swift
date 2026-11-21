@@ -165,6 +165,7 @@ public struct IOSKeyboardLayoutEngine: Equatable {
         case 20: return "拼"
         case 21: return "双"
         case 10: return "鹤"
+        case 33, 35, 36: return "仓"
         default: return "五"
         }
     }

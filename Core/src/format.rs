@@ -3,7 +3,7 @@ use crate::mmap_buf::ByteSource;
 use std::io;
 use std::path::Path;
 
-pub const WBDICT_MAGIC: &[u8; 8] = b"WBDICT01";
+pub const WBDICT_MAGIC: &[u8; 8] = b"WBDICT02";
 pub const WBAUX_MAGIC: &[u8; 8] = b"WBAUX001";
 pub const WBAUX_MAGIC_V2: &[u8; 8] = b"WBAUX002";
 pub const WBAUX_MAGIC_V3: &[u8; 8] = b"WBAUX003";
@@ -105,13 +105,14 @@ pub fn serialize_wbdict(mut input: DictBuildInput) -> Vec<u8> {
     input.char_metas.dedup_by_key(|m| m.codepoint);
 
     // Compute primary_short_code accurately from sorted buckets!
+    let max_code_len = if matches!(input.schema_id, 33 | 35 | 36) { 5 } else { 4 };
     let mut primary_short_by_cp = std::collections::HashMap::<u32, PackedCode>::new();
     {
         let mut i = 0;
         while i < deduped.len() {
             let code = deduped[i].0;
             let code_len = code.len();
-            if code_len < 4 {
+            if code_len < max_code_len {
                 // First non-rare entry in this bucket is #1 primary candidate at `code`
                 let first = &deduped[i];
                 if (first.3 & ENTRY_FLAG_SINGLE_CHAR) != 0
@@ -381,16 +382,18 @@ impl DictView {
     }
 
     /// Return a 26-bit mask (`bit i` = `'a' + i`) of letters that yield at least one valid code
-    /// starting with `[prefix_bytes..., letter]` (`1 <= prefix_bytes.len() <= 3`).
+    /// starting with `[prefix_bytes..., letter]` (`1 <= prefix_bytes.len() <= 4`).
     pub fn valid_next_letters_mask(&self, prefix_bytes: &[u8], include_rare: bool) -> u32 {
-        if prefix_bytes.is_empty() || prefix_bytes.len() >= 4 {
+        let max_len = if matches!(self.schema_id, 33 | 35 | 36) { 5 } else { 4 };
+        if prefix_bytes.is_empty() || prefix_bytes.len() >= max_len {
             return 0x03FF_FFFF;
         }
-        let mut buf = [0u8; 4];
+        let mut buf = [0u8; 5];
         let n = prefix_bytes.len();
         buf[..n].copy_from_slice(prefix_bytes);
+        let letter_limit = if matches!(self.schema_id, 86 | 98 | 6) { 25u8 } else { 26u8 };
         let mut mask = 0u32;
-        for idx in 0..25u8 {
+        for idx in 0..letter_limit {
             buf[n] = b'a' + idx;
             let Some(ext) = PackedCode::from_bytes(&buf[..=n]) else {
                 continue;
@@ -429,17 +432,18 @@ impl DictView {
     }
 
     /// Return the highest-weight non-rare entry for each next letter `'a'..='z'` (`0..26`)
-    /// continuing `prefix_bytes` (`1 <= len <= 3`). Used for sub-microsecond neural gutter priors.
+    /// continuing `prefix_bytes` (`1 <= len < max_len`). Used for sub-microsecond neural gutter priors.
     pub fn best_continuation_per_letter(
         &self,
         prefix_bytes: &[u8],
         include_rare: bool,
     ) -> [Option<DictEntryRef<'_>>; 26] {
         let mut out: [Option<DictEntryRef<'_>>; 26] = [None; 26];
-        if prefix_bytes.is_empty() || prefix_bytes.len() >= 4 {
+        let max_len = if matches!(self.schema_id, 33 | 35 | 36) { 5 } else { 4 };
+        if prefix_bytes.is_empty() || prefix_bytes.len() >= max_len {
             return out;
         }
-        let mut buf = [0u8; 4];
+        let mut buf = [0u8; 5];
         let n = prefix_bytes.len();
         buf[..n].copy_from_slice(prefix_bytes);
 

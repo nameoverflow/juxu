@@ -11,6 +11,9 @@ pub enum WubiSchema {
     Xiaohe = 10,
     Pinyin = 20,
     XiaoheShuangpin = 21,
+    Cangjie3 = 33,
+    Cangjie5 = 35,
+    Cangjie6 = 36,
 }
 
 pub type InputSchema = WubiSchema;
@@ -23,6 +26,9 @@ impl WubiSchema {
             10 => Self::Xiaohe,
             20 => Self::Pinyin,
             21 => Self::XiaoheShuangpin,
+            33 => Self::Cangjie3,
+            35 => Self::Cangjie5,
+            36 => Self::Cangjie6,
             _ => Self::Wubi86,
         }
     }
@@ -34,6 +40,9 @@ impl WubiSchema {
             "10" | "xiaohe" | "flypy" | "xh" => Self::Xiaohe,
             "20" | "pinyin" | "quanpin" | "qp" => Self::Pinyin,
             "21" | "xiaohe_sp" | "shuangpin" | "sp" | "flypy_sp" | "xhsp" => Self::XiaoheShuangpin,
+            "33" | "cj3" | "cangjie3" | "cangjie_3" => Self::Cangjie3,
+            "35" | "cj5" | "cangjie5" | "cangjie_5" | "cangjie" | "cj" => Self::Cangjie5,
+            "36" | "cj6" | "cangjie6" | "cangjie_6" => Self::Cangjie6,
             _ => Self::Wubi86,
         }
     }
@@ -46,6 +55,9 @@ impl WubiSchema {
             Self::Xiaohe => "xiaohe",
             Self::Pinyin => "pinyin",
             Self::XiaoheShuangpin => "xiaohe_sp",
+            Self::Cangjie3 => "cangjie3",
+            Self::Cangjie5 => "cangjie5",
+            Self::Cangjie6 => "cangjie6",
         }
     }
 
@@ -57,6 +69,9 @@ impl WubiSchema {
             Self::Xiaohe => "小鹤音形",
             Self::Pinyin => "全拼",
             Self::XiaoheShuangpin => "小鹤双拼",
+            Self::Cangjie3 => "仓颉三代",
+            Self::Cangjie5 => "仓颉五代",
+            Self::Cangjie6 => "仓颉六代",
         }
     }
 
@@ -66,8 +81,11 @@ impl WubiSchema {
             Self::Wubi98 => 1,
             Self::Wubi06 => 2,
             Self::Xiaohe => 3,
-            Self::Pinyin => 4,
-            Self::XiaoheShuangpin => 5,
+            Self::Cangjie3 => 4,
+            Self::Cangjie5 => 5,
+            Self::Cangjie6 => 6,
+            Self::Pinyin => 7,
+            Self::XiaoheShuangpin => 8,
         }
     }
 
@@ -82,6 +100,11 @@ impl WubiSchema {
     }
 
     #[inline]
+    pub fn is_cangjie(self) -> bool {
+        matches!(self, Self::Cangjie3 | Self::Cangjie5 | Self::Cangjie6)
+    }
+
+    #[inline]
     pub fn is_pinyin(self) -> bool {
         matches!(self, Self::Pinyin | Self::XiaoheShuangpin)
     }
@@ -89,6 +112,11 @@ impl WubiSchema {
     #[inline]
     pub fn is_shuangpin(self) -> bool {
         matches!(self, Self::XiaoheShuangpin)
+    }
+
+    #[inline]
+    pub fn max_code_len(self) -> usize {
+        if self.is_cangjie() { 5 } else { 4 }
     }
 
     #[inline]
@@ -283,7 +311,7 @@ impl WubiConfig {
                 "# 句序 (Juxu) 配置文件 — macOS 与 iOS 通用内核\n",
                 "# 修改保存后将实时生效\n\n",
                 "[general]\n",
-                "# 输入方案: \"86\" | \"98\" | \"06\" (新世纪) | \"xiaohe\" (小鹤音形) | \"pinyin\" (全拼) | \"xiaohe_sp\" (小鹤双拼)\n",
+                "# 输入方案: \"86\" | \"98\" | \"06\" (新世纪) | \"xiaohe\" (小鹤音形) | \"pinyin\" (全拼) | \"xiaohe_sp\" (小鹤双拼) | \"cangjie3\" | \"cangjie5\" | \"cangjie6\"\n",
                 "schema = \"{}\"\n",
                 "page_size = {}\n",
                 "# 候选栏方向: \"horizontal\" | \"vertical\"\n",

@@ -138,31 +138,46 @@ public struct SettingsRootView: View {
     // MARK: - Section 1: Schema & Core Typing
 
     private var schemaSectionView: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        let activeCategory = bridge.prefs.schemaCategory
+        let isCangjie = bridge.prefs.isCangjieFamily
+        let maxCodeLabel = isCangjie ? "五" : "四"
+        let pushCodeLabel = isCangjie ? "六" : "五"
+        return VStack(alignment: .leading, spacing: 16) {
             sectionHeader(
                 title: "输入方案与编码规则",
-                subtitle: "内置全拼、小鹤双拼、小鹤音形与 86 / 98 / 新世纪五笔零拷贝词典，共用 RWKV-7 整句模型与触点纠错"
+                subtitle: "内置拼音、五笔、仓颉三大类零拷贝词典，共用 RWKV-7 语言模型与触点纠错"
             )
 
             settingsCard {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("拼音 / 双拼 / 音形方案")
-                        .font(.system(size: 13, weight: .medium))
+                VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("1. 选择方案大类")
+                                .font(.system(size: 13, weight: .semibold))
+                            Spacer()
+                            Text("当前：\(activeCategory.rawValue) · \(bridge.state.schemaName)")
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(.secondary)
+                        }
 
-                    HStack(spacing: 10) {
-                        schemaOptionCard(id: 20, title: "全拼", desc: "整句连打 · 声母简拼 · 触点纠错")
-                        schemaOptionCard(id: 21, title: "小鹤双拼", desc: "小鹤双拼键位 · 整句连打 · 触点纠错")
-                        schemaOptionCard(id: 10, title: "小鹤音形", desc: "双拼 + 鹤形辅助码 · 定长/整句")
+                        HStack(spacing: 10) {
+                            ForEach(InputSchemaCategory.allCases) { category in
+                                schemaCategoryCard(category)
+                            }
+                        }
                     }
 
-                    Text("五笔方案")
-                        .font(.system(size: 13, weight: .medium))
-                        .padding(.top, 4)
+                    Divider()
 
-                    HStack(spacing: 10) {
-                        schemaOptionCard(id: 86, title: "86 版五笔", desc: "王永民经典版 · 通用度最广")
-                        schemaOptionCard(id: 98, title: "98 版五笔", desc: "码元规范化 · 拆分更科学")
-                        schemaOptionCard(id: 6, title: "新世纪五笔", desc: "2006 第三代国家规范码表")
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("2. 选择\(activeCategory.rawValue)方案版本")
+                            .font(.system(size: 13, weight: .semibold))
+
+                        HStack(spacing: 10) {
+                            ForEach(InputSchemaOption.options(for: activeCategory)) { option in
+                                schemaOptionCard(id: option.id, title: option.title, desc: option.desc)
+                            }
+                        }
                     }
                 }
             }
@@ -171,28 +186,28 @@ public struct SettingsRootView: View {
                 settingsCard {
                     VStack(spacing: 11) {
                         toggleRow(
-                            title: "四码唯一自动上屏",
-                            subtitle: "输满四码且精确匹配唯一候选时免按空格直接上屏",
+                            title: "\(maxCodeLabel)码唯一自动上屏",
+                            subtitle: "输满\(maxCodeLabel)码且精确匹配唯一候选时免按空格直接上屏",
                             isOn: binding(\.fourthCodeAutoCommit)
                         )
                         Divider()
                         toggleRow(
-                            title: "第五码顶字上屏",
-                            subtitle: "四码存在重码时，继续敲第 5 码自动将首选词顶上屏并开始新编码",
+                            title: "第\(pushCodeLabel)码顶字上屏",
+                            subtitle: "\(maxCodeLabel)码存在重码时，继续敲第 \(isCangjie ? "6" : "5") 码自动将首选词顶上屏并开始新编码",
                             isOn: binding(\.fifthCodePushCommit)
                         )
                         Divider()
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("四码空码处理")
+                                Text("\(maxCodeLabel)码空码处理")
                                     .font(.system(size: 13, weight: .medium))
-                                Text("第四码无匹配且无高置信度纠错项时的行为")
+                                Text("第\(maxCodeLabel)码无匹配且无高置信度纠错项时的行为")
                                     .font(.system(size: 11.5))
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
                             Picker("", selection: binding(\.fourthEmptyBehavior)) {
-                                Text("阻断第 4 码并提示").tag("block")
+                                Text("阻断第 \(isCangjie ? "5" : "4") 码并提示").tag("block")
                                 Text("自动清空重输").tag("clear")
                             }
                             .labelsHidden()
@@ -222,13 +237,17 @@ public struct SettingsRootView: View {
                         Divider()
                         toggleRow(
                             title: "最短编码（简码）优先",
-                            subtitle: "输入 1–3 码时简码字词始终优先于长码前缀补全",
+                            subtitle: isCangjie
+                                ? "输入 1–4 码时精确匹配字词始终优先于长码前缀补全"
+                                : "输入 1–3 码时简码字词始终优先于长码前缀补全",
                             isOn: binding(\.shortestCodeFirst)
                         )
                         Divider()
                         toggleRow(
                             title: "全码显示简码提示",
-                            subtitle: "打全码时在候选旁标注最短简码（如打 khk 在“中”旁轻提示 k）",
+                            subtitle: isCangjie
+                                ? "打较长编码时在候选旁标注更短编码"
+                                : "打全码时在候选旁标注最短简码（如打 khk 在“中”旁轻提示 k）",
                             isOn: binding(\.showShortcodeHint)
                         )
                         Divider()
@@ -236,10 +255,10 @@ public struct SettingsRootView: View {
                             title: "出简不出全",
                             subtitle: bridge.prefs.spaceless
                                 ? "优先按首选简码切分单字，较长的编码仍可出字"
-                                : "拥有首选简码的单字在输入四码全码时后置",
+                                : "拥有首选简码的单字在输入\(maxCodeLabel)码全码时后置",
                             isOn: binding(\.strictShortcode)
                         )
-                        if bridge.prefs.schemaId != 10 {
+                        if bridge.prefs.isWubiFamily {
                             Divider()
                             toggleRow(
                                 title: "z 键万能通配与拼音反查",
@@ -251,7 +270,7 @@ public struct SettingsRootView: View {
                     }
                     toggleRow(
                         title: "启用 Unicode 扩展区大字集",
-                        subtitle: "包含 CJK 扩展 B–G 生僻古籍字（日常盲打建议关闭以保持四码唯一性）",
+                        subtitle: "包含 CJK 扩展 B–I 生僻古籍字（日常盲打建议关闭以保持重码精简）",
                         isOn: binding(\.enableRareCharset)
                     )
                 }
@@ -646,6 +665,49 @@ public struct SettingsRootView: View {
                 WubiCandidateItem(index: 4, text: "语言", comment: "", badge: 0, confidence: 0.01, isExact: true),
             ]
         )
+    }
+
+    private func schemaCategoryCard(_ category: InputSchemaCategory) -> some View {
+        let selected = bridge.prefs.schemaCategory == category
+        return Button {
+            if !selected {
+                bridge.switchSchema(category.defaultSchemaId)
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Image(systemName: category.symbolName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(selected ? Color.white : Color.accentColor)
+                    Text(category.rawValue)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(selected ? Color.white : Color.primary)
+                    Spacer()
+                    if selected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 13))
+                            .foregroundStyle(Color.white.opacity(0.92))
+                    }
+                }
+                Text(category.subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(selected ? Color.white.opacity(0.85) : Color.secondary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(selected ? Color.accentColor : Color.primary.opacity(0.035))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(selected ? Color.accentColor : Color.primary.opacity(0.10), lineWidth: selected ? 1.2 : 0.6)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private func schemaOptionCard(id: UInt32, title: String, desc: String) -> some View {

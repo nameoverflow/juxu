@@ -247,33 +247,22 @@ public final class JuxuInputController: IMKInputController {
     public override func menu() -> NSMenu! {
         let m = NSMenu(title: "句序")
         let curSchema = WubiBridge.shared.prefs.schemaId
+        let curCategory = InputSchemaCategory.category(for: curSchema)
 
-        let itemPy = NSMenuItem(title: "全拼", action: #selector(selectSchemaPinyin(_:)), keyEquivalent: "")
-        itemPy.target = self
-        itemPy.state = (curSchema == 20) ? .on : .off
-        m.addItem(itemPy)
-
-        let itemXh = NSMenuItem(title: "小鹤音形", action: #selector(selectSchemaXiaohe(_:)), keyEquivalent: "")
-        itemXh.target = self
-        itemXh.state = (curSchema == 10) ? .on : .off
-        m.addItem(itemXh)
-
-        m.addItem(.separator())
-
-        let item86 = NSMenuItem(title: "86 版五笔", action: #selector(selectSchema86(_:)), keyEquivalent: "")
-        item86.target = self
-        item86.state = (curSchema == 86) ? .on : .off
-        m.addItem(item86)
-
-        let item98 = NSMenuItem(title: "98 版五笔", action: #selector(selectSchema98(_:)), keyEquivalent: "")
-        item98.target = self
-        item98.state = (curSchema == 98) ? .on : .off
-        m.addItem(item98)
-
-        let item06 = NSMenuItem(title: "新世纪五笔 (06)", action: #selector(selectSchema06(_:)), keyEquivalent: "")
-        item06.target = self
-        item06.state = (curSchema == 6) ? .on : .off
-        m.addItem(item06)
+        for category in InputSchemaCategory.allCases {
+            let catItem = NSMenuItem(title: category.rawValue, action: nil, keyEquivalent: "")
+            catItem.state = (curCategory == category) ? .on : .off
+            let sub = NSMenu(title: category.rawValue)
+            for opt in InputSchemaOption.options(for: category) {
+                let item = NSMenuItem(title: opt.title, action: #selector(selectSchemaFromMenu(_:)), keyEquivalent: "")
+                item.target = self
+                item.tag = Int(opt.id)
+                item.state = (curSchema == opt.id) ? .on : .off
+                sub.addItem(item)
+            }
+            catItem.submenu = sub
+            m.addItem(catItem)
+        }
 
         m.addItem(.separator())
 
@@ -338,24 +327,8 @@ public final class JuxuInputController: IMKInputController {
         return m
     }
 
-    @objc private func selectSchemaPinyin(_ sender: Any?) {
-        WubiBridge.shared.switchSchema(20)
-    }
-
-    @objc private func selectSchemaXiaohe(_ sender: Any?) {
-        WubiBridge.shared.switchSchema(10)
-    }
-
-    @objc private func selectSchema86(_ sender: Any?) {
-        WubiBridge.shared.switchSchema(86)
-    }
-
-    @objc private func selectSchema98(_ sender: Any?) {
-        WubiBridge.shared.switchSchema(98)
-    }
-
-    @objc private func selectSchema06(_ sender: Any?) {
-        WubiBridge.shared.switchSchema(6)
+    @objc private func selectSchemaFromMenu(_ sender: NSMenuItem) {
+        WubiBridge.shared.switchSchema(UInt32(sender.tag))
     }
 
     @objc private func toggleTypoCorrection(_ sender: Any?) {

@@ -1,4 +1,4 @@
-use crate::code::{expand_wildcards, PackedCode};
+use crate::code::{cangjie_radicals_str, expand_wildcards, PackedCode};
 use crate::config::{FourthEmptyBehavior, ShiftToggleMode, WubiConfig, WubiSchema};
 use crate::format::{AuxView, DictView, ENTRY_FLAG_SYMBOL};
 use crate::neural::{NeuralContextTracker, NeuralView, RwkvState};
@@ -117,7 +117,7 @@ impl Default for LmWeights {
 }
 
 pub struct WubiEngine {
-    pub dicts: [Option<DictView>; 4],
+    pub dicts: [Option<DictView>; 9],
     pub pinyin_dict: Option<PinyinDictView>,
     pub aux: Option<AuxView>,
     pub config: WubiConfig,
@@ -160,7 +160,7 @@ impl Default for WubiEngine {
 impl WubiEngine {
     pub fn new(config: WubiConfig) -> Self {
         Self {
-            dicts: [None, None, None, None],
+            dicts: [None, None, None, None, None, None, None, None, None],
             pinyin_dict: None,
             aux: None,
             config,
@@ -759,6 +759,8 @@ impl WubiEngine {
                 .map_or_else(|| self.raw_code.clone(), |p| p.text.clone())
         } else if self.uses_spaceless() {
             self.stream.preview(&self.raw_code)
+        } else if self.config.schema.is_cangjie() {
+            cangjie_radicals_str(&self.raw_code)
         } else {
             self.raw_code.clone()
         }
@@ -1123,8 +1125,9 @@ impl WubiEngine {
             return ALL_26;
         }
         let bytes = self.raw_code.as_bytes();
+        let max_len = self.config.schema.max_code_len();
         if bytes.is_empty()
-            || bytes.len() >= 4
+            || bytes.len() >= max_len
             || (self.config.schema.is_wubi() && bytes.contains(&b'z'))
         {
             return ALL_26;
@@ -1304,7 +1307,8 @@ impl WubiEngine {
             return out;
         }
         let bytes = self.raw_code.as_bytes();
-        if bytes.len() >= 4 || (self.config.schema.is_wubi() && bytes.contains(&b'z')) {
+        let max_len = self.config.schema.max_code_len();
+        if bytes.len() >= max_len || (self.config.schema.is_wubi() && bytes.contains(&b'z')) {
             return out;
         }
 
@@ -1712,13 +1716,15 @@ impl WubiEngine {
             && self.config.z_omnipotent
             && self.raw_code.starts_with('z')
             && !self.raw_code.starts_with("zz");
-        let max_len = if is_z_pinyin_mode { 7 } else { 4 };
+        let schema_max_len = self.config.schema.max_code_len();
+        let max_len = if is_z_pinyin_mode { 7 } else { schema_max_len };
 
-        // Fifth-code push-commit (第五码自动顶字上屏) + LM Missed-Space Key-#5 Disambiguation!
+        // Push-commit at max_len+1 (第五码/第六码自动顶字上屏) + LM Missed-Space Key-#5 Disambiguation!
         let mut resolved_via_fifth_split = false;
         if self.raw_code.len() >= max_len {
             if !is_z_pinyin_mode && self.config.fifth_code_push_commit {
-                if self.raw_code.len() == 4
+                if schema_max_len == 4
+                    && self.raw_code.len() == 4
                     && self.try_resolve_fifth_key_split(obs, &mut commit_prefix, &mut notice)
                 {
                     resolved_via_fifth_split = true;
@@ -1732,7 +1738,7 @@ impl WubiEngine {
             } else {
                 return EngineOutput {
                     consumed: true,
-                    preedit: self.raw_code.clone(),
+                    preedit: self.preedit(),
                     bell: true,
                     ..Default::default()
                 };
@@ -1746,13 +1752,14 @@ impl WubiEngine {
             self.rebuild_candidates();
         }
 
-        // Check 4th-code behaviors (ONLY for standard 4-letter Wubi codes, not z+pinyin)!
-        let now_z_pinyin = self.config.z_omnipotent
+        // Check max-code behaviors (4th code for Wubi/Xiaohe, 5th code for Cangjie; not z+pinyin)!
+        let now_z_pinyin = self.config.schema.is_wubi()
+            && self.config.z_omnipotent
             && self.raw_code.starts_with('z')
             && !self.raw_code.starts_with("zz");
 
-        if !now_z_pinyin && self.raw_code.len() == 4 {
-            // Seamless smart push-commit for high-confidence missed-space on an empty 4-letter code!
+        if !now_z_pinyin && self.raw_code.len() == schema_max_len {
+            // Seamless smart push-commit for high-confidence missed-space on an empty max-letter code!
             if self.config.fifth_code_push_commit {
                 if let Some((cut, c1_text)) = self.pending_empty_split.take() {
                     if cut >= 1 && cut < self.raw_code.len() && self.observations.len() == self.raw_code.len() {
@@ -1769,7 +1776,7 @@ impl WubiEngine {
                         return EngineOutput {
                             consumed: true,
                             commit_text: commit_prefix,
-                            preedit: self.raw_code.clone(),
+                            preedit: self.preedit(),
                             bell: false,
                             notice,
                         };
@@ -1778,7 +1785,7 @@ impl WubiEngine {
             }
 
             if self.candidates.is_empty() {
-                // Truly empty 4-letter code (even typo rescue & missed-space found no match)
+                // Truly empty max-letter code (even typo rescue & missed-space found no match)
                 match self.config.fourth_empty_behavior {
                     FourthEmptyBehavior::Block => {
                         self.raw_code.pop();
@@ -1787,7 +1794,7 @@ impl WubiEngine {
                         return EngineOutput {
                             consumed: true,
                             commit_text: commit_prefix,
-                            preedit: self.raw_code.clone(),
+                            preedit: self.preedit(),
                             bell: true,
                             notice,
                         };
@@ -1821,7 +1828,7 @@ impl WubiEngine {
         EngineOutput {
             consumed: true,
             commit_text: commit_prefix,
-            preedit: self.raw_code.clone(),
+            preedit: self.preedit(),
             bell: false,
             notice,
         }
@@ -2515,11 +2522,12 @@ impl WubiEngine {
                             badge = CandidateBadge::Shortcode;
                             comment = format!("⚡{}", meta.shortest_code.as_string());
                         }
-                        // Strict shortcode ("出简不出全"): demote at 4-code if char has a primary short code
+                        // Strict shortcode ("出简不出全"): demote at full code if char has a primary short code
+                        let schema_max_len = self.config.schema.max_code_len();
                         if self.config.strict_shortcode
-                            && exact_code.len() == 4
+                            && exact_code.len() == schema_max_len
                             && !meta.primary_short_code.is_empty()
-                            && meta.primary_short_code.len() < 4
+                            && meta.primary_short_code.len() < schema_max_len
                         {
                             demoted = true;
                         }
@@ -2595,8 +2603,9 @@ impl WubiEngine {
             });
         }
 
-        // 1c. Prefix completions when `raw_code.len() < 4` (placed AFTER exact shortcodes when `shortest_code_first` is true!)
-        if exact_code.len() < 4 && exact_items.len() < 15 {
+        // 1c. Prefix completions when `raw_code.len() < schema_max_len` (placed AFTER exact shortcodes when `shortest_code_first` is true!)
+        let schema_max_len = self.config.schema.max_code_len();
+        if exact_code.len() < schema_max_len && exact_items.len() < 15 {
             let need = 15 - exact_items.len();
             for (pcode, utext, ucnt) in self.user.lookup_prefix(exact_code, 4) {
                 if exact_seen.insert(utext.to_string()) {

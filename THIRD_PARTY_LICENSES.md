@@ -8,6 +8,9 @@
 | `Resources/RawTables/wubi98/` | [lotem/rime-wubi98](https://github.com/lotem/rime-wubi98) | `0bc5b2b296f536d38ffe38381d37e5011da55e59` | `wubi98.dict.yaml`, `LICENSE` | `wubi98.wbdict`, `wubi_aux.wbaux` | `GPL-3.0-only` | [wubi98/LICENSE](Resources/RawTables/wubi98/LICENSE) |
 | `Resources/RawTables/wubi06/` | [g178253/rime-wubi06](https://github.com/g178253/rime-wubi06) | `b10733bb001c0b38917577f51d78834bdc56a35f` | `wubi06.dict.yaml`, `LICENSE` | `wubi06.wbdict`, `wubi_aux.wbaux` | `Apache-2.0` | [wubi06/LICENSE](Resources/RawTables/wubi06/LICENSE) |
 | `Resources/RawTables/pinyin/` | [mozillazg/pinyin-data](https://github.com/mozillazg/pinyin-data) (v0.16.0) | `fe29ad32bdf352b31a02b9936e537f575432e9a6` | `kTGHZ2013.txt`, `kMandarin_8105.txt`, `pinyin.txt`, `LICENSE` | `wubi_aux.wbaux` | `MIT` | [pinyin/LICENSE](Resources/RawTables/pinyin/LICENSE) |
+| `Resources/RawTables/cangjie3/` | [cangjie-system/rime-cangjie-integrated](https://github.com/cangjie-system/rime-cangjie-integrated) | `master` | `cangjie.3-base.dict.yaml`, `cangjie.3-base-dups.dict.yaml`, `LICENSE` | `cangjie3.wbdict` | `LGPL-3.0-only` | [cangjie3/LICENSE](Resources/RawTables/cangjie3/LICENSE) |
+| `Resources/RawTables/cangjie5/` | [rime/rime-cangjie](https://github.com/rime/rime-cangjie) | `master` | `cangjie5.base.dict.yaml`, `cangjie5.extended.dict.yaml`, `LICENSE` | `cangjie5.wbdict` | `LGPL-3.0-only` | [cangjie5/LICENSE](Resources/RawTables/cangjie5/LICENSE) |
+| `Resources/RawTables/cangjie6/` | [rime-aca/rime-cangjie6](https://github.com/rime-aca/rime-cangjie6) | `master` | `cangjie6.dict.yaml`, `README.md` | `cangjie6.wbdict` | `GPL-3.0-only` | [cangjie6/README.md](Resources/RawTables/cangjie6/README.md) |
 
 ## 著作权与衍生来源说明
 

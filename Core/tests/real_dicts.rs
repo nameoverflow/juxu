@@ -874,3 +874,96 @@ fn real_dicts_xiaohe_shuangpin_sentence_and_priors() {
         "expected '昂' for zero-initial 'ah' (ang)"
     );
 }
+
+#[test]
+fn real_dicts_cangjie_3_5_6_input_and_five_code_rules() {
+    let base = dicts_dir();
+    let cj3 = DictView::open_mmap(base.join("cangjie3.wbdict")).expect("open cangjie3.wbdict");
+    let cj5 = DictView::open_mmap(base.join("cangjie5.wbdict")).expect("open cangjie5.wbdict");
+    let cj6 = DictView::open_mmap(base.join("cangjie6.wbdict")).expect("open cangjie6.wbdict");
+    let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
+
+    let mut cfg = WubiConfig::default();
+    cfg.schema = WubiSchema::Cangjie5;
+    let mut engine = WubiEngine::new(cfg);
+    engine.load_dict(WubiSchema::Cangjie3, cj3);
+    engine.load_dict(WubiSchema::Cangjie5, cj5);
+    engine.load_dict(WubiSchema::Cangjie6, cj6);
+    engine.set_aux(aux);
+
+    // 1. Verify Cangjie 5 radical preedit and basic characters
+    // "hqi" (竹手戈) -> "我"; "oi" (人戈) -> "代" / "仓" etc.; "a" (日) -> "日"
+    let out_a = engine.handle_key_event(0, Some('a'), false, 100);
+    assert_eq!(out_a.preedit, "日");
+    assert_eq!(engine.page_candidates().first().map(|c| c.text.as_str()), Some("日"));
+    engine.clear_composition();
+
+    for ch in "hqi".chars() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 200);
+    }
+    assert_eq!(engine.preedit(), "竹手戈");
+    assert_eq!(engine.page_candidates().first().map(|c| c.text.as_str()), Some("我"));
+    engine.clear_composition();
+
+    // 2. Verify 5-code Cangjie character does NOT prematurely commit or block on 4th code!
+    // "蒼" in Cangjie 5 is "toir" (4 codes), "頡" is "grmbc" (5 codes: 土口一月金)!
+    for ch in "grmb".chars() {
+        let out = engine.handle_key_event(0, Some(ch), false, 300);
+        assert!(out.commit_text.is_empty(), "4th code in Cangjie must NOT auto-commit");
+    }
+    assert_eq!(engine.preedit(), "土口一月");
+    let out5 = engine.handle_key_event(0, Some('c'), false, 350);
+    // "grmbc" is unique for 頡 -> auto-commits on 5th code!
+    assert_eq!(out5.commit_text, "頡", "expected 5th-code unique auto-commit '頡', got '{}'", out5.commit_text);
+
+    // 3. Verify Cangjie 3 and Cangjie 6 switching and lookup
+    engine.set_schema(WubiSchema::Cangjie3);
+    for ch in "hqi".chars() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 400);
+    }
+    assert_eq!(engine.preedit(), "竹手戈");
+    assert!(
+        engine.all_candidates().iter().any(|c| c.text == "我"),
+        "expected '我' in Cangjie 3 for 'hqi'"
+    );
+    engine.clear_composition();
+
+    engine.set_schema(WubiSchema::Cangjie6);
+    for ch in "a".chars() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 500);
+    }
+    assert_eq!(engine.preedit(), "日");
+    assert_eq!(engine.page_candidates().first().map(|c| c.text.as_str()), Some("日"));
+    engine.clear_composition();
+
+    // 4. Verify authentic differences across Cangjie 3, 5, and 6:
+    // "面": Cangjie 3 = "mwyl" (一田卜中), Cangjie 5 = "mwsl" (一田尸中), Cangjie 6 = "mws" (一田尸)
+    engine.set_schema(WubiSchema::Cangjie3);
+    for ch in "mwyl".chars() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 600);
+    }
+    assert!(
+        engine.all_candidates().iter().any(|c| c.text == "面"),
+        "expected '面' at 'mwyl' in Cangjie 3"
+    );
+    engine.clear_composition();
+
+    engine.set_schema(WubiSchema::Cangjie5);
+    for ch in "mwsl".chars() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 700);
+    }
+    assert!(
+        engine.all_candidates().iter().any(|c| c.text == "面"),
+        "expected '面' at 'mwsl' in Cangjie 5"
+    );
+    engine.clear_composition();
+
+    engine.set_schema(WubiSchema::Cangjie6);
+    for ch in "mws".chars() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 800);
+    }
+    assert!(
+        engine.all_candidates().iter().any(|c| c.text == "面"),
+        "expected '面' at 'mws' in Cangjie 6"
+    );
+}
