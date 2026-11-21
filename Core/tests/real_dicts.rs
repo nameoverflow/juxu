@@ -500,3 +500,139 @@ fn real_dicts_full_pinyin_and_xiaohe_sentence_and_typo() {
     println!("Xiaohe 'z' -> '{}'", top_z);
     assert!(!top_z.is_empty());
 }
+
+#[test]
+fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
+    use wubi_core::pinyin_dict::PinyinDictView;
+
+    let base = dicts_dir();
+    if !base.join("pinyin.pydict").exists() || !base.join("wubi86.wbdict").exists() {
+        return;
+    }
+    let pdict = PinyinDictView::from_file(base.join("pinyin.pydict")).expect("open pinyin.pydict");
+    let d86 = DictView::open_mmap(base.join("wubi86.wbdict")).expect("open wubi86.wbdict");
+    let xh = DictView::open_mmap(base.join("xiaohe.wbdict")).expect("open xiaohe.wbdict");
+    let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
+
+    let mut cfg = WubiConfig::default();
+    cfg.schema = WubiSchema::Pinyin;
+    cfg.auto_phrase = true;
+    cfg.auto_phrase_threshold = 2;
+    let mut engine = WubiEngine::new(cfg.clone());
+    engine.load_dict(WubiSchema::Wubi86, d86);
+    engine.load_dict(WubiSchema::Xiaohe, xh);
+    engine.load_pinyin_dict(pdict);
+    engine.set_aux(aux);
+
+    // 1. RWKV-driven next_key_priors in Full Pinyin: after "今天天气真", 'h' (好 hao) must beat 'q'
+    engine.clear_composition();
+    engine.set_recent_context("今天天气真");
+    let py_priors = engine.next_key_priors();
+    let p_h = py_priors[(b'h' - b'a') as usize];
+    let p_q = py_priors[(b'q' - b'a') as usize];
+    println!("Pinyin RWKV next_key_priors after '今天天气真': h={}, q={}", p_h, p_q);
+    assert!(p_h > p_q, "expected RWKV Pinyin prior for 'h' ({}) > 'q' ({})", p_h, p_q);
+
+    // 2. RWKV-driven next_key_priors in Spaceless Wubi86: after "大模", 'g' (型 = gaej) must be boosted (> 100)
+    let mut cfg_sp = cfg.clone();
+    cfg_sp.schema = WubiSchema::Wubi86;
+    cfg_sp.spaceless = true;
+    engine.set_config(cfg_sp);
+    engine.set_recent_context("大模");
+    let sp_priors = engine.next_key_priors();
+    let p_g = sp_priors[(b'g' - b'a') as usize];
+    println!("Spaceless Wubi86 RWKV next_key_priors after '大模': g={}", p_g);
+    assert!(p_g > 110, "expected RWKV Spaceless prior for 'g' (型) > 110, got {}", p_g);
+
+    // 3. RWKV-driven next_key_priors in Xiaohe: after "大模", 'x' (型 = xk..) must be boosted (> 110)
+    let mut cfg_xh = cfg.clone();
+    cfg_xh.schema = WubiSchema::Xiaohe;
+    cfg_xh.spaceless = false;
+    engine.set_config(cfg_xh);
+    engine.set_recent_context("大模");
+    let xh_priors = engine.next_key_priors();
+    let p_x = xh_priors[(b'x' - b'a') as usize];
+    println!("Xiaohe RWKV next_key_priors after '大模': x={}", p_x);
+    assert!(p_x > 110, "expected RWKV Xiaohe prior for 'x' (型) > 110, got {}", p_x);
+
+    // 4. Cross-mode dynamic phrase: a phrase added via Wubi86/UserStore is immediately retrievable in Full Pinyin!
+    engine.set_schema(WubiSchema::Wubi86);
+    {
+        let d = engine.dicts[WubiSchema::Wubi86.slot_index()].as_ref();
+        let pd = engine.pinyin_dict.as_ref();
+        let _ = engine.user.add_phrase_with_pinyin("句序", false, d, pd);
+    }
+    engine.set_schema(WubiSchema::Pinyin);
+    engine.clear_context();
+    for (i, ch) in "juxu".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 4000 + i as u64 * 40);
+    }
+    let top_juxu = engine.page_candidates().first().map(|c| c.text.as_str()).unwrap_or("");
+    println!("Cross-mode Pinyin 'juxu' after adding '句序' -> top='{}'", top_juxu);
+    assert_eq!(top_juxu, "句序", "expected cross-mode user phrase '句序' at #1 in Full Pinyin");
+
+    // 5. Surprisal-driven auto-phrase: low-surprisal pair "我的" must NOT pollute user phrases,
+    //    while high-surprisal OOV pair "星锚" promotes quickly on repeat!
+    engine.clear_composition();
+    engine.set_schema(WubiSchema::Wubi86);
+    for round in 0..3u64 {
+        engine.clear_context();
+        let base_t = 5000 + round * 1000;
+        let _ = engine.user.record_commit_with_surprisal(
+            "",
+            "我",
+            base_t,
+            true,
+            2,
+            engine.dicts[0].as_ref(),
+            engine.pinyin_dict.as_ref(),
+            Some(2.0),
+        );
+        let _ = engine.user.record_commit_with_surprisal(
+            "我",
+            "的",
+            base_t + 200,
+            true,
+            2,
+            engine.dicts[0].as_ref(),
+            engine.pinyin_dict.as_ref(),
+            Some(0.8), // very low surprisal (RWKV strongly predicts '的' after '我')
+        );
+    }
+    assert!(
+        !engine.user.phrases.contains_key("我的"),
+        "low-surprisal glue pair '我的' must not be promoted into user phrases"
+    );
+
+    // High-surprisal coined term "星锚" (surprisal = 8.5 nats) promotes in 1 burst (bump=2 >= threshold=2)!
+    let _ = engine.user.record_commit_with_surprisal(
+        "",
+        "星",
+        9000,
+        true,
+        2,
+        engine.dicts[0].as_ref(),
+        engine.pinyin_dict.as_ref(),
+        Some(5.0),
+    );
+    let promoted = engine.user.record_commit_with_surprisal(
+        "星",
+        "锚",
+        9200,
+        true,
+        2,
+        engine.dicts[0].as_ref(),
+        engine.pinyin_dict.as_ref(),
+        Some(8.5),
+    );
+    assert_eq!(promoted.as_deref(), Some("星锚"));
+    // Verify it is immediately indexed and retrievable in Full Pinyin!
+    engine.set_schema(WubiSchema::Pinyin);
+    engine.clear_context();
+    for (i, ch) in "xingmao".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 9500 + i as u64 * 40);
+    }
+    let top_xm = engine.page_candidates().first().map(|c| c.text.as_str()).unwrap_or("");
+    println!("Surprisal-promoted '星锚' in Full Pinyin 'xingmao' -> top='{}'", top_xm);
+    assert_eq!(top_xm, "星锚");
+}

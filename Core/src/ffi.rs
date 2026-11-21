@@ -272,6 +272,9 @@ pub extern "C" fn wubi_engine_load_user_data(
             if let Some(d) = h.inner.active_dict() {
                 store.reindex_phrases(d);
             }
+            if let Some(ref pd) = h.inner.pinyin_dict {
+                store.reindex_pinyin_phrases(pd);
+            }
             h.inner.user = store;
             true
         }

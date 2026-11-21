@@ -13,7 +13,7 @@ use crate::personalization::Context as PersonalContext;
 use crate::pinyin_dict::{base_initial_id, PinyinDictView, SylConstraint};
 use crate::typo::{key_choices_for_obs, softmax_confidences, CorrectionKind, KeyLayout, KeyObs};
 use crate::user_data::UserStore;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const BEAM_WIDTH: usize = 8;
 const MAX_SYL_LEN: usize = 6;
@@ -355,14 +355,14 @@ fn build_lattice(
                 .partial_cmp(&(a.spatial_logp + a.kind_cost))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let mut deduped: Vec<LatticeEdge> = Vec::with_capacity(16);
+        let mut deduped: Vec<LatticeEdge> = Vec::with_capacity(24);
         for edge in list.drain(..) {
             if !deduped
                 .iter()
                 .any(|e| e.start == edge.start && e.syl == edge.syl)
             {
                 deduped.push(edge);
-                if deduped.len() >= 18 {
+                if deduped.len() >= 24 {
                     break;
                 }
             }
@@ -453,7 +453,10 @@ fn extend_pinyin_layer(
 
     struct Step<'a> {
         parent: &'a PinyinPath,
+        parent_key: (usize, usize),
         text: String,
+        first: char,
+        n_chars: usize,
         estimate: f32,
         bias: f32,
         syl_display: String,
@@ -487,6 +490,10 @@ fn extend_pinyin_layer(
         frontier = next_frontier;
     }
 
+    let has_neural = decoder.model.is_some();
+    let aux_bi_scale = if has_neural { 0.04 } else { 0.14 };
+    let aux_tri_scale = if has_neural { 0.04 } else { 0.12 };
+
     for mut chain in chains {
         chain.reverse();
         let chain_start = chain[0].start;
@@ -509,7 +516,8 @@ fn extend_pinyin_layer(
             .collect::<Vec<_>>()
             .join("'");
 
-        let mut entries: Vec<(String, u32)> = Vec::new();
+        // (text, weight, is_user_phrase)
+        let mut entries: Vec<(String, u32, bool)> = Vec::new();
         if chain.len() == 1 {
             match &chain[0].syl {
                 SylMatch::Full(sid) => {
@@ -524,7 +532,7 @@ fn extend_pinyin_layer(
                             || (decoder.config.dynamic_word_freq
                                 && decoder.user.unigram_boost(e.text) > 0.0)
                         {
-                            entries.push((e.text.to_owned(), e.weight));
+                            entries.push((e.text.to_owned(), e.weight, false));
                         }
                     }
                 }
@@ -541,7 +549,7 @@ fn extend_pinyin_layer(
                                 .into_iter()
                                 .take(2)
                             {
-                                pool.push((e.text.to_owned(), e.weight));
+                                pool.push((e.text.to_owned(), e.weight, false));
                             }
                         }
                     }
@@ -559,7 +567,7 @@ fn extend_pinyin_layer(
                             .into_iter()
                             .take(4)
                         {
-                            pool.push((e.text.to_owned(), e.weight));
+                            pool.push((e.text.to_owned(), e.weight, false));
                         }
                     }
                     pool.sort_by(|a, b| b.1.cmp(&a.1));
@@ -576,12 +584,20 @@ fn extend_pinyin_layer(
                     SylMatch::Prefix(p) => SylConstraint::Prefix(p.as_str()),
                 })
                 .collect();
+            // 1. Cross-mode personal user phrases indexed by Pinyin syllables
+            for (utext, ucnt) in decoder.user.lookup_pinyin_phrases(&constraints, decoder.dict, 12) {
+                let w = 200_000u32.saturating_add(ucnt.saturating_mul(100_000));
+                entries.push((utext.to_owned(), w, true));
+            }
+            // 2. Built-in Pinyin dictionary phrases
             for (rank, e) in decoder.dict.lookup_phrases(&constraints, 200).into_iter().enumerate() {
                 if rank < 48
                     || (decoder.config.dynamic_word_freq
                         && decoder.user.unigram_boost(e.text) > 0.0)
                 {
-                    entries.push((e.text.to_owned(), e.weight));
+                    if !entries.iter().any(|x| x.0 == e.text) {
+                        entries.push((e.text.to_owned(), e.weight, false));
+                    }
                 }
             }
         }
@@ -590,7 +606,7 @@ fn extend_pinyin_layer(
             continue;
         }
 
-        for (text, weight) in entries {
+        for (text, weight, is_user_phrase) in entries {
             let mut chars = text.chars();
             let Some(first) = chars.next() else { continue };
             let second = chars.next();
@@ -607,15 +623,16 @@ fn extend_pinyin_layer(
             };
             let phrase_bonus_cold = if n_chars >= 2 { 1.35 * ((n_chars - 1) as f32) } else { 0.0 };
             let phrase_bonus_ctx = if n_chars >= 2 { 0.95 * ((n_chars - 1) as f32) } else { 0.0 };
-            let mut shared_bias = syl_score;
+            let user_phrase_bonus = if is_user_phrase { 4.5 } else { 0.0 };
+            let mut shared_bias = syl_score + user_phrase_bonus;
             if let (Some(aux), Some(sec)) = (decoder.aux, second) {
-                shared_bias += 0.04 * aux.bigram_boost(first, sec);
+                shared_bias += (if has_neural { 0.015 } else { 0.04 }) * aux.bigram_boost(first, sec);
             }
 
             if decoder.config.dynamic_word_freq {
-                shared_bias += 1.6 * decoder.user.unigram_boost(&text);
+                shared_bias += 1.2 * decoder.user.unigram_boost(&text);
             }
-            for parent in parents {
+            for (parent_idx, parent) in parents.iter().enumerate() {
                 let in_sentence = !parent.text.is_empty();
                 let neural_w = if in_sentence { 0.95 } else { 0.72 };
                 let mut contextual_bias = shared_bias
@@ -631,41 +648,46 @@ fn extend_pinyin_layer(
                         .rev()
                         .chain(decoder.context.iter().rev().copied());
                     if let Some(prev) = preceding.next() {
-                        contextual_bias += 0.14 * aux.bigram_boost(prev, first);
+                        contextual_bias += aux_bi_scale * aux.bigram_boost(prev, first);
                         if let Some(prev2) = preceding.next() {
-                            contextual_bias += 0.12 * aux.trigram_boost(prev2, prev, first);
+                            contextual_bias += aux_tri_scale * aux.trigram_boost(prev2, prev, first);
                         }
                     }
                 }
-                if personalize {
-                    contextual_bias += personal.score(parent.personal_context, &text);
-                }
                 let neural_est = if let Some(nv) = &decoder.model {
-                    if n_chars == 1 {
-                        neural_w * nv.score_next_char(&parent.state, first)
-                    } else if n_chars == 2 {
-                        neural_w * nv.score_phrase_fast(&parent.state, &text) * 2.0f32.powf(0.65)
+                    let raw_lp1 = nv.score_next_char(&parent.state, first);
+                    let lp1 = if personalize {
+                        personal.interpolate_logp(
+                            raw_lp1,
+                            parent.personal_context,
+                            first,
+                            use_personal_states.then_some(&parent.state),
+                        )
                     } else {
-                        // Avoid penalizing 3-4 char phrases in coarse pruning with unconditioned uni_bias:
-                        // estimate first 2 chars via MTP-2 and remaining in-word chars via mild continuation prior.
+                        raw_lp1
+                    };
+                    if n_chars == 1 {
+                        neural_w * lp1
+                    } else if n_chars == 2 {
+                        let fast_total = nv.score_phrase_fast(&parent.state, &text) * 2.0f32.powf(0.65);
+                        neural_w * (fast_total - raw_lp1 + lp1)
+                    } else {
                         let prefix2: String = text.chars().take(2).collect();
-                        let lp12 = neural_w
-                            * nv.score_phrase_fast(&parent.state, &prefix2)
-                            * 2.0f32.powf(0.65);
-                        lp12 - 2.1 * ((n_chars - 2) as f32)
+                        let fast12 = nv.score_phrase_fast(&parent.state, &prefix2) * 2.0f32.powf(0.65);
+                        neural_w * (fast12 - raw_lp1 + lp1) - 2.1 * ((n_chars - 2) as f32)
                     }
-                } else {
-                    0.0
-                };
-                let personal_est = if use_personal_states {
-                    personal.state_bonus(parent.personal_context, first, &parent.state)
+                } else if personalize {
+                    personal.score(parent.personal_context, &text)
                 } else {
                     0.0
                 };
                 steps.push(Step {
                     parent,
+                    parent_key: (chain_start, parent_idx),
                     text: text.clone(),
-                    estimate: parent.score + contextual_bias + neural_est + personal_est,
+                    first,
+                    n_chars,
+                    estimate: parent.score + contextual_bias + neural_est,
                     bias: contextual_bias,
                     syl_display: syl_display.clone(),
                     correction: any_corr,
@@ -676,23 +698,114 @@ fn extend_pinyin_layer(
     }
 
     steps.sort_unstable_by(|a, b| b.estimate.total_cmp(&a.estimate));
+
+    // Trie-shared prefix state refinement for top candidates when RWKV is active
+    // Reuses `step_token(c1)` across both refinement and final beam unroll (zero wasted steps!)
+    let refine_limit = (BEAM_WIDTH * 2).min(steps.len());
+    let mut prefix_cache: HashMap<(usize, usize, char), RwkvState> =
+        HashMap::with_capacity(refine_limit);
+    if let Some(nv) = &decoder.model {
+        for step in &mut steps[..refine_limit] {
+            if step.n_chars >= 2 {
+                let in_sentence = !step.parent.text.is_empty();
+                let neural_w = if in_sentence { 0.95 } else { 0.72 };
+                let cache_key = (step.parent_key.0, step.parent_key.1, step.first);
+                let state_after_c1 = prefix_cache.entry(cache_key).or_insert_with(|| {
+                    let mut st = step.parent.state.clone();
+                    nv.step_token(nv.char_to_token(step.first), &mut st);
+                    st
+                });
+                let raw_lp1 = nv.score_next_char(&step.parent.state, step.first);
+                let lp1 = if personalize {
+                    personal.interpolate_logp(
+                        raw_lp1,
+                        step.parent.personal_context,
+                        step.first,
+                        use_personal_states.then_some(&step.parent.state),
+                    )
+                } else {
+                    raw_lp1
+                };
+                let rest = &step.text[step.first.len_utf8()..];
+                let rest_chars = step.n_chars - 1;
+                let rest_est = if rest_chars == 1 {
+                    let c2 = rest.chars().next().unwrap();
+                    let raw_lp2 = nv.score_next_char(state_after_c1, c2);
+                    if personalize {
+                        let ctx2 = step.parent.personal_context.push(step.first);
+                        personal.interpolate_logp(
+                            raw_lp2,
+                            ctx2,
+                            c2,
+                            use_personal_states.then_some(state_after_c1),
+                        )
+                    } else {
+                        raw_lp2
+                    }
+                } else {
+                    nv.score_phrase_fast(state_after_c1, rest)
+                        * (rest_chars.min(4) as f32).powf(0.65)
+                };
+                step.estimate = step.parent.score + step.bias + neural_w * (lp1 + rest_est);
+            }
+        }
+        steps[..refine_limit].sort_unstable_by(|a, b| b.estimate.total_cmp(&a.estimate));
+    }
+
     let mut next_paths: Vec<PinyinPath> = Vec::with_capacity(BEAM_WIDTH * 2);
     for step in steps.into_iter().take(BEAM_WIDTH * 2) {
-        let mut state = step.parent.state.clone();
         let mut score = step.parent.score + step.bias;
         let mut personal_context = step.parent.personal_context;
         let in_sentence = !step.parent.text.is_empty();
         let neural_w = if in_sentence { 0.95 } else { 0.72 };
-        if let Some(nv) = &decoder.model {
-            for ch in step.text.chars() {
-                score += neural_w * nv.score_next_char(&state, ch);
-                if use_personal_states {
-                    score += personal.state_bonus(personal_context, ch, &state);
-                }
-                nv.step_token(nv.char_to_token(ch), &mut state);
+        let state = if let Some(nv) = &decoder.model {
+            let raw_lp1 = nv.score_next_char(&step.parent.state, step.first);
+            let lp1 = if personalize {
+                personal.interpolate_logp(
+                    raw_lp1,
+                    personal_context,
+                    step.first,
+                    use_personal_states.then_some(&step.parent.state),
+                )
+            } else {
+                raw_lp1
+            };
+            score += neural_w * lp1;
+            let cache_key = (step.parent_key.0, step.parent_key.1, step.first);
+            let mut st = if let Some(cached) = prefix_cache.get(&cache_key) {
+                cached.clone()
+            } else {
+                let mut s = step.parent.state.clone();
+                nv.step_token(nv.char_to_token(step.first), &mut s);
+                s
+            };
+            personal_context = personal_context.push(step.first);
+            for ch in step.text.chars().skip(1) {
+                let raw_lp = nv.score_next_char(&st, ch);
+                let lp = if personalize {
+                    personal.interpolate_logp(
+                        raw_lp,
+                        personal_context,
+                        ch,
+                        use_personal_states.then_some(&st),
+                    )
+                } else {
+                    raw_lp
+                };
+                score += neural_w * lp;
+                nv.step_token(nv.char_to_token(ch), &mut st);
                 personal_context = personal_context.push(ch);
             }
-        }
+            st
+        } else {
+            if personalize {
+                score += personal.score(personal_context, &step.text);
+                for ch in step.text.chars() {
+                    personal_context = personal_context.push(ch);
+                }
+            }
+            step.parent.state.clone()
+        };
         let mut text = step.parent.text.clone();
         text.push_str(&step.text);
         let mut boundaries = step.parent.boundaries.clone();
@@ -794,6 +907,10 @@ fn build_pinyin_candidates(
                             SylMatch::Prefix(p) => SylConstraint::Prefix(p.as_str()),
                         })
                         .collect();
+                    for (utext, ucnt) in decoder.user.lookup_pinyin_phrases(&constraints, decoder.dict, 8) {
+                        let sc = 4.0 + ((ucnt as f32) + 1.0).ln();
+                        extra_phrases.push((utext.to_owned(), sc));
+                    }
                     for e in decoder.dict.lookup_phrases(&constraints, 80) {
                         let mut sc = 0.42 * (((e.weight as f32) + 1.0).ln() - 8.5);
                         if decoder.config.dynamic_word_freq {
@@ -977,8 +1094,14 @@ fn build_pinyin_candidates(
     (out, full_paths.to_vec())
 }
 
-/// Compute 26-bit `validNextMask` and 26-key `nextKeyPriors` for Pinyin touch-keyboard缝裁决.
-pub fn pinyin_next_key_priors(raw_code: &str, dict: &PinyinDictView) -> (u32, [u8; 26]) {
+/// Compute 26-bit `validNextMask` and 26-key `nextKeyPriors` for Pinyin touch-keyboard键缝裁决.
+/// When `rwkv_start_priors` is provided (`0.0..=1.0` probability mass per letter from `Micro-RWKV-7`),
+/// syllable-start keys are weighted by contextual neural probability rather than flat uniform priors.
+pub fn pinyin_next_key_priors(
+    raw_code: &str,
+    dict: &PinyinDictView,
+    rwkv_start_priors: Option<&[f32; 26]>,
+) -> (u32, [u8; 26]) {
     let mut mask = 0u32;
     let mut scores = [0.0f32; 26];
 
@@ -1011,7 +1134,8 @@ pub fn pinyin_next_key_priors(raw_code: &str, dict: &PinyinDictView) -> (u32, [u
         for &b in syl_starts {
             let idx = (b - b'a') as usize;
             mask |= 1u32 << idx;
-            scores[idx] += 1.0;
+            let rwkv_w = rwkv_start_priors.map_or(0.0, |p| p[idx]);
+            scores[idx] += 1.0 + 4.5 * rwkv_w;
         }
     }
 
@@ -1019,7 +1143,11 @@ pub fn pinyin_next_key_priors(raw_code: &str, dict: &PinyinDictView) -> (u32, [u
     let mut priors = [0u8; 26];
     if max_s > 0.0 {
         for i in 0..26 {
-            priors[i] = ((scores[i] / max_s) * 255.0).round().clamp(0.0, 255.0) as u8;
+            if (mask & (1u32 << i)) != 0 {
+                // Keep calibrated in the same 54..=180 hitbox range used by Wubi/Xiaohe
+                let norm = (scores[i] / max_s).clamp(0.0, 1.0);
+                priors[i] = (65.0 + 115.0 * norm).round().clamp(54.0, 180.0) as u8;
+            }
         }
     }
     (mask, priors)

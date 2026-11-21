@@ -1,6 +1,7 @@
 use crate::code::PackedCode;
 use crate::format::DictView;
 use crate::personalization::PersonalContinuations;
+use crate::pinyin_dict::{pack_init_key, PinyinDictView, SylConstraint};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
@@ -82,13 +83,15 @@ pub struct UserStore {
     pub phrases: HashMap<String, UserPhrase>,
     /// Active schema code -> list of `(text, count, last_seq)`
     code_index: HashMap<PackedCode, Vec<String>>,
+    /// Full Pinyin index: `(syl_count, init_key)` -> list of `(syl_ids, text)`
+    pinyin_index: HashMap<(u8, u32), Vec<(Vec<u16>, String)>>,
     pub unigram_counts: HashMap<String, u32>,
     pub word_bigrams: HashMap<(String, String), u32>,
     pub char_bigrams: HashMap<(char, char), u32>,
     pub(crate) continuations: PersonalContinuations,
     pub touch_profile: TouchProfile,
-    /// Rolling buffer of recent consecutive single-char commits `(ch, timestamp_ms)`
-    recent_singles: Vec<(char, u64)>,
+    /// Rolling buffer of recent consecutive single-char commits `(ch, timestamp_ms, rwkv_surprisal)`
+    recent_singles: Vec<(char, u64, Option<f32>)>,
     /// Candidate consecutive n-grams waiting to reach `auto_phrase_threshold`
     pending_ngrams: HashMap<String, u8>,
     pub dirty: bool,
@@ -100,6 +103,7 @@ impl Default for UserStore {
             seq: 1,
             phrases: HashMap::new(),
             code_index: HashMap::new(),
+            pinyin_index: HashMap::new(),
             unigram_counts: HashMap::new(),
             word_bigrams: HashMap::new(),
             char_bigrams: HashMap::new(),
@@ -183,11 +187,136 @@ impl UserStore {
         out
     }
 
+    /// Rebuild Pinyin phrase index for all user phrases using `pdict`'s reverse char->syllable table.
+    /// Allows phrases learned in Wubi/Xiaohe/Pinyin to be immediately retrievable in Full Pinyin!
+    pub fn reindex_pinyin_phrases(&mut self, pdict: &PinyinDictView) {
+        self.pinyin_index.clear();
+        let texts: Vec<String> = self.phrases.keys().cloned().collect();
+        for text in texts {
+            self.index_phrase_pinyin(&text, pdict);
+        }
+    }
+
+    fn index_phrase_pinyin(&mut self, text: &str, pdict: &PinyinDictView) {
+        let chars: Vec<char> = text.chars().collect();
+        let len = chars.len();
+        if !(2..=6).contains(&len) || !chars.iter().all(|&c| is_cjk_ideograph(c)) {
+            return;
+        }
+        let mut readings: Vec<Vec<u16>> = vec![Vec::with_capacity(len)];
+        for &ch in &chars {
+            let syls = pdict.char_syllables(ch);
+            if syls.is_empty() {
+                return;
+            }
+            let mut next = Vec::new();
+            'outer: for r in &readings {
+                for &sid in syls.iter().take(3) {
+                    let mut nr = r.clone();
+                    nr.push(sid);
+                    next.push(nr);
+                    if next.len() >= 8 {
+                        break 'outer;
+                    }
+                }
+            }
+            readings = next;
+        }
+        for syl_ids in readings {
+            let inits: Vec<u8> = syl_ids.iter().map(|&sid| pdict.syllable_init(sid).0).collect();
+            let Some(init_key) = pack_init_key(&inits) else {
+                continue;
+            };
+            let bucket = self.pinyin_index.entry((len as u8, init_key)).or_default();
+            if !bucket.iter().any(|(s, t)| s == &syl_ids && t == text) {
+                bucket.push((syl_ids, text.to_owned()));
+            }
+        }
+    }
+
+    /// Look up user phrases matching Full Pinyin `constraints`, sorted by `(count DESC, last_seq DESC)`.
+    pub fn lookup_pinyin_phrases(
+        &self,
+        constraints: &[SylConstraint<'_>],
+        pdict: &PinyinDictView,
+        limit: usize,
+    ) -> Vec<(&str, u32)> {
+        let len = constraints.len();
+        if !(2..=6).contains(&len) || self.pinyin_index.is_empty() {
+            return Vec::new();
+        }
+        let mut inits = [0u8; 6];
+        for (i, c) in constraints.iter().enumerate() {
+            inits[i] = match c {
+                SylConstraint::Full(sid) => pdict.syllable_init(*sid).0,
+                SylConstraint::Initial(init_id, _) => *init_id,
+                SylConstraint::Prefix(p) => crate::pinyin_dict::base_initial_id(p),
+            };
+        }
+        let Some(init_key) = pack_init_key(&inits[..len]) else {
+            return Vec::new();
+        };
+        let Some(bucket) = self.pinyin_index.get(&(len as u8, init_key)) else {
+            return Vec::new();
+        };
+        let mut hits: Vec<(&str, u32, u64)> = Vec::new();
+        for (syl_ids, text) in bucket {
+            if syl_ids.len() != len {
+                continue;
+            }
+            let mut matched = true;
+            for j in 0..len {
+                let sid = syl_ids[j];
+                match constraints[j] {
+                    SylConstraint::Full(req_sid) => {
+                        if sid != req_sid {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    SylConstraint::Initial(_, req_digraph) => {
+                        if req_digraph && !pdict.syllable_init(sid).1 {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    SylConstraint::Prefix(pref) => {
+                        if !pdict.syllable_str(sid).starts_with(pref) {
+                            matched = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !matched {
+                continue;
+            }
+            if let Some(up) = self.phrases.get(text) {
+                if !hits.iter().any(|h| h.0 == up.text.as_str()) {
+                    hits.push((up.text.as_str(), up.count, up.last_seq));
+                }
+            }
+        }
+        hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+        hits.truncate(limit);
+        hits.into_iter().map(|(t, c, _)| (t, c)).collect()
+    }
+
     pub fn add_phrase(
         &mut self,
         text: &str,
         auto_composed: bool,
         dict: Option<&DictView>,
+    ) -> Option<PackedCode> {
+        self.add_phrase_with_pinyin(text, auto_composed, dict, None)
+    }
+
+    pub fn add_phrase_with_pinyin(
+        &mut self,
+        text: &str,
+        auto_composed: bool,
+        dict: Option<&DictView>,
+        pdict: Option<&PinyinDictView>,
     ) -> Option<PackedCode> {
         let char_len = text.chars().count();
         if char_len < 2 || char_len > 12 {
@@ -210,6 +339,9 @@ impl UserStore {
             });
         let _ = entry;
         self.dirty = true;
+        if let Some(pd) = pdict {
+            self.index_phrase_pinyin(text, pd);
+        }
         if let Some(d) = dict {
             if let Some(code) = d.encode_phrase(text) {
                 let list = self.code_index.entry(code).or_default();
@@ -227,6 +359,9 @@ impl UserStore {
         if existed {
             for list in self.code_index.values_mut() {
                 list.retain(|s| s != text);
+            }
+            for list in self.pinyin_index.values_mut() {
+                list.retain(|(_, s)| s != text);
             }
             self.dirty = true;
         }
@@ -248,6 +383,32 @@ impl UserStore {
         auto_phrase: bool,
         auto_threshold: u8,
         dict: Option<&DictView>,
+    ) -> Option<String> {
+        self.record_commit_with_surprisal(
+            prev_committed,
+            committed,
+            timestamp_ms,
+            auto_phrase,
+            auto_threshold,
+            dict,
+            None,
+            None,
+        )
+    }
+
+    /// Extended commit recorder driven by `Micro-RWKV-7` surprisal (`-log P_rwkv`) and cross-mode
+    /// Pinyin phrase indexing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_commit_with_surprisal(
+        &mut self,
+        prev_committed: &str,
+        committed: &str,
+        timestamp_ms: u64,
+        auto_phrase: bool,
+        auto_threshold: u8,
+        dict: Option<&DictView>,
+        pdict: Option<&PinyinDictView>,
+        surprisal: Option<f32>,
     ) -> Option<String> {
         if committed.is_empty() {
             return None;
@@ -292,12 +453,12 @@ impl UserStore {
             return None;
         }
 
-        if let Some(&(_, last_ts)) = self.recent_singles.last() {
+        if let Some(&(_, last_ts, _)) = self.recent_singles.last() {
             if timestamp_ms > 0 && last_ts > 0 && timestamp_ms.saturating_sub(last_ts) > 5000 {
                 self.recent_singles.clear();
             }
         }
-        self.recent_singles.push((first_ch, timestamp_ms));
+        self.recent_singles.push((first_ch, timestamp_ms, surprisal));
         if self.recent_singles.len() > 4 {
             self.recent_singles.remove(0);
         }
@@ -309,15 +470,43 @@ impl UserStore {
         // Check 2-char suffix (and 3-char suffix if available)
         let n = self.recent_singles.len();
         let cand2: String = self.recent_singles[n - 2..n].iter().map(|x| x.0).collect();
-        let promoted = self.bump_pending_ngram(&cand2, auto_threshold, dict);
+        let surp2 = self.recent_singles[n - 1].2;
+        let promoted = self.bump_pending_ngram(&cand2, auto_threshold, dict, pdict, surp2);
         if promoted.is_some() {
             return promoted;
         }
         if n >= 3 {
             let cand3: String = self.recent_singles[n - 3..n].iter().map(|x| x.0).collect();
-            return self.bump_pending_ngram(&cand3, auto_threshold, dict);
+            let surp3 = match (self.recent_singles[n - 2].2, self.recent_singles[n - 1].2) {
+                (Some(a), Some(b)) => Some(0.5 * (a + b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            return self.bump_pending_ngram(&cand3, auto_threshold, dict, pdict, surp3);
         }
         None
+    }
+
+    /// Promote a multi-character phrase assembled by the user (e.g. from Pinyin multi-segment selection)
+    /// when it is surprising to RWKV and not already in the dictionary.
+    pub fn record_assembled_phrase(
+        &mut self,
+        phrase: &str,
+        mean_surprisal: Option<f32>,
+        auto_phrase: bool,
+        auto_threshold: u8,
+        dict: Option<&DictView>,
+        pdict: Option<&PinyinDictView>,
+    ) -> Option<String> {
+        if !auto_phrase {
+            return None;
+        }
+        let len = phrase.chars().count();
+        if !(2..=4).contains(&len) || !phrase.chars().all(is_cjk_ideograph) {
+            return None;
+        }
+        self.bump_pending_ngram(phrase, auto_threshold, dict, pdict, mean_surprisal)
     }
 
     fn bump_pending_ngram(
@@ -325,15 +514,35 @@ impl UserStore {
         phrase: &str,
         threshold: u8,
         dict: Option<&DictView>,
+        pdict: Option<&PinyinDictView>,
+        mean_surprisal: Option<f32>,
     ) -> Option<String> {
         if self.phrases.contains_key(phrase) {
             return None;
         }
-        // Skip common functional stop-chars at boundaries (的、了、是、在、我、你、他、吗、呢、吧、啊)
-        // so typing "我的" or "是在" doesn't pollute user phrases unless already in base dict.
-        if phrase.chars().any(is_stop_glue_char) {
-            return None;
-        }
+        // Surprisal-guided gating when Micro-RWKV-7 is active:
+        // - Low surprisal (< 2.8 nats, P > 6%): RWKV already predicts this naturally -> don't pollute phrases!
+        // - High surprisal (>= 6.5 nats): true OOV name/jargon/coined term -> accelerate promotion (+2)!
+        // - Without RWKV: fall back to static stop-glue filter.
+        let bump: u8 = if let Some(surp) = mean_surprisal {
+            if surp < 2.8 {
+                return None;
+            }
+            if surp >= 6.5 {
+                2
+            } else {
+                if phrase.chars().any(is_stop_glue_char) {
+                    return None;
+                }
+                1
+            }
+        } else {
+            if phrase.chars().any(is_stop_glue_char) {
+                return None;
+            }
+            1
+        };
+
         if let Some(d) = dict {
             let Some(code) = d.encode_phrase(phrase) else {
                 return None;
@@ -347,10 +556,10 @@ impl UserStore {
             }
         }
         let cnt = self.pending_ngrams.entry(phrase.to_string()).or_insert(0);
-        *cnt = cnt.saturating_add(1);
+        *cnt = cnt.saturating_add(bump);
         if *cnt >= threshold.max(1) {
             self.pending_ngrams.remove(phrase);
-            self.add_phrase(phrase, true, dict);
+            self.add_phrase_with_pinyin(phrase, true, dict, pdict);
             return Some(phrase.to_string());
         }
         None

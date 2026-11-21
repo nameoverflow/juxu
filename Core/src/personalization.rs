@@ -183,6 +183,72 @@ impl Counts {
         let similarity = 1.0 - nearest as f32 / 32.0;
         2.25 * similarity * (support / (support + 3.0)) * (matches / (support + 1.0))
     }
+
+    /// Estimate `(p_cache, lambda)` from suffix n-gram counts at this context row.
+    fn cache_suffix_prob(&self, ch: u16, max_lambda: f32, now: u64) -> (f32, f32) {
+        let decay = self.decay(now);
+        let total = self.total * decay;
+        if total < 0.25 {
+            return (0.0, 0.0);
+        }
+        let support = total / (total + 3.0);
+        let lambda = max_lambda * support;
+        let w = self
+            .options
+            .iter()
+            .find(|o| o.ch == ch)
+            .map_or(0.0, |o| o.weight * decay);
+        let p_cache = (w / (total + 1.0)).clamp(0.0, 0.99);
+        (p_cache, lambda)
+    }
+
+    /// Estimate `(p_cache, lambda)` from RWKV `p1_q` 128-bit state-signature kNN samples.
+    fn cache_state_prob(&self, ch: u16, state: &RwkvState, now: u64) -> (f32, f32) {
+        let decay = self.decay(now);
+        let signature = state_signature(state);
+        let mut nearest = u32::MAX;
+        for sample in &self.states {
+            if sample.continuation.ch == 0 {
+                continue;
+            }
+            let w = sample.continuation.weight * decay;
+            if w < 0.1 {
+                continue;
+            }
+            let dist = (sample.signature ^ signature).count_ones();
+            if dist <= MAX_STATE_DISTANCE && dist < nearest {
+                nearest = dist;
+            }
+        }
+        if nearest == u32::MAX {
+            return (0.0, 0.0);
+        }
+        let mut support = 0.0f32;
+        let mut matches = 0.0f32;
+        for sample in &self.states {
+            if sample.continuation.ch == 0 {
+                continue;
+            }
+            let w = sample.continuation.weight * decay;
+            if w < 0.1 {
+                continue;
+            }
+            let dist = (sample.signature ^ signature).count_ones();
+            if dist <= nearest + STATE_NEIGHBORHOOD {
+                support += w;
+                if sample.continuation.ch == ch {
+                    matches += w;
+                }
+            }
+        }
+        if support <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let similarity = (1.0 - nearest as f32 / 32.0).clamp(0.0, 1.0);
+        let lambda = 0.55 * similarity * (support / (support + 3.0));
+        let p_cache = (matches / (support + 1.0)).clamp(0.0, 0.99);
+        (p_cache, lambda)
+    }
 }
 
 #[derive(Default)]
@@ -292,6 +358,57 @@ impl PersonalContinuations {
             return 0.0;
         }
         row.state_bonus(ch as u16, state, self.tick)
+    }
+
+    /// Unified Neural Cache LM probability-space interpolation:
+    /// `P_final(ch | h) = (1 - lambda) * exp(rwkv_logp) + lambda * P_cache(ch | h_sig, suffix)`
+    /// Returns the calibrated log-probability in nats.
+    pub fn interpolate_logp(
+        &self,
+        rwkv_logp: f32,
+        context: Context,
+        ch: char,
+        state: Option<&RwkvState>,
+    ) -> f32 {
+        if self.rows.is_empty() || !han(ch) {
+            return rwkv_logp;
+        }
+        let ch_u16 = ch as u16;
+        let mut best_p = 0.0f32;
+        let mut best_lambda = 0.0f32;
+
+        // 1. Prefer RWKV state-signature kNN distribution at 3-char context when available
+        if let Some(st) = state {
+            if let Some(row) = context.three_chars().and_then(|key| self.rows.get(&key)) {
+                let (p_st, l_st) = row.cache_state_prob(ch_u16, st, self.tick);
+                if l_st > 0.04 {
+                    best_p = p_st;
+                    best_lambda = l_st;
+                }
+            }
+        }
+
+        // 2. Fall back to or blend with longest matching character suffix (1..=3 chars)
+        if best_lambda < 0.04 {
+            let max_lambdas = [0.18f32, 0.30, 0.42];
+            for (idx, (key, _)) in context.suffixes().enumerate() {
+                if let Some(row) = self.rows.get(&key) {
+                    let (p_suf, l_suf) =
+                        row.cache_suffix_prob(ch_u16, max_lambdas[idx.min(2)], self.tick);
+                    if l_suf > best_lambda || (l_suf > 0.04 && p_suf > best_p) {
+                        best_p = p_suf;
+                        best_lambda = l_suf;
+                    }
+                }
+            }
+        }
+
+        if best_lambda <= 1e-4 {
+            return rwkv_logp;
+        }
+        let p_rwkv = rwkv_logp.clamp(-13.5, -0.001).exp();
+        let p_final = ((1.0 - best_lambda) * p_rwkv + best_lambda * best_p).clamp(1e-6, 0.999);
+        p_final.ln()
     }
 
     pub fn write_to(&self, out: &mut String) {

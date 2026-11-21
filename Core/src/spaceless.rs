@@ -7,7 +7,7 @@ use crate::typo::{
     generate_hypotheses_with_options, CorrectionKind, KeyLayout, KeyObs,
 };
 use crate::user_data::UserStore;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 const BEAM_WIDTH: usize = 8;
 const MAX_CODE_LEN: usize = 4;
@@ -150,6 +150,13 @@ impl Stream {
         self.layers.back().map_or(&[], Vec::as_slice)
     }
 
+    pub fn best_state(&self) -> Option<&RwkvState> {
+        self.layers
+            .iter()
+            .rev()
+            .find_map(|layer| layer.first().map(|p| &p.state))
+    }
+
     pub fn preview(&self, code: &str) -> String {
         for (index, layer) in self.layers.iter().enumerate().rev() {
             if let Some(best) = layer.first() {
@@ -259,7 +266,10 @@ impl Stream {
     fn extend(&self, decoder: &Decoder<'_>, observations: &[KeyObs]) -> Vec<Path> {
         struct Step<'a> {
             parent: &'a Path,
+            parent_key: (usize, usize), // (layer_pos, parent_idx) for trie-shared prefix state cache
             text: &'a str,
+            first: char,
+            n_chars: usize,
             estimate: f32,
             bias: f32,
             code: PackedCode,
@@ -272,11 +282,12 @@ impl Stream {
         let personalize = decoder.config.dynamic_word_freq && !personal.is_empty();
         let use_personal_states = personalize && personal.matches_model(&decoder.model);
         for len in 1..=end.min(MAX_CODE_LEN) {
-            let parents = self.layer(end - len);
+            let parent_pos = end - len;
+            let parents = self.layer(parent_pos);
             if parents.is_empty() {
                 continue;
             }
-            let window = &observations[end - len..];
+            let window = &observations[parent_pos..];
             let hypotheses = generate_hypotheses_with_options(
                 window,
                 decoder.layout,
@@ -377,7 +388,8 @@ impl Stream {
                         .filter(|&c| decoder.model.char_to_token(c) <= 1)
                         .count() as f32;
                 if let Some(second) = second {
-                    bias += 0.0375 * decoder.aux.bigram_boost(first, second);
+                    // Light tie-breaking cohesion since RWKV V2 provides primary contextual LM in nats
+                    bias += 0.02 * decoder.aux.bigram_boost(first, second);
                     if len == MAX_CODE_LEN && rank == 0 {
                         bias += 0.45;
                     }
@@ -385,7 +397,7 @@ impl Stream {
                 if custom {
                     bias += 2.5;
                 }
-                for parent in parents {
+                for (parent_idx, parent) in parents.iter().enumerate() {
                     let mut preceding = parent
                         .text
                         .chars()
@@ -393,29 +405,38 @@ impl Stream {
                         .chain(decoder.context.iter().rev().copied());
                     let mut contextual_bias = bias;
                     if let Some(prev) = preceding.next() {
-                        contextual_bias += 0.15 * decoder.aux.bigram_boost(prev, first);
+                        // Reduced static N-gram weight because RWKV V2 is active in nats
+                        contextual_bias += 0.05 * decoder.aux.bigram_boost(prev, first);
                         if let Some(prev2) = preceding.next() {
-                            contextual_bias += 0.15 * decoder.aux.trigram_boost(prev2, prev, first);
+                            contextual_bias += 0.05 * decoder.aux.trigram_boost(prev2, prev, first);
                         }
                     }
-                    if personalize {
-                        contextual_bias += personal.score(parent.personal_context, text);
-                    }
-                    let estimate = if n_chars == 1 {
-                        decoder.model.score_next_char(&parent.state, first)
+                    let raw_lp1 = decoder.model.score_next_char(&parent.state, first);
+                    let lp1 = if personalize {
+                        personal.interpolate_logp(
+                            raw_lp1,
+                            parent.personal_context,
+                            first,
+                            use_personal_states.then_some(&parent.state),
+                        )
                     } else {
-                        decoder.model.score_phrase_fast(&parent.state, text)
-                            * (n_chars.min(MAX_CODE_LEN) as f32).powf(0.65)
+                        raw_lp1
                     };
-                    let personal_estimate = if use_personal_states {
-                        personal.state_bonus(parent.personal_context, first, &parent.state)
+                    let estimate = if n_chars == 1 {
+                        lp1
                     } else {
-                        0.0
+                        let fast_total = decoder.model.score_phrase_fast(&parent.state, text)
+                            * (n_chars.min(MAX_CODE_LEN) as f32).powf(0.65);
+                        // Replace c1's raw logp with Neural-Cache-interpolated lp1
+                        fast_total - raw_lp1 + lp1
                     };
                     steps.push(Step {
                         parent,
+                        parent_key: (parent_pos, parent_idx),
                         text,
-                        estimate: parent.score + contextual_bias + estimate + personal_estimate,
+                        first,
+                        n_chars,
+                        estimate: parent.score + contextual_bias + estimate,
                         bias: contextual_bias,
                         code,
                         correction,
@@ -425,16 +446,96 @@ impl Stream {
         }
         steps.sort_unstable_by(|a, b| b.estimate.total_cmp(&a.estimate));
 
+        // Trie-shared prefix state refinement for top candidates:
+        // Share `step_token(c1)` across multi-char candidates sharing `(parent_key, first)`
+        // so 2-char phrases get 100% exact RWKV probability and 3-char phrases get exact c1,c2 + MTP-2 c3!
+        let refine_limit = (BEAM_WIDTH * 2).min(steps.len());
+        let mut prefix_cache: HashMap<(usize, usize, char), RwkvState> =
+            HashMap::with_capacity(refine_limit);
+        for step in &mut steps[..refine_limit] {
+            if step.n_chars >= 2 {
+                let cache_key = (step.parent_key.0, step.parent_key.1, step.first);
+                let state_after_c1 = prefix_cache.entry(cache_key).or_insert_with(|| {
+                    let mut st = step.parent.state.clone();
+                    decoder
+                        .model
+                        .step_token(decoder.model.char_to_token(step.first), &mut st);
+                    st
+                });
+                let raw_lp1 = decoder.model.score_next_char(&step.parent.state, step.first);
+                let lp1 = if personalize {
+                    personal.interpolate_logp(
+                        raw_lp1,
+                        step.parent.personal_context,
+                        step.first,
+                        use_personal_states.then_some(&step.parent.state),
+                    )
+                } else {
+                    raw_lp1
+                };
+                let rest = &step.text[step.first.len_utf8()..];
+                let rest_chars = step.n_chars - 1;
+                let rest_est = if rest_chars == 1 {
+                    let c2 = rest.chars().next().unwrap();
+                    let raw_lp2 = decoder.model.score_next_char(state_after_c1, c2);
+                    if personalize {
+                        let ctx2 = step.parent.personal_context.push(step.first);
+                        personal.interpolate_logp(
+                            raw_lp2,
+                            ctx2,
+                            c2,
+                            use_personal_states.then_some(state_after_c1),
+                        )
+                    } else {
+                        raw_lp2
+                    }
+                } else {
+                    decoder.model.score_phrase_fast(state_after_c1, rest)
+                        * (rest_chars.min(MAX_CODE_LEN) as f32).powf(0.65)
+                };
+                step.estimate = step.parent.score + step.bias + lp1 + rest_est;
+            }
+        }
+        steps[..refine_limit].sort_unstable_by(|a, b| b.estimate.total_cmp(&a.estimate));
+
         let mut paths: Vec<Path> = Vec::with_capacity(BEAM_WIDTH * 2);
         for step in steps.into_iter().take(BEAM_WIDTH * 2) {
-            let mut state = step.parent.state.clone();
             let mut score = step.parent.score + step.bias;
             let mut personal_context = step.parent.personal_context;
-            for ch in step.text.chars() {
-                score += decoder.model.score_next_char(&state, ch);
-                if use_personal_states {
-                    score += personal.state_bonus(personal_context, ch, &state);
-                }
+            let raw_lp1 = decoder.model.score_next_char(&step.parent.state, step.first);
+            score += if personalize {
+                personal.interpolate_logp(
+                    raw_lp1,
+                    personal_context,
+                    step.first,
+                    use_personal_states.then_some(&step.parent.state),
+                )
+            } else {
+                raw_lp1
+            };
+            let cache_key = (step.parent_key.0, step.parent_key.1, step.first);
+            let mut state = if let Some(cached) = prefix_cache.get(&cache_key) {
+                cached.clone()
+            } else {
+                let mut st = step.parent.state.clone();
+                decoder
+                    .model
+                    .step_token(decoder.model.char_to_token(step.first), &mut st);
+                st
+            };
+            personal_context = personal_context.push(step.first);
+            for ch in step.text.chars().skip(1) {
+                let raw_lp = decoder.model.score_next_char(&state, ch);
+                score += if personalize {
+                    personal.interpolate_logp(
+                        raw_lp,
+                        personal_context,
+                        ch,
+                        use_personal_states.then_some(&state),
+                    )
+                } else {
+                    raw_lp
+                };
                 decoder
                     .model
                     .step_token(decoder.model.char_to_token(ch), &mut state);

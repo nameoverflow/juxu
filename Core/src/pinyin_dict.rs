@@ -303,6 +303,8 @@ pub struct PinyinDictView {
     phrase_entries_off: usize,
     syl_seq_pool_off: usize,
     string_pool_off: usize,
+    /// Compact sorted reverse index `(unicode_cp, syl_id)` for O(log N) char -> syllables lookup.
+    char_syl_index: Vec<(u32, u16)>,
 }
 
 impl PinyinDictView {
@@ -336,6 +338,38 @@ impl PinyinDictView {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated PYDICT01"));
         }
 
+        let mut char_syl_index = Vec::<(u32, u16)>::with_capacity(char_entry_count);
+        for sid in 0..syl_count {
+            let boff = char_buckets_off + sid * CHAR_BUCKET_STRIDE;
+            if boff + CHAR_BUCKET_STRIDE > b.len() {
+                break;
+            }
+            let start = read_u32(b, boff) as usize;
+            let count = read_u16(b, boff + 4) as usize;
+            for i in 0..count {
+                if start + i >= char_entry_count {
+                    break;
+                }
+                let eoff = char_entries_off + (start + i) * CHAR_ENTRY_STRIDE;
+                if eoff + CHAR_ENTRY_STRIDE > b.len() {
+                    break;
+                }
+                let str_off = read_u32(b, eoff) as usize;
+                let str_len = read_u16(b, eoff + 8) as usize;
+                let text_start = string_pool_off + str_off;
+                if text_start + str_len <= b.len() {
+                    if let Ok(text) = std::str::from_utf8(&b[text_start..text_start + str_len]) {
+                        let mut chars = text.chars();
+                        if let (Some(ch), None) = (chars.next(), chars.next()) {
+                            char_syl_index.push((ch as u32, sid as u16));
+                        }
+                    }
+                }
+            }
+        }
+        char_syl_index.sort_unstable();
+        char_syl_index.dedup();
+
         Ok(Self {
             buf,
             syl_count,
@@ -349,6 +383,7 @@ impl PinyinDictView {
             phrase_entries_off,
             syl_seq_pool_off,
             string_pool_off,
+            char_syl_index,
         })
     }
 
@@ -552,6 +587,38 @@ impl PinyinDictView {
 
     pub fn stats(&self) -> (usize, usize, usize) {
         (self.syl_count, self.char_entry_count, self.phrase_entry_count)
+    }
+
+    /// Return all syllable IDs for a single character via O(log N) binary search.
+    pub fn char_syllables(&self, ch: char) -> Vec<u16> {
+        let target = ch as u32;
+        let start = self.char_syl_index.partition_point(|&(cp, _)| cp < target);
+        let mut out = Vec::new();
+        for &(cp, sid) in &self.char_syl_index[start..] {
+            if cp != target {
+                break;
+            }
+            out.push(sid);
+        }
+        out
+    }
+
+    /// Return a 26-bit mask of valid syllable-starting letters (`'a'..='z'`) for `ch`.
+    pub fn char_first_letters_mask(&self, ch: char) -> u32 {
+        let target = ch as u32;
+        let start = self.char_syl_index.partition_point(|&(cp, _)| cp < target);
+        let mut mask = 0u32;
+        for &(cp, sid) in &self.char_syl_index[start..] {
+            if cp != target {
+                break;
+            }
+            if let Some(&b) = self.syllable_str(sid).as_bytes().first() {
+                if b.is_ascii_lowercase() {
+                    mask |= 1u32 << (b - b'a');
+                }
+            }
+        }
+        mask
     }
 }
 

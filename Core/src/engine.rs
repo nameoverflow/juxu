@@ -2,6 +2,7 @@ use crate::code::{expand_wildcards, PackedCode};
 use crate::config::{FourthEmptyBehavior, ShiftToggleMode, WubiConfig, WubiSchema};
 use crate::format::{AuxView, DictView, ENTRY_FLAG_SYMBOL};
 use crate::neural::{NeuralContextTracker, NeuralView, RwkvState};
+use crate::personalization::Context as PersonalContext;
 use crate::pinyin::{
     pinyin_next_key_priors, PinyinCandidate, PinyinDecoder, PinyinPath, PinyinStream,
 };
@@ -689,6 +690,7 @@ impl WubiEngine {
     }
 
     pub fn load_pinyin_dict(&mut self, dict: PinyinDictView) {
+        self.user.reindex_pinyin_phrases(&dict);
         self.pinyin_dict = Some(dict);
         if self.config.schema.is_pinyin() && !self.raw_code.is_empty() {
             self.rebuild_candidates();
@@ -895,21 +897,44 @@ impl WubiEngine {
             let pc = self.pinyin_candidates.get(abs_idx)?;
             let commit_text = pc.candidate.text.clone();
             let consumed = pc.consumed_keys.min(self.observations.len());
+            let multi_segment = pc.boundaries.len() >= 2;
             let learn = self.config.dynamic_word_freq && (explicit || pc.candidate.is_exact);
             let first_choice = (learn && explicit && abs_idx > 0)
                 .then(|| self.candidates.first().map(|c| c.text.clone()))
                 .flatten();
+            // Compute RWKV surprisal BEFORE advancing neural_tracker so auto-phrase can gate on it
+            let surprisal = self.compute_rwkv_surprisal(&commit_text);
+            let mut notice = String::new();
             if learn {
                 self.learn_continuation(&commit_text, explicit, first_choice.as_deref());
                 let prev = self.last_committed.clone();
-                let _ = self.user.record_commit(
+                let dict_idx = self.config.schema.slot_index();
+                let dict_opt = self.dicts.get(dict_idx).and_then(|d| d.as_ref());
+                let learned = self.user.record_commit_with_surprisal(
                     &prev,
                     &commit_text,
                     timestamp_ms,
-                    false,
-                    2,
-                    None,
+                    self.config.auto_phrase,
+                    self.config.auto_phrase_threshold,
+                    dict_opt,
+                    self.pinyin_dict.as_ref(),
+                    surprisal,
                 );
+                if let Some(new_word) = learned {
+                    notice = format!("自动成词：{}", new_word);
+                } else if multi_segment {
+                    // User assembled a multi-segment phrase in Pinyin; promote if surprising to RWKV
+                    if let Some(new_word) = self.user.record_assembled_phrase(
+                        &commit_text,
+                        surprisal,
+                        self.config.auto_phrase,
+                        self.config.auto_phrase_threshold,
+                        dict_opt,
+                        self.pinyin_dict.as_ref(),
+                    ) {
+                        notice = format!("自动成词：{}", new_word);
+                    }
+                }
                 // Also record individual CJK characters of a committed word so subsequent single-char lookup (e.g. ju -> 橘 after 橘子) boosts them!
                 if commit_text.chars().count() >= 2 {
                     for ch in commit_text.chars() {
@@ -957,7 +982,7 @@ impl WubiEngine {
                     commit_text,
                     preedit: self.preedit(),
                     bell: false,
-                    notice: String::new(),
+                    notice,
                 });
             }
             self.clear_composition();
@@ -966,7 +991,7 @@ impl WubiEngine {
                 commit_text,
                 preedit: String::new(),
                 bell: false,
-                notice: String::new(),
+                notice,
             });
         }
         let cand = self.candidates.get(abs_idx)?.clone();
@@ -1042,7 +1067,7 @@ impl WubiEngine {
         }
         if self.is_pinyin_mode() {
             if let Some(ref pdict) = self.pinyin_dict {
-                let (mask, _) = pinyin_next_key_priors(&self.raw_code, pdict);
+                let (mask, _) = pinyin_next_key_priors(&self.raw_code, pdict, None);
                 return if mask == 0 { ALL_26 } else { mask };
             }
             return ALL_26;
@@ -1071,9 +1096,105 @@ impl WubiEngine {
         mask
     }
 
+    /// Compute normalized 26-key probability mass (`0.0..=1.0`) for the next syllable's initial
+    /// letter from `Micro-RWKV-7`'s top-32 predicted characters.
+    fn rwkv_pinyin_start_priors(&self, pdict: &PinyinDictView) -> Option<[f32; 26]> {
+        let nv = self.aux.as_ref()?.neural_view()?;
+        if !self.neural_tracker.is_ready() {
+            return None;
+        }
+        let state = self
+            .pinyin_paths
+            .first()
+            .map(|p| &p.state)
+            .unwrap_or(&self.neural_tracker.active);
+        let top = nv.top_next_chars(state, 32);
+        if top.is_empty() {
+            return None;
+        }
+        let mut mass = [0.0f32; 26];
+        let mut total = 0.0f32;
+        for (ch, lp) in top {
+            let p = lp.clamp(-13.5, 0.0).exp();
+            let mask = pdict.char_first_letters_mask(ch);
+            if mask == 0 {
+                continue;
+            }
+            let cnt = mask.count_ones() as f32;
+            let share = p / cnt;
+            for idx in 0..26usize {
+                if (mask & (1u32 << idx)) != 0 {
+                    mass[idx] += share;
+                }
+            }
+            total += p;
+        }
+        if total <= 1e-6 {
+            return None;
+        }
+        for v in &mut mass {
+            *v /= total;
+        }
+        Some(mass)
+    }
+
+    /// Compute 26-key contextual priors (`54..=180`) for any shape/phonetic-shape schema
+    /// (Wubi98/06/Xiaohe/spaceless) from `Micro-RWKV-7`'s `top_next_chars`.
+    fn rwkv_dict_first_key_priors(&self, state: &RwkvState, dict: &DictView) -> Option<[u8; 26]> {
+        let nv = self.aux.as_ref()?.neural_view()?;
+        if !self.neural_tracker.is_ready() {
+            return None;
+        }
+        let top = nv.top_next_chars(state, 32);
+        if top.is_empty() {
+            return None;
+        }
+        let mut mass = [0.0f32; 26];
+        let mut total = 0.0f32;
+        for (ch, lp) in top {
+            let Some(meta) = dict.char_meta(ch) else {
+                continue;
+            };
+            let p = lp.clamp(-13.5, 0.0).exp();
+            let mut mask = 0u32;
+            if let Some(&b) = meta.shortest_code.as_string().as_bytes().first() {
+                if b.is_ascii_lowercase() {
+                    mask |= 1u32 << (b - b'a');
+                }
+            }
+            if let Some(&b) = meta.full_code.as_string().as_bytes().first() {
+                if b.is_ascii_lowercase() {
+                    mask |= 1u32 << (b - b'a');
+                }
+            }
+            if mask == 0 {
+                continue;
+            }
+            let share = p / (mask.count_ones() as f32);
+            for idx in 0..26usize {
+                if (mask & (1u32 << idx)) != 0 {
+                    mass[idx] += share;
+                }
+            }
+            total += p;
+        }
+        if total <= 1e-6 {
+            return None;
+        }
+        let mut out = [100u8; 26];
+        let uniform = 1.0 / 26.0;
+        for idx in 0..26usize {
+            let p = (mass[idx] / total).max(1e-4);
+            let delta = (p / uniform).ln().clamp(-2.5, 3.0);
+            out[idx] = (100.0 + 22.0 * delta).round().clamp(68.0, 172.0) as u8;
+        }
+        Some(out)
+    }
+
     /// 26-element continuous touch hitbox weight vector (`0` = dead key, `100` = neutral valid key,
-    /// `50..=180` = `Micro-RWKV-7` context-weighted valid key).
-    /// Powers Key #1 predictive gutter bias AND Keys #2..#4 valid-vs-valid gutter disambiguation!
+    /// `54..=180` = `Micro-RWKV-7` context-weighted valid key).
+    /// Powers Key #1 predictive gutter bias AND Keys #2..#4 valid-vs-valid gutter disambiguation
+    /// across Wubi86/98/06, Xiaohe, Spaceless, and Full Pinyin!
     pub fn next_key_priors(&self) -> [u8; 26] {
         let mut out = [100u8; 26];
         if self.ascii_mode || !self.config.typo.enabled {
@@ -1081,12 +1202,23 @@ impl WubiEngine {
         }
         if self.is_pinyin_mode() {
             if let Some(ref pdict) = self.pinyin_dict {
-                let (_, priors) = pinyin_next_key_priors(&self.raw_code, pdict);
+                let rwkv_starts = self.rwkv_pinyin_start_priors(pdict);
+                let (_, priors) =
+                    pinyin_next_key_priors(&self.raw_code, pdict, rwkv_starts.as_ref());
                 return priors;
             }
             return out;
         }
         if self.uses_spaceless() {
+            if let Some(dict) = self.active_dict() {
+                let state = self
+                    .stream
+                    .best_state()
+                    .unwrap_or(&self.neural_tracker.active);
+                if let Some(priors) = self.rwkv_dict_first_key_priors(state, dict) {
+                    return priors;
+                }
+            }
             return out;
         }
         let bytes = self.raw_code.as_bytes();
@@ -1094,14 +1226,22 @@ impl WubiEngine {
             return out;
         }
 
-        // Case 1: Key #1 (`raw_code` is empty) — use cached `Micro-RWKV-7` first-stroke head!
+        // Case 1: Key #1 (`raw_code` is empty) — use `Micro-RWKV-7` first-key priors for ALL schemas!
         if bytes.is_empty() {
             if self.neural_tracker.is_ready() {
-                // Uniform log-prob across 25 Wubi keys ('a'..'y') is ln(1/25) = -3.2189
-                for idx in 0..25usize {
-                    let lp = self.neural_tracker.active.key1_logp[idx];
-                    let delta = lp - (-3.2189f32);
-                    out[idx] = (100.0 + 20.0 * delta).round().clamp(72.0, 168.0) as u8;
+                if self.config.schema == WubiSchema::Wubi86 {
+                    // Uniform log-prob across 25 Wubi keys ('a'..'y') is ln(1/25) = -3.2189
+                    for idx in 0..25usize {
+                        let lp = self.neural_tracker.active.key1_logp[idx];
+                        let delta = lp - (-3.2189f32);
+                        out[idx] = (100.0 + 20.0 * delta).round().clamp(72.0, 168.0) as u8;
+                    }
+                } else if let Some(dict) = self.active_dict() {
+                    if let Some(priors) =
+                        self.rwkv_dict_first_key_priors(&self.neural_tracker.active, dict)
+                    {
+                        return priors;
+                    }
                 }
             }
             return out;
@@ -1838,6 +1978,31 @@ impl WubiEngine {
         }
     }
 
+    /// Compute mean per-character RWKV surprisal (`-log P_rwkv(c_i | ctx)`) before advancing context.
+    fn compute_rwkv_surprisal(&self, text: &str) -> Option<f32> {
+        let nv = self.aux.as_ref()?.neural_view()?;
+        if !self.neural_tracker.is_ready() {
+            return None;
+        }
+        let mut chars = text.chars().filter(|&c| is_cjk_char(c));
+        let c1 = chars.next()?;
+        let lp1 = nv.score_next_char(&self.neural_tracker.active, c1).clamp(-13.5, -0.01);
+        let Some(c2) = chars.next() else {
+            return Some(-lp1);
+        };
+        let mut st = self.neural_tracker.active.clone();
+        nv.step_token(nv.char_to_token(c1), &mut st);
+        let mut sum_surp = -nv.score_next_char(&st, c2).clamp(-13.5, -0.01);
+        let mut count = 1.0f32;
+        nv.step_token(nv.char_to_token(c2), &mut st);
+        for ch in chars {
+            sum_surp += -nv.score_next_char(&st, ch).clamp(-13.5, -0.01);
+            count += 1.0;
+            nv.step_token(nv.char_to_token(ch), &mut st);
+        }
+        Some(sum_surp / count)
+    }
+
     fn finalize_commit(
         &mut self,
         text: &str,
@@ -1850,17 +2015,21 @@ impl WubiEngine {
             self.learn_touch_offsets(code, 0..self.observations.len());
         }
 
-        // 2. Update personal history & consecutive auto-phrase learning
+        // 2. Compute RWKV surprisal BEFORE advancing neural context, then update personal history
+        //    & surprisal-guided auto-phrase (indexed for both active shape schema AND Full Pinyin!)
+        let surprisal = self.compute_rwkv_surprisal(text);
         let dict_idx = self.config.schema.slot_index();
         let dict_opt = self.dicts.get(dict_idx).and_then(|d| d.as_ref());
         let prev = self.last_committed.clone();
-        let learned = self.user.record_commit(
+        let learned = self.user.record_commit_with_surprisal(
             &prev,
             text,
             timestamp_ms,
             self.config.auto_phrase,
             self.config.auto_phrase_threshold,
             dict_opt,
+            self.pinyin_dict.as_ref(),
+            surprisal,
         );
         if let Some(new_word) = learned {
             if let Some(d) = dict_opt {
@@ -1895,7 +2064,9 @@ impl WubiEngine {
         let d = self.dicts[dict_idx].as_ref()?;
         if self.last_committed.chars().count() >= 2 {
             let phrase = self.last_committed.clone();
-            let code = self.user.add_phrase(&phrase, false, Some(d))?;
+            let code =
+                self.user
+                    .add_phrase_with_pinyin(&phrase, false, Some(d), self.pinyin_dict.as_ref())?;
             return Some(EngineOutput {
                 consumed: true,
                 notice: format!("已收录词条：{} ({})", phrase, code.as_string()),
@@ -2203,7 +2374,16 @@ impl WubiEngine {
             );
             let n_fast = neural_view
                 .as_ref()
-                .map(|nv| lm_w.neural_scale * smooth_neural_score(nv.score_phrase_fast(&self.neural_tracker.active, utext)))
+                .map(|nv| {
+                    lm_w.neural_scale
+                        * smooth_neural_score(self.neural_cache_phrase_logp(
+                            nv,
+                            &self.neural_tracker.active,
+                            &self.recent_context,
+                            utext,
+                            false,
+                        ))
+                })
                 .unwrap_or(0.0);
             let base = 8.8 + ((ucnt as f32 + 1.0).ln() * 0.8) + ctx;
             let post = base + n_fast;
@@ -2278,7 +2458,16 @@ impl WubiEngine {
             );
             let n_fast = neural_view
                 .as_ref()
-                .map(|nv| lm_w.neural_scale * smooth_neural_score(nv.score_phrase_fast(&self.neural_tracker.active, entry.text)))
+                .map(|nv| {
+                    lm_w.neural_scale
+                        * smooth_neural_score(self.neural_cache_phrase_logp(
+                            nv,
+                            &self.neural_tracker.active,
+                            &self.recent_context,
+                            entry.text,
+                            false,
+                        ))
+                })
                 .unwrap_or(0.0);
             let base = prior + ctx;
             let post = base + n_fast;
@@ -2491,7 +2680,16 @@ impl WubiEngine {
                     );
                     let n_fast = neural_view
                         .as_ref()
-                        .map(|nv| lm_w.neural_scale * smooth_neural_score(nv.score_phrase_fast(&self.neural_tracker.active, e.text)))
+                        .map(|nv| {
+                            lm_w.neural_scale
+                                * smooth_neural_score(self.neural_cache_phrase_logp(
+                                    nv,
+                                    &self.neural_tracker.active,
+                                    &self.recent_context,
+                                    e.text,
+                                    false,
+                                ))
+                        })
                         .unwrap_or(0.0);
                     let base = spatial_scale * h.spatial_logp + prior + ctx;
                     fuzzy_items.push(FuzzyItem {
@@ -2530,7 +2728,13 @@ impl WubiEngine {
                         for item in exact_items.iter_mut().filter(|x| x.sort_bucket <= 2).take(2) {
                             if item.text.chars().nth(1).is_some() {
                                 let n_ex = lm_w.neural_scale
-                                    * smooth_neural_score(nv.score_phrase_exact(&self.neural_tracker.active, &item.text));
+                                    * smooth_neural_score(self.neural_cache_phrase_logp(
+                                        nv,
+                                        &self.neural_tracker.active,
+                                        &self.recent_context,
+                                        &item.text,
+                                        true,
+                                    ));
                                 item.posterior_score = item.base_score + n_ex;
                             }
                         }
@@ -2538,7 +2742,13 @@ impl WubiEngine {
                         for f in &mut fuzzy_items[..refine_k] {
                             if f.text.chars().nth(1).is_some() {
                                 let n_ex = lm_w.neural_scale
-                                    * smooth_neural_score(nv.score_phrase_exact(&self.neural_tracker.active, &f.text));
+                                    * smooth_neural_score(self.neural_cache_phrase_logp(
+                                        nv,
+                                        &self.neural_tracker.active,
+                                        &self.recent_context,
+                                        &f.text,
+                                        true,
+                                    ));
                                 f.posterior_score = f.base_score + n_ex;
                             }
                         }
@@ -2701,6 +2911,42 @@ impl WubiEngine {
             .map(|(utext, _, _)| (utext.to_string(), 50_000_000, utext.chars().count() == 1))
     }
 
+    /// Unified RWKV-7 + Neural Cache LM phrase log-probability (in nats), shared by standard-mode
+    /// exact/typo ranking and missed-space split decoding.
+    fn neural_cache_phrase_logp(
+        &self,
+        nv: &NeuralView<'_>,
+        state: &RwkvState,
+        ctx_chars: &[char],
+        text: &str,
+        exact_unroll: bool,
+    ) -> f32 {
+        let mut raw_lp = if exact_unroll && text.chars().nth(1).is_some() {
+            nv.score_phrase_exact(state, text)
+        } else {
+            nv.score_phrase_fast(state, text)
+        }
+        .clamp(-13.5, -0.02);
+
+        if self.config.dynamic_word_freq && !self.user.continuations.is_empty() {
+            if let Some(c1) = text.chars().next() {
+                let raw_lp1 = nv.score_next_char(state, c1).clamp(-13.5, -0.02);
+                let pctx = PersonalContext::with_chars(ctx_chars.iter().copied());
+                let st_opt = self
+                    .user
+                    .continuations
+                    .matches_model(nv)
+                    .then_some(state);
+                let interp_lp1 = self
+                    .user
+                    .continuations
+                    .interpolate_logp(raw_lp1, pctx, c1, st_opt);
+                raw_lp = (raw_lp - raw_lp1 + interp_lp1).clamp(-13.5, -0.02);
+            }
+        }
+        raw_lp
+    }
+
     /// Calibrated log-probability proxy (in nats) for committing `text` after `(state, ctx_chars, last_comm)`.
     fn lm_word_logp(
         &self,
@@ -2721,17 +2967,19 @@ impl WubiEngine {
             &self.lm_weights,
         );
         if let (Some(nv), Some(st)) = (nv, state) {
-            let mut rwkv_lp = if exact_unroll && text.chars().nth(1).is_some() {
-                nv.score_phrase_exact(st, text)
-            } else {
-                nv.score_phrase_fast(st, text)
-            }
-            .clamp(-13.5, -0.02);
+            let mut rwkv_lp =
+                self.neural_cache_phrase_logp(nv, st, ctx_chars, text, exact_unroll);
             // Enforce probability monotonicity P(c1 c2 ...) <= P(c1) so long phrases in prefix
             // scans cannot be artificially inflated above 1-char words by sublinear length scaling.
             if let Some(c1) = text.chars().next() {
                 if text.chars().nth(1).is_some() {
-                    let lp1 = nv.score_next_char(st, c1).clamp(-13.5, -0.02);
+                    let lp1 = self.neural_cache_phrase_logp(
+                        nv,
+                        st,
+                        ctx_chars,
+                        &c1.to_string(),
+                        false,
+                    );
                     if rwkv_lp > lp1 {
                         rwkv_lp = lp1;
                     }
