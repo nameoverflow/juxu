@@ -100,6 +100,7 @@ public struct WubiActionState: Codable, Equatable, Sendable {
     public let calibratedKeyCount: Int
     public let validNextMask: UInt32
     public let nextKeyPriors: [UInt8]
+    public let touchOffsets: [Float]
     public let candidates: [WubiCandidateItem]
 
     #if os(macOS)
@@ -129,6 +130,7 @@ public struct WubiActionState: Codable, Equatable, Sendable {
         calibratedKeyCount: Int,
         validNextMask: UInt32 = 0x03FF_FFFF,
         nextKeyPriors: [UInt8] = Array(repeating: 100, count: 26),
+        touchOffsets: [Float] = Array(repeating: 0, count: 52),
         candidates: [WubiCandidateItem]
     ) {
         self.consumed = consumed
@@ -147,13 +149,14 @@ public struct WubiActionState: Codable, Equatable, Sendable {
         self.calibratedKeyCount = calibratedKeyCount
         self.validNextMask = validNextMask
         self.nextKeyPriors = nextKeyPriors
+        self.touchOffsets = touchOffsets
         self.candidates = candidates
     }
 
     private enum CodingKeys: String, CodingKey {
         case consumed, bell, asciiMode, schemaId, page, totalPages, vertical
         case schemaName, commitText, preedit, segmentedCode, notice, userPhraseCount, calibratedKeyCount
-        case validNextMask, nextKeyPriors, candidates
+        case validNextMask, nextKeyPriors, touchOffsets, candidates
     }
 
     public init(from decoder: Decoder) throws {
@@ -174,6 +177,7 @@ public struct WubiActionState: Codable, Equatable, Sendable {
         self.calibratedKeyCount = try c.decode(Int.self, forKey: .calibratedKeyCount)
         self.validNextMask = try c.decodeIfPresent(UInt32.self, forKey: .validNextMask) ?? 0x03FF_FFFF
         self.nextKeyPriors = try c.decodeIfPresent([UInt8].self, forKey: .nextKeyPriors) ?? Array(repeating: 100, count: 26)
+        self.touchOffsets = try c.decodeIfPresent([Float].self, forKey: .touchOffsets) ?? Array(repeating: 0, count: 52)
         self.candidates = try c.decode([WubiCandidateItem].self, forKey: .candidates)
     }
 

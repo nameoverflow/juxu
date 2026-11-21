@@ -897,8 +897,10 @@ impl WubiEngine {
             let pc = self.pinyin_candidates.get(abs_idx)?;
             let commit_text = pc.candidate.text.clone();
             let consumed = pc.consumed_keys.min(self.observations.len());
-            let multi_segment = pc.boundaries.len() >= 2;
-            let learn = self.config.dynamic_word_freq && (explicit || pc.candidate.is_exact);
+            let pc_boundaries = pc.boundaries.clone();
+            let pc_is_exact = pc.candidate.is_exact;
+            let multi_segment = pc_boundaries.len() >= 2;
+            let learn = self.config.dynamic_word_freq && (explicit || pc_is_exact);
             let first_choice = (learn && explicit && abs_idx > 0)
                 .then(|| self.candidates.first().map(|c| c.text.clone()))
                 .flatten();
@@ -963,12 +965,49 @@ impl WubiEngine {
                 self.recent_context.drain(..drain_n);
             }
             if self.config.typo.enabled && self.config.typo.touch_hitbox_adapt {
-                for obs in self.observations.iter().take(consumed) {
-                    if obs.has_touch && obs.ch.is_ascii_lowercase() {
-                        let (cx, cy) = self.key_layout.center_of(obs.ch);
-                        self.user
-                            .touch_profile
-                            .observe(obs.ch, obs.norm_x - cx, obs.norm_y - cy);
+                if !pc_boundaries.is_empty() {
+                    // Learn touch offsets against the *corrected* syllable letters (not raw mis-tapped keys!)
+                    let mut seg_start = 0usize;
+                    for b in &pc_boundaries {
+                        let seg_end = b.keys.min(consumed);
+                        if seg_end > seg_start
+                            && (b.correction == CorrectionKind::Exact
+                                || (explicit && b.correction != CorrectionKind::Transposition))
+                        {
+                            let target_letters: Vec<u8> = b
+                                .syl_display
+                                .bytes()
+                                .filter(|ch| ch.is_ascii_lowercase())
+                                .collect();
+                            let seg_obs: Vec<&KeyObs> = self.observations[seg_start..seg_end]
+                                .iter()
+                                .filter(|o| o.ch.is_ascii_lowercase())
+                                .collect();
+                            if target_letters.len() == seg_obs.len() {
+                                for (obs, &target_key) in seg_obs.iter().zip(target_letters.iter()) {
+                                    if obs.has_touch {
+                                        let (cx, cy) = self.key_layout.center_of(target_key);
+                                        self.user.touch_profile.observe(
+                                            target_key,
+                                            obs.norm_x - cx,
+                                            obs.norm_y - cy,
+                                        );
+                                        self.user.dirty = true;
+                                    }
+                                }
+                            }
+                        }
+                        seg_start = seg_end;
+                    }
+                } else if pc_is_exact {
+                    for obs in self.observations.iter().take(consumed) {
+                        if obs.has_touch && obs.ch.is_ascii_lowercase() {
+                            let (cx, cy) = self.key_layout.center_of(obs.ch);
+                            self.user
+                                .touch_profile
+                                .observe(obs.ch, obs.norm_x - cx, obs.norm_y - cy);
+                            self.user.dirty = true;
+                        }
                     }
                 }
             }
@@ -1085,6 +1124,38 @@ impl WubiEngine {
         let mut mask = self.user.valid_next_letters_mask(bytes);
         if let Some(dict) = self.active_dict() {
             mask |= dict.valid_next_letters_mask(bytes, self.config.enable_rare_charset);
+            // Soften `validNextMask` when an earlier touch landed near a key boundary:
+            // union valid continuations of top TouchBoundary prefix hypotheses so a Key #1 slip
+            // does not mark the true Key #2 as a dead key!
+            if self.config.typo.enabled
+                && !self.observations.is_empty()
+                && self.observations.iter().any(|o| o.has_touch)
+            {
+                let hyps = generate_hypotheses_with_options(
+                    &self.observations,
+                    &self.key_layout,
+                    &self.user.touch_profile,
+                    &self.config.typo,
+                    self.config.schema.allows_z_code(),
+                );
+                let mut added = 0usize;
+                for h in hyps {
+                    if h.kind == CorrectionKind::TouchBoundary {
+                        let (buf, hlen) = h.code.to_bytes_buf();
+                        if hlen == bytes.len() {
+                            mask |= dict.valid_next_letters_mask(
+                                &buf[..hlen],
+                                self.config.enable_rare_charset,
+                            );
+                            mask |= self.user.valid_next_letters_mask(&buf[..hlen]);
+                            added += 1;
+                            if added >= 2 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
         // If current prefix has no exact continuations at all (e.g. already a typo), stay neutral.
         if mask == 0 {
@@ -1265,11 +1336,16 @@ impl WubiEngine {
             if self.neural_tracker.is_ready() {
                 let best_conts =
                     dict.best_continuation_per_letter(bytes, self.config.enable_rare_charset);
-                let mut raw_s = [f32::NEG_INFINITY; 25];
+                let max_keys = if self.config.schema.allows_z_code() {
+                    26usize
+                } else {
+                    25usize
+                };
+                let mut raw_s = [f32::NEG_INFINITY; 26];
                 let mut sum_s = 0.0f32;
                 let mut cnt_s = 0usize;
 
-                for idx in 0..25usize {
+                for idx in 0..max_keys {
                     if out[idx] == 0 {
                         continue;
                     }
@@ -1284,7 +1360,7 @@ impl WubiEngine {
                 }
                 if cnt_s >= 2 {
                     let mean_s = sum_s / (cnt_s as f32);
-                    for idx in 0..25usize {
+                    for idx in 0..max_keys {
                         if raw_s[idx].is_finite() {
                             out[idx] = (100.0 + 15.0 * (raw_s[idx] - mean_s))
                                 .round()

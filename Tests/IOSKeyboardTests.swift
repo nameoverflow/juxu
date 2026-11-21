@@ -392,6 +392,22 @@ struct IOSKeyboardTests {
         )
         assert(corePreserved?.kind == .letter(UInt8(ascii: "f")), "Sacred keycap core must never be overridden by neural priors")
 
-        print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, clipboard & idle prediction tests passed!")
+        // (d) Adaptive personal `touchOffsets` shift gutter ownership toward the user's calibrated key center!
+        var personalOffsets = Array(repeating: Float(0), count: 52)
+        personalOffsets[Int(UInt8(ascii: "f") - 97) * 2] = 0.16 // User consistently strikes 'f' to the right
+        let personalHit = IOSKeyboardLayoutEngine.hitTest(
+            point: fgMidGutter,
+            in: snap220,
+            validNextMask: 0x03FF_FFFF,
+            nextKeyPriors: Array(repeating: UInt8(100), count: 26),
+            touchOffsets: personalOffsets
+        )
+        assert(personalHit?.kind == .letter(UInt8(ascii: "f")), "Personal right-shifted TouchProfile for 'f' should capture f/g gutter tap")
+
+        // (e) `compensatedLetterPoint` matches `hitTest` ergonomic Y compensation 1:1
+        let row1Comp = IOSKeyboardLayoutEngine.compensatedLetterPoint(CGPoint(x: f220.frame.midX, y: f220.frame.midY), in: snap220)
+        assert(abs((f220.frame.midY - row1Comp.y) - IOSKeyboardLayoutEngine.ergonomicThumbYBias) < 0.01)
+
+        print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard & idle prediction tests passed!")
     }
 }

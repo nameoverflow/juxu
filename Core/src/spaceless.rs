@@ -316,7 +316,9 @@ impl Stream {
                     };
                     let cost = match correction {
                         CorrectionKind::Exact => 0.0,
-                        CorrectionKind::TouchBoundary if len > 1 => 2.5,
+                        // Touch-boundary taps already pay continuous 2D Gaussian `relative_logp`;
+                        // avoid double-counting frontend `hitTest` priors with a steep step penalty.
+                        CorrectionKind::TouchBoundary if len > 1 => 1.1,
                         _ => 4.5,
                     };
                     let penalty = cost - 1.65 * relative_logp.min(0.0);

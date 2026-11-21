@@ -293,7 +293,9 @@ fn build_lattice(
                 } else {
                     match correction {
                         CorrectionKind::Exact => 0.0,
-                        CorrectionKind::TouchBoundary => -1.8,
+                        // Touch-boundary taps already pay continuous 2D Gaussian `spatial_logp`;
+                        // keep step cost light so frontend `hitTest` priors aren't double-counted.
+                        CorrectionKind::TouchBoundary => -0.45,
                         CorrectionKind::NeighborKey => -4.8,
                         CorrectionKind::Transposition => -3.6,
                     }

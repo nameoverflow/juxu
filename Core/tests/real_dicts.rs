@@ -635,4 +635,38 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
     let top_xm = engine.page_candidates().first().map(|c| c.text.as_str()).unwrap_or("");
     println!("Surprisal-promoted '星锚' in Full Pinyin 'xingmao' -> top='{}'", top_xm);
     assert_eq!(top_xm, "星锚");
+
+    // 6. Pinyin touch-offset learning must learn the *corrected* syllable letter (`i`), NOT the mis-tapped (`o`)!
+    engine.clear_composition();
+    engine.clear_context();
+    engine.user.touch_profile.reset();
+    let _ = engine.push_touch_letter(b'j', 6.5, 1.0, true, 10_000);
+    let _ = engine.push_touch_letter(b'o', 7.42, 0.0, true, 10_040); // between i(7.0) and o(8.0)
+    for (i, ch) in "ntiantianqi".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 10_080 + i as u64 * 40);
+    }
+    assert_eq!(engine.page_candidates()[0].text, "今天天气");
+    let _ = engine.select_abs_candidate(0, 10_600);
+    assert!(
+        engine.user.touch_profile.offset_for(b'i').0 > 0.02,
+        "expected corrected Pinyin touch commit to adapt 'i' offset (+x), got {:?}",
+        engine.user.touch_profile.offset_for(b'i')
+    );
+    assert_eq!(
+        engine.user.touch_profile.keys[(b'o' - b'a') as usize].samples,
+        0,
+        "mis-tapped key 'o' must not absorb corrected 'i' touch sample"
+    );
+
+    // 7. Softened validNextMask after a boundary-slip Key #1 in Wubi86:
+    //    Touching near t(4.0)/y(5.0) border -> reported 'y', mask must still allow 'r' (from 'tr..' = 我们)
+    let mut cfg_wb = cfg.clone();
+    cfg_wb.schema = WubiSchema::Wubi86;
+    cfg_wb.spaceless = false;
+    engine.set_config(cfg_wb);
+    engine.clear_composition();
+    let _ = engine.push_touch_letter(b'y', 4.54, 0.02, true, 11_000);
+    let mask = engine.valid_next_mask();
+    let r_bit = 1u32 << (b'r' - b'a');
+    assert_ne!(mask & r_bit, 0, "softened validNextMask should keep 'r' valid after t/y border slip");
 }

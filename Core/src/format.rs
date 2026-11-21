@@ -428,14 +428,14 @@ impl DictView {
         mask
     }
 
-    /// Return the highest-weight non-rare entry for each next letter `'a'..='y'` (`0..25`)
+    /// Return the highest-weight non-rare entry for each next letter `'a'..='z'` (`0..26`)
     /// continuing `prefix_bytes` (`1 <= len <= 3`). Used for sub-microsecond neural gutter priors.
     pub fn best_continuation_per_letter(
         &self,
         prefix_bytes: &[u8],
         include_rare: bool,
-    ) -> [Option<DictEntryRef<'_>>; 25] {
-        let mut out: [Option<DictEntryRef<'_>>; 25] = [None; 25];
+    ) -> [Option<DictEntryRef<'_>>; 26] {
+        let mut out: [Option<DictEntryRef<'_>>; 26] = [None; 26];
         if prefix_bytes.is_empty() || prefix_bytes.len() >= 4 {
             return out;
         }
@@ -443,7 +443,7 @@ impl DictView {
         let n = prefix_bytes.len();
         buf[..n].copy_from_slice(prefix_bytes);
 
-        for idx in 0..25u8 {
+        for idx in 0..26u8 {
             buf[n] = b'a' + idx;
             let Some(ext) = PackedCode::from_bytes(&buf[..=n]) else {
                 continue;

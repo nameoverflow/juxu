@@ -505,10 +505,16 @@ public final class KeyboardViewController: UIInputViewController {
                 layoutEngine.consumeOneShotShiftIfNeeded()
                 syncEngineToUI()
             } else {
+                let sendPt: CGPoint
+                if let snap = keyCanvas.snapshot {
+                    sendPt = IOSKeyboardLayoutEngine.compensatedLetterPoint(pointInCanvas, in: snap)
+                } else {
+                    sendPt = pointInCanvas
+                }
                 let out = bridge.pushTouch(
                     reportedAscii: ascii,
-                    x: Float(pointInCanvas.x),
-                    y: Float(pointInCanvas.y),
+                    x: Float(sendPt.x),
+                    y: Float(sendPt.y),
                     isNormalized: false,
                     timestampMs: Self.nowMs()
                 )
@@ -812,8 +818,10 @@ public final class KeyboardViewController: UIInputViewController {
         layoutEngine.isComposing = !st.preedit.isEmpty
         layoutEngine.validNextMask = st.validNextMask
         layoutEngine.nextKeyPriors = st.nextKeyPriors
+        layoutEngine.touchOffsets = st.touchOffsets
         keyCanvas.validNextMask = st.validNextMask
         keyCanvas.nextKeyPriors = st.nextKeyPriors
+        keyCanvas.touchOffsets = st.touchOffsets
         ribbonView.update(
             state: st,
             dark: isDarkAppearance,

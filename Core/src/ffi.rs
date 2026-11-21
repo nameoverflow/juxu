@@ -94,6 +94,17 @@ fn serialize_action_and_state(engine: &WubiEngine, act: Option<&EngineOutput>) -
         }
         j.push_str(&pv.to_string());
     }
+    j.push_str("],\"touchOffsets\":[");
+    for (ti, tk) in engine.user.touch_profile.keys.iter().enumerate() {
+        if ti > 0 {
+            j.push(',');
+        }
+        if tk.samples == 0 || (tk.dx.abs() < 1e-4 && tk.dy.abs() < 1e-4) {
+            j.push_str("0,0");
+        } else {
+            j.push_str(&format!("{:.3},{:.3}", tk.dx, tk.dy));
+        }
+    }
     j.push_str("],\"candidates\":[");
 
     for (idx, c) in engine.page_candidates().iter().enumerate() {

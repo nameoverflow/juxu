@@ -115,6 +115,8 @@ public struct IOSKeyboardLayoutEngine: Equatable {
     public var validNextMask: UInt32 = 0x03FF_FFFF
     /// 26-element continuous neural prior weights (`0` = dead, `100` = neutral, `50..180` = RWKV weighted).
     public var nextKeyPriors: [UInt8] = Array(repeating: 100, count: 26)
+    /// 52-element per-key adaptive touch offsets `[dx0, dy0, ..., dx25, dy25]` in normalized key-pitch units.
+    public var touchOffsets: [Float] = Array(repeating: 0, count: 52)
 
     private var lastShiftTapTime: TimeInterval = 0
 
@@ -423,10 +425,11 @@ public struct IOSKeyboardLayoutEngine: Equatable {
             )
         )
 
-        // Compute exact 26-key normalized coordinates matching our actual Row 0/1/2 centers,
-        // incorporating ergonomic downward thumb strike bias (`~2.0pt`) for Rust Gaussian rescue!
+        // Compute exact 26-key normalized coordinates matching our actual Row 0/1/2 geometric centers.
+        // Ergonomic thumb Y-bias is applied consistently via `compensatedLetterPoint(_:in:)` before
+        // both UI `hitTest` and Rust `pushTouch`, keeping frontend and backend coordinates 1:1 aligned.
         let qMidX = outerX + stdKeyW * 0.5
-        let qMidY = rowY[0] + keyH * 0.5 + Self.ergonomicThumbYBias * 0.75
+        let qMidY = rowY[0] + keyH * 0.5
         var centers52 = [Float](repeating: 0, count: 52)
         for (c, b) in Array("qwertyuiop".utf8).enumerated() {
             let idx = Int(b - UInt8(ascii: "a"))
@@ -456,11 +459,23 @@ public struct IOSKeyboardLayoutEngine: Equatable {
         )
     }
 
+    /// Apply consistent row-aware ergonomic upward thumb compensation for letter taps,
+    /// shared by both frontend `hitTest` and backend `pushTouch` coordinate normalization.
+    public static func compensatedLetterPoint(_ point: CGPoint, in snapshot: LayoutSnapshot) -> CGPoint {
+        var qPt = point
+        let row0MidY = CGFloat(snapshot.originY)
+        if point.y > row0MidY && point.y < snapshot.bottomRowMinY - 5.0 {
+            qPt.y -= ergonomicThumbYBias
+        }
+        return qPt
+    }
+
     public static func hitTest(
         point: CGPoint,
         in snapshot: LayoutSnapshot,
         validNextMask: UInt32 = 0x03FF_FFFF,
-        nextKeyPriors: [UInt8] = []
+        nextKeyPriors: [UInt8] = [],
+        touchOffsets: [Float] = []
     ) -> IOSKeySpec? {
         guard snapshot.bounds.insetBy(dx: -18, dy: -28).contains(point) else {
             return nil
@@ -481,15 +496,20 @@ public struct IOSKeyboardLayoutEngine: Equatable {
 
         // 2. Apply ergonomic upward compensation strictly inside the 3 letter/symbol rows (never near Row 3
         //    `Space`/`123`/`Return`, so top-edge Space taps never get pulled into `c`/`v`/`b`/`n`!).
-        var qPt = point
-        let row0MidY = CGFloat(snapshot.originY)
-        if point.y > row0MidY && point.y < snapshot.bottomRowMinY - 5.0 {
-            qPt.y -= ergonomicThumbYBias
-        }
+        let qPt = compensatedLetterPoint(point, in: snapshot)
 
         let hasMaskWeights = (validNextMask != 0x03FF_FFFF) && (validNextMask != 0)
         let hasNeuralPriors = (nextKeyPriors.count == 26) && nextKeyPriors.contains(where: { $0 != 100 })
-        let hasDynamicWeights = hasMaskWeights || hasNeuralPriors
+        let hasTouchOffsets = (touchOffsets.count == 52) && touchOffsets.contains(where: { abs($0) > 1e-4 })
+        let hasDynamicWeights = hasMaskWeights || hasNeuralPriors || hasTouchOffsets
+
+        let personalShift: (UInt8) -> (CGFloat, CGFloat) = { ascii in
+            guard hasTouchOffsets, ascii >= 97, ascii <= 122 else { return (0, 0) }
+            let idx = Int(ascii - 97)
+            let dx = CGFloat(max(-0.20, min(0.20, touchOffsets[idx * 2]))) * CGFloat(snapshot.pitchX)
+            let dy = CGFloat(max(-0.20, min(0.20, touchOffsets[idx * 2 + 1]))) * CGFloat(snapshot.pitchY)
+            return (dx, dy)
+        }
 
         if !hasDynamicWeights {
             if let direct = snapshot.keys.first(where: { $0.frame.contains(qPt) }) {
@@ -497,13 +517,15 @@ public struct IOSKeyboardLayoutEngine: Equatable {
             }
         } else {
             // Sacred Keycap Core: any tap landing cleanly inside the visual interior (`>= 3.0pt` from X bevel,
-            // `>= 2.6pt` from Y bevel) ALWAYS belongs to that keycap even if `validNextMask` marks it 0
-            // (e.g. 5th-code push-commit or 4th-code completion after an earlier key slip).
+            // `>= 2.6pt` from Y bevel, shifted gently by personal TouchProfile) ALWAYS belongs to that keycap
+            // even if `validNextMask` marks it 0.
             // Dynamic weighting only arbitrates border/bevel (`0..3pt`) & inter-key gutter taps!
             for k in snapshot.keys {
                 switch k.kind {
-                case .letter:
-                    if k.frame.insetBy(dx: 3.0, dy: 2.6).contains(qPt) {
+                case .letter(let ascii):
+                    let (px, py) = personalShift(ascii)
+                    let core = k.frame.offsetBy(dx: px * 0.5, dy: py * 0.5).insetBy(dx: 3.0, dy: 2.6)
+                    if core.contains(qPt) {
                         return k
                     }
                 case .symbol:
@@ -555,6 +577,8 @@ public struct IOSKeyboardLayoutEngine: Equatable {
             case .shift, .backspace:
                 evalPt = point
             case .letter(let ascii) where hasDynamicWeights && ascii >= 97 && ascii <= 122:
+                let (px, py) = personalShift(ascii)
+                effRect = effRect.offsetBy(dx: px, dy: py)
                 let idx = Int(ascii - 97)
                 let bit = UInt32(1) << UInt32(idx)
                 let pVal = (nextKeyPriors.count == 26) ? Int(nextKeyPriors[idx]) : ((validNextMask & bit) != 0 ? 100 : 0)
