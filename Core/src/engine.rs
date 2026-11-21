@@ -1015,6 +1015,7 @@ impl WubiEngine {
             if consumed > 0 && consumed < self.observations.len() {
                 self.raw_code.drain(..consumed);
                 self.observations.drain(..consumed);
+                self.pinyin_stream.clear();
                 self.page = 0;
                 self.rebuild_pinyin_candidates();
                 return Some(EngineOutput {

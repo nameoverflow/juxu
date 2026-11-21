@@ -1146,8 +1146,12 @@ fn build_pinyin_candidates(
     decoder: &PinyinDecoder<'_>,
 ) -> (Vec<PinyinCandidate>, Vec<PinyinPath>) {
 
-    // Build final candidate list:
-    // 1. Full-sentence paths from `layers[n]` (or deepest non-empty layer)
+    // Build final candidate list in 3 clean tiers:
+    //   Tier 1: Top full-sentence paths (capped at 3 for multi-word sentences >= 4 chars so the ribbon
+    //           and expanded grid aren't flooded with near-duplicate full sentences)
+    //   Tier 2: High-confidence multi-character prefix words (2..=4 chars starting at 0, ranked by
+    //           RWKV + lexical prior, longest/best first)
+    //   Tier 3: Single-character candidates at position 0 (exact syllables strictly before typo fallbacks)
     let mut out = Vec::<PinyinCandidate>::new();
     let mut seen = HashSet::<String>::new();
 
@@ -1156,13 +1160,25 @@ fn build_pinyin_candidates(
         .find(|&pos| !layers[pos].is_empty())
         .map_or((0, &[][..]), |pos| (pos, layers[pos].as_slice()));
 
+    let top_char_len = full_paths
+        .first()
+        .map_or(0, |p| p.text.chars().count());
+    let is_long_sentence = top_char_len >= 4;
+    let max_full_sentences = if is_long_sentence { 3usize } else { BEAM_WIDTH };
+    let top_score = full_paths.first().map_or(f32::NEG_INFINITY, |p| p.score);
+
     let mut raw_scores: Vec<f32> = full_paths.iter().map(|p| p.score).collect();
     let confs = softmax_confidences(&raw_scores);
+    let mut full_added = 0usize;
     for (idx, path) in full_paths.iter().enumerate() {
+        if full_added >= max_full_sentences {
+            break;
+        }
+        // For long sentences, only keep #2..#3 when they are genuinely competitive with #1
+        if is_long_sentence && full_added >= 1 && path.score < top_score - 4.2 {
+            break;
+        }
         if seen.insert(path.text.clone()) {
-            if let Some(hint_comment) = (!path.correction_hint().is_empty()).then(|| path.correction_hint()) {
-                let _ = hint_comment;
-            }
             let hint = path.correction_hint();
             out.push(PinyinCandidate {
                 candidate: Candidate {
@@ -1180,6 +1196,7 @@ fn build_pinyin_candidates(
                 consumed_keys: best_end,
                 boundaries: path.boundaries.clone(),
             });
+            full_added += 1;
         }
     }
 
@@ -1280,50 +1297,163 @@ fn build_pinyin_candidates(
         }
     }
 
-    // 2. Prefix word & single-char candidates at the start of the buffer (so user can select a prefix word)
-    let mut prefix_items: Vec<(String, usize, f32, bool, String)> = Vec::new();
-    for end in (1..n).rev() {
-        for edge in lattice[end].iter().filter(|e| e.start == 0).take(2) {
-            match &edge.syl {
-                SylMatch::Full(sid) => {
-                    let syl_s = decoder.dict.syllable_str(*sid);
-                    for e in decoder
-                        .dict
-                        .lookup_chars(*sid, decoder.config.enable_rare_charset)
-                        .into_iter()
-                        .take(4)
-                    {
-                        let hint = if edge.correction != CorrectionKind::Exact {
-                            format!("{}({})", e.text, syl_s)
-                        } else {
-                            String::new()
-                        };
-                        prefix_items.push((
-                            e.text.to_owned(),
-                            end,
-                            ((e.weight as f32) + 1.0).ln() + edge.kind_cost,
-                            edge.correction != CorrectionKind::Exact,
-                            hint,
-                        ));
-                    }
-                }
-                _ => {}
+    // 2. Tier 2: High-confidence multi-character prefix words (2..=4 chars starting at 0, ending < best_end)
+    //    Kept in a dedicated pool strictly BEFORE single characters so users can commit a partial phrase cleanly!
+    struct PrefixWordItem {
+        text: String,
+        consumed: usize,
+        char_len: usize,
+        score: f32,
+        corr: bool,
+        hint: String,
+    }
+    let mut prefix_words: Vec<PrefixWordItem> = Vec::new();
+    let init_state = layers[0].first().map(|p| &p.state);
+
+    // 2a. Multi-char paths already decoded in intermediate beam layers `layers[end]`
+    for end in (2..best_end).rev() {
+        let mut taken_at_end = 0usize;
+        for path in layers[end].iter() {
+            let clen = path.text.chars().count();
+            if !(2..=4).contains(&clen) {
+                continue;
             }
-        }
-        // Also take top phrase starting at 0 ending at `end`
-        for path in layers[end].iter().take(2) {
-            if path.boundaries.len() == 1 {
-                prefix_items.push((
-                    path.text.clone(),
-                    end,
-                    path.score,
-                    path.any_corrected,
-                    path.correction_hint(),
-                ));
+            // Prefer single-word phrases (`boundaries.len() == 1`) and high-confidence 2-3 char compounds
+            let single_word_bonus = if path.boundaries.len() == 1 { 1.8 } else { 0.0 };
+            prefix_words.push(PrefixWordItem {
+                text: path.text.clone(),
+                consumed: end,
+                char_len: clen,
+                score: path.score + single_word_bonus,
+                corr: path.any_corrected,
+                hint: path.correction_hint(),
+            });
+            taken_at_end += 1;
+            if taken_at_end >= 5 {
+                break;
             }
         }
     }
-    // Single-char candidates at position 0: prioritize longest exact Full syllables first (e.g. `jian` in `jianpin` before `jia`/`ji`)
+
+    // 2b. Direct dictionary + user phrase lookup on exact prefix syllable chains (2..=4 syllables)
+    //     so high-frequency words like `试试`/`事实`/`实时`/`实施` always surface even if beam pruned them!
+    for end in (2..best_end).rev() {
+        let mut chains: Vec<Vec<&LatticeEdge>> = lattice[end]
+            .iter()
+            .filter(|e| e.correction == CorrectionKind::Exact && matches!(e.syl, SylMatch::Full(_)))
+            .take(2)
+            .map(|e| vec![e])
+            .collect();
+        for _k in 2..=MAX_PHRASE_SYLS {
+            let mut next_f = Vec::new();
+            for ch in &chains {
+                let hs = ch.last().unwrap().start;
+                if hs == 0 {
+                    continue;
+                }
+                for pe in lattice[hs]
+                    .iter()
+                    .filter(|e| e.correction == CorrectionKind::Exact && matches!(e.syl, SylMatch::Full(_)))
+                    .take(2)
+                {
+                    let mut nc = ch.clone();
+                    nc.push(pe);
+                    if nc.last().unwrap().start == 0 {
+                        let mut rev = nc.clone();
+                        rev.reverse();
+                        let constraints: Vec<SylConstraint<'_>> = rev
+                            .iter()
+                            .map(|e| match &e.syl {
+                                SylMatch::Full(sid) => SylConstraint::Full(*sid),
+                                SylMatch::Initial(id, dg) => SylConstraint::Initial(*id, *dg),
+                                SylMatch::Prefix(p) => SylConstraint::Prefix(p.as_str()),
+                            })
+                            .collect();
+                        let clen = constraints.len();
+                        for (utext, ucnt) in decoder.user.lookup_pinyin_phrases(&constraints, decoder.dict, 4) {
+                            let sc = 6.0 + ((ucnt as f32) + 1.0).ln();
+                            prefix_words.push(PrefixWordItem {
+                                text: utext.to_owned(),
+                                consumed: end,
+                                char_len: clen,
+                                score: sc,
+                                corr: false,
+                                hint: String::new(),
+                            });
+                        }
+                        for e in decoder.dict.lookup_phrases(&constraints, 10) {
+                            let freq = 0.45 * (((e.weight as f32) + 1.0).ln() - 8.5);
+                            let rwkv = match (&decoder.model, init_state) {
+                                (Some(nv), Some(st)) => {
+                                    0.72 * nv.score_phrase_fast(st, e.text) * (clen.min(4) as f32).powf(0.65)
+                                }
+                                _ => 0.0,
+                            };
+                            let dyn_b = if decoder.config.dynamic_word_freq {
+                                1.2 * decoder.user.unigram_boost(e.text)
+                            } else {
+                                0.0
+                            };
+                            prefix_words.push(PrefixWordItem {
+                                text: e.text.to_owned(),
+                                consumed: end,
+                                char_len: clen,
+                                score: freq + rwkv + dyn_b + 1.35 * ((clen - 1) as f32),
+                                corr: false,
+                                hint: String::new(),
+                            });
+                        }
+                    } else {
+                        next_f.push(nc);
+                    }
+                }
+            }
+            if next_f.is_empty() {
+                break;
+            }
+            chains = next_f;
+        }
+    }
+
+    // Deduplicate prefix words keeping best score, sort by (exact first, longer prefix preferred slightly, score DESC)
+    prefix_words.sort_by(|a, b| {
+        a.corr
+            .cmp(&b.corr)
+            .then_with(|| {
+                let sa = a.score + 0.35 * (a.char_len as f32);
+                let sb = b.score + 0.35 * (b.char_len as f32);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let mut prefix_words_added = 0usize;
+    let max_prefix_words = 16usize;
+    for pw in prefix_words {
+        if prefix_words_added >= max_prefix_words {
+            break;
+        }
+        if seen.insert(pw.text.clone()) {
+            out.push(PinyinCandidate {
+                candidate: Candidate {
+                    text: pw.text,
+                    matched_code: PackedCode::EMPTY,
+                    comment: pw.hint,
+                    badge: if pw.corr {
+                        CandidateBadge::TypoCorrected
+                    } else {
+                        CandidateBadge::None
+                    },
+                    confidence: 0.25,
+                    is_exact: !pw.corr,
+                },
+                consumed_keys: pw.consumed,
+                boundaries: Vec::new(),
+            });
+            prefix_words_added += 1;
+        }
+    }
+
+    // 3. Tier 3: Single-char candidates at position 0 (longest exact Full syllables strictly BEFORE typo fallbacks)
+    let mut single_items: Vec<(String, usize, f32, bool, String)> = Vec::new();
     let mut head_full_edges: Vec<&LatticeEdge> = Vec::new();
     for end in (1..=n).rev() {
         for edge in &lattice[end] {
@@ -1340,34 +1470,44 @@ fn build_pinyin_candidates(
     for edge in head_full_edges.into_iter().take(3) {
         if let SylMatch::Full(sid) = edge.syl {
             let syl_s = decoder.dict.syllable_str(sid);
+            let is_corr = edge.correction != CorrectionKind::Exact;
+            let take_n = if is_corr { 6 } else { 80 };
             for e in decoder
                 .dict
                 .lookup_chars(sid, decoder.config.enable_rare_charset)
                 .into_iter()
-                .take(80)
+                .take(take_n)
             {
                 let mut sc = 0.25 * (((e.weight as f32) + 1.0).ln() - 15.0) + edge.kind_cost;
+                if let (Some(nv), Some(st)) = (&decoder.model, init_state) {
+                    if let Some(ch) = e.text.chars().next() {
+                        sc += 0.35 * nv.score_next_char(st, ch);
+                    }
+                }
                 if decoder.config.dynamic_word_freq {
                     sc += 1.2 * decoder.user.unigram_boost(e.text);
                 }
-                let hint = if edge.correction != CorrectionKind::Exact {
+                let hint = if is_corr {
                     format!("{}({})", e.text, syl_s)
                 } else {
                     String::new()
                 };
-                prefix_items.push((
+                single_items.push((
                     e.text.to_owned(),
                     edge.end,
                     sc,
-                    edge.correction != CorrectionKind::Exact,
+                    is_corr,
                     hint,
                 ));
             }
         }
     }
 
-    prefix_items.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-    for (text, consumed, _, corr, hint) in prefix_items {
+    single_items.sort_by(|a, b| {
+        a.3.cmp(&b.3)
+            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    for (text, consumed, _, corr, hint) in single_items {
         if seen.insert(text.clone()) {
             out.push(PinyinCandidate {
                 candidate: Candidate {

@@ -669,6 +669,54 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
     let mask = engine.valid_next_mask();
     let r_bit = 1u32 << (b'r' - b'a');
     assert_ne!(mask & r_bit, 0, "softened validNextMask should keep 'r' valid after t/y border slip");
+
+    // 8. Full-Pinyin tiered candidate list: cap long full sentences at <= 3, then surface high-confidence
+    //    multi-character prefix words (e.g. `试试`/`事实`/`实时`) BEFORE single characters!
+    engine.set_schema(WubiSchema::Pinyin);
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "shishijiuss".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 12_000 + i as u64 * 40);
+    }
+    let all = engine.all_candidates();
+    let preview: Vec<&str> = all.iter().take(12).map(|c| c.text.as_str()).collect();
+    println!("Pinyin 'shishijiuss' tiered top-12: {:?}", preview);
+    let full_sent_cnt = all.iter().take(6).filter(|c| c.text.chars().count() >= 5).count();
+    assert!(full_sent_cnt <= 3, "expected <= 3 full sentences at top, got {} in {:?}", full_sent_cnt, preview);
+    let prefix_word_cnt = all
+        .iter()
+        .skip(full_sent_cnt)
+        .take(6)
+        .filter(|c| (2..=4).contains(&c.text.chars().count()))
+        .count();
+    assert!(
+        prefix_word_cnt >= 4,
+        "expected >= 4 high-confidence prefix words right after full sentences, got {} in {:?}",
+        prefix_word_cnt,
+        preview
+    );
+
+    // 9. Partial prefix selection in Full Pinyin must drain committed keys AND reset PinyinStream
+    //    so remaining preedit/candidates decode ONLY the uncommitted tail!
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "zhegejianpan".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 13_000 + i as u64 * 40);
+    }
+    let idx_zhe = engine
+        .all_candidates()
+        .iter()
+        .position(|c| c.text == "这")
+        .expect("expected single-char '这' in candidates for zhegejianpan");
+    let out1 = engine.select_abs_candidate(idx_zhe, 13_600).unwrap();
+    assert_eq!(out1.commit_text, "这");
+    assert_eq!(engine.raw_code(), "gejianpan");
+    assert!(
+        !engine.preedit().starts_with('这'),
+        "remaining preedit must not keep committed prefix '这', got '{}'",
+        engine.preedit()
+    );
+    assert_eq!(engine.preedit(), "个键盘");
 }
 
 #[test]
