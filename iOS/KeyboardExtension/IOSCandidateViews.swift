@@ -905,12 +905,14 @@ final class IOSExpandedCandidateView: UIView {
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.accessibilityIdentifier = "JuxuExpandedCandidates"
         scrollView.contentInsetAdjustmentBehavior = .never
+        #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
             scrollView.topEdgeEffect.isHidden = true
             scrollView.bottomEdgeEffect.isHidden = true
             scrollView.leftEdgeEffect.isHidden = true
             scrollView.rightEdgeEffect.isHidden = true
         }
+        #endif
 
         gridStack.translatesAutoresizingMaskIntoConstraints = false
         gridStack.axis = .vertical
