@@ -629,13 +629,14 @@ public final class JuxuBridge: ObservableObject {
         guard let h = handle else { return }
         let candidateDirs: [URL] = [
             overrideDir,
-            Bundle.main.resourceURL?.appendingPathComponent("Dicts", isDirectory: true),
-            // Allow iOS App Extensions (`JuxuApp.app/PlugIns/JuxuKeyboard.appex`) to share
-            // the containing app's single `JuxuApp.app/Dicts` copy without duplicating 99 MB!
+            // On iOS App Extensions (`JuxuApp.app/PlugIns/JuxuKeyboard.appex`), prefer the
+            // containing app's single `JuxuApp.app/Dicts` copy first so stale extension copies
+            // can never shadow freshly bundled dictionaries.
             Bundle.main.bundleURL
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
                 .appendingPathComponent("Dicts", isDirectory: true),
+            Bundle.main.resourceURL?.appendingPathComponent("Dicts", isDirectory: true),
             Bundle.main.resourceURL,
             URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
                 .appendingPathComponent("Resources/Dicts", isDirectory: true),

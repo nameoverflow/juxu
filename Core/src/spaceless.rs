@@ -512,7 +512,7 @@ impl Stream {
                     } else {
                         None
                     }
-                } else if len >= 2 && (user_hit.is_some() || dict_hit.is_some()) {
+                } else if len >= 4 && (user_hit.is_some() || dict_hit.is_some()) {
                     let (canonical, weight, is_user) = if let Some((disp, cnt)) = user_hit {
                         (
                             disp.to_owned(),
@@ -523,14 +523,19 @@ impl Stream {
                         let (disp, w, _) = dict_hit.unwrap();
                         (disp, w, false)
                     };
-                    // For short lowercase words (len <= 3) require high freq or user-learned so Wubi codes stay primary
-                    if !has_upper && !is_user && len <= 3 && weight < 46_000 {
+                    // In spaceless Wubi/shape mode, every 1..4-letter sequence can be a real Wubi code.
+                    // Avoid hijacking normal Wubi typing with lowercase English:
+                    // - require `len >= 4` (2..3-letter English in spaceless uses uppercase anchor like `PR`/`Go`/`iOS`)
+                    // - for 4-letter lowercase words, require user-learned OR empty exact Wubi code + high freq
+                    let wubi_has_exact = len <= max_code_len
+                        && PackedCode::from_ascii(&lower)
+                            .is_some_and(|c| !decoder.dict.lookup_exact(c, false).is_empty());
+                    if !has_upper && !is_user && (weight < 40_000 || (len == 4 && wubi_has_exact)) {
                         None
                     } else {
                         let display = format_english_display(raw_slice, &canonical);
-                        let w_bonus = ((weight as f32) / 65535.0) * 1.4 + if is_user { 2.0 } else { 0.0 };
-                        let len_factor = if len >= 4 { 0.85 } else { 0.45 };
-                        Some((display, len_factor * (len as f32) + w_bonus - 1.2))
+                        let w_bonus = ((weight as f32) / 65535.0) * 1.1 + if is_user { 1.8 } else { 0.0 };
+                        Some((display, 0.55 * (len as f32) + w_bonus - 2.4))
                     }
                 } else {
                     None
