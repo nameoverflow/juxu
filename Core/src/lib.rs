@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_neural_cross_clause_punctuation_context() {
+    fn v3_neural_cross_clause_punctuation_context() {
         let aux_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../Resources/Dicts/wubi_aux.wbaux");
         let Ok(aux) = AuxView::open_mmap(&aux_path) else {
@@ -584,17 +584,18 @@ mod tests {
         };
         let nv = aux.neural_view().expect("wubi_aux.wbaux should embed WBLM0001");
         let s = nv.offs.summary;
-        assert_eq!((s.vocab_size, s.rank, s.d_model, s.n_heads, s.n_layers, s.ffn_dim), (8192, 160, 256, 8, 6, 768));
-        assert!(nv.offs.has_punct_tokens, "V2 model must expose comma/period tokens");
+        assert_eq!((s.vocab_size, s.rank, s.d_model, s.n_heads, s.n_layers, s.ffn_dim), (8192, 192, 320, 10, 7, 1024));
+        assert!(nv.offs.has_punct_tokens, "V3 model must expose comma/period tokens");
+        assert!(nv.offs.has_eng_num_token, "V3 model must expose <ENG_NUM> token");
         assert_eq!(nv.punct_to_token('，'), Some(crate::neural::TOK_COMMA));
         assert_eq!(nv.punct_to_token('。'), Some(crate::neural::TOK_PERIOD));
 
-        // Parity check against V2 export parity.json ("今天天气真" -> 好/热)
+        // Parity check against V3-Distill INT8 WBLM0001 ("今天天气真" -> 好/热; BF16 parity.json=-0.753486)
         let mut tracker = crate::neural::NeuralContextTracker::default();
         tracker.set_context_str(&nv, "今天天气真");
         let sc_hao = nv.score_next_char(&tracker.active, '好');
         let sc_re = nv.score_next_char(&tracker.active, '热');
-        assert!((sc_hao - (-0.255945)).abs() < 1e-3, "unexpected score_hao={sc_hao}");
+        assert!((sc_hao - (-0.725084)).abs() < 1e-3, "unexpected score_hao={sc_hao}");
         assert!(sc_hao > sc_re);
 
         // Cross-clause state must survive comma & period, and differ from a reset clause

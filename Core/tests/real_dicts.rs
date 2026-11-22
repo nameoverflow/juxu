@@ -185,10 +185,10 @@ fn real_dicts_latency_schemas_and_typo_correction() {
             "RWKV-7 parity check '今天天气真' -> 好={:.6}, 热={:.6}, 油={:.6}, 突={:.6}",
             s_hao, s_re, s_you, s_tu
         );
-        assert!((s_hao - (-0.255945)).abs() < 2e-4, "hao parity mismatch: {}", s_hao);
-        assert!((s_re - (-5.737987)).abs() < 2e-4, "re parity mismatch: {}", s_re);
-        assert!((s_you - (-10.955288)).abs() < 2e-4, "you parity mismatch: {}", s_you);
-        assert!((s_tu - (-11.684685)).abs() < 2e-4, "tu parity mismatch: {}", s_tu);
+        assert!((s_hao - (-0.725084)).abs() < 2e-4, "hao parity mismatch: {}", s_hao);
+        assert!((s_re - (-5.352890)).abs() < 2e-4, "re parity mismatch: {}", s_re);
+        assert!((s_you - (-10.429049)).abs() < 2e-4, "you parity mismatch: {}", s_you);
+        assert!((s_tu - (-9.223639)).abs() < 2e-4, "tu parity mismatch: {}", s_tu);
 
         // Verify modern tech entity awareness in Micro-RWKV-7 ("大模" -> '型')
         tracker.init_with_model(&nv);
