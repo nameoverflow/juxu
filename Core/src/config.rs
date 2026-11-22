@@ -269,6 +269,8 @@ pub struct JuxuConfig {
     pub page_size: u8,
     /// 候选栏方向
     pub orientation: CandidateOrientation,
+    /// 本地输入诊断与评测日志（记录手选非首选、纠错、退格重打等用于制作 eval set）
+    pub eval_logging: bool,
     /// 统计 + 触控热区误触纠正配置
     pub typo: TypoConfig,
 }
@@ -298,6 +300,7 @@ impl Default for JuxuConfig {
             shift_toggle_mode: ShiftToggleMode::CommitCode,
             page_size: 5,
             orientation: CandidateOrientation::Horizontal,
+            eval_logging: true,
             typo: TypoConfig::default(),
         }
     }
@@ -320,7 +323,8 @@ impl JuxuConfig {
                 "smart_punctuation = {}\n",
                 "semicolon_quote_select = {}\n",
                 "auto_space_zh_en = {}\n",
-                "auto_space_digits = {}\n\n",
+                "auto_space_digits = {}\n",
+                "eval_logging = {}\n\n",
                 "[typing]\n",
                 "fourth_code_auto_commit = {}\n",
                 "fifth_code_push_commit = {}\n",
@@ -353,6 +357,7 @@ impl JuxuConfig {
             self.semicolon_quote_select,
             self.auto_space_zh_en,
             self.auto_space_digits,
+            self.eval_logging,
             self.fourth_code_auto_commit,
             self.fifth_code_push_commit,
             self.fourth_empty_behavior.as_tag(),
@@ -412,6 +417,7 @@ impl JuxuConfig {
                 (_, "semicolon_quote_select") => cfg.semicolon_quote_select = parse_bool(val),
                 (_, "auto_space_zh_en") => cfg.auto_space_zh_en = parse_bool(val),
                 (_, "auto_space_digits") => cfg.auto_space_digits = parse_bool(val),
+                (_, "eval_logging") => cfg.eval_logging = parse_bool(val),
                 (_, "fourth_code_auto_commit") => cfg.fourth_code_auto_commit = parse_bool(val),
                 (_, "fifth_code_push_commit") => cfg.fifth_code_push_commit = parse_bool(val),
                 (_, "fourth_empty_behavior") => {

@@ -5,6 +5,7 @@ import Security
 private enum IOSSharedSettings {
     static let preferencesAccount = "input-settings"
     static let touchProfileAccount = "touch-profile"
+    static let evalLogAccount = "eval-log-ring"
 
     private static func query(account: String, groupKey: String = "JuxuSettingsGroup", service: String = "Juxu") -> [String: Any]? {
         guard let group = Bundle.main.object(forInfoDictionaryKey: groupKey) as? String else { return nil }
@@ -81,6 +82,32 @@ public struct TouchKeyCalibrationItem: Codable, Identifiable, Equatable, Sendabl
     public let dy: Float
     public let samples: UInt32
     public var id: String { key }
+}
+
+public struct EvalLogSummary: Equatable, Sendable {
+    public let totalEvents: Int
+    public let commits: Int
+    public let top1Hits: Int
+    public let manualSelects: Int
+    public let lmOverruled: Int
+    public let typoTriggered: Int
+    public let backspaceAfterCommit: Int
+    public let abandons: Int
+
+    public var top1RatePercent: Double {
+        commits > 0 ? (Double(top1Hits) * 100.0 / Double(commits)) : 0.0
+    }
+
+    public static let empty = EvalLogSummary(
+        totalEvents: 0,
+        commits: 0,
+        top1Hits: 0,
+        manualSelects: 0,
+        lmOverruled: 0,
+        typoTriggered: 0,
+        backspaceAfterCommit: 0,
+        abandons: 0
+    )
 }
 
 public struct JuxuActionState: Codable, Equatable, Sendable {
@@ -287,6 +314,7 @@ public struct JuxuPreferences: Equatable, Sendable {
     public var clipboardSuggestion: Bool = true
     public var cangjieKeycapRadicals: Bool = true
     public var wubiKeycapRadicals: Bool = false
+    public var evalLogging: Bool = true
 
     public var fourthCodeAutoCommit: Bool = true
     public var fifthCodePushCommit: Bool = true
@@ -357,6 +385,7 @@ public struct JuxuPreferences: Equatable, Sendable {
         clipboard_suggestion = \(clipboardSuggestion)
         cangjie_keycap_radicals = \(cangjieKeycapRadicals)
         wubi_keycap_radicals = \(wubiKeycapRadicals)
+        eval_logging = \(evalLogging)
 
         [typing]
         fourth_code_auto_commit = \(fourthCodeAutoCommit)
@@ -434,6 +463,8 @@ public struct JuxuPreferences: Equatable, Sendable {
                 p.cangjieKeycapRadicals = boolVal
             case (_, "wubi_keycap_radicals"):
                 p.wubiKeycapRadicals = boolVal
+            case (_, "eval_logging"):
+                p.evalLogging = boolVal
             case (_, "fourth_code_auto_commit"):
                 p.fourthCodeAutoCommit = boolVal
             case (_, "fifth_code_push_commit"):
@@ -502,12 +533,20 @@ public final class JuxuBridge: ObservableObject {
     @Published public var prefs: JuxuPreferences = JuxuPreferences()
     @Published public private(set) var userPhrases: [UserPhraseRecord] = []
     @Published public private(set) var touchCalibrations: [TouchKeyCalibrationItem] = []
+    @Published public private(set) var evalLogSummary: EvalLogSummary = .empty
 
     public let configURL: URL
     public let userDataURL: URL
+    public let evalLogURL: URL
     public let hasSharedContainerAccess: Bool
+    private let bridgeInMemoryOnly: Bool
+    #if os(iOS)
+    private var iosEvalRingLoaded: Bool = false
+    private var iosEvalRingLines: [String] = []
+    #endif
 
     public init(customDictsDir: URL? = nil, inMemoryOnly: Bool = false) {
+        self.bridgeInMemoryOnly = inMemoryOnly
         #if os(iOS)
         self.inMemoryOnly = inMemoryOnly
         #endif
@@ -542,6 +581,7 @@ public final class JuxuBridge: ObservableObject {
             self.configURL = appSupport.appendingPathComponent("config.toml")
         }
         self.userDataURL = appSupport.appendingPathComponent("user_data.tsv")
+        self.evalLogURL = appSupport.appendingPathComponent("eval_log.jsonl")
         self.hasSharedContainerAccess = true
         #else
         if let groupURL = FileManager.default.containerURL(
@@ -549,12 +589,14 @@ public final class JuxuBridge: ObservableObject {
         ) {
             self.configURL = groupURL.appendingPathComponent("config.toml")
             self.userDataURL = groupURL.appendingPathComponent("user_data.tsv")
+            self.evalLogURL = groupURL.appendingPathComponent("eval_log.jsonl")
             self.hasSharedContainerAccess = true
         } else {
             let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
                 ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             self.configURL = docs.appendingPathComponent("config.toml")
             self.userDataURL = docs.appendingPathComponent("user_data.tsv")
+            self.evalLogURL = docs.appendingPathComponent("eval_log.jsonl")
             self.hasSharedContainerAccess = false
         }
         #endif
@@ -773,6 +815,7 @@ public final class JuxuBridge: ObservableObject {
         let json = takeString(juxu_engine_handle_key_json(h, keyCode, scalar, hasCmdOrCtrl, timestampMs))
         let decoded = decodeState(json)
         self.state = decoded
+        drainEvalLogIfNeeded()
         return decoded
     }
 
@@ -790,6 +833,7 @@ public final class JuxuBridge: ObservableObject {
         let json = takeString(juxu_engine_push_touch_json(h, reportedAscii, x, y, isNormalized, timestampMs))
         let decoded = decodeState(json)
         self.state = decoded
+        drainEvalLogIfNeeded()
         return decoded
     }
 
@@ -798,6 +842,7 @@ public final class JuxuBridge: ObservableObject {
         let json = takeString(juxu_engine_select_candidate_json(h, UInt32(max(0, pageRelIndex)), timestampMs))
         let decoded = decodeState(json)
         self.state = decoded
+        drainEvalLogIfNeeded()
         return decoded
     }
 
@@ -806,6 +851,7 @@ public final class JuxuBridge: ObservableObject {
         let json = takeString(juxu_engine_select_abs_candidate_json(h, UInt32(max(0, absIndex)), timestampMs))
         let decoded = decodeState(json)
         self.state = decoded
+        drainEvalLogIfNeeded()
         return decoded
     }
 
@@ -989,6 +1035,157 @@ public final class JuxuBridge: ObservableObject {
         guard let p = ptr else { return "" }
         defer { juxu_string_free(p) }
         return String(cString: p)
+    }
+
+    // MARK: - Local Input Eval Log (macOS JSONL + iOS Shared Keychain Ring)
+
+    private func drainEvalLogIfNeeded() {
+        guard !bridgeInMemoryOnly, let h = handle else { return }
+        let batch = takeString(juxu_engine_drain_eval_log_jsonl(h))
+        guard !batch.isEmpty else { return }
+        appendEvalLogLines(batch)
+    }
+
+    private func appendEvalLogLines(_ batch: String) {
+        let payload = Data((batch + "\n").utf8)
+        let fm = FileManager.default
+        if let attrs = try? fm.attributesOfItem(atPath: evalLogURL.path),
+           let size = attrs[.size] as? UInt64,
+           size > 8 * 1024 * 1024 {
+            let prevURL = evalLogURL.deletingLastPathComponent().appendingPathComponent("eval_log.prev.jsonl")
+            try? fm.removeItem(at: prevURL)
+            try? fm.moveItem(at: evalLogURL, to: prevURL)
+        }
+        if !fm.fileExists(atPath: evalLogURL.path) {
+            fm.createFile(
+                atPath: evalLogURL.path,
+                contents: payload,
+                attributes: [.posixPermissions: NSNumber(value: Int16(0o600))]
+            )
+        } else if let fh = try? FileHandle(forWritingTo: evalLogURL) {
+            defer { try? fh.close() }
+            _ = try? fh.seekToEnd()
+            try? fh.write(contentsOf: payload)
+        }
+
+        #if os(iOS)
+        syncIOSEvalLogRing(newBatch: batch)
+        #endif
+    }
+
+    #if os(iOS)
+    private static func decodeSharedEvalRing() -> [String] {
+        guard let compressed = IOSSharedSettings.read(account: IOSSharedSettings.evalLogAccount) else {
+            return []
+        }
+        let rawData: Data
+        if let inflated = try? (compressed as NSData).decompressed(using: .zlib) as Data {
+            rawData = inflated
+        } else {
+            rawData = compressed
+        }
+        guard let text = String(data: rawData, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+    }
+
+    private func syncIOSEvalLogRing(newBatch: String) {
+        if !iosEvalRingLoaded {
+            iosEvalRingLines = Self.decodeSharedEvalRing()
+            iosEvalRingLoaded = true
+        }
+        let added = newBatch.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        guard !added.isEmpty else { return }
+        iosEvalRingLines.append(contentsOf: added)
+        if iosEvalRingLines.count > 400 {
+            iosEvalRingLines.removeFirst(iosEvalRingLines.count - 400)
+        }
+        let joined = iosEvalRingLines.joined(separator: "\n")
+        if let compressed = try? (Data(joined.utf8) as NSData).compressed(using: .zlib) as Data {
+            _ = IOSSharedSettings.write(compressed, account: IOSSharedSettings.evalLogAccount)
+        }
+    }
+    #endif
+
+    public func readEvalLogText() -> String {
+        #if os(iOS)
+        let ring = Self.decodeSharedEvalRing()
+        if !ring.isEmpty {
+            return ring.joined(separator: "\n") + "\n"
+        }
+        #endif
+        return (try? String(contentsOf: evalLogURL, encoding: .utf8)) ?? ""
+    }
+
+    public func reloadEvalLogSummary() {
+        let text = readEvalLogText()
+        var totalEvents = 0
+        var commits = 0
+        var top1Hits = 0
+        var manualSelects = 0
+        var lmOverruled = 0
+        var typoTriggered = 0
+        var backspaceAfterCommit = 0
+        var abandons = 0
+
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            let s = String(line)
+            guard s.hasPrefix("{") else { continue }
+            totalEvents += 1
+            if s.contains("\"event\":\"commit\"") || s.contains("\"event\":\"partial_commit\"") {
+                commits += 1
+                if s.contains("\"rank\":0,") {
+                    top1Hits += 1
+                } else {
+                    manualSelects += 1
+                }
+                if s.contains("\"lm_overruled\":true") {
+                    lmOverruled += 1
+                }
+                if !s.contains("\"typo\":\"none\"") && s.contains("\"typo\":\"") {
+                    typoTriggered += 1
+                }
+            } else if s.contains("\"event\":\"backspace_after_commit\"") {
+                backspaceAfterCommit += 1
+            } else if s.contains("\"event\":\"abandon\"") {
+                abandons += 1
+            }
+        }
+        self.evalLogSummary = EvalLogSummary(
+            totalEvents: totalEvents,
+            commits: commits,
+            top1Hits: top1Hits,
+            manualSelects: manualSelects,
+            lmOverruled: lmOverruled,
+            typoTriggered: typoTriggered,
+            backspaceAfterCommit: backspaceAfterCommit,
+            abandons: abandons
+        )
+    }
+
+    public func exportEvalLogFileURL() -> URL? {
+        #if os(macOS)
+        return FileManager.default.fileExists(atPath: evalLogURL.path) ? evalLogURL : nil
+        #else
+        let text = readEvalLogText()
+        guard !text.isEmpty else { return nil }
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("juxu_ios_eval_log.jsonl")
+        try? Data(text.utf8).write(to: out, options: .atomic)
+        return out
+        #endif
+    }
+
+    public func clearEvalLog() {
+        try? FileManager.default.removeItem(at: evalLogURL)
+        let prevURL = evalLogURL.deletingLastPathComponent().appendingPathComponent("eval_log.prev.jsonl")
+        try? FileManager.default.removeItem(at: prevURL)
+        #if os(iOS)
+        iosEvalRingLines.removeAll()
+        iosEvalRingLoaded = true
+        if let emptyCompressed = try? (Data() as NSData).compressed(using: .zlib) as Data {
+            _ = IOSSharedSettings.write(emptyCompressed, account: IOSSharedSettings.evalLogAccount)
+        }
+        #endif
+        self.evalLogSummary = .empty
     }
 }
 

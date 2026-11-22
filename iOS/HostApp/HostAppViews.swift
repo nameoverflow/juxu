@@ -58,7 +58,10 @@ public struct IOSHostRootView: View {
             typoTab
                 .tabItem { Label(IOSHostTab.typo.title, systemImage: IOSHostTab.typo.icon) }
                 .tag(IOSHostTab.typo)
-                .onAppear { bridge.reloadTouchCalibration() }
+                .onAppear {
+                    bridge.reloadTouchCalibration()
+                    bridge.reloadEvalLogSummary()
+                }
 
             lexiconTab
                 .tabItem { Label(IOSHostTab.lexicon.title, systemImage: IOSHostTab.lexicon.icon) }
@@ -448,10 +451,76 @@ public struct IOSHostRootView: View {
                     }
                     .padding(14)
                     .background(iosCardBackground)
+
+                    // Local Input Eval Log Card (for building real-world eval sets)
+                    VStack(alignment: .leading, spacing: 11) {
+                        iosToggleRow(
+                            "记录输入与选词诊断日志",
+                            sub: "仅本地保存手选非首选、纠错、退格重打与 2D 落点，用于制作 eval set 改进排序策略",
+                            isOn: binding(\.evalLogging)
+                        )
+                        Divider()
+                        let s = bridge.evalLogSummary
+                        HStack(spacing: 10) {
+                            evalStatPill(title: "总上屏", value: "\(s.commits)")
+                            evalStatPill(title: "Top-1 率", value: s.commits > 0 ? String(format: "%.1f%%", s.top1RatePercent) : "—")
+                            evalStatPill(title: "手选非首选", value: "\(s.manualSelects)")
+                        }
+                        HStack(spacing: 10) {
+                            evalStatPill(title: "策略压制模型", value: "\(s.lmOverruled)")
+                            evalStatPill(title: "退格重打", value: "\(s.backspaceAfterCommit)")
+                            evalStatPill(title: "纠错触发", value: "\(s.typoTriggered)")
+                        }
+                        HStack(spacing: 10) {
+                            Button("刷新统计") {
+                                bridge.reloadEvalLogSummary()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+
+                            #if os(iOS)
+                            if let exportURL = bridge.exportEvalLogFileURL() {
+                                ShareLink(item: exportURL) {
+                                    Label("导出 JSONL", systemImage: "square.and.arrow.up")
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                            }
+                            #endif
+
+                            Spacer()
+
+                            Button("清空", role: .destructive) {
+                                bridge.clearEvalLog()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(s.totalEvents == 0)
+                        }
+                    }
+                    .padding(14)
+                    .background(iosCardBackground)
                 }
                 .padding(16)
             }
         }
+    }
+
+    private func evalStatPill(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 15, weight: .semibold, design: .monospaced))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
+        )
     }
 
     // MARK: - Tab 4: Personal Lexicon & Auto-Phrase

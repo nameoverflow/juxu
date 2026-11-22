@@ -1,6 +1,7 @@
 pub mod code;
 pub mod config;
 pub mod engine;
+pub mod eval_log;
 pub mod ffi;
 pub mod format;
 pub mod mmap_buf;
@@ -623,6 +624,40 @@ mod tests {
         t_nl.set_context_str(&nv, "今天下雨了\n我");
         let sc_dai_nl = nv.score_next_char(&t_nl.active, '带');
         assert!((sc_dai_nl - sc_dai_short).abs() < 1e-5);
+    }
+
+    #[test]
+    fn eval_log_captures_commits_manual_select_and_backspace() {
+        let mut eng = JuxuEngine::new(JuxuConfig {
+            schema: InputSchema::Wubi86,
+            eval_logging: true,
+            fourth_code_auto_commit: false,
+            ..Default::default()
+        });
+        eng.load_dict(InputSchema::Wubi86, build_sample_dict_86());
+
+        // Top-1 commit ("q" + Space -> "我")
+        eng.handle_key_event(0, Some('q'), false, 1000);
+        let out1 = eng.handle_key_event(KEY_SPACE, Some(' '), false, 1050);
+        assert_eq!(out1.commit_text, "我");
+
+        // Backspace immediately after commit -> backspace_after_commit
+        eng.handle_key_event(crate::engine::KEY_BACKSPACE, None, false, 1500);
+
+        // Escape on >=2-key preedit -> abandon
+        eng.handle_key_event(0, Some('t'), false, 2000);
+        eng.handle_key_event(0, Some('r'), false, 2050);
+        eng.handle_key_event(crate::engine::KEY_ESCAPE, None, false, 2100);
+
+        let jsonl = eng.drain_eval_log_jsonl();
+        let lines: Vec<&str> = jsonl.lines().collect();
+        assert_eq!(lines.len(), 3, "expected commit + backspace_after_commit + abandon, got:\n{}", jsonl);
+        assert!(lines[0].contains("\"event\":\"commit\""));
+        assert!(lines[0].contains("\"chosen\":\"我\""));
+        assert!(lines[1].contains("\"event\":\"backspace_after_commit\""));
+        assert!(lines[2].contains("\"event\":\"abandon\""));
+        assert!(lines[2].contains("\"keys\":\"tr\""));
+        assert!(eng.drain_eval_log_jsonl().is_empty());
     }
 
     #[test]

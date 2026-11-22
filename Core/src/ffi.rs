@@ -721,3 +721,13 @@ pub extern "C" fn juxu_engine_predict_next_json(
     j.push(']');
     into_c_string(j)
 }
+
+#[no_mangle]
+pub extern "C" fn juxu_engine_drain_eval_log_jsonl(
+    handle: *mut JuxuEngineHandle,
+) -> *mut c_char {
+    let Some(h) = (unsafe { handle.as_mut() }) else {
+        return into_c_string(String::new());
+    };
+    into_c_string(h.inner.drain_eval_log_jsonl())
+}

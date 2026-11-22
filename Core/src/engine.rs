@@ -149,6 +149,8 @@ pub struct JuxuEngine {
     /// Spatial log-likelihood of the top 4-key typo candidate (when `candidates[0]` is a 4-key typo),
     /// carried into Key #5 disambiguation so a typo rescue pays its real spatial cost against `abc | de`.
     top_typo_spatial_logp: Option<f32>,
+    /// Local diagnostic/eval event queue (drained to disk / shared ring by host shell).
+    eval_logger: crate::eval_log::EvalLogger,
 }
 
 impl Default for JuxuEngine {
@@ -185,6 +187,137 @@ impl JuxuEngine {
             hold_fourth_for_split: false,
             pending_empty_split: None,
             top_typo_spatial_logp: None,
+            eval_logger: crate::eval_log::EvalLogger::default(),
+        }
+    }
+
+    pub fn drain_eval_log_jsonl(&mut self) -> String {
+        self.eval_logger.drain_jsonl()
+    }
+
+    fn eval_context_string(&self) -> String {
+        self.recent_context.iter().collect()
+    }
+
+    fn log_commit_event(
+        &mut self,
+        timestamp_ms: u64,
+        event_kind: &'static str,
+        keys: String,
+        touches: Vec<[f32; 2]>,
+        rank: usize,
+        explicit: bool,
+        chosen: &str,
+        top1: &str,
+        typo: &'static str,
+        lm_chosen: Option<f32>,
+        cands: Vec<crate::eval_log::EvalCandSnapshot>,
+    ) {
+        if !self.config.eval_logging || chosen.is_empty() {
+            return;
+        }
+        let schema = self.config.schema.as_tag();
+        let ctx = self.eval_context_string();
+        let lm_top1 = if rank > 0 || chosen != top1 {
+            self.compute_rwkv_surprisal(top1)
+        } else {
+            lm_chosen
+        };
+        let lm_overruled = match (lm_chosen, lm_top1) {
+            (Some(c), Some(t)) if rank > 0 && chosen != top1 => c + 0.05 < t,
+            _ => false,
+        };
+        let ev = crate::eval_log::EvalEvent {
+            ts_ms: timestamp_ms,
+            schema,
+            event: event_kind,
+            ctx: ctx.clone(),
+            keys: keys.clone(),
+            touches,
+            rank,
+            explicit,
+            chosen: chosen.to_string(),
+            top1: top1.to_string(),
+            typo,
+            lm_chosen,
+            lm_top1,
+            lm_overruled,
+            cands,
+        };
+        self.eval_logger.push(&ev);
+        self.eval_logger.last_commit = Some(crate::eval_log::LastCommitSnapshot {
+            ts_ms: timestamp_ms,
+            schema,
+            ctx,
+            keys,
+            chosen: chosen.to_string(),
+            top1: top1.to_string(),
+            rank,
+            typo,
+        });
+    }
+
+    fn log_abandon_event(&mut self, timestamp_ms: u64) {
+        if !self.config.eval_logging || self.raw_code.len() < 2 {
+            return;
+        }
+        let top1 = self
+            .candidates
+            .first()
+            .map(|c| c.text.clone())
+            .unwrap_or_default();
+        let typo = self
+            .candidates
+            .first()
+            .map(crate::eval_log::candidate_typo_tag)
+            .unwrap_or("none");
+        let ev = crate::eval_log::EvalEvent {
+            ts_ms: timestamp_ms,
+            schema: self.config.schema.as_tag(),
+            event: "abandon",
+            ctx: self.eval_context_string(),
+            keys: self.raw_code.clone(),
+            touches: crate::eval_log::touches_from_obs(&self.observations),
+            rank: 0,
+            explicit: false,
+            chosen: String::new(),
+            top1,
+            typo,
+            lm_chosen: None,
+            lm_top1: None,
+            lm_overruled: false,
+            cands: crate::eval_log::top_cand_snapshots(&self.candidates),
+        };
+        self.eval_logger.push(&ev);
+    }
+
+    fn log_backspace_after_commit_if_recent(&mut self, timestamp_ms: u64) {
+        if !self.config.eval_logging {
+            return;
+        }
+        let Some(last) = self.eval_logger.last_commit.take() else {
+            return;
+        };
+        // Only treat backspace within 4 seconds of a commit as an implicit negative signal.
+        if timestamp_ms.saturating_sub(last.ts_ms) <= 4_000 {
+            let ev = crate::eval_log::EvalEvent {
+                ts_ms: timestamp_ms,
+                schema: last.schema,
+                event: "backspace_after_commit",
+                ctx: last.ctx,
+                keys: last.keys,
+                touches: Vec::new(),
+                rank: last.rank,
+                explicit: true,
+                chosen: last.chosen,
+                top1: last.top1,
+                typo: last.typo,
+                lm_chosen: None,
+                lm_top1: None,
+                lm_overruled: false,
+                cands: Vec::new(),
+            };
+            self.eval_logger.push(&ev);
         }
     }
 
@@ -930,8 +1063,52 @@ impl JuxuEngine {
             let first_choice = (learn && explicit && abs_idx > 0)
                 .then(|| self.candidates.first().map(|c| c.text.clone()))
                 .flatten();
-            // Compute RWKV surprisal BEFORE advancing neural_tracker so auto-phrase can gate on it
+            // Compute RWKV surprisal BEFORE advancing neural_tracker so auto-phrase & eval log can gate on it
             let surprisal = self.compute_rwkv_surprisal(&commit_text);
+            if self.config.eval_logging {
+                let top1 = self
+                    .candidates
+                    .first()
+                    .map(|c| c.text.clone())
+                    .unwrap_or_default();
+                let eval_keys: String = if consumed > 0 && consumed <= self.raw_code.len() {
+                    self.raw_code[..consumed].to_string()
+                } else {
+                    self.raw_code.clone()
+                };
+                let eval_obs_end = consumed.min(self.observations.len());
+                let eval_touches = crate::eval_log::touches_from_obs(&self.observations[..eval_obs_end]);
+                let eval_typo = pc_boundaries
+                    .iter()
+                    .find(|b| b.correction != CorrectionKind::Exact)
+                    .map(|b| crate::eval_log::correction_kind_tag(b.correction))
+                    .unwrap_or_else(|| {
+                        if !pc_is_exact {
+                            "typo_cand"
+                        } else {
+                            "none"
+                        }
+                    });
+                let eval_cands = crate::eval_log::top_cand_snapshots(&self.candidates);
+                let event_kind = if consumed > 0 && consumed < self.observations.len() {
+                    "partial_commit"
+                } else {
+                    "commit"
+                };
+                self.log_commit_event(
+                    timestamp_ms,
+                    event_kind,
+                    eval_keys,
+                    eval_touches,
+                    abs_idx,
+                    explicit,
+                    &commit_text,
+                    &top1,
+                    eval_typo,
+                    surprisal,
+                    eval_cands,
+                );
+            }
             let mut notice = String::new();
             if learn {
                 self.learn_continuation(&commit_text, explicit, first_choice.as_deref());
@@ -1065,6 +1242,19 @@ impl JuxuEngine {
         let first_choice =
             (learn && explicit && abs_idx > 0).then(|| self.candidates[0].text.clone());
         let mut notice = String::new();
+        let eval_top1 = self
+            .candidates
+            .first()
+            .map(|c| c.text.clone())
+            .unwrap_or_default();
+        let eval_keys = self.raw_code.clone();
+        let eval_touches = crate::eval_log::touches_from_obs(&self.observations);
+        let eval_typo = crate::eval_log::candidate_typo_tag(&cand);
+        let eval_cands = if self.config.eval_logging {
+            crate::eval_log::top_cand_snapshots(&self.candidates)
+        } else {
+            Vec::new()
+        };
         let commit_text = if self.uses_spaceless() {
             let segments = if cand.matched_code.is_empty() {
                 let path = self.stream.paths().iter().find(|path| path.text == cand.text)?;
@@ -1083,13 +1273,44 @@ impl JuxuEngine {
                 });
                 segments
             };
+            let selected: String = segments.iter().map(|segment| segment.text.as_str()).collect();
+            if self.config.eval_logging {
+                let lm_chosen = self.compute_rwkv_surprisal(&selected);
+                self.log_commit_event(
+                    timestamp_ms,
+                    "commit",
+                    eval_keys,
+                    eval_touches,
+                    abs_idx,
+                    explicit,
+                    &selected,
+                    &eval_top1,
+                    eval_typo,
+                    lm_chosen,
+                    eval_cands,
+                );
+            }
             if learn {
-                let selected: String =
-                    segments.iter().map(|segment| segment.text.as_str()).collect();
                 self.learn_continuation(&selected, explicit, first_choice.as_deref());
             }
             self.finalize_stream_segments(segments, true, timestamp_ms, &mut notice)
         } else {
+            if self.config.eval_logging {
+                let lm_chosen = self.compute_rwkv_surprisal(&cand.text);
+                self.log_commit_event(
+                    timestamp_ms,
+                    "commit",
+                    eval_keys,
+                    eval_touches,
+                    abs_idx,
+                    explicit,
+                    &cand.text,
+                    &eval_top1,
+                    eval_typo,
+                    lm_chosen,
+                    eval_cands,
+                );
+            }
             if learn {
                 self.learn_continuation(&cand.text, explicit, first_choice.as_deref());
             }
@@ -1498,6 +1719,7 @@ impl JuxuEngine {
         match keycode {
             KEY_BACKSPACE => {
                 if self.raw_code.is_empty() {
+                    self.log_backspace_after_commit_if_recent(timestamp_ms);
                     self.user.break_single_burst();
                     self.recent_context.clear();
                     let nv = self.aux.as_ref().and_then(|a| a.neural_view());
@@ -1525,6 +1747,7 @@ impl JuxuEngine {
                 if self.raw_code.is_empty() {
                     return EngineOutput::default();
                 }
+                self.log_abandon_event(timestamp_ms);
                 self.clear_composition();
                 return EngineOutput {
                     consumed: true,

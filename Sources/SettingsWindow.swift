@@ -422,7 +422,70 @@ public struct SettingsRootView: View {
                     }
                 }
             }
+
+            settingsCard {
+                VStack(alignment: .leading, spacing: 11) {
+                    toggleRow(
+                        title: "记录输入与选词诊断日志（本地 Eval Set）",
+                        subtitle: "保存手选非首选、RWKV 策略压制标记、纠错与退格重打到 ~/Library/Application Support/Juxu/eval_log.jsonl",
+                        isOn: binding(\.evalLogging)
+                    )
+                    Divider()
+                    let s = bridge.evalLogSummary
+                    HStack(spacing: 12) {
+                        macEvalStatBox(title: "总上屏", value: "\(s.commits)")
+                        macEvalStatBox(title: "Top-1 命中率", value: s.commits > 0 ? String(format: "%.1f%%", s.top1RatePercent) : "—")
+                        macEvalStatBox(title: "手选非首选", value: "\(s.manualSelects)")
+                        macEvalStatBox(title: "策略压制模型", value: "\(s.lmOverruled)")
+                        macEvalStatBox(title: "退格重打", value: "\(s.backspaceAfterCommit)")
+                        macEvalStatBox(title: "纠错触发", value: "\(s.typoTriggered)")
+                    }
+                    HStack(spacing: 8) {
+                        Button("刷新统计") {
+                            bridge.reloadEvalLogSummary()
+                        }
+                        .controlSize(.small)
+
+                        Button("在 Finder 中显示日志") {
+                            if FileManager.default.fileExists(atPath: bridge.evalLogURL.path) {
+                                NSWorkspace.shared.activateFileViewerSelecting([bridge.evalLogURL])
+                            } else {
+                                NSWorkspace.shared.open(bridge.evalLogURL.deletingLastPathComponent())
+                            }
+                        }
+                        .controlSize(.small)
+
+                        Spacer()
+
+                        Button("清空日志", role: .destructive) {
+                            bridge.clearEvalLog()
+                        }
+                        .controlSize(.small)
+                        .disabled(s.totalEvents == 0)
+                    }
+                }
+                .onAppear {
+                    bridge.reloadEvalLogSummary()
+                }
+            }
         }
+    }
+
+    private func macEvalStatBox(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.primary.opacity(0.045))
+        )
     }
 
     // MARK: - Section 3: Auto-Phrase & Personal Lexicon

@@ -101,6 +101,7 @@ void juxu_engine_accept_prediction(
     uint64_t timestamp_ms
 );
 char *juxu_engine_predict_next_json(const JuxuEngineHandle *handle, uint32_t max_count);
+char *juxu_engine_drain_eval_log_jsonl(JuxuEngineHandle *handle);
 
 #ifdef __cplusplus
 }
