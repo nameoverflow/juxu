@@ -769,6 +769,19 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
             // 2. Spacebar 2D trackpad cursor drag
             if state.startedOnSpace {
                 trackedTouches[id] = state
+                // A clear horizontal drag moves the cursor right away, without waiting for the long-press.
+                if !trackpad.isActive,
+                   IOSSpaceDrag.shouldBeginCursorDrag(from: state.initialPoint, to: pt) {
+                    if spaceHoldTouchId == id {
+                        spaceHoldTimer?.invalidate()
+                        spaceHoldTimer = nil
+                        spaceHoldTouchId = nil
+                    }
+                    trackpad.begin(at: pt, timestamp: touch.timestamp)
+                    onTrackpadStateChanged?(true)
+                    syncKeycapPressStates()
+                    continue
+                }
                 if !trackpad.isActive && hypot(pt.x - state.initialPoint.x, pt.y - state.initialPoint.y) > 14 {
                     if spaceHoldTouchId == id {
                         spaceHoldTimer?.invalidate()

@@ -509,6 +509,12 @@ struct IOSKeyboardTests {
         t9Prefs.pinyinT9Layout = true
         assert(JuxuPreferences.fromTOML(t9Prefs.toTOML()).pinyinT9Layout == true)
 
+        // Spacebar direct horizontal cursor drag
+        let sp = CGPoint(x: 200, y: 180)
+        assert(IOSSpaceDrag.shouldBeginCursorDrag(from: sp, to: CGPoint(x: 220, y: 184)))
+        assert(IOSSpaceDrag.shouldBeginCursorDrag(from: sp, to: CGPoint(x: 180, y: 178)))
+        assert(!IOSSpaceDrag.shouldBeginCursorDrag(from: sp, to: CGPoint(x: 208, y: 181)), "Small drift must remain a space tap")
+        assert(!IOSSpaceDrag.shouldBeginCursorDrag(from: sp, to: CGPoint(x: 218, y: 205)), "Diagonal or vertical drag must not start")
         print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi & T9 Pinyin tests passed!")
     }
 }

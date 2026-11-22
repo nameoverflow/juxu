@@ -59,6 +59,17 @@ public enum IOSKeyKind: Equatable {
     case returnKey
 }
 
+/// Spacebar drag: a mostly horizontal slide starts cursor movement; small drift stays a normal space tap.
+public enum IOSSpaceDrag {
+    public static let startDistance: CGFloat = 16.0
+
+    public static func shouldBeginCursorDrag(from start: CGPoint, to current: CGPoint) -> Bool {
+        let dx = abs(current.x - start.x)
+        let dy = abs(current.y - start.y)
+        return dx >= startDistance && dx >= dy * 1.5
+    }
+}
+
 public struct IOSKeySpec: Identifiable, Equatable {
     public let id: String
     public let kind: IOSKeyKind
