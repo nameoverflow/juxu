@@ -201,7 +201,7 @@ final class JuxuSimulatorUITests: XCTestCase {
             kbsCell.tap()
         }
 
-        let alreadyAdded = settings.cells.containing(NSPredicate(format: "label CONTAINS '形序'")).firstMatch
+        let alreadyAdded = settings.cells.containing(NSPredicate(format: "label CONTAINS '句序'")).firstMatch
         if !alreadyAdded.waitForExistence(timeout: 1.5) {
             let addBtn = settings.buttons["AddNewKeyboard"].firstMatch
             let addCell = settings.cells["AddNewKeyboard"].firstMatch
@@ -217,7 +217,7 @@ final class JuxuSimulatorUITests: XCTestCase {
             Thread.sleep(forTimeInterval: 0.8)
             attachHierarchy(of: settings, name: "settings-add-keyboard-tree")
 
-            let prisRow = settings.staticTexts.containing(NSPredicate(format: "label CONTAINS '形序'")).firstMatch
+            let prisRow = settings.staticTexts.containing(NSPredicate(format: "label CONTAINS '句序'")).firstMatch
             if prisRow.waitForExistence(timeout: 3) {
                 prisRow.tap()
                 Thread.sleep(forTimeInterval: 0.8)
@@ -237,13 +237,13 @@ final class JuxuSimulatorUITests: XCTestCase {
         let inputUI = XCUIApplication(bundleIdentifier: "com.apple.InputUI")
         let globeCoord = app.coordinate(withNormalizedOffset: CGVector(dx: 0.095, dy: 0.955))
 
-        // Long-press Globe to open the Input Mode picker and select 形序 directly
+        // Long-press Globe to open the Input Mode picker and select 句序 directly
         globeCoord.press(forDuration: 0.75)
         Thread.sleep(forTimeInterval: 0.6)
         attachHierarchy(of: inputUI, name: "inputui-globe-menu-tree")
 
-        let pickerInInputUI = inputUI.staticTexts.containing(NSPredicate(format: "label CONTAINS '形序'")).firstMatch
-        let pickerInApp = app.staticTexts.containing(NSPredicate(format: "label CONTAINS '形序'")).firstMatch
+        let pickerInInputUI = inputUI.staticTexts.containing(NSPredicate(format: "label CONTAINS '句序'")).firstMatch
+        let pickerInApp = app.staticTexts.containing(NSPredicate(format: "label CONTAINS '句序'")).firstMatch
         if pickerInInputUI.waitForExistence(timeout: 1.5) {
             pickerInInputUI.tap()
         } else if pickerInApp.exists && pickerInApp.frame.minY > 500 {
@@ -298,13 +298,12 @@ final class JuxuSimulatorUITests: XCTestCase {
             let key = try letter(byte)
             origin.withOffset(CGVector(dx: key.midX, dy: key.midY)).tap()
         }
-        XCTAssertEqual(typingApp.staticTexts["JuxuSegmentedCode"].label, "yrwu")
+        XCTAssertEqual(typingApp.textFields.firstMatch.value as? String, "yrwu")
         let corrected = typingApp.staticTexts["我们 trwu"].firstMatch
         XCTAssertTrue(corrected.waitForExistence(timeout: 3))
         attachShot(name: "spaceless-neighbor-key-correction")
         corrected.tap()
         XCTAssertEqual(typingApp.textFields.firstMatch.value as? String, "我们")
-        XCTAssertFalse(typingApp.staticTexts["JuxuSegmentedCode"].exists)
 
         Thread.sleep(forTimeInterval: 1.7) // Allow the keyboard's deferred user-data flush.
         typingApp.launchArguments = []
@@ -371,10 +370,8 @@ final class JuxuSimulatorUITests: XCTestCase {
         for letter in "wygdgdrtfhvbtrwuggfhfcuktqnkc".utf8 {
             try tap(.letter(letter))
         }
-        XCTAssertEqual(field.value as? String, target)
-        let segmented = typingApp.staticTexts["JuxuSegmentedCode"]
-        XCTAssertTrue(segmented.exists)
-        XCTAssertTrue(segmented.label.hasSuffix("│ fcu·ktqn·kc"))
+        let fieldVal = (field.value as? String) ?? ""
+        XCTAssertTrue(fieldVal.hasSuffix("fcu·ktqn·kc"), "Expected active code in text field, got: \(fieldVal)")
         attachShot(name: "spaceless-98-composing")
         typingApp.staticTexts["去吃饭吧"].tap()
         XCTAssertEqual(field.value as? String, target)
@@ -384,7 +381,6 @@ final class JuxuSimulatorUITests: XCTestCase {
         }
         try tap(.returnKey)
         XCTAssertEqual(field.value as? String, target + " hello")
-        XCTAssertFalse(segmented.exists)
         attachShot(name: "spaceless-98-return-english")
     }
 
@@ -417,16 +413,10 @@ final class JuxuSimulatorUITests: XCTestCase {
         app.buttons["重输"].tap()
 
         try typeCodes("tvqqiepbdggtebjfddwpukwdedgxbtudcakftdgdcgwgdc")
-        let codeStrip = app.staticTexts["JuxuSegmentedCode"]
-        XCTAssertTrue(codeStrip.exists)
-        XCTAssertGreaterThanOrEqual(codeStrip.frame.minX, canvas.frame.minX + 16)
-        XCTAssertLessThanOrEqual(codeStrip.frame.maxX, canvas.frame.maxX - 16)
-        XCTAssertLessThan(codeStrip.frame.maxY, canvas.frame.minY)
-        let latestCodes = codeStrip.screenshot().pngRepresentation
+        let inlineVal = (app.textFields.firstMatch.value as? String) ?? ""
+        XCTAssertTrue(inlineVal.contains("·"), "Expected segmented inline code in text field, got: \(inlineVal)")
+        XCTAssertFalse(app.staticTexts["JuxuSegmentedCode"].exists)
         attachShot(name: "code-strip-long")
-        codeStrip.swipeRight()
-        XCTAssertNotEqual(codeStrip.screenshot().pngRepresentation, latestCodes)
-        attachShot(name: "code-strip-pan")
         expand.tap()
         XCTAssertTrue(first.waitForExistence(timeout: 5))
         XCTAssertEqual(first.label, "常用字在五笔里其实只有三级简码或者三码全码")

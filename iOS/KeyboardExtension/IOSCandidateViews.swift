@@ -4,12 +4,14 @@ import UIKit
 /// Direct `UIControl` + `UILabel` candidate slot (zero `UIButton.Configuration` deferred layout pass).
 @MainActor
 private final class IOSRibbonSlotControl: UIControl {
+    static let horizontalPadding: CGFloat = 12.0
+
     var slotIndex: Int = 0
     var starterWord: String?
     private(set) var slotWidth: CGFloat = 0
     private let label = UILabel()
 
-    private static let idleHitBacking = UIColor.systemBackground.withAlphaComponent(0.02)
+    private static let idleHitBacking = UIColor(white: 0.5, alpha: 0.01)
 
     override var isHighlighted: Bool {
         didSet {
@@ -24,7 +26,7 @@ private final class IOSRibbonSlotControl: UIControl {
         isOpaque = false
         // Non-zero alpha backing prevents iOS cross-process CALayerHost hit-testing from skipping transparent pixels.
         backgroundColor = Self.idleHitBacking
-        layer.cornerRadius = 8.0
+        layer.cornerRadius = 9.0
         layer.cornerCurve = .continuous
 
         label.numberOfLines = 1
@@ -40,7 +42,7 @@ private final class IOSRibbonSlotControl: UIControl {
 
     func setRibbonTitle(_ title: NSAttributedString) {
         label.attributedText = title
-        slotWidth = ceil(title.size().width) + 16.0
+        slotWidth = ceil(title.size().width) + Self.horizontalPadding * 2.0
     }
 
     override func layoutSubviews() {
@@ -188,16 +190,33 @@ private final class IOSClipboardPillControl: UIControl {
     }
 }
 
-/// Cross-process hit-test safe chevron toggle button with generous expanded touch bounds.
+/// Cross-process hit-test safe chevron toggle button with single-row visual pill & generous touch bounds.
 @MainActor
-private final class IOSRibbonChevronButton: UIButton {
-    private static let idleHitBacking = UIColor.systemBackground.withAlphaComponent(0.02)
+private final class IOSRibbonChevronButton: UIControl {
+    private static let idleHitBacking = UIColor(white: 0.5, alpha: 0.01)
+    private let highlightPill = UIView()
+    private let iconView = UIImageView()
+
+    var bandTopInset: CGFloat = 4.0 {
+        didSet {
+            if bandTopInset != oldValue {
+                setNeedsLayout()
+            }
+        }
+    }
+    var bandBottomInset: CGFloat = 7.0 {
+        didSet {
+            if bandBottomInset != oldValue {
+                setNeedsLayout()
+            }
+        }
+    }
 
     override var isHighlighted: Bool {
         didSet {
-            backgroundColor = isHighlighted
+            highlightPill.backgroundColor = isHighlighted
                 ? UIColor.label.withAlphaComponent(0.10)
-                : Self.idleHitBacking
+                : .clear
         }
     }
 
@@ -205,16 +224,57 @@ private final class IOSRibbonChevronButton: UIButton {
         super.init(frame: frame)
         isOpaque = false
         backgroundColor = Self.idleHitBacking
-        layer.cornerRadius = 8.0
-        layer.cornerCurve = .continuous
+        isAccessibilityElement = true
+        accessibilityTraits = .button
+
+        highlightPill.isUserInteractionEnabled = false
+        highlightPill.backgroundColor = .clear
+        highlightPill.layer.cornerRadius = 9.0
+        highlightPill.layer.cornerCurve = .continuous
+        addSubview(highlightPill)
+
+        iconView.contentMode = .center
+        iconView.isUserInteractionEnabled = false
+        addSubview(iconView)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
+    func setChevronImage(_ image: UIImage?) {
+        iconView.image = image?.withRenderingMode(.alwaysTemplate)
+    }
+
+    override func tintColorDidChange() {
+        super.tintColorDidChange()
+        iconView.tintColor = tintColor
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let bandHeight = max(20.0, bounds.height - bandTopInset - bandBottomInset)
+        let centerY = bandTopInset + bandHeight * 0.5
+        let centerX = bounds.width * 0.5
+        let iconSide: CGFloat = 18.0
+        iconView.frame = CGRect(
+            x: round(centerX - iconSide * 0.5),
+            y: round(centerY - iconSide * 0.5),
+            width: iconSide,
+            height: iconSide
+        )
+        let pillW = min(36.0, bounds.width - 8.0)
+        let pillH = min(34.0, bandHeight - 4.0)
+        highlightPill.frame = CGRect(
+            x: round(centerX - pillW * 0.5),
+            y: round(centerY - pillH * 0.5),
+            width: pillW,
+            height: pillH
+        )
+    }
+
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        bounds.inset(by: UIEdgeInsets(top: -4, left: -16, bottom: -6, right: -4)).contains(point)
+        bounds.inset(by: UIEdgeInsets(top: -4, left: -12, bottom: -6, right: -4)).contains(point)
     }
 }
 
@@ -230,15 +290,21 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
     var onDismissClipboard: ((IOSClipboardSuggestion) -> Void)?
     var onTapChevron: (() -> Void)?
 
-    private let codeStrip = IOSCodeStripView()
+    private static let visualHorizontalInset: CGFloat = 18.0
+    private static let chevronWidth: CGFloat = 48.0
+
     private let clipContainer = UIView()
     private let contentTrack = UIView()
     private let edgeFadeMask = CAGradientLayer()
-    private let chevronBtn = IOSRibbonChevronButton(type: .system)
+    private let chevronDivider = UIView()
+    private let chevronBtn = IOSRibbonChevronButton(frame: .zero)
     private let clipboardPill = IOSClipboardPillControl()
     private let clipboardDismissBtn = UIButton(type: .system)
     private var slotControls: [IOSRibbonSlotControl] = []
+    private var slotDividers: [UIView] = []
 
+    private var clipTopConstraint: NSLayoutConstraint!
+    private var clipBottomConstraint: NSLayoutConstraint!
     private var clipTrailingToChevron: NSLayoutConstraint!
     private var clipTrailingToFull: NSLayoutConstraint!
 
@@ -262,9 +328,9 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
     private func isInsideChevronHitZone(_ point: CGPoint) -> Bool {
         guard !chevronBtn.isHidden else { return false }
         let expanded = CGRect(
-            x: chevronBtn.frame.minX - 16.0,
+            x: chevronBtn.frame.minX - 10.0,
             y: -4.0,
-            width: bounds.width - (chevronBtn.frame.minX - 16.0) + 4.0,
+            width: bounds.width - (chevronBtn.frame.minX - 10.0) + 4.0,
             height: bounds.height + 10.0
         )
         return expanded.contains(point)
@@ -320,13 +386,13 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
                 return clipboardPill
             }
         }
-        if hit === clipContainer || hit === contentTrack || (hit === self && codeStrip.isHidden && point.y >= 12.0) {
+        if hit === clipContainer || hit === contentTrack || (hit === self && point.y >= 4.0) {
             let trackPt = convert(point, to: contentTrack)
             var nearestSlot: IOSRibbonSlotControl?
             var bestDx = CGFloat.greatestFiniteMagnitude
             for slot in slotControls where !slot.isHidden {
                 let dx = max(slot.frame.minX - trackPt.x, 0, trackPt.x - slot.frame.maxX)
-                if dx <= 8.0 && dx < bestDx {
+                if dx <= 10.0 && dx < bestDx {
                     bestDx = dx
                     nearestSlot = slot
                 }
@@ -360,11 +426,13 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
         pan.cancelsTouchesInView = true
         clipContainer.addGestureRecognizer(pan)
 
+        chevronDivider.isUserInteractionEnabled = false
+
         chevronBtn.translatesAutoresizingMaskIntoConstraints = false
         chevronBtn.accessibilityIdentifier = "JuxuCandidateToggle"
         chevronBtn.accessibilityLabel = "展开候选"
-        let cfg = UIImage.SymbolConfiguration(pointSize: 15.5, weight: .medium)
-        chevronBtn.setImage(UIImage(systemName: "chevron.down", withConfiguration: cfg), for: .normal)
+        let cfg = UIImage.SymbolConfiguration(pointSize: 15.0, weight: .semibold)
+        chevronBtn.setChevronImage(UIImage(systemName: "chevron.down", withConfiguration: cfg))
         chevronBtn.addTarget(self, action: #selector(handleChevron), for: .touchUpInside)
 
         clipboardPill.isHidden = true
@@ -378,25 +446,26 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
         clipboardDismissBtn.addTarget(self, action: #selector(handleClipboardDismiss), for: .touchUpInside)
 
         addSubview(clipContainer)
-        addSubview(codeStrip)
+        addSubview(chevronDivider)
         addSubview(chevronBtn)
         addSubview(clipboardPill)
         addSubview(clipboardDismissBtn)
 
         clipTrailingToChevron = clipContainer.trailingAnchor.constraint(equalTo: chevronBtn.leadingAnchor)
         clipTrailingToFull = clipContainer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6)
-        candidatesTop = clipContainer.topAnchor.constraint(equalTo: topAnchor)
+        clipTopConstraint = clipContainer.topAnchor.constraint(equalTo: topAnchor, constant: 4.0)
+        clipBottomConstraint = clipContainer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -7.0)
 
         NSLayoutConstraint.activate([
             clipContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
             clipTrailingToFull,
-            candidatesTop,
-            clipContainer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -5),
+            clipTopConstraint,
+            clipBottomConstraint,
 
             chevronBtn.trailingAnchor.constraint(equalTo: trailingAnchor),
             chevronBtn.topAnchor.constraint(equalTo: topAnchor),
             chevronBtn.bottomAnchor.constraint(equalTo: bottomAnchor),
-            chevronBtn.widthAnchor.constraint(equalToConstant: 56),
+            chevronBtn.widthAnchor.constraint(equalToConstant: Self.chevronWidth),
         ])
 
         ensureSlotCapacity(10)
@@ -409,10 +478,16 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
         return abs(vel.x) > abs(vel.y) * 1.2
     }
 
-    private var candidatesTop: NSLayoutConstraint!
+    private var isCompactBar: Bool {
+        bounds.height > 0 && bounds.height < 46.0
+    }
 
-    private var codeBandHeight: CGFloat {
-        bounds.height > 0 && bounds.height < 46 ? 16 : 20
+    private var bandTopInset: CGFloat {
+        isCompactBar ? 2.0 : 4.0
+    }
+
+    private var bandBottomInset: CGFloat {
+        isCompactBar ? 5.0 : 7.0
     }
 
     @objc private func handleHorizontalPan(_ pan: UIPanGestureRecognizer) {
@@ -453,21 +528,33 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        let codeHeight = codeBandHeight
-        if candidatesTop.constant != codeHeight {
-            candidatesTop.constant = codeHeight
+        let topInset = bandTopInset
+        let bottomInset = bandBottomInset
+        if clipTopConstraint.constant != topInset {
+            clipTopConstraint.constant = topInset
         }
-        let targetInsets = UIEdgeInsets(top: max(0, codeHeight - 4), left: 0, bottom: 0, right: 0)
-        if chevronBtn.imageEdgeInsets != targetInsets {
-            chevronBtn.imageEdgeInsets = targetInsets
+        if clipBottomConstraint.constant != -bottomInset {
+            clipBottomConstraint.constant = -bottomInset
         }
-        if !codeStrip.isHidden {
-            let topInset: CGFloat = codeHeight == 18 ? 2 : 4
-            codeStrip.frame = CGRect(x: 16, y: topInset, width: max(0, bounds.width - 32), height: codeHeight - topInset - 1)
-        }
-        let barH = clipContainer.bounds.height
-        let slotH = min(34.0, barH)
+        chevronBtn.bandTopInset = topInset
+        chevronBtn.bandBottomInset = bottomInset
+
+        let scale = max(1.0, traitCollection.displayScale)
+        let hairline = 1.0 / scale
+        let barH = max(0, bounds.height - topInset - bottomInset)
+        let slotH = min(36.0, barH)
         let slotY = floor((barH - slotH) * 0.5)
+
+        if !chevronBtn.isHidden {
+            let dividerH = min(20.0, max(14.0, barH - 20.0))
+            let dividerY = topInset + (barH - dividerH) * 0.5
+            chevronDivider.frame = CGRect(
+                x: bounds.width - Self.chevronWidth,
+                y: round(dividerY * scale) / scale,
+                width: hairline,
+                height: round(dividerH * scale) / scale
+            )
+        }
 
         // Layout centered native clipboard pill when visible (keeping bottom >= 8pt clear for Row 0 q..p)
         if !clipboardPill.isHidden, let suggestion = activeClipboardSuggestion {
@@ -495,26 +582,42 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
             )
         }
 
-        // Adaptive spacing when idle starter words slightly exceed narrower screens (e.g. 393/402pt)
+        // Keep first candidate text comfortably clear of the 26pt top-left continuous corner.
+        let firstSlotX = Self.visualHorizontalInset - IOSRibbonSlotControl.horizontalPadding
         let visibleSlots = slotControls.filter { !$0.isHidden }
         let totalSlotWidths = visibleSlots.reduce(CGFloat(0)) { $0 + $1.slotWidth }
         let availW = clipContainer.bounds.width
         let spacing: CGFloat
         if lastPreeditEmpty == true, visibleSlots.count > 1, availW > 200 {
-            let naturalSpan = 10.0 + totalSlotWidths + CGFloat(visibleSlots.count - 1) * 8.0 + 10.0
+            let naturalSpan = firstSlotX + totalSlotWidths + CGFloat(visibleSlots.count - 1) * 6.0 + 10.0
             if naturalSpan <= availW {
-                spacing = min(14.0, floor((availW - 20.0 - totalSlotWidths) / CGFloat(visibleSlots.count - 1)))
+                spacing = min(14.0, floor((availW - firstSlotX - 10.0 - totalSlotWidths) / CGFloat(visibleSlots.count - 1)))
             } else {
-                spacing = 6.0
+                spacing = 4.0
             }
         } else {
-            spacing = 8.0
+            spacing = 6.0
         }
 
-        var x: CGFloat = 10.0
-        for slot in visibleSlots {
+        let dividerH = min(18.0, max(12.0, slotH - 16.0))
+        let dividerY = slotY + (slotH - dividerH) * 0.5
+        var x = firstSlotX
+        for (idx, slot) in visibleSlots.enumerated() {
             slot.frame = CGRect(x: x, y: slotY, width: slot.slotWidth, height: slotH)
+            if idx + 1 < visibleSlots.count, idx < slotDividers.count {
+                let div = slotDividers[idx]
+                div.isHidden = false
+                div.frame = CGRect(
+                    x: round((slot.frame.maxX + spacing * 0.5) * scale) / scale,
+                    y: round(dividerY * scale) / scale,
+                    width: hairline,
+                    height: round(dividerH * scale) / scale
+                )
+            }
             x = slot.frame.maxX + spacing
+        }
+        for idx in max(0, visibleSlots.count - 1)..<slotDividers.count {
+            slotDividers[idx].isHidden = true
         }
         contentWidth = max(0, x - spacing + 10.0)
 
@@ -534,13 +637,29 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
             width: max(availW, contentWidth),
             height: barH
         )
-        // Only attach an alpha-fade mask when right-side content actually overflows:
+        // Only attach an alpha-fade mask when horizontal content actually overflows:
         // avoids unnecessary Core Animation offscreen group rendering on normal/idle frames!
+        let hasLeftOverflow = scrollOffsetX > 0.5
         let hasRightOverflow = (contentWidth - scrollOffsetX) > availW + 2.0
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        if hasRightOverflow {
+        if (hasLeftOverflow || hasRightOverflow), availW > 0 {
+            let fadeFraction = Double(min(18.0 / availW, 0.25))
+            let solid = UIColor.black.cgColor
+            let clear = UIColor.clear.cgColor
             edgeFadeMask.frame = clipContainer.bounds
+            edgeFadeMask.colors = [
+                hasLeftOverflow ? clear : solid,
+                solid,
+                solid,
+                hasRightOverflow ? clear : solid,
+            ]
+            edgeFadeMask.locations = [
+                0.0,
+                NSNumber(value: hasLeftOverflow ? fadeFraction : 0.0),
+                NSNumber(value: hasRightOverflow ? 1.0 - fadeFraction : 1.0),
+                1.0,
+            ]
             if clipContainer.layer.mask !== edgeFadeMask {
                 clipContainer.layer.mask = edgeFadeMask
             }
@@ -558,6 +677,14 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
             contentTrack.addSubview(ctrl)
             slotControls.append(ctrl)
         }
+        let neededDividers = max(0, count - 1)
+        while slotDividers.count < neededDividers {
+            let div = UIView()
+            div.isUserInteractionEnabled = false
+            div.isHidden = true
+            contentTrack.addSubview(div)
+            slotDividers.append(div)
+        }
     }
 
     @objc private func handleSlotTap(_ sender: IOSRibbonSlotControl) {
@@ -569,10 +696,9 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
     }
 
     func setExpanded(_ expanded: Bool) {
-        let cfg = UIImage.SymbolConfiguration(pointSize: 15.5, weight: .medium)
-        chevronBtn.setImage(
-            UIImage(systemName: expanded ? "chevron.up" : "chevron.down", withConfiguration: cfg),
-            for: .normal
+        let cfg = UIImage.SymbolConfiguration(pointSize: 15.0, weight: .semibold)
+        chevronBtn.setChevronImage(
+            UIImage(systemName: expanded ? "chevron.up" : "chevron.down", withConfiguration: cfg)
         )
         chevronBtn.accessibilityLabel = expanded ? "收起候选" : "展开候选"
     }
@@ -593,7 +719,6 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
         let resolvedIdleWords = idleWords ?? Self.starterWords
         if lastPreeditEmpty == isEmpty,
            lastDark == dark,
-           codeStrip.text == state.segmentedCode,
            activeClipboardSuggestion == effectiveClipboard,
            (isEmpty ? lastIdleWords == resolvedIdleWords : lastCandidates == state.candidates) {
             return
@@ -604,13 +729,20 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
         lastIdleWords = isEmpty ? resolvedIdleWords : nil
         activeClipboardSuggestion = effectiveClipboard
 
-        let textCol: UIColor = dark ? .white : .black
-        let subtleCol: UIColor = dark ? UIColor(white: 0.64, alpha: 1.0) : UIColor(white: 0.44, alpha: 1.0)
-        codeStrip.update(text: state.segmentedCode, dark: dark)
-        candidatesTop.constant = codeBandHeight
+        let primaryCol: UIColor = dark ? .white : UIColor(white: 0.08, alpha: 1.0)
+        let secondaryCol: UIColor = dark ? UIColor(white: 0.90, alpha: 1.0) : UIColor(white: 0.16, alpha: 1.0)
+        let subtleCol: UIColor = dark ? UIColor(white: 0.62, alpha: 1.0) : UIColor(white: 0.46, alpha: 1.0)
+        let chevronCol: UIColor = dark ? UIColor(white: 0.84, alpha: 1.0) : UIColor(white: 0.26, alpha: 1.0)
+        let slotDividerCol: UIColor = dark ? UIColor(white: 1.0, alpha: 0.16) : UIColor(white: 0.0, alpha: 0.14)
+        let chevronDividerCol: UIColor = dark ? UIColor(white: 1.0, alpha: 0.22) : UIColor(white: 0.0, alpha: 0.18)
+        let candidateFontSize: CGFloat = isCompactBar ? 17.5 : 19.5
+        let idleFontSize: CGFloat = isCompactBar ? 17.0 : 19.0
+
         let hideChevron = (effectiveClipboard != nil)
-        chevronBtn.tintColor = textCol
+        chevronBtn.tintColor = chevronCol
         chevronBtn.isHidden = hideChevron
+        chevronDivider.backgroundColor = chevronDividerCol
+        chevronDivider.isHidden = hideChevron
         clipTrailingToChevron.isActive = !hideChevron
         clipTrailingToFull.isActive = hideChevron
 
@@ -639,8 +771,8 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
                             let attr = NSAttributedString(
                                 string: words[i],
                                 attributes: [
-                                    .font: UIFont.systemFont(ofSize: 19.5, weight: .regular),
-                                    .foregroundColor: textCol,
+                                    .font: UIFont.systemFont(ofSize: idleFontSize, weight: .regular),
+                                    .foregroundColor: secondaryCol,
                                 ]
                             )
                             ctrl.setRibbonTitle(attr)
@@ -660,8 +792,8 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
                             let attr = NSMutableAttributedString(
                                 string: item.text,
                                 attributes: [
-                                    .font: UIFont.systemFont(ofSize: 19.5, weight: i == 0 ? .medium : .regular),
-                                    .foregroundColor: textCol,
+                                    .font: UIFont.systemFont(ofSize: candidateFontSize, weight: i == 0 ? .medium : .regular),
+                                    .foregroundColor: i == 0 ? primaryCol : secondaryCol,
                                 ]
                             )
                             if !item.comment.isEmpty && (item.badgeKind == .typoCorrected || item.badgeKind == .pinyinLookup || item.badgeKind == .shortcode) {
@@ -672,7 +804,7 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
                                     NSAttributedString(
                                         string: " \(cleanHint)",
                                         attributes: [
-                                            .font: UIFont.monospacedSystemFont(ofSize: 10.5, weight: .regular),
+                                            .font: UIFont.monospacedSystemFont(ofSize: 11.0, weight: .regular),
                                             .foregroundColor: subtleCol,
                                         ]
                                     )
@@ -684,6 +816,9 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
                             ctrl.isHidden = true
                         }
                     }
+                }
+                for div in slotDividers {
+                    div.backgroundColor = slotDividerCol
                 }
             }
             scrollOffsetX = 0
@@ -704,118 +839,6 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
     @objc private func handleClipboardDismiss() {
         guard let suggestion = activeClipboardSuggestion else { return }
         onDismissClipboard?(suggestion)
-    }
-}
-
-@MainActor
-private final class IOSCodeStripView: UIView, UIGestureRecognizerDelegate {
-    private(set) var text = ""
-    private let viewport = UIView()
-    private let label = UILabel()
-    private let fade = CAGradientLayer()
-    private var offset: CGFloat?
-    private var panStart: CGFloat = 0
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        isOpaque = false
-        clipsToBounds = true
-        isHidden = true
-        isAccessibilityElement = true
-        accessibilityTraits = .staticText
-        accessibilityIdentifier = "JuxuSegmentedCode"
-        viewport.clipsToBounds = true
-        label.isAccessibilityElement = false
-        viewport.addSubview(label)
-        addSubview(viewport)
-
-        fade.startPoint = CGPoint(x: 0, y: 0.5)
-        fade.endPoint = CGPoint(x: 1, y: 0.5)
-        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
-        pan.delegate = self
-        addGestureRecognizer(pan)
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    func update(text: String, dark: Bool) {
-        if self.text != text {
-            self.text = text
-            offset = nil
-        }
-        accessibilityLabel = text
-        isHidden = text.isEmpty
-        if isHidden {
-            label.attributedText = nil
-            return
-        }
-
-        let activeColor = UIColor(white: dark ? 0.96 : 0.16, alpha: 1)
-        let previousColor = UIColor(white: dark ? 0.70 : 0.39, alpha: 1)
-        let separatorColor = UIColor(white: dark ? 0.58 : 0.50, alpha: 1)
-        let regular = UIFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
-        let styled = NSMutableAttributedString(string: text, attributes: [
-            .font: UIFont.monospacedSystemFont(ofSize: 12.5, weight: .medium),
-            .foregroundColor: activeColor,
-        ])
-        let boundary = (text as NSString).range(of: " │ ")
-        if boundary.location != NSNotFound {
-            styled.addAttributes([.font: regular, .foregroundColor: previousColor],
-                                 range: NSRange(location: 0, length: boundary.location))
-            styled.addAttributes([.font: regular, .foregroundColor: separatorColor], range: boundary)
-        }
-        for (index, unit) in text.utf16.enumerated() where unit == 0x00B7 {
-            styled.addAttributes([.font: regular, .foregroundColor: separatorColor], range: NSRange(location: index, length: 1))
-        }
-        label.attributedText = styled
-        setNeedsLayout()
-    }
-
-    private var maxOffset: CGFloat {
-        max(0, ceil(label.intrinsicContentSize.width) - viewport.bounds.width)
-    }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        viewport.frame = bounds.insetBy(dx: 6, dy: 0)
-        let current = min(offset ?? maxOffset, maxOffset)
-        label.frame = CGRect(x: -current, y: 0, width: ceil(label.intrinsicContentSize.width), height: viewport.bounds.height)
-
-        let fadeLeft = current > 0.5
-        let fadeRight = maxOffset - current > 0.5
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        if (fadeLeft || fadeRight) && viewport.bounds.width > 0 {
-            let edge = Double(min(12 / viewport.bounds.width, 0.5))
-            let solid = UIColor.black.cgColor
-            let clear = UIColor.clear.cgColor
-            fade.frame = viewport.bounds
-            fade.colors = [fadeLeft ? clear : solid, solid, solid, fadeRight ? clear : solid]
-            fade.locations = [0, NSNumber(value: edge), NSNumber(value: 1 - edge), 1]
-            if viewport.layer.mask !== fade {
-                viewport.layer.mask = fade
-            }
-        } else {
-            viewport.layer.mask = nil
-        }
-        CATransaction.commit()
-    }
-
-    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        guard let pan = gestureRecognizer as? UIPanGestureRecognizer, maxOffset > 0 else { return false }
-        let velocity = pan.velocity(in: self)
-        return abs(velocity.x) > abs(velocity.y)
-    }
-
-    @objc private func handlePan(_ pan: UIPanGestureRecognizer) {
-        if pan.state == .began {
-            panStart = min(offset ?? maxOffset, maxOffset)
-        } else if pan.state == .changed {
-            offset = min(maxOffset, max(0, panStart - pan.translation(in: self).x))
-            setNeedsLayout()
-        }
     }
 }
 
@@ -1028,7 +1051,7 @@ final class IOSExpandedCandidateView: UIView {
         label.translatesAutoresizingMaskIntoConstraints = false
         label.text = text
         label.textColor = dark ? .white : .black
-        label.font = candidateFont
+        label.font = index == 0 ? UIFont.systemFont(ofSize: 17.5, weight: .medium) : candidateFont
         label.textAlignment = fullWidth ? .natural : .center
         label.lineBreakMode = .byCharWrapping
         label.numberOfLines = 0

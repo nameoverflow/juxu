@@ -873,18 +873,19 @@ public final class KeyboardViewController: UIInputViewController {
             markedCode = ""
             scheduleUserDataFlush()
         }
-        if out.preedit.isEmpty {
+        let inlinePreedit = out.activeInlinePreedit
+        if inlinePreedit.isEmpty {
             compositionBaseContext = nil
             cancelMarkedCode()
-        } else if out.preedit != markedCode {
+        } else if inlinePreedit != markedCode {
             if markedCode.isEmpty {
                 compositionBaseContext = autoSpaceTracker.effectiveBefore(
                     hostBefore: textDocumentProxy.documentContextBeforeInput,
                     hostBeforeIsAuthoritative: false
                 )
             }
-            textDocumentProxy.setMarkedText(out.preedit, selectedRange: NSRange(location: out.preedit.utf16.count, length: 0))
-            markedCode = out.preedit
+            textDocumentProxy.setMarkedText(inlinePreedit, selectedRange: NSRange(location: inlinePreedit.utf16.count, length: 0))
+            markedCode = inlinePreedit
         }
         if out.preedit.isEmpty && !expandedGrid.isHidden {
             expandedGrid.isHidden = true

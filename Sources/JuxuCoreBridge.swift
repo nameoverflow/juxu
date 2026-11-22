@@ -130,14 +130,19 @@ public struct JuxuActionState: Codable, Equatable, Sendable {
     public let touchOffsets: [Float]
     public let candidates: [JuxuCandidateItem]
 
-    #if os(macOS)
-    var macOSPreedit: String {
+    /// Active inline preedit shown in the host text field (`markedText`):
+    /// uses the current uncommitted segment after `" │ "` when segmented code is present.
+    public var activeInlinePreedit: String {
+        guard !preedit.isEmpty else { return "" }
         guard !segmentedCode.isEmpty else { return preedit }
         if let boundary = segmentedCode.range(of: " │ ") {
             return String(segmentedCode[boundary.upperBound...])
         }
         return segmentedCode
     }
+
+    #if os(macOS)
+    var macOSPreedit: String { activeInlinePreedit }
     #endif
 
     public init(
