@@ -819,6 +819,44 @@ private final class IOSCodeStripView: UIView, UIGestureRecognizerDelegate {
     }
 }
 
+/// ScrollView for expanded candidates: zero touch-down delay on buttons while still allowing drag-to-scroll.
+@MainActor
+private final class IOSExpandedScrollView: UIScrollView {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        delaysContentTouches = false
+        canCancelContentTouches = true
+        panGestureRecognizer.delaysTouchesBegan = false
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func touchesShouldCancel(in view: UIView) -> Bool {
+        true
+    }
+}
+
+/// Tactile button for expanded candidate cells & right rail with instant keycap-style press highlight.
+@MainActor
+private final class IOSExpandedCellButton: UIButton {
+    var normalSurfaceColor: UIColor = .white {
+        didSet { updateSurface() }
+    }
+    var pressedSurfaceColor: UIColor = UIColor(red: 214.0 / 255.0, green: 216.0 / 255.0, blue: 222.0 / 255.0, alpha: 1.0) {
+        didSet { updateSurface() }
+    }
+
+    override var isHighlighted: Bool {
+        didSet { updateSurface() }
+    }
+
+    private func updateSurface() {
+        backgroundColor = isHighlighted ? pressedSurfaceColor : normalSurfaceColor
+    }
+}
+
 /// Compact choices share a row. Longer candidates take the full width and wrap.
 final class IOSExpandedCandidateView: UIView {
     var onSelectAbsCandidate: ((Int) -> Void)?
@@ -827,7 +865,7 @@ final class IOSExpandedCandidateView: UIView {
     var onClear: (() -> Void)?
     var onOpenSettings: (() -> Void)?
 
-    private let scrollView = UIScrollView()
+    private let scrollView = IOSExpandedScrollView()
     private let gridStack = UIStackView()
     private let railStack = UIStackView()
     private let candidateFont = UIFont.systemFont(ofSize: 17.5, weight: .regular)
@@ -839,6 +877,8 @@ final class IOSExpandedCandidateView: UIView {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+        // Non-zero alpha backing prevents iOS cross-process CALayerHost hit-testing from skipping gutters/margins.
+        backgroundColor = UIColor.systemBackground.withAlphaComponent(0.02)
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.accessibilityIdentifier = "JuxuExpandedCandidates"
         scrollView.contentInsetAdjustmentBehavior = .never
@@ -884,7 +924,7 @@ final class IOSExpandedCandidateView: UIView {
         let delBtn = makeRailButton(title: nil, symbol: "delete.backward") { [weak self] in self?.onBackspace?() }
         let clrBtn = makeRailButton(title: "重输", symbol: nil) { [weak self] in self?.onClear?() }
         let settingsBtn = makeRailButton(title: nil, symbol: "gearshape") { [weak self] in self?.onOpenSettings?() }
-        settingsBtn.accessibilityIdentifier = "PrisWubiOpenSettings"
+        settingsBtn.accessibilityIdentifier = "JuxuOpenSettings"
         settingsBtn.accessibilityLabel = "打开句序设置"
         railStack.addArrangedSubview(collapseBtn)
         railStack.addArrangedSubview(delBtn)
@@ -901,10 +941,14 @@ final class IOSExpandedCandidateView: UIView {
         self.dark = dark
         renderedWidth = 0
         let cellBg = dark ? UIColor(white: 1.0, alpha: 0.175) : UIColor.white
+        let pressedBg = dark
+            ? UIColor(white: 1.0, alpha: 0.30)
+            : UIColor(red: 214.0 / 255.0, green: 216.0 / 255.0, blue: 222.0 / 255.0, alpha: 1.0)
         let textCol = dark ? UIColor.white : UIColor.black
 
-        for case let btn as UIButton in railStack.arrangedSubviews {
-            btn.backgroundColor = cellBg
+        for case let btn as IOSExpandedCellButton in railStack.arrangedSubviews {
+            btn.normalSurfaceColor = cellBg
+            btn.pressedSurfaceColor = pressedBg
             btn.tintColor = textCol
             btn.setTitleColor(textCol, for: .normal)
             btn.layer.shadowOpacity = 0
@@ -968,8 +1012,11 @@ final class IOSExpandedCandidateView: UIView {
     }
 
     private func makeCandidateButton(text: String, hint: String?, index: Int, width: CGFloat, fullWidth: Bool) -> UIButton {
-        let button = UIButton(type: .system)
-        button.backgroundColor = dark ? UIColor(white: 1.0, alpha: 0.175) : .white
+        let button = IOSExpandedCellButton(type: .custom)
+        button.normalSurfaceColor = dark ? UIColor(white: 1.0, alpha: 0.175) : .white
+        button.pressedSurfaceColor = dark
+            ? UIColor(white: 1.0, alpha: 0.30)
+            : UIColor(red: 214.0 / 255.0, green: 216.0 / 255.0, blue: 222.0 / 255.0, alpha: 1.0)
         button.layer.cornerRadius = IOSKeyboardLayoutEngine.keyCornerRadius
         button.layer.cornerCurve = .continuous
         button.isAccessibilityElement = true
@@ -1030,7 +1077,7 @@ final class IOSExpandedCandidateView: UIView {
     }
 
     private func makeRailButton(title: String?, symbol: String?, action: @escaping () -> Void) -> UIButton {
-        let b = UIButton(type: .system)
+        let b = IOSExpandedCellButton(type: .system)
         b.layer.cornerRadius = IOSKeyboardLayoutEngine.keyCornerRadius
         b.layer.cornerCurve = .continuous
         if let s = symbol {
