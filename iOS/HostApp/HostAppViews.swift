@@ -401,7 +401,7 @@ public struct IOSHostRootView: View {
                             }
                             Divider()
                         }
-                        iosToggleRow("中文标点与引号智能配对", sub: "自动转换全角标点并成对输入引号", isOn: binding(\.smartPunctuation))
+                        iosToggleRow("中文标点与引号智能配对", sub: "打左引号、括号或书名号时自动补全右半边，光标停在中间", isOn: binding(\.smartPunctuation))
                         Divider()
                         iosToggleRow("中英文之间自动加空格", sub: "中英混输、直输英文及剪贴板插入时自动补全空格", isOn: binding(\.autoSpaceZhEn))
                         if bridge.prefs.autoSpaceZhEn {
