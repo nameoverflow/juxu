@@ -223,6 +223,18 @@ pub extern "C" fn juxu_engine_retain_only_schema_dict(
 }
 
 #[no_mangle]
+pub extern "C" fn juxu_engine_has_active_dict(handle: *const JuxuEngineHandle) -> bool {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return false;
+    };
+    if h.inner.config.schema.is_pinyin() {
+        h.inner.pinyin_dict.is_some()
+    } else {
+        h.inner.active_dict().is_some()
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn juxu_engine_load_config(
     handle: *mut JuxuEngineHandle,
     path: *const c_char,

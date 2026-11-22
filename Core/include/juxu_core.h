@@ -18,6 +18,7 @@ bool juxu_engine_load_dict_mmap(JuxuEngineHandle *handle, uint32_t schema_id, co
 bool juxu_engine_load_pinyin_dict_mmap(JuxuEngineHandle *handle, const char *path);
 bool juxu_engine_load_aux_mmap(JuxuEngineHandle *handle, const char *path);
 void juxu_engine_retain_only_schema_dict(JuxuEngineHandle *handle, uint32_t schema_id);
+bool juxu_engine_has_active_dict(const JuxuEngineHandle *handle);
 
 bool juxu_engine_load_config(JuxuEngineHandle *handle, const char *path);
 bool juxu_engine_save_config(const JuxuEngineHandle *handle, const char *path);

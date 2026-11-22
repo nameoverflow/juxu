@@ -614,7 +614,11 @@ public final class JuxuBridge: ObservableObject {
     }
 
     public func ensureDictionaryLoaded(for schemaId: UInt32) {
-        guard let h = handle, let dir = resolvedDictsDir else { return }
+        guard let h = handle else { return }
+        if resolvedDictsDir == nil {
+            loadDictionaries()
+        }
+        guard let dir = resolvedDictsDir else { return }
         if !auxDictLoaded {
             let pAux = dir.appendingPathComponent("wubi_aux.wbaux").path
             if pAux.withCString({ juxu_engine_load_aux_mmap(h, $0) }) {
@@ -622,21 +626,30 @@ public final class JuxuBridge: ObservableObject {
             }
         }
         if schemaId == 20 || schemaId == 21 {
-            if !pinyinDictLoaded {
-                let pPy = dir.appendingPathComponent("pinyin.pydict").path
-                if pPy.withCString({ juxu_engine_load_pinyin_dict_mmap(h, $0) }) {
-                    pinyinDictLoaded = true
-                }
-            }
             #if os(iOS)
             if !loadedDictSchemas.isEmpty {
                 juxu_engine_retain_only_schema_dict(h, schemaId)
                 loadedDictSchemas.removeAll()
             }
             #endif
+            if !pinyinDictLoaded || !juxu_engine_has_active_dict(h) {
+                let pPy = dir.appendingPathComponent("pinyin.pydict").path
+                if pPy.withCString({ juxu_engine_load_pinyin_dict_mmap(h, $0) }) {
+                    pinyinDictLoaded = true
+                }
+            }
             return
         }
-        if !loadedDictSchemas.contains(schemaId) {
+        #if os(iOS)
+        // Release the 67 MB Pinyin dictionary and other unused dicts BEFORE mapping the new `.wbdict`
+        // so iOS keyboard extension never peaks above its memory ceiling during a schema switch.
+        if pinyinDictLoaded || loadedDictSchemas.contains(where: { $0 != schemaId }) {
+            juxu_engine_retain_only_schema_dict(h, schemaId)
+            pinyinDictLoaded = false
+            loadedDictSchemas = loadedDictSchemas.contains(schemaId) ? [schemaId] : []
+        }
+        #endif
+        if !loadedDictSchemas.contains(schemaId) || (juxu_engine_get_schema(h) == schemaId && !juxu_engine_has_active_dict(h)) {
             let fileName: String
             switch schemaId {
             case 98: fileName = "wubi98.wbdict"
@@ -652,13 +665,6 @@ public final class JuxuBridge: ObservableObject {
                 loadedDictSchemas.insert(schemaId)
             }
         }
-        #if os(iOS)
-        if pinyinDictLoaded || loadedDictSchemas.count > 1 {
-            juxu_engine_retain_only_schema_dict(h, schemaId)
-            pinyinDictLoaded = false
-            loadedDictSchemas = loadedDictSchemas.contains(schemaId) ? [schemaId] : []
-        }
-        #endif
     }
 
     public func loadConfigAndUser(refreshPublishedLists: Bool = true) {
@@ -761,6 +767,9 @@ public final class JuxuBridge: ObservableObject {
         timestampMs: UInt64
     ) -> JuxuActionState {
         guard let h = handle else { return .empty }
+        if !juxu_engine_has_active_dict(h) {
+            ensureDictionaryLoaded(for: juxu_engine_get_schema(h))
+        }
         let json = takeString(juxu_engine_handle_key_json(h, keyCode, scalar, hasCmdOrCtrl, timestampMs))
         let decoded = decodeState(json)
         self.state = decoded
@@ -775,6 +784,9 @@ public final class JuxuBridge: ObservableObject {
         timestampMs: UInt64
     ) -> JuxuActionState {
         guard let h = handle else { return .empty }
+        if !juxu_engine_has_active_dict(h) {
+            ensureDictionaryLoaded(for: juxu_engine_get_schema(h))
+        }
         let json = takeString(juxu_engine_push_touch_json(h, reportedAscii, x, y, isNormalized, timestampMs))
         let decoded = decodeState(json)
         self.state = decoded
