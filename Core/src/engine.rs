@@ -213,11 +213,15 @@ impl JuxuEngine {
         lm_chosen: Option<f32>,
         cands: Vec<crate::eval_log::EvalCandSnapshot>,
     ) {
-        if !self.config.eval_logging || chosen.is_empty() {
+        if !self.config.eval_logging
+            || chosen.is_empty()
+            || crate::eval_log::is_sensitive_numeric_text(chosen)
+            || crate::eval_log::is_sensitive_numeric_text(&keys)
+        {
             return;
         }
         let schema = self.config.schema.as_tag();
-        let ctx = self.eval_context_string();
+        let ctx = crate::eval_log::scrub_numeric_context(&self.eval_context_string());
         let lm_top1 = if rank > 0 || chosen != top1 {
             self.compute_rwkv_surprisal(top1)
         } else {
@@ -258,7 +262,10 @@ impl JuxuEngine {
     }
 
     fn log_abandon_event(&mut self, timestamp_ms: u64) {
-        if !self.config.eval_logging || self.raw_code.len() < 2 {
+        if !self.config.eval_logging
+            || self.raw_code.len() < 2
+            || crate::eval_log::is_sensitive_numeric_text(&self.raw_code)
+        {
             return;
         }
         let top1 = self
@@ -275,7 +282,7 @@ impl JuxuEngine {
             ts_ms: timestamp_ms,
             schema: self.config.schema.as_tag(),
             event: "abandon",
-            ctx: self.eval_context_string(),
+            ctx: crate::eval_log::scrub_numeric_context(&self.eval_context_string()),
             keys: self.raw_code.clone(),
             touches: crate::eval_log::touches_from_obs(&self.observations),
             rank: 0,

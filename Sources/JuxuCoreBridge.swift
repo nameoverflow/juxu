@@ -534,6 +534,8 @@ public final class JuxuBridge: ObservableObject {
     @Published public private(set) var userPhrases: [UserPhraseRecord] = []
     @Published public private(set) var touchCalibrations: [TouchKeyCalibrationItem] = []
     @Published public private(set) var evalLogSummary: EvalLogSummary = .empty
+    /// When true (e.g. password / OTP / numeric field), queued eval events are drained and discarded.
+    public var suppressEvalLogging: Bool = false
 
     public let configURL: URL
     public let userDataURL: URL
@@ -1040,9 +1042,9 @@ public final class JuxuBridge: ObservableObject {
     // MARK: - Local Input Eval Log (macOS JSONL + iOS Shared Keychain Ring)
 
     private func drainEvalLogIfNeeded() {
-        guard !bridgeInMemoryOnly, let h = handle else { return }
+        guard let h = handle else { return }
         let batch = takeString(juxu_engine_drain_eval_log_jsonl(h))
-        guard !batch.isEmpty else { return }
+        guard !bridgeInMemoryOnly, !suppressEvalLogging, !batch.isEmpty else { return }
         appendEvalLogLines(batch)
     }
 

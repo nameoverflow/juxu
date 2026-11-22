@@ -658,6 +658,14 @@ mod tests {
         assert!(lines[2].contains("\"event\":\"abandon\""));
         assert!(lines[2].contains("\"keys\":\"tr\""));
         assert!(eng.drain_eval_log_jsonl().is_empty());
+
+        // Sensitive numeric filter & context scrubbing
+        assert!(crate::eval_log::is_sensitive_numeric_text("123456"));
+        assert!(crate::eval_log::is_sensitive_numeric_text("42"));
+        assert!(crate::eval_log::is_sensitive_numeric_text("验证码839201"));
+        assert!(!crate::eval_log::is_sensitive_numeric_text("我们"));
+        assert!(!crate::eval_log::is_sensitive_numeric_text("第3次"));
+        assert_eq!(crate::eval_log::scrub_numeric_context("验证码839201好了"), "验证码[NUM]好了");
     }
 
     #[test]

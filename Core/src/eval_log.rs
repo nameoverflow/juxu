@@ -95,6 +95,56 @@ impl EvalLogger {
     }
 }
 
+pub fn is_sensitive_numeric_text(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let mut has_digit = false;
+    let mut only_digit_or_sep = true;
+    let mut consec_digits = 0usize;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_digit() || ('０'..='９').contains(&ch) {
+            has_digit = true;
+            consec_digits += 1;
+            if consec_digits >= 4 {
+                // Skip 4+ consecutive digits (OTP codes, PINs, phone/card fragments)
+                return true;
+            }
+        } else {
+            consec_digits = 0;
+            if !matches!(ch, '-' | ' ' | '.' | ',' | ':' | '/' | '+' | '(' | ')') {
+                only_digit_or_sep = false;
+            }
+        }
+    }
+    has_digit && only_digit_or_sep
+}
+
+pub fn scrub_numeric_context(ctx: &str) -> String {
+    let mut out = String::with_capacity(ctx.len());
+    let mut digits = String::new();
+    for ch in ctx.chars() {
+        if ch.is_ascii_digit() || ('０'..='９').contains(&ch) {
+            digits.push(ch);
+        } else {
+            if digits.len() >= 4 {
+                out.push_str("[NUM]");
+            } else {
+                out.push_str(&digits);
+            }
+            digits.clear();
+            out.push(ch);
+        }
+    }
+    if digits.len() >= 4 {
+        out.push_str("[NUM]");
+    } else {
+        out.push_str(&digits);
+    }
+    out
+}
+
 pub fn touches_from_obs(obs: &[KeyObs]) -> Vec<[f32; 2]> {
     if !obs.iter().any(|o| o.has_touch) {
         return Vec::new();

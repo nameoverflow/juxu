@@ -81,6 +81,7 @@ public final class JuxuInputController: IMKInputController {
         guard let event else { return false }
         let clientObj = (sender as? (any IMKTextInput & NSObjectProtocol)) ?? activeClient
         self.activeClient = clientObj
+        JuxuBridge.shared.suppressEvalLogging = IsSecureEventInputEnabled()
 
         // Strictly on-demand voice entry: when disabled, zero voice controllers or panels are loaded.
         if VoicePreferencesStore.shared.prefs.enabled {

@@ -144,6 +144,7 @@ public final class KeyboardViewController: UIInputViewController {
 
     public override func textDidChange(_ textInput: UITextInput?) {
         super.textDidChange(textInput)
+        bridge.suppressEvalLogging = isSensitiveEvalProxy()
         syncContextFromProxyIfIdle()
         if markedCode.isEmpty {
             autoSpaceTracker.reconcileExternalContext(hostBefore: textDocumentProxy.documentContextBeforeInput)
@@ -814,6 +815,24 @@ public final class KeyboardViewController: UIInputViewController {
             return []
         }
         return bridge.predictNextWords(maxCount: 8)
+    }
+
+    private func isSensitiveEvalProxy() -> Bool {
+        if textDocumentProxy.isSecureTextEntry == true { return true }
+        if let ct = textDocumentProxy.textContentType {
+            switch ct {
+            case .password, .newPassword, .oneTimeCode, .creditCardNumber, .telephoneNumber, .emailAddress, .URL, .username:
+                return true
+            default:
+                break
+            }
+        }
+        switch textDocumentProxy.keyboardType {
+        case .numberPad, .phonePad, .decimalPad, .asciiCapableNumberPad, .namePhonePad, .emailAddress, .URL:
+            return true
+        default:
+            return false
+        }
     }
 
     private func isAutoSpacingAllowedForProxy() -> Bool {
