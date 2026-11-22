@@ -411,6 +411,8 @@ public struct IOSHostRootView: View {
                         Divider()
                         iosToggleRow("候选栏剪贴板提示", sub: "空闲时在候选栏中央显示最近复制内容，并自动提取剪贴板验证码（需开启完全访问）", isOn: binding(\.clipboardSuggestion))
                         Divider()
+                        iosToggleRow("Emoji 候选", sub: "拼音输入时，在匹配的词语后显示 Emoji 作为次要候选（如 思考 → 🤔）", isOn: binding(\.emojiCandidates))
+                        Divider()
                         iosToggleRow("上滑输入数字和符号", sub: "在字母键上滑，输入键帽顶部的小字符", isOn: binding(\.keySwipeUpInput))
                         Divider()
                         iosToggleRow("长按弹出更多字符", sub: "长按字母键后左右滑动，选择声调字母、大小写、数字或符号", isOn: binding(\.keyLongPressAlternates))

@@ -99,7 +99,7 @@ public final class NativeCandidateContentView: NSView {
             return raw.replacingOccurrences(of: "⌖", with: "").trimmingCharacters(in: .whitespaces)
         case .pinyinLookup, .wildcard:
             return item.comment.trimmingCharacters(in: .whitespaces)
-        case .userPhrase, .none:
+        case .userPhrase, .emoji, .none:
             return ""
         }
     }

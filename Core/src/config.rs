@@ -278,6 +278,8 @@ pub struct JuxuConfig {
     pub orientation: CandidateOrientation,
     /// 本地输入诊断与评测日志（记录手选非首选、纠错、退格重打等用于制作 eval set）
     pub eval_logging: bool,
+    /// 拼音方案中，在匹配词语后追加 Emoji 次要候选
+    pub emoji_candidates: bool,
     /// 统计 + 触控热区误触纠正配置
     pub typo: TypoConfig,
 }
@@ -309,6 +311,7 @@ impl Default for JuxuConfig {
             page_size: 5,
             orientation: CandidateOrientation::Horizontal,
             eval_logging: true,
+            emoji_candidates: false,
             typo: TypoConfig::default(),
         }
     }
@@ -332,6 +335,7 @@ impl JuxuConfig {
                 "semicolon_quote_select = {}\n",
                 "auto_space_zh_en = {}\n",
                 "auto_space_digits = {}\n",
+                "emoji_candidates = {}\n",
                 "eval_logging = {}\n\n",
                 "[typing]\n",
                 "fourth_code_auto_commit = {}\n",
@@ -366,6 +370,7 @@ impl JuxuConfig {
             self.semicolon_quote_select,
             self.auto_space_zh_en,
             self.auto_space_digits,
+            self.emoji_candidates,
             self.eval_logging,
             self.fourth_code_auto_commit,
             self.fifth_code_push_commit,
@@ -428,6 +433,7 @@ impl JuxuConfig {
                 (_, "auto_space_zh_en") => cfg.auto_space_zh_en = parse_bool(val),
                 (_, "auto_space_digits") => cfg.auto_space_digits = parse_bool(val),
                 (_, "eval_logging") => cfg.eval_logging = parse_bool(val),
+                (_, "emoji_candidates") => cfg.emoji_candidates = parse_bool(val),
                 (_, "fourth_code_auto_commit") => cfg.fourth_code_auto_commit = parse_bool(val),
                 (_, "fifth_code_push_commit") => cfg.fifth_code_push_commit = parse_bool(val),
                 (_, "fourth_empty_behavior") => {

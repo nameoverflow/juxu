@@ -266,6 +266,26 @@ pub extern "C" fn juxu_engine_load_english_dict_mmap(
 }
 
 #[no_mangle]
+pub extern "C" fn juxu_engine_load_emoji_table_mmap(
+    handle: *mut JuxuEngineHandle,
+    path: *const c_char,
+) -> bool {
+    let Some(h) = (unsafe { handle.as_mut() }) else {
+        return false;
+    };
+    let Some(p) = cstr_to_str(path) else {
+        return false;
+    };
+    match crate::emoji::EmojiTable::open_mmap(p) {
+        Ok(table) => {
+            h.inner.load_emoji_table(table);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn juxu_engine_retain_only_schema_dict(
     handle: *mut JuxuEngineHandle,
     schema_id: u32,

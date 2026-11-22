@@ -62,6 +62,7 @@ public struct JuxuCandidateItem: Codable, Identifiable, Equatable, Sendable {
         case wildcard
         case pinyinLookup
         case userPhrase
+        case emoji
     }
 
     public var badgeKind: BadgeKind {
@@ -71,6 +72,7 @@ public struct JuxuCandidateItem: Codable, Identifiable, Equatable, Sendable {
         case 3: return .wildcard
         case 4: return .pinyinLookup
         case 5: return .userPhrase
+        case 6: return .emoji
         default: return .none
         }
     }
@@ -349,6 +351,7 @@ public struct JuxuPreferences: Equatable, Sendable {
     public var keyLongPressAlternates: Bool = false
     public var backspaceSwipeClear: Bool = false
     public var evalLogging: Bool = true
+    public var emojiCandidates: Bool = false
 
     public var fourthCodeAutoCommit: Bool = true
     public var fifthCodePushCommit: Bool = true
@@ -423,6 +426,7 @@ public struct JuxuPreferences: Equatable, Sendable {
         key_swipe_up_input = \(keySwipeUpInput)
         key_long_press_alternates = \(keyLongPressAlternates)
         backspace_swipe_clear = \(backspaceSwipeClear)
+        emoji_candidates = \(emojiCandidates)
         eval_logging = \(evalLogging)
 
         [typing]
@@ -508,6 +512,8 @@ public struct JuxuPreferences: Equatable, Sendable {
                 p.keyLongPressAlternates = boolVal
             case (_, "backspace_swipe_clear"):
                 p.backspaceSwipeClear = boolVal
+            case (_, "emoji_candidates"):
+                p.emojiCandidates = boolVal
             case (_, "eval_logging"):
                 p.evalLogging = boolVal
             case (_, "fourth_code_auto_commit"):
@@ -567,6 +573,7 @@ public final class JuxuBridge: ObservableObject {
     nonisolated(unsafe) private var handle: OpaquePointer?
     private let decoder = JSONDecoder()
     private var resolvedDictsDir: URL?
+    private var emojiTableLoaded = false
     private var loadedDictSchemas: Set<UInt32> = []
     private var pinyinDictLoaded: Bool = false
     private var auxDictLoaded: Bool = false
@@ -793,6 +800,7 @@ public final class JuxuBridge: ObservableObject {
         }
         self.prefs = loaded
         ensureDictionaryLoaded(for: loaded.schemaId)
+        ensureEmojiTableLoaded()
         if FileManager.default.fileExists(atPath: userDataURL.path) {
             let mtime = (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
             if lastLoadedUserDataMtime == nil || mtime == nil || mtime != lastLoadedUserDataMtime {
@@ -808,10 +816,18 @@ public final class JuxuBridge: ObservableObject {
         }
     }
 
+    /// The emoji table is a separate read-only file, mapped only once the feature is switched on.
+    private func ensureEmojiTableLoaded() {
+        guard prefs.emojiCandidates, !emojiTableLoaded, let h = handle, let dir = resolvedDictsDir else { return }
+        let path = dir.appendingPathComponent("emoji.tsv").path
+        emojiTableLoaded = path.withCString { juxu_engine_load_emoji_table_mmap(h, $0) }
+    }
+
     public func applyAndSavePreferences(_ newPrefs: JuxuPreferences, persist: Bool = true) {
         guard let h = handle else { return }
         self.prefs = newPrefs
         ensureDictionaryLoaded(for: newPrefs.schemaId)
+        ensureEmojiTableLoaded()
         let toml = newPrefs.toTOML()
         toml.withCString { juxu_engine_set_config_toml(h, $0) }
         if persist {
