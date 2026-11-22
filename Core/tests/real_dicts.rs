@@ -1003,3 +1003,73 @@ fn real_dicts_cangjie_3_5_6_input_and_five_code_rules() {
         engine.clear_composition();
     }
 }
+
+#[test]
+fn real_dicts_full_pinyin_orthographic_mappings_and_enword_resilience() {
+    use juxu_core::english::EnDictView;
+    use juxu_core::pinyin_dict::PinyinDictView;
+
+    let base = dicts_dir();
+    let pdict = PinyinDictView::from_file(base.join("pinyin.pydict")).expect("open pinyin.pydict");
+    let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
+    let endict = EnDictView::open_mmap(base.join("english.endict")).expect("open english.endict");
+
+    let mut cfg = JuxuConfig::default();
+    cfg.schema = InputSchema::Pinyin;
+    let mut engine = JuxuEngine::new(cfg);
+    engine.load_pinyin_dict(pdict);
+    engine.set_aux(aux);
+    engine.load_english_dict(endict);
+
+    // Even if user once committed raw "celue", "ue", "lve" via Return, real Pinyin words must win cleanly at #1
+    engine.user.record_english_word("celue");
+    engine.user.record_english_word("ue");
+    engine.user.record_english_word("lve");
+    engine
+        .user
+        .add_phrase_with_pinyin("句序", false, None, engine.pinyin_dict.as_ref());
+
+    let cases = [
+        ("celue", "策略"),
+        ("gonglue", "攻略"),
+        ("hulue", "忽略"),
+        ("nuedai", "虐待"),
+        ("luyou", "旅游"),
+        ("xiaolu", "效率"),
+        ("kaolu", "考虑"),
+        ("gailu", "概率"),
+        ("nuhai", "女孩"),
+        ("nusheng", "女生"),
+        ("malu", "马路"),
+        ("nuli", "努力"),
+        ("jveding", "决定"),
+        ("jvxv", "句序"),
+        ("xvyao", "需要"),
+        ("qvanbu", "全部"),
+        ("yvanlai", "原来"),
+        ("shueiguo", "水果"),
+        ("liouxuesheng", "留学生"),
+        ("taoluen", "讨论"),
+    ];
+
+    for (keys, expected) in cases {
+        engine.clear_composition();
+        engine.clear_context();
+        for (i, ch) in keys.chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 1000 + i as u64 * 35);
+        }
+        let top = engine.page_candidates().first().cloned().expect("expected candidate");
+        assert_eq!(
+            top.text, expected,
+            "full pinyin '{}' expected #1 '{}', got '{}' (cands={:?})",
+            keys,
+            expected,
+            top.text,
+            engine.page_candidates().iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        assert!(top.is_exact, "'{}' -> '{}' should be exact (not typo badge)", keys, top.text);
+        let out = engine.handle_key_event(KEY_SPACE, Some(' '), false, 2000);
+        assert_eq!(out.commit_text, expected);
+        assert!(!engine.is_composing(), "'{}' must consume full buffer without leftover preedit '{}'", keys, engine.preedit());
+    }
+}

@@ -407,6 +407,57 @@ fn build_shuangpin_lattice(
     edges_by_end
 }
 
+/// Standard Full Pinyin orthographic spelling aliases (Hanyu Pinyin + Rime-ice / iOS / Sogou conventions):
+/// - `lue -> lve`, `nue -> nve` (`略/掠/虐/疟`, unambiguous `0.0` offset)
+/// - `lu -> lv`, `nu -> nv` (`绿/率/旅/律/虑/女`, `-0.45` offset so bare `lu`/`nu` still prefers `路`/`努`)
+/// - `j/q/x/y + v* -> u*` (`jv->ju`, `jve->jue`, `jvan->juan`, `jvn->jun`, `jven->jun`, `0.0` offset)
+/// - Uncontracted finals `*iou -> *iu`, `*uei -> *ui`, `*uen -> *un` (`shuei->shui`, `liou->liu`, `luen->lun`, `0.0` offset)
+fn pinyin_orthographic_variants(exact_bytes: &[u8], exact_str: &str) -> Vec<(String, f32)> {
+    let mut out = Vec::new();
+    let len = exact_bytes.len();
+    match exact_str {
+        "lue" => out.push(("lve".to_owned(), 0.0)),
+        "nue" => out.push(("nve".to_owned(), 0.0)),
+        "lu" => out.push(("lv".to_owned(), -0.45)),
+        "nu" => out.push(("nv".to_owned(), -0.45)),
+        _ => {}
+    }
+    if (2..=4).contains(&len)
+        && matches!(exact_bytes[0], b'j' | b'q' | b'x' | b'y')
+        && exact_bytes[1] == b'v'
+    {
+        if &exact_bytes[1..] == b"ven" {
+            let mut s = String::with_capacity(3);
+            s.push(exact_bytes[0] as char);
+            s.push_str("un");
+            out.push((s, 0.0));
+        } else {
+            let mut norm = exact_bytes.to_vec();
+            norm[1] = b'u';
+            out.push((String::from_utf8_lossy(&norm).into_owned(), 0.0));
+        }
+    }
+    if len >= 4 && !matches!(exact_bytes[0], b'a' | b'e' | b'i' | b'o' | b'u' | b'v') {
+        if let Some(stem) = exact_str.strip_suffix("iou") {
+            out.push((format!("{stem}iu"), 0.0));
+        } else if let Some(stem) = exact_str.strip_suffix("uei") {
+            out.push((format!("{stem}ui"), 0.0));
+        } else if let Some(stem) = exact_str.strip_suffix("uen") {
+            out.push((format!("{stem}un"), 0.0));
+        }
+    }
+    out
+}
+
+const ORTHO_PINYIN_SYLLABLES: &[&str] = &[
+    "lue", "nue", "jv", "jve", "jvan", "jvn", "jven", "qv", "qve", "qvan", "qvn", "qven", "xv",
+    "xve", "xvan", "xvn", "xven", "yv", "yve", "yvan", "yvn", "yven", "diou", "miou", "niou",
+    "liou", "jiou", "qiou", "xiou", "duei", "tuei", "guei", "kuei", "huei", "zhuei", "chuei",
+    "shuei", "ruei", "zuei", "cuei", "suei", "duen", "tuen", "nuen", "luen", "guen", "kuen",
+    "huen", "zhuen", "chuen", "shuen", "ruen", "zuen", "cuen", "suen", "juen", "quen", "xuen",
+    "yuen",
+];
+
 fn build_lattice(
     observations: &[KeyObs],
     raw_code: &str,
@@ -467,18 +518,14 @@ fn build_lattice(
                 .sum();
             if len <= MAX_SYL_LEN {
                 hyps.push((exact_str.clone(), exact_lp, CorrectionKind::Exact, 0.0));
+                for (ortho_syl, ortho_offset) in pinyin_orthographic_variants(&exact_bytes, &exact_str) {
+                    hyps.push((ortho_syl, exact_lp, CorrectionKind::Exact, ortho_offset));
+                }
             }
 
-            // Compatible v->u normalization after j/q/x/y (e.g. jv->ju, jve->jue, jvan->juan, jvn->jun)
-            if (2..=4).contains(&len)
-                && matches!(exact_bytes[0], b'j' | b'q' | b'x' | b'y')
-                && exact_bytes[1] == b'v'
-            {
-                let mut norm = exact_bytes.clone();
-                norm[1] = b'u';
-                let norm_str = String::from_utf8_lossy(&norm).into_owned();
-                hyps.push((norm_str, exact_lp, CorrectionKind::TouchBoundary, -0.35));
-            }
+            let is_exact_or_ortho_syl = hyps
+                .iter()
+                .any(|(cand, _, kind, _)| *kind == CorrectionKind::Exact && decoder.dict.lookup_syllable_id(cand).is_some());
 
             if decoder.config.typo.enabled {
                 if len <= MAX_SYL_LEN {
@@ -537,11 +584,12 @@ fn build_lattice(
                 }
 
                 // Missing letter (omission):
-                // 1) Missing trailing 'g' in -ng finals (an->ang, en->eng, in->ing, ian->iang, uan->uang)
+                // 1) Missing trailing 'g' in -ng finals (an->ang, en->eng, in->ing, on->ong, ian->iang, uan->uang, ion->iong)
                 if (2..=5).contains(&len)
                     && (exact_str.ends_with("an")
                         || exact_str.ends_with("en")
-                        || exact_str.ends_with("in"))
+                        || exact_str.ends_with("in")
+                        || exact_str.ends_with("on"))
                 {
                     let mut with_g = exact_str.clone();
                     with_g.push('g');
@@ -550,7 +598,7 @@ fn build_lattice(
                     }
                 }
                 // 2) Missing 1 letter anywhere inside a syllable (e.g. zhog->zhong, xio->xiao)
-                if (2..=5).contains(&len) && decoder.dict.lookup_syllable_id(&exact_str).is_none() {
+                if (2..=5).contains(&len) && !is_exact_or_ortho_syl {
                     let target_len = len + 1;
                     let first_ch = exact_bytes[0];
                     for sid in 0..decoder.dict.syllable_count() {
@@ -576,9 +624,7 @@ fn build_lattice(
                 }
 
                 // Extra letter (insertion / fat-finger double-tap, e.g. zhonng->zhong, womren->women)
-                if (3..=7).contains(&len)
-                    && (len > MAX_SYL_LEN || decoder.dict.lookup_syllable_id(&exact_str).is_none())
-                {
+                if (3..=7).contains(&len) && (len > MAX_SYL_LEN || !is_exact_or_ortho_syl) {
                     for drop_pos in 0..len {
                         let mut b = Vec::with_capacity(len - 1);
                         b.extend_from_slice(&exact_bytes[..drop_pos]);
@@ -604,7 +650,9 @@ fn build_lattice(
             };
 
             for (s, spatial_logp, correction, extra_cost) in hyps {
-                let typo_cost = if extra_cost < 0.0 {
+                let typo_cost = if correction == CorrectionKind::Exact {
+                    extra_cost
+                } else if extra_cost < 0.0 {
                     extra_cost
                 } else {
                     match correction {
@@ -616,9 +664,14 @@ fn build_lattice(
                         CorrectionKind::Transposition => -3.6,
                     }
                 };
+                let disp_syl = if correction == CorrectionKind::Exact {
+                    exact_str.clone()
+                } else {
+                    s.clone()
+                };
                 if let Some(sid) = decoder.dict.lookup_syllable_id(&s) {
                     let full_cost = if correction == CorrectionKind::Exact {
-                        1.35 * ((end - start) as f32)
+                        1.35 * ((end - start) as f32) + extra_cost
                     } else {
                         typo_cost
                     };
@@ -629,7 +682,7 @@ fn build_lattice(
                         spatial_logp,
                         kind_cost: full_cost,
                         correction,
-                        display_syl: s,
+                        display_syl: disp_syl,
                     });
                 } else if decoder.config.pinyin_initial_abbr
                     && (len == 1 || (len == 2 && (s == "zh" || s == "ch" || s == "sh")))
@@ -655,11 +708,11 @@ fn build_lattice(
                     edges_by_end[actual_end].push(LatticeEdge {
                         start,
                         end: actual_end,
-                        syl: SylMatch::Prefix(s.clone()),
+                        syl: SylMatch::Prefix(s),
                         spatial_logp,
                         kind_cost: typo_cost - 3.5,
                         correction,
-                        display_syl: s,
+                        display_syl: disp_syl,
                     });
                 }
             }
@@ -822,8 +875,22 @@ fn add_latin_lattice_edges(
             }
 
             // 2b. All-lowercase (or known mixed-case like `iOS`/`macOS`) dictionary / user English word
-            let user_hit = decoder.user.lookup_english_exact(&lower);
+            let raw_user_hit = decoder.user.lookup_english_exact(&lower);
             let dict_hit = decoder.english.lookup_with_morphology(&lower);
+            let exact_py_span = !has_upper && can_parse_exact_full(start, end);
+            // Guard against 1-off `Return` passthrough of raw Pinyin examples (e.g. `"celue"`, `"lve"`, `"ue"`):
+            // an all-lowercase OOV string (`dict_hit.is_none()` and no uppercase in `disp`) must not hijack
+            // short `<=3`-letter spans on `cnt == 1` or override valid exact Chinese Pinyin at #1.
+            let user_hit = raw_user_hit.filter(|&(disp, cnt)| {
+                let disp_has_upper = disp.bytes().any(|b| b.is_ascii_uppercase());
+                if has_upper || disp_has_upper || dict_hit.is_some() {
+                    true
+                } else if exact_py_span {
+                    cnt >= 3
+                } else {
+                    len > 3 || cnt >= 2
+                }
+            });
             if user_hit.is_some() || dict_hit.is_some() {
                 let (canonical, weight, is_user) = if let Some((disp, cnt)) = user_hit {
                     (
@@ -2018,7 +2085,7 @@ pub fn pinyin_next_key_priors(
 
     for l in 1..=max_tail {
         let sub = &tail[tail.len() - l..];
-        if dict.lookup_syllable_id(sub).is_some() {
+        if dict.lookup_syllable_id(sub).is_some() || ORTHO_PINYIN_SYLLABLES.contains(&sub) {
             can_end_syllable = true;
         }
         for s_id in dict.syllables_with_prefix(sub) {
@@ -2028,6 +2095,17 @@ pub fn pinyin_next_key_priors(
                     let idx = (next_b - b'a') as usize;
                     mask |= 1u32 << idx;
                     scores[idx] += 2.0;
+                }
+            }
+        }
+        for &os in ORTHO_PINYIN_SYLLABLES {
+            if os.starts_with(sub) {
+                if let Some(&next_b) = os.as_bytes().get(sub.len()) {
+                    if next_b.is_ascii_lowercase() {
+                        let idx = (next_b - b'a') as usize;
+                        mask |= 1u32 << idx;
+                        scores[idx] += 2.0;
+                    }
                 }
             }
         }

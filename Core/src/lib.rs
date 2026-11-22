@@ -775,6 +775,107 @@ mod tests {
     }
 
     #[test]
+    fn full_pinyin_orthographic_aliases_umlaut_and_uncontracted_finals() {
+        use crate::pinyin_dict::{serialize_pydict, PinyinDictBuildInput, PinyinDictView};
+        let py_bytes = serialize_pydict(PinyinDictBuildInput {
+            chars: vec![
+                ("ce".into(), "策".into(), 9000, 0),
+                ("lu".into(), "路".into(), 12000, 0),
+                ("lv".into(), "绿".into(), 9500, 0),
+                ("lve".into(), "略".into(), 9000, 0),
+                ("nu".into(), "努".into(), 9000, 0),
+                ("nv".into(), "女".into(), 10000, 0),
+                ("nve".into(), "虐".into(), 7000, 0),
+                ("you".into(), "游".into(), 10000, 0),
+                ("hai".into(), "孩".into(), 9500, 0),
+                ("dai".into(), "待".into(), 9000, 0),
+                ("ju".into(), "句".into(), 10000, 0),
+                ("xu".into(), "序".into(), 9500, 0),
+                ("jue".into(), "决".into(), 10000, 0),
+                ("juan".into(), "卷".into(), 9000, 0),
+                ("jun".into(), "军".into(), 10000, 0),
+                ("shui".into(), "水".into(), 12000, 0),
+                ("liu".into(), "留".into(), 11000, 0),
+                ("lun".into(), "论".into(), 10000, 0),
+                ("e".into(), "鹅".into(), 6000, 0),
+            ],
+            phrases: vec![
+                (vec!["ce".into(), "lve".into()], "策略".into(), 500000, 0),
+                (vec!["lv".into(), "you".into()], "旅游".into(), 450000, 0),
+                (vec!["nv".into(), "hai".into()], "女孩".into(), 450000, 0),
+                (vec!["nve".into(), "dai".into()], "虐待".into(), 200000, 0),
+                (vec!["ju".into(), "xu".into()], "句序".into(), 300000, 0),
+            ],
+        });
+        let pdict = PinyinDictView::from_bytes(py_bytes).unwrap();
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::Pinyin;
+        let mut engine = JuxuEngine::new(cfg);
+        engine.load_pinyin_dict(pdict);
+
+        // 1. lue -> lve ("celue" -> "策略", consumes all 5 keys cleanly with zero leftover "ue")
+        for ch in "celue".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 100);
+        }
+        assert_eq!(engine.page_candidates()[0].text, "策略");
+        assert!(engine.page_candidates()[0].is_exact);
+        assert_eq!(engine.segmented_code(), "ce'lue");
+        let committed = engine.handle_key_event(KEY_SPACE, Some(' '), false, 150);
+        assert_eq!(committed.commit_text, "策略");
+        assert!(!engine.is_composing(), "must consume all 5 keys without leaving 'ue'");
+
+        // 2. nue -> nve ("nuedai" -> "虐待")
+        for ch in "nuedai".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 200);
+        }
+        assert_eq!(engine.page_candidates()[0].text, "虐待");
+        assert!(engine.page_candidates()[0].is_exact);
+        engine.clear_composition();
+
+        // 3. lu -> lv / nu -> nv ("luyou" -> "旅游", "nuhai" -> "女孩", while bare "lu" keeps "路" #1)
+        for ch in "luyou".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 300);
+        }
+        assert_eq!(engine.page_candidates()[0].text, "旅游");
+        assert!(engine.page_candidates()[0].is_exact);
+        engine.clear_composition();
+
+        for ch in "nuhai".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 350);
+        }
+        assert_eq!(engine.page_candidates()[0].text, "女孩");
+        engine.clear_composition();
+
+        for ch in "lu".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 380);
+        }
+        assert_eq!(engine.page_candidates()[0].text, "路");
+        assert!(engine.all_candidates().iter().any(|c| c.text == "绿"));
+        let mask_after_lu = engine.valid_next_mask();
+        assert_ne!(mask_after_lu & (1u32 << (b'e' - b'a')), 0, "'e' must be valid after 'lu' for 'lue'");
+        engine.clear_composition();
+
+        // 4. j/q/x/y + v -> u as exact spelling ("jvxv" -> "句序", "jve" -> "决", "jvan" -> "卷", "jvn" -> "军")
+        for ch in "jvxv".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 400);
+        }
+        assert_eq!(engine.page_candidates()[0].text, "句序");
+        assert!(engine.page_candidates()[0].is_exact);
+        assert_eq!(engine.page_candidates()[0].badge, CandidateBadge::None);
+        engine.clear_composition();
+
+        // 5. Uncontracted Hanyu Pinyin finals: shuei -> shui, liou -> liu, luen -> lun
+        for (keys, expected) in [("shuei", "水"), ("liou", "留"), ("luen", "论")] {
+            for ch in keys.chars() {
+                let _ = engine.handle_key_event(0, Some(ch), false, 500);
+            }
+            assert_eq!(engine.page_candidates()[0].text, expected, "{} failed", keys);
+            assert!(engine.page_candidates()[0].is_exact);
+            engine.clear_composition();
+        }
+    }
+
+    #[test]
     fn xiaohe_shuangpin_sentence_zero_initial_and_typo() {
         use crate::pinyin_dict::{serialize_pydict, PinyinDictBuildInput, PinyinDictView};
         let py_bytes = serialize_pydict(PinyinDictBuildInput {
