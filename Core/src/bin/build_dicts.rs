@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use juxu_core::code::{PackedCode, PackedPinyin, Stem2};
+use juxu_core::english::{serialize_endict, EN_FLAG_ABBR, EN_FLAG_HIGH_FREQ, EN_FLAG_TECH};
 use juxu_core::format::{
     pack_trigram, serialize_wbaux, serialize_wbdict, AuxBuildInput, CharMeta, DictBuildInput,
     ENTRY_FLAG_EXT_RARE, ENTRY_FLAG_SINGLE_CHAR, ENTRY_FLAG_SYMBOL,
@@ -521,6 +522,19 @@ fn main() {
                 wbdict_only = true;
                 i += 1;
             }
+            "--english-only" => {
+                fs::create_dir_all(&out_dir).expect("failed to create output dir");
+                let ice_dir = raw_dir.join("pinyin_ice");
+                let (en_blob, en_cnt) = build_english_dict(&ice_dir);
+                let out_path = out_dir.join("english.endict");
+                fs::write(&out_path, &en_blob).expect("failed to write english.endict");
+                println!(
+                    "Built english.endict ({:.2} KB, {} entries)",
+                    en_blob.len() as f64 / 1024.0,
+                    en_cnt
+                );
+                return;
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -635,6 +649,16 @@ fn main() {
                     "Built pinyin.pydict ({:.2} MB)",
                     py_blob.len() as f64 / (1024.0 * 1024.0)
                 );
+                let (en_blob, en_cnt) = build_english_dict(&ice_dir);
+                if en_cnt > 0 {
+                    let en_out = out_dir.join("english.endict");
+                    fs::write(&en_out, &en_blob).expect("failed to write english.endict");
+                    println!(
+                        "Built english.endict ({:.2} KB, {} entries)",
+                        en_blob.len() as f64 / 1024.0,
+                        en_cnt
+                    );
+                }
             }
         }
     }
@@ -1087,4 +1111,163 @@ fn build_pinyin_dict(ice_dir: &Path, tghz_set: &HashSet<u32>) -> Vec<u8> {
     }
 
     serialize_pydict(PinyinDictBuildInput { chars, phrases })
+}
+
+fn build_english_dict(ice_dir: &Path) -> (Vec<u8>, usize) {
+    // 1. Load frequency rank map from `google_20k.txt` (rank 0 = most frequent)
+    let mut freq_rank: HashMap<String, usize> = HashMap::new();
+    if let Ok(content) = fs::read_to_string(ice_dir.join("google_20k.txt")) {
+        for (rank, line) in content.lines().enumerate() {
+            let w = line.trim().to_ascii_lowercase();
+            if w.len() >= 2 && w.bytes().all(|b| b.is_ascii_lowercase()) {
+                freq_rank.entry(w).or_insert(rank);
+            }
+        }
+    }
+
+    // 2. Map lower -> (canonical_display, weight, flags)
+    let mut map: HashMap<String, (String, u16, u16)> = HashMap::new();
+
+    let mut insert_word = |disp: &str, weight: u16, flags: u16| {
+        let lower = disp.to_ascii_lowercase();
+        if !(2..=40).contains(&lower.len()) || !lower.bytes().all(|b| b.is_ascii_lowercase()) {
+            return;
+        }
+        let has_upper = disp.bytes().any(|b| b.is_ascii_uppercase());
+        map.entry(lower)
+            .and_modify(|e| {
+                if weight > e.1 {
+                    e.1 = weight;
+                }
+                e.2 |= flags;
+                if has_upper && e.0 == e.0.to_ascii_lowercase() {
+                    e.0 = disp.to_owned();
+                }
+            })
+            .or_insert_with(|| (disp.to_owned(), weight, flags));
+    };
+
+    // 2a. Parse `en.dict.yaml` (core 20k+ English words with canonical casing)
+    if let Ok(content) = fs::read_to_string(ice_dir.join("en.dict.yaml")) {
+        let mut in_body = false;
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if !in_body {
+                if line == "..." {
+                    in_body = true;
+                }
+                continue;
+            }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let disp = line.split('\t').next().unwrap_or("").trim();
+            if disp.is_empty() || !disp.bytes().all(|b| b.is_ascii_alphabetic()) {
+                continue;
+            }
+            let lower = disp.to_ascii_lowercase();
+            let (weight, flags) = if let Some(&rank) = freq_rank.get(&lower) {
+                let w = if rank < 1000 {
+                    62_000 - (rank as u16) * 10
+                } else if rank < 5000 {
+                    52_000 - ((rank - 1000) as u16) * 4
+                } else {
+                    (36_000u32.saturating_sub(((rank - 5000) as u32) * 2)).max(8_000) as u16
+                };
+                let f = if rank < 5000 { EN_FLAG_HIGH_FREQ } else { 0 };
+                (w, f)
+            } else {
+                (14_000, 0)
+            };
+            insert_word(disp, weight, flags);
+        }
+    }
+
+    // 2b. Parse `en_ext.dict.yaml` (tech, internet, brand & abbreviation words)
+    if let Ok(content) = fs::read_to_string(ice_dir.join("en_ext.dict.yaml")) {
+        let mut in_body = false;
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if !in_body {
+                if line == "..." {
+                    in_body = true;
+                }
+                continue;
+            }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let disp = line.split('\t').next().unwrap_or("").trim();
+            if disp.is_empty() || !disp.bytes().all(|b| b.is_ascii_alphabetic()) {
+                continue;
+            }
+            let is_abbr = disp.len() <= 4 && disp.bytes().all(|b| b.is_ascii_uppercase());
+            let mut flags = EN_FLAG_TECH | EN_FLAG_HIGH_FREQ;
+            if is_abbr {
+                flags |= EN_FLAG_ABBR;
+            }
+            insert_word(disp, 44_000, flags);
+        }
+    }
+
+    // 2c. Ensure all top-20k frequency words are present even if omitted from `en.dict.yaml`
+    for (w, rank) in &freq_rank {
+        let weight = if *rank < 1000 {
+            60_000 - (*rank as u16) * 10
+        } else if *rank < 5000 {
+            50_000 - ((*rank - 1000) as u16) * 4
+        } else {
+            (34_000u32.saturating_sub(((*rank - 5000) as u32) * 2)).max(8_000) as u16
+        };
+        let flags = if *rank < 5000 { EN_FLAG_HIGH_FREQ } else { 0 };
+        insert_word(w, weight, flags);
+    }
+    drop(insert_word);
+
+    // 2d. Curated modern tech/AI canonical-case overrides (2024–2026)
+    let tech_overrides: &[(&str, u16, u16)] = &[
+        ("Rust", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("Python", 56_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("Swift", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("TypeScript", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("JavaScript", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("GitHub", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("iOS", 56_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
+        ("macOS", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("iPhone", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("iPad", 52_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("Mac", 52_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("Claude", 52_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("Gemini", 52_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("DeepSeek", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("Qwen", 48_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("Cursor", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("GPT", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
+        ("AI", 58_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
+        ("LLM", 52_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
+        ("API", 56_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
+        ("PR", 52_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
+        ("MCP", 48_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
+        ("RWKV", 48_000, EN_FLAG_TECH | EN_FLAG_ABBR),
+        ("Xcode", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("Docker", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("Kubernetes", 48_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("PyTorch", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("CUDA", 48_000, EN_FLAG_TECH | EN_FLAG_ABBR),
+        ("MLX", 46_000, EN_FLAG_TECH | EN_FLAG_ABBR),
+        ("bug", 56_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("demo", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+        ("Git", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
+    ];
+    for &(disp, w, f) in tech_overrides {
+        let lower = disp.to_ascii_lowercase();
+        map.insert(lower, (disp.to_owned(), w, f));
+    }
+
+    let entries: Vec<(String, String, u16, u16)> = map
+        .into_iter()
+        .map(|(k, (d, w, f))| (k, d, w, f))
+        .collect();
+    let cnt = entries.len();
+    (serialize_endict(&entries), cnt)
 }

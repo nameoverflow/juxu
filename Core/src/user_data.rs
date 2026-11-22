@@ -88,6 +88,8 @@ pub struct UserStore {
     pub unigram_counts: HashMap<String, u32>,
     pub word_bigrams: HashMap<(String, String), u32>,
     pub char_bigrams: HashMap<(char, char), u32>,
+    /// Personal learned English / OOV Latin words: `lower_key -> (preferred_display, count, last_seq)`
+    pub english_words: HashMap<String, (String, u32, u64)>,
     pub(crate) continuations: PersonalContinuations,
     pub touch_profile: TouchProfile,
     /// Rolling buffer of recent consecutive CJK characters `(ch, timestamp_ms, rwkv_surprisal, commit_id)`
@@ -108,6 +110,7 @@ impl Default for UserStore {
             unigram_counts: HashMap::new(),
             word_bigrams: HashMap::new(),
             char_bigrams: HashMap::new(),
+            english_words: HashMap::new(),
             continuations: PersonalContinuations::default(),
             touch_profile: TouchProfile::default(),
             recent_singles: Vec::new(),
@@ -585,6 +588,100 @@ impl UserStore {
         }
     }
 
+    /// Record a user-committed English / OOV Latin word (preserving user casing) for future mixed decoding.
+    pub fn record_english_word(&mut self, word: &str) {
+        let trimmed = word.trim();
+        if !(2..=48).contains(&trimmed.len()) {
+            return;
+        }
+        if !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+' | b'#'))
+        {
+            return;
+        }
+        if !trimmed.bytes().any(|b| b.is_ascii_alphabetic()) {
+            return;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        let seq = self.seq;
+        self.seq = self.seq.saturating_add(1);
+        let has_upper = trimmed.bytes().any(|b| b.is_ascii_uppercase());
+        self.english_words
+            .entry(lower)
+            .and_modify(|e| {
+                e.1 = e.1.saturating_add(1);
+                e.2 = seq;
+                if has_upper || e.0 == e.0.to_ascii_lowercase() {
+                    e.0 = trimmed.to_owned();
+                }
+            })
+            .or_insert_with(|| (trimmed.to_owned(), 1, seq));
+        self.dirty = true;
+    }
+
+    /// Extract and record any Latin words (`len >= 2`) from a committed mixed string.
+    pub fn record_english_words_in_text(&mut self, text: &str, record_all_latin: bool) {
+        let mut start: Option<usize> = None;
+        for (idx, ch) in text.char_indices() {
+            let is_lat = ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-');
+            if is_lat {
+                if start.is_none() {
+                    start = Some(idx);
+                }
+            } else if let Some(s) = start.take() {
+                let tok = &text[s..idx];
+                if tok.len() >= 2
+                    && tok.bytes().any(|b| b.is_ascii_alphabetic())
+                    && (record_all_latin || tok.bytes().any(|b| b.is_ascii_uppercase()))
+                {
+                    self.record_english_word(tok);
+                }
+            }
+        }
+        if let Some(s) = start {
+            let tok = &text[s..];
+            if tok.len() >= 2
+                && tok.bytes().any(|b| b.is_ascii_alphabetic())
+                && (record_all_latin || tok.bytes().any(|b| b.is_ascii_uppercase()))
+            {
+                self.record_english_word(tok);
+            }
+        }
+    }
+
+    pub fn lookup_english_exact(&self, lower: &str) -> Option<(&str, u32)> {
+        self.english_words
+            .get(lower)
+            .map(|(disp, cnt, _)| (disp.as_str(), *cnt))
+    }
+
+    pub fn has_english_prefix(&self, lower: &str) -> bool {
+        if lower.is_empty() || self.english_words.is_empty() {
+            return false;
+        }
+        self.english_words.keys().any(|k| k.starts_with(lower))
+    }
+
+    pub fn lookup_english_prefix(&self, lower: &str, limit: usize) -> Vec<(&str, u32)> {
+        if lower.is_empty() || limit == 0 || self.english_words.is_empty() {
+            return Vec::new();
+        }
+        let mut hits: Vec<(&str, u32, u64, bool)> = self
+            .english_words
+            .iter()
+            .filter(|(k, _)| k.starts_with(lower))
+            .map(|(k, (disp, cnt, seq))| (disp.as_str(), *cnt, *seq, k.len() == lower.len()))
+            .collect();
+        hits.sort_by(|a, b| {
+            b.3.cmp(&a.3)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.2.cmp(&a.2))
+        });
+        hits.truncate(limit);
+        hits.into_iter().map(|(d, c, _, _)| (d, c)).collect()
+    }
+
     /// Personal language model log-boost given `prev_committed` context (in nats).
     #[inline]
     pub fn context_boost(&self, prev_committed: &str, candidate: &str) -> f32 {
@@ -692,6 +789,17 @@ impl UserStore {
                 c
             ));
         }
+        let mut en_words: Vec<(&String, &(String, u32, u64))> = self.english_words.iter().collect();
+        en_words.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then_with(|| b.1 .2.cmp(&a.1 .2)));
+        for (lower, (disp, cnt, seq)) in en_words.into_iter().take(2000) {
+            out.push_str(&format!(
+                "ENWORD\t{}\t{}\t{}\t{}\n",
+                escape_tab(lower),
+                escape_tab(disp),
+                cnt,
+                seq
+            ));
+        }
         self.continuations.write_to(&mut out);
         let write_id = USER_DATA_WRITE_ID.fetch_add(1, Ordering::Relaxed);
         let temporary_path = path.with_extension(format!("tmp.{}.{write_id}", std::process::id()));
@@ -764,6 +872,15 @@ impl UserStore {
                             *store.char_bigrams.entry((cp, cn)).or_insert(0) += c;
                         }
                         store.word_bigrams.insert((p, n), c);
+                    }
+                }
+                "ENWORD" if parts.len() >= 5 => {
+                    let lower = parts[1].to_ascii_lowercase();
+                    let disp = parts[2].to_string();
+                    let count: u32 = parts[3].parse().unwrap_or(1);
+                    let last_seq: u64 = parts[4].parse().unwrap_or(1);
+                    if lower.len() >= 2 && lower.len() <= 48 && !disp.is_empty() {
+                        store.english_words.insert(lower, (disp, count, last_seq));
                     }
                 }
                 "CONT_SEQ" if parts.len() == 2 => store.continuations.load_clock(parts[1]),

@@ -1,5 +1,6 @@
 use crate::code::PackedCode;
 use crate::config::JuxuConfig;
+use crate::english::{format_english_display, EnDictView};
 use crate::format::{AuxView, DictView};
 use crate::neural::{NeuralView, RwkvState};
 use crate::personalization::Context as PersonalContext;
@@ -11,12 +12,15 @@ use std::collections::{HashMap, VecDeque};
 
 const BEAM_WIDTH: usize = 8;
 const MAX_CODE_LEN: usize = 5;
-const RETAINED_LAYERS: usize = 8;
+const MAX_EN_LEN: usize = 24;
+const RETAINED_LAYERS: usize = 24;
 const COMMIT_DELAY: usize = 8;
 const COMMIT_SCORE_MARGIN: f32 = 5.0;
 
 pub(crate) struct Decoder<'a> {
     pub dict: &'a DictView,
+    pub english: &'a EnDictView,
+    pub raw_code: &'a str,
     pub aux: &'a AuxView,
     pub model: NeuralView<'a>,
     pub config: &'a JuxuConfig,
@@ -185,10 +189,27 @@ impl Stream {
         &mut self,
         code: &str,
         dict: &DictView,
+        english: &EnDictView,
         user: &UserStore,
         config: &JuxuConfig,
     ) -> Option<StablePrefix> {
         let limit = code.len().checked_sub(COMMIT_DELAY)?;
+        // Protect in-progress long English words from being chopped mid-word by COMMIT_DELAY.
+        let tail_start = code.len().saturating_sub(MAX_EN_LEN);
+        for start in tail_start..=limit {
+            let slice = &code[start..];
+            if slice.len() >= 3 {
+                let lower = slice.to_ascii_lowercase();
+                if slice.bytes().any(|b| b.is_ascii_uppercase())
+                    || user.has_english_prefix(&lower)
+                    || english
+                        .prefix_info(&lower)
+                        .is_some_and(|(w, _)| w >= 24_000)
+                {
+                    return None;
+                }
+            }
+        }
         let best = self.paths().first()?;
         let mut cuts: Vec<Boundary> = best
             .boundaries
@@ -268,9 +289,10 @@ impl Stream {
         struct Step<'a> {
             parent: &'a Path,
             parent_key: (usize, usize), // (layer_pos, parent_idx) for trie-shared prefix state cache
-            text: &'a str,
+            text: String,
             first: char,
             n_chars: usize,
+            is_latin: bool,
             estimate: f32,
             bias: f32,
             code: PackedCode,
@@ -290,6 +312,9 @@ impl Stream {
                 continue;
             }
             let window = &observations[parent_pos..];
+            if window.iter().any(|o| o.is_upper) {
+                continue;
+            }
             let hypotheses = generate_hypotheses_with_options(
                 window,
                 decoder.layout,
@@ -437,9 +462,10 @@ impl Stream {
                     steps.push(Step {
                         parent,
                         parent_key: (parent_pos, parent_idx),
-                        text,
+                        text: text.to_owned(),
                         first,
                         n_chars,
+                        is_latin: false,
                         estimate: parent.score + contextual_bias + estimate,
                         bias: contextual_bias,
                         code,
@@ -448,6 +474,92 @@ impl Stream {
                 }
             }
         }
+
+        // Mixed Chinese-English: allow dictionary, user-learned, uppercase-anchored, and empty-code OOV Latin words
+        if decoder.raw_code.len() >= end {
+            for len in 1..=end.min(MAX_EN_LEN) {
+                let parent_pos = end - len;
+                let parents = self.layer(parent_pos);
+                if parents.is_empty() {
+                    continue;
+                }
+                let raw_slice = &decoder.raw_code[parent_pos..end];
+                if !raw_slice.bytes().all(|b| b.is_ascii_alphabetic()) {
+                    continue;
+                }
+                let has_upper = observations[parent_pos..end].iter().any(|o| o.is_upper);
+                let starts_upper = observations[parent_pos].is_upper;
+                let lower = raw_slice.to_ascii_lowercase();
+                if has_upper && !starts_upper {
+                    let known = decoder.user.lookup_english_exact(&lower).is_some()
+                        || decoder.english.lookup_exact(&lower).is_some();
+                    if !known {
+                        continue;
+                    }
+                }
+                let user_hit = decoder.user.lookup_english_exact(&lower);
+                let dict_hit = if len >= 2 || starts_upper {
+                    decoder.english.lookup_with_morphology(&lower)
+                } else {
+                    None
+                };
+
+                let latin_cand: Option<(String, f32)> = if starts_upper {
+                    let is_known = user_hit.is_some() || dict_hit.is_some();
+                    let bonus = if is_known { 3.5 } else { 1.8 };
+                    if is_known || len >= 2 || end == decoder.raw_code.len() {
+                        Some((raw_slice.to_owned(), 1.2 * (len as f32) + bonus))
+                    } else {
+                        None
+                    }
+                } else if len >= 2 && (user_hit.is_some() || dict_hit.is_some()) {
+                    let (canonical, weight, is_user) = if let Some((disp, cnt)) = user_hit {
+                        (
+                            disp.to_owned(),
+                            (54_000u32 + cnt.min(10) * 1000).min(65_535) as u16,
+                            true,
+                        )
+                    } else {
+                        let (disp, w, _) = dict_hit.unwrap();
+                        (disp, w, false)
+                    };
+                    // For short lowercase words (len <= 3) require high freq or user-learned so Wubi codes stay primary
+                    if !has_upper && !is_user && len <= 3 && weight < 46_000 {
+                        None
+                    } else {
+                        let display = format_english_display(raw_slice, &canonical);
+                        let w_bonus = ((weight as f32) / 65535.0) * 1.4 + if is_user { 2.0 } else { 0.0 };
+                        let len_factor = if len >= 4 { 0.85 } else { 0.45 };
+                        Some((display, len_factor * (len as f32) + w_bonus - 1.2))
+                    }
+                } else {
+                    None
+                };
+
+                if let Some((display, bias)) = latin_cand {
+                    let Some(first) = display.chars().next() else {
+                        continue;
+                    };
+                    let n_chars = display.chars().count();
+                    for (parent_idx, parent) in parents.iter().enumerate() {
+                        let est = decoder.model.estimate_latin_logp(&parent.state, &display);
+                        steps.push(Step {
+                            parent,
+                            parent_key: (parent_pos, parent_idx),
+                            text: display.clone(),
+                            first,
+                            n_chars,
+                            is_latin: true,
+                            estimate: parent.score + bias + est,
+                            bias,
+                            code: PackedCode::EMPTY,
+                            correction: CorrectionKind::Exact,
+                        });
+                    }
+                }
+            }
+        }
+
         steps.sort_unstable_by(|a, b| b.estimate.total_cmp(&a.estimate));
 
         // Trie-shared prefix state refinement for top candidates:
@@ -457,7 +569,7 @@ impl Stream {
         let mut prefix_cache: HashMap<(usize, usize, char), RwkvState> =
             HashMap::with_capacity(refine_limit);
         for step in &mut steps[..refine_limit] {
-            if step.n_chars >= 2 {
+            if !step.is_latin && step.n_chars >= 2 {
                 let cache_key = (step.parent_key.0, step.parent_key.1, step.first);
                 let state_after_c1 = prefix_cache.entry(cache_key).or_insert_with(|| {
                     let mut st = step.parent.state.clone();
@@ -506,47 +618,59 @@ impl Stream {
         for step in steps.into_iter().take(BEAM_WIDTH * 2) {
             let mut score = step.parent.score + step.bias;
             let mut personal_context = step.parent.personal_context;
-            let raw_lp1 = decoder.model.score_next_char(&step.parent.state, step.first);
-            score += if personalize {
-                personal.interpolate_logp(
-                    raw_lp1,
-                    personal_context,
-                    step.first,
-                    use_personal_states.then_some(&step.parent.state),
-                )
-            } else {
-                raw_lp1
-            };
-            let cache_key = (step.parent_key.0, step.parent_key.1, step.first);
-            let mut state = if let Some(cached) = prefix_cache.get(&cache_key) {
-                cached.clone()
-            } else {
-                let mut st = step.parent.state.clone();
-                decoder
+            let state = if step.is_latin {
+                let (lp, st) = decoder
                     .model
-                    .step_token(decoder.model.char_to_token(step.first), &mut st);
+                    .score_and_step_latin(&step.parent.state, &step.text, true, true);
+                score += lp;
+                for ch in step.text.chars() {
+                    personal_context = personal_context.push(ch);
+                }
                 st
-            };
-            personal_context = personal_context.push(step.first);
-            for ch in step.text.chars().skip(1) {
-                let raw_lp = decoder.model.score_next_char(&state, ch);
+            } else {
+                let raw_lp1 = decoder.model.score_next_char(&step.parent.state, step.first);
                 score += if personalize {
                     personal.interpolate_logp(
-                        raw_lp,
+                        raw_lp1,
                         personal_context,
-                        ch,
-                        use_personal_states.then_some(&state),
+                        step.first,
+                        use_personal_states.then_some(&step.parent.state),
                     )
                 } else {
-                    raw_lp
+                    raw_lp1
                 };
-                decoder
-                    .model
-                    .step_token(decoder.model.char_to_token(ch), &mut state);
-                personal_context = personal_context.push(ch);
-            }
+                let cache_key = (step.parent_key.0, step.parent_key.1, step.first);
+                let mut st = if let Some(cached) = prefix_cache.get(&cache_key) {
+                    cached.clone()
+                } else {
+                    let mut s = step.parent.state.clone();
+                    decoder
+                        .model
+                        .step_token(decoder.model.char_to_token(step.first), &mut s);
+                    s
+                };
+                personal_context = personal_context.push(step.first);
+                for ch in step.text.chars().skip(1) {
+                    let raw_lp = decoder.model.score_next_char(&st, ch);
+                    score += if personalize {
+                        personal.interpolate_logp(
+                            raw_lp,
+                            personal_context,
+                            ch,
+                            use_personal_states.then_some(&st),
+                        )
+                    } else {
+                        raw_lp
+                    };
+                    decoder
+                        .model
+                        .step_token(decoder.model.char_to_token(ch), &mut st);
+                    personal_context = personal_context.push(ch);
+                }
+                st
+            };
             let mut text = step.parent.text.clone();
-            text.push_str(step.text);
+            text.push_str(&step.text);
             let mut boundaries = step.parent.boundaries.clone();
             boundaries.push(Boundary {
                 keys: end,

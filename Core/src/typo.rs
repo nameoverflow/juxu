@@ -6,6 +6,7 @@ use crate::user_data::TouchProfile;
 #[derive(Clone, Copy, Debug)]
 pub struct KeyObs {
     pub ch: u8,
+    pub is_upper: bool,
     pub has_touch: bool,
     /// Touch coordinates in normalized key-pitch units (or view coordinates converted via `KeyLayout`).
     pub norm_x: f32,
@@ -17,6 +18,7 @@ impl KeyObs {
     pub fn physical(ch: u8, timestamp_ms: u64) -> Self {
         Self {
             ch: ch.to_ascii_lowercase(),
+            is_upper: ch.is_ascii_uppercase(),
             has_touch: false,
             norm_x: 0.0,
             norm_y: 0.0,
@@ -27,6 +29,7 @@ impl KeyObs {
     pub fn touch(ch: u8, norm_x: f32, norm_y: f32, timestamp_ms: u64) -> Self {
         Self {
             ch: ch.to_ascii_lowercase(),
+            is_upper: ch.is_ascii_uppercase(),
             has_touch: true,
             norm_x,
             norm_y,

@@ -565,7 +565,7 @@ public final class KeyboardViewController: UIInputViewController {
         switch spec.kind {
         case .letter(let ascii):
             markUserTypedForClipboard()
-            if layoutEngine.asciiMode || layoutEngine.shiftState.isUppercase {
+            if layoutEngine.asciiMode {
                 commitPendingFirstIfComposing()
                 let ch = String(UnicodeScalar(ascii))
                 let outStr = layoutEngine.shiftState.isUppercase ? ch.uppercased() : ch.lowercased()
@@ -573,6 +573,13 @@ public final class KeyboardViewController: UIInputViewController {
                 bridge.setContext("")
                 layoutEngine.consumeOneShotShiftIfNeeded()
                 syncEngineToUI()
+            } else if layoutEngine.shiftState.isUppercase {
+                // Inline uppercase English anchor: route through Core so mixed sentences (e.g. `woyongRust`)
+                // and Wubi English words (`Rust`, `Juxu`) compose without clearing neural context!
+                let upperScalar = String(UnicodeScalar(ascii)).uppercased().unicodeScalars.first?.value ?? UInt32(ascii)
+                let out = bridge.handleKey(keyCode: 0, scalar: upperScalar, hasCmdOrCtrl: false, timestampMs: Self.nowMs())
+                layoutEngine.consumeOneShotShiftIfNeeded()
+                applyEngineState(out)
             } else {
                 let sendPt: CGPoint
                 if let snap = keyCanvas.snapshot {

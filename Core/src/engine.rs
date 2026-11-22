@@ -1,5 +1,6 @@
 use crate::code::{cangjie_radicals_str, expand_wildcards, PackedCode};
 use crate::config::{FourthEmptyBehavior, ShiftToggleMode, JuxuConfig, InputSchema};
+use crate::english::{format_english_display, EnDictView};
 use crate::format::{AuxView, DictView, ENTRY_FLAG_SYMBOL};
 use crate::neural::{NeuralContextTracker, NeuralView, RwkvState};
 use crate::personalization::Context as PersonalContext;
@@ -119,6 +120,7 @@ impl Default for LmWeights {
 pub struct JuxuEngine {
     pub dicts: [Option<DictView>; 9],
     pub pinyin_dict: Option<PinyinDictView>,
+    pub english_dict: EnDictView,
     pub aux: Option<AuxView>,
     pub config: JuxuConfig,
     pub user: UserStore,
@@ -165,6 +167,7 @@ impl JuxuEngine {
         Self {
             dicts: [None, None, None, None, None, None, None, None, None],
             pinyin_dict: None,
+            english_dict: EnDictView::builtin_default(),
             aux: None,
             config,
             user: UserStore::default(),
@@ -859,6 +862,13 @@ impl JuxuEngine {
         self.user.reindex_pinyin_phrases(&dict);
         self.pinyin_dict = Some(dict);
         if self.config.schema.is_pinyin() && !self.raw_code.is_empty() {
+            self.rebuild_candidates();
+        }
+    }
+
+    pub fn load_english_dict(&mut self, dict: EnDictView) {
+        self.english_dict = dict;
+        if !self.raw_code.is_empty() {
             self.rebuild_candidates();
         }
     }
@@ -1786,9 +1796,14 @@ impl JuxuEngine {
                     return EngineOutput::default();
                 }
                 let raw = self.raw_code.clone();
+                self.user.record_english_word(&raw);
                 self.clear_composition();
                 self.user.break_single_burst();
-                self.clear_context();
+                if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
+                    self.neural_tracker.commit_cjk_str(&nv, &raw);
+                }
+                self.last_committed = raw.clone();
+                self.recent_context.clear();
                 return EngineOutput {
                     consumed: true,
                     commit_text: raw,
@@ -1859,26 +1874,37 @@ impl JuxuEngine {
             return self.push_code_observation(obs);
         }
 
-        // Uppercase letter 'A'..='Z': commit current candidate #1 (if composing) and pass/commit uppercase
+        // Uppercase letter 'A'..='Z': inline English anchor (preserves casing & neural context!)
         if c.is_ascii_uppercase() {
-            if self.raw_code.is_empty() {
-                self.user.break_single_burst();
-                self.clear_context();
-                return EngineOutput::default();
+            let obs = KeyObs::physical(c as u8, timestamp_ms);
+            if self.is_pinyin_mode() || self.uses_spaceless() {
+                return self.push_code_observation(obs);
             }
-            let mut out = if self.uses_spaceless() {
-                self.finish_spaceless(timestamp_ms)
-            } else {
-                self.commit_candidate(0, timestamp_ms, false)
-                    .unwrap_or_else(|| {
-                        self.clear_composition();
-                        EngineOutput::default()
-                    })
-            };
-            self.user.break_single_burst();
-            self.clear_context();
-            out.consumed = true;
-            out.commit_text.push(c);
+            // Traditional fixed-code schema (Wubi/Xiaohe/Cangjie):
+            // - If already composing an English/uppercase buffer or empty, append directly without committing.
+            // - If currently composing a lowercase Chinese code (e.g. `tr`), commit #1 Chinese candidate first
+            //   (preserving neural context!) and immediately start composing the uppercase English word.
+            let already_english = self.raw_code.is_empty()
+                || self.raw_code.bytes().any(|b| b.is_ascii_uppercase())
+                || self.raw_code.len() > self.config.schema.max_code_len();
+            if already_english {
+                return self.push_code_observation(obs);
+            }
+            let mut commit_prefix = String::new();
+            let mut notice = String::new();
+            if let Some(first) = self.candidates.first().cloned() {
+                self.finalize_automatic_candidate(&first, timestamp_ms, &mut notice);
+                commit_prefix.push_str(&first.text);
+            }
+            self.clear_composition();
+            let mut out = self.push_code_observation(obs);
+            if !commit_prefix.is_empty() {
+                commit_prefix.push_str(&out.commit_text);
+                out.commit_text = commit_prefix;
+            }
+            if out.notice.is_empty() && !notice.is_empty() {
+                out.notice = notice;
+            }
             return out;
         }
 
@@ -1964,8 +1990,13 @@ impl JuxuEngine {
     }
 
     fn push_code_observation(&mut self, obs: KeyObs) -> EngineOutput {
+        let push_ch = if obs.is_upper {
+            obs.ch.to_ascii_uppercase() as char
+        } else {
+            obs.ch as char
+        };
         if self.is_pinyin_mode() {
-            self.raw_code.push(obs.ch as char);
+            self.raw_code.push(push_ch);
             self.observations.push(obs);
             self.page = 0;
             self.rebuild_pinyin_candidates();
@@ -1978,7 +2009,7 @@ impl JuxuEngine {
         let mut commit_prefix = String::new();
         let mut notice = String::new();
         if self.uses_spaceless() && obs.ch.is_ascii_lowercase() {
-            if obs.ch != b'z' || !self.config.z_omnipotent || !self.config.schema.supports_z_pinyin() {
+            if obs.is_upper || obs.ch != b'z' || !self.config.z_omnipotent || !self.config.schema.supports_z_pinyin() {
                 return self.push_spaceless(obs);
             }
             if self.is_composing() {
@@ -1995,9 +2026,25 @@ impl JuxuEngine {
         let schema_max_len = self.config.schema.max_code_len();
         let max_len = if is_z_pinyin_mode { 7 } else { schema_max_len };
 
+        // Check whether we are in (or smoothly transitioning into) an English word buffer
+        let already_english_buf = self.raw_code.bytes().any(|b| b.is_ascii_uppercase())
+            || self.raw_code.len() > max_len;
+        let next_combined = if !is_z_pinyin_mode && self.raw_code.len() >= max_len && self.raw_code.len() < 32 {
+            let mut s = self.raw_code.clone();
+            s.push(push_ch);
+            Some(s)
+        } else {
+            None
+        };
+        let extend_as_english = already_english_buf
+            || obs.is_upper
+            || next_combined
+                .as_deref()
+                .is_some_and(|comb| self.should_extend_fixed_as_english(comb));
+
         // Push-commit at max_len+1 (第五码/第六码自动顶字上屏) + LM Missed-Space Key-#5 Disambiguation!
         let mut resolved_via_fifth_split = false;
-        if self.raw_code.len() >= max_len {
+        if self.raw_code.len() >= max_len && !extend_as_english {
             if !is_z_pinyin_mode && self.config.fifth_code_push_commit {
                 if schema_max_len == 4
                     && self.raw_code.len() == 4
@@ -2022,21 +2069,22 @@ impl JuxuEngine {
         }
 
         if !resolved_via_fifth_split {
-            self.raw_code.push(obs.ch as char);
+            self.raw_code.push(push_ch);
             self.observations.push(obs);
             self.page = 0;
             self.rebuild_candidates();
         }
 
-        // Check max-code behaviors (4th code for Wubi/Xiaohe, 5th code for Cangjie; not z+pinyin)!
+        // Check max-code behaviors (4th code for Wubi/Xiaohe, 5th code for Cangjie; not z+pinyin or English buffer)!
         let now_z_pinyin = self.config.schema.supports_z_pinyin()
             && self.config.z_omnipotent
             && self.raw_code.starts_with('z')
             && !self.raw_code.starts_with("zz");
+        let now_has_upper = self.raw_code.bytes().any(|b| b.is_ascii_uppercase());
 
-        if !now_z_pinyin && self.raw_code.len() == schema_max_len {
+        if !now_z_pinyin && !now_has_upper && self.raw_code.len() == schema_max_len {
             // Seamless smart push-commit for high-confidence missed-space on an empty max-letter code!
-            if self.config.fifth_code_push_commit {
+            if self.config.fifth_code_push_commit && !self.looks_like_english_word_or_prefix(&self.raw_code) {
                 if let Some((cut, c1_text)) = self.pending_empty_split.take() {
                     if cut >= 1 && cut < self.raw_code.len() && self.observations.len() == self.raw_code.len() {
                         let tail_code = self.raw_code[cut..].to_string();
@@ -2061,6 +2109,18 @@ impl JuxuEngine {
             }
 
             if self.candidates.is_empty() {
+                // If an empty max-letter code matches a known English word or prefix (built-in or personal),
+                // keep it in English buffer instead of blocking/clearing the 4th key!
+                if self.looks_like_english_word_or_prefix(&self.raw_code) {
+                    self.build_english_buffer_candidates();
+                    return EngineOutput {
+                        consumed: true,
+                        commit_text: commit_prefix,
+                        preedit: self.preedit(),
+                        bell: false,
+                        notice,
+                    };
+                }
                 // Truly empty max-letter code (even typo rescue & missed-space found no match)
                 match self.config.fourth_empty_behavior {
                     FourthEmptyBehavior::Block => {
@@ -2110,8 +2170,165 @@ impl JuxuEngine {
         }
     }
 
+    fn looks_like_english_word_or_prefix(&self, code: &str) -> bool {
+        if code.len() < 2 || !code.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return false;
+        }
+        let lower = code.to_ascii_lowercase();
+        if self.user.lookup_english_exact(&lower).is_some() || self.user.has_english_prefix(&lower) {
+            return true;
+        }
+        if self.english_dict.lookup_with_morphology(&lower).is_some() {
+            return true;
+        }
+        self.english_dict
+            .prefix_info(&lower)
+            .is_some_and(|(w, _)| w >= 22_000)
+    }
+
+    fn should_extend_fixed_as_english(&self, combined: &str) -> bool {
+        if combined.len() < 5 || combined.len() > 32 || !combined.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return false;
+        }
+        let lower = combined.to_ascii_lowercase();
+        // If current candidates are already English (e.g. empty 4-code entered English buffer), always extend!
+        if self.candidates.first().is_some_and(|c| {
+            !c.text.is_empty() && c.text.bytes().all(|b| b.is_ascii_graphic())
+        }) {
+            return true;
+        }
+        if self.user.lookup_english_exact(&lower).is_some() || self.user.has_english_prefix(&lower) {
+            return true;
+        }
+        if self.english_dict.lookup_with_morphology(&lower).is_some() {
+            return true;
+        }
+        self.english_dict
+            .prefix_info(&lower)
+            .is_some_and(|(w, _)| w >= 28_000)
+    }
+
+    fn should_suppress_fourth_for_english(&self) -> bool {
+        if self.raw_code.bytes().any(|b| b.is_ascii_uppercase()) {
+            return true;
+        }
+        let lower = self.raw_code.to_ascii_lowercase();
+        let is_user_en =
+            self.user.lookup_english_exact(&lower).is_some() || self.user.has_english_prefix(&lower);
+        let is_dict_en = self
+            .english_dict
+            .lookup_exact(&lower)
+            .is_some_and(|e| e.weight >= 24_000);
+        let is_dict_prefix = self
+            .english_dict
+            .prefix_info(&lower)
+            .is_some_and(|(w, has_longer)| has_longer && w >= 34_000);
+        if !is_user_en && !is_dict_en && !is_dict_prefix {
+            return false;
+        }
+        // Context gating: if RWKV-7 strongly favors the #1 Chinese Wubi candidate in an active Chinese
+        // sentence, keep snappy 4th-code auto-commit!
+        if !self.recent_context.is_empty() {
+            if let Some(first) = self.candidates.first() {
+                if first.is_exact && !first.text.is_ascii() {
+                    if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
+                        let lp = nv.score_phrase_fast(&self.neural_tracker.active, &first.text);
+                        if lp > -3.2 {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn build_english_buffer_candidates(&mut self) {
+        self.candidates.clear();
+        if self.raw_code.is_empty() {
+            return;
+        }
+        let raw = self.raw_code.clone();
+        let lower = raw.to_ascii_lowercase();
+        let has_upper = raw.bytes().any(|b| b.is_ascii_uppercase());
+        let mut seen = HashSet::<String>::new();
+
+        // 1. Exact user-typed or canonical dictionary match goes #1
+        let primary = if has_upper {
+            raw.clone()
+        } else if let Some((disp, _)) = self.user.lookup_english_exact(&lower) {
+            disp.to_owned()
+        } else if let Some((disp, _, _)) = self.english_dict.lookup_with_morphology(&lower) {
+            disp
+        } else {
+            raw.clone()
+        };
+        if seen.insert(primary.clone()) {
+            self.candidates.push(Candidate {
+                text: primary,
+                matched_code: PackedCode::EMPTY,
+                comment: String::new(),
+                badge: CandidateBadge::None,
+                confidence: 0.95,
+                is_exact: true,
+            });
+        }
+        if seen.insert(raw.clone()) {
+            self.candidates.push(Candidate {
+                text: raw.clone(),
+                matched_code: PackedCode::EMPTY,
+                comment: String::new(),
+                badge: CandidateBadge::None,
+                confidence: 0.80,
+                is_exact: true,
+            });
+        }
+
+        // 2. Personal & built-in English prefix completions
+        for (disp, _) in self.user.lookup_english_prefix(&lower, 3) {
+            let text = if has_upper {
+                format_english_display(&raw, disp)
+            } else {
+                disp.to_owned()
+            };
+            if seen.insert(text.clone()) {
+                self.candidates.push(Candidate {
+                    text,
+                    matched_code: PackedCode::EMPTY,
+                    comment: String::new(),
+                    badge: CandidateBadge::None,
+                    confidence: 0.60,
+                    is_exact: true,
+                });
+            }
+        }
+        for e in self.english_dict.lookup_prefix(&lower, 5) {
+            let text = if e.key == lower && has_upper {
+                raw.clone()
+            } else {
+                e.display.to_owned()
+            };
+            if seen.insert(text.clone()) {
+                self.candidates.push(Candidate {
+                    text,
+                    matched_code: PackedCode::EMPTY,
+                    comment: String::new(),
+                    badge: CandidateBadge::None,
+                    confidence: 0.40,
+                    is_exact: true,
+                });
+            }
+            if self.candidates.len() >= 8 {
+                break;
+            }
+        }
+    }
+
     fn should_auto_commit_fourth(&self) -> bool {
-        if self.raw_code.contains('z') || self.hold_fourth_for_split {
+        if self.raw_code.contains('z')
+            || self.hold_fourth_for_split
+            || self.should_suppress_fourth_for_english()
+        {
             return false;
         }
         // Count exact candidates vs typo-corrected candidates
@@ -2143,6 +2360,8 @@ impl JuxuEngine {
             &self.observations,
             &Decoder {
                 dict,
+                english: &self.english_dict,
+                raw_code: &self.raw_code,
                 aux,
                 model,
                 config: &self.config,
@@ -2322,7 +2541,12 @@ impl JuxuEngine {
     }
 
     fn push_spaceless(&mut self, obs: KeyObs) -> EngineOutput {
-        self.raw_code.push(obs.ch as char);
+        let push_ch = if obs.is_upper {
+            obs.ch.to_ascii_uppercase() as char
+        } else {
+            obs.ch as char
+        };
+        self.raw_code.push(push_ch);
         self.observations.push(obs);
         self.page = 0;
         self.update_spaceless();
@@ -2330,6 +2554,7 @@ impl JuxuEngine {
         let stable = self.stream.take_stable_prefix(
             &self.raw_code,
             dict,
+            &self.english_dict,
             &self.user,
             &self.config,
         );
@@ -2509,6 +2734,36 @@ impl JuxuEngine {
                 }
             }
         }
+        // Learn any OOV or user-cased English words from committed text (pure English or mixed sentences)
+        if text.bytes().any(|b| b.is_ascii_alphabetic()) {
+            let mut start: Option<usize> = None;
+            for (idx, ch) in text.char_indices() {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+                    if start.is_none() {
+                        start = Some(idx);
+                    }
+                } else if let Some(s) = start.take() {
+                    let tok = &text[s..idx];
+                    if tok.len() >= 2 && tok.bytes().any(|b| b.is_ascii_alphabetic()) {
+                        let lower = tok.to_ascii_lowercase();
+                        let is_oov = self.english_dict.lookup_exact(&lower).is_none();
+                        if is_oov || tok.bytes().any(|b| b.is_ascii_uppercase()) {
+                            self.user.record_english_word(tok);
+                        }
+                    }
+                }
+            }
+            if let Some(s) = start {
+                let tok = &text[s..];
+                if tok.len() >= 2 && tok.bytes().any(|b| b.is_ascii_alphabetic()) {
+                    let lower = tok.to_ascii_lowercase();
+                    let is_oov = self.english_dict.lookup_exact(&lower).is_none();
+                    if is_oov || tok.bytes().any(|b| b.is_ascii_uppercase()) {
+                        self.user.record_english_word(tok);
+                    }
+                }
+            }
+        }
         self.last_committed = text.to_string();
         for ch in text.chars() {
             if is_cjk_char(ch) {
@@ -2609,6 +2864,7 @@ impl JuxuEngine {
         };
         let decoder = PinyinDecoder {
             dict: pdict,
+            english: &self.english_dict,
             aux: self.aux.as_ref(),
             model: nv,
             config: &self.config,
@@ -2649,6 +2905,14 @@ impl JuxuEngine {
         if self.uses_spaceless() {
             self.update_spaceless();
             self.show_spaceless_candidates();
+            return;
+        }
+
+        // Branch 0: Explicit uppercase or extended (> max_code_len) English word buffer in fixed-code mode
+        if self.raw_code.bytes().any(|b| b.is_ascii_uppercase())
+            || self.raw_code.len() > self.config.schema.max_code_len()
+        {
+            self.build_english_buffer_candidates();
             return;
         }
 
@@ -3366,6 +3630,38 @@ impl JuxuEngine {
                 best_exact_meta.as_ref(),
                 top_fuzzy_meta.as_ref(),
             );
+        }
+
+        // 5. Append matching English word candidate when a 3..=5 letter code matches an English word
+        //    (so users typing `rust`, `work`, `code`, `git` see English alongside Wubi without premature commit)
+        if self.raw_code.len() >= 3 && self.raw_code.bytes().all(|b| b.is_ascii_alphabetic()) {
+            let lower = self.raw_code.to_ascii_lowercase();
+            let en_disp = self
+                .user
+                .lookup_english_exact(&lower)
+                .map(|(d, _)| d.to_owned())
+                .or_else(|| {
+                    self.english_dict
+                        .lookup_exact(&lower)
+                        .filter(|e| e.weight >= 24_000)
+                        .map(|e| e.display.to_owned())
+                });
+            if let Some(disp) = en_disp {
+                if !self.candidates.iter().any(|c| c.text == disp) {
+                    let insert_pos = self.candidates.len().min(2);
+                    self.candidates.insert(
+                        insert_pos,
+                        Candidate {
+                            text: disp,
+                            matched_code: PackedCode::EMPTY,
+                            comment: String::new(),
+                            badge: CandidateBadge::None,
+                            confidence: 0.35,
+                            is_exact: true,
+                        },
+                    );
+                }
+            }
         }
     }
 

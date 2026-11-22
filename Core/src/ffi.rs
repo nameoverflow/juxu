@@ -1,5 +1,6 @@
 use crate::config::{JuxuConfig, InputSchema};
 use crate::engine::{EngineOutput, JuxuEngine};
+use crate::english::EnDictView;
 use crate::format::{AuxView, DictView};
 use crate::pinyin_dict::PinyinDictView;
 use crate::user_data::{TouchKeyOffset, UserStore, MAX_TOUCH_OFFSET};
@@ -206,6 +207,26 @@ pub extern "C" fn juxu_engine_load_pinyin_dict_mmap(
     match PinyinDictView::from_file(p) {
         Ok(dict) => {
             h.inner.load_pinyin_dict(dict);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn juxu_engine_load_english_dict_mmap(
+    handle: *mut JuxuEngineHandle,
+    path: *const c_char,
+) -> bool {
+    let Some(h) = (unsafe { handle.as_mut() }) else {
+        return false;
+    };
+    let Some(p) = cstr_to_str(path) else {
+        return false;
+    };
+    match EnDictView::open_mmap(p) {
+        Ok(dict) => {
+            h.inner.load_english_dict(dict);
             true
         }
         Err(_) => false,

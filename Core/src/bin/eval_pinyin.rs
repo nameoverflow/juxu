@@ -16,6 +16,7 @@ use std::time::Instant;
 use juxu_core::config::JuxuConfig;
 use juxu_core::format::AuxView;
 use juxu_core::neural::{NeuralContextTracker, NeuralView};
+use juxu_core::english::EnDictView;
 use juxu_core::pinyin::{decode_pinyin, PinyinDecoder, PinyinStream};
 use juxu_core::pinyin_dict::PinyinDictView;
 use juxu_core::typo::{KeyLayout, KeyObs};
@@ -196,6 +197,7 @@ fn make_obs(keys: &str, layout: &KeyLayout) -> Vec<KeyObs> {
             };
             KeyObs {
                 ch,
+                is_upper: b.is_ascii_uppercase(),
                 norm_x: cx,
                 norm_y: cy,
                 has_touch: false,
@@ -338,6 +340,8 @@ fn main() {
         beam_or_dict_miss: usize,
     }
 
+    let english_dict = EnDictView::open_mmap("Resources/Dicts/english.endict")
+        .unwrap_or_else(|_| EnDictView::builtin_default());
     let mut by_domain: BTreeMap<&str, DomainStat> = BTreeMap::new();
     let mut all_lat_us: Vec<u128> = Vec::new();
     let mut misses: Vec<(&str, &str, String, String, Option<usize>)> = Vec::new();
@@ -350,6 +354,7 @@ fn main() {
         let obs = make_obs(&keys_lower, &layout);
         let decoder = PinyinDecoder {
             dict: &dict,
+            english: &english_dict,
             aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
@@ -479,6 +484,7 @@ fn main() {
         cc_nll_chars += nc0;
         let dec0 = PinyinDecoder {
             dict: &dict,
+            english: &english_dict,
             aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
@@ -503,6 +509,7 @@ fn main() {
         let ctx_chars: Vec<char> = ctx_str.chars().collect();
         let dec1 = PinyinDecoder {
             dict: &dict,
+            english: &english_dict,
             aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
@@ -552,6 +559,7 @@ fn main() {
         let obs = make_obs(raw_keys, &layout);
         let dec = PinyinDecoder {
             dict: &dict,
+            english: &english_dict,
             aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
@@ -602,6 +610,7 @@ fn main() {
         let obs = make_obs(raw_keys, &layout);
         let dec = PinyinDecoder {
             dict: &dict,
+            english: &english_dict,
             aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
@@ -682,6 +691,7 @@ fn main() {
             let obs = make_obs(&py, &layout);
             let dec = PinyinDecoder {
                 dict: &dict,
+                english: &english_dict,
                 aux: Some(&aux),
                 model: Some(aux.neural_view().unwrap()),
                 config: &config,
@@ -739,6 +749,7 @@ fn main() {
         let obs = make_obs(&keys_lower, &layout);
         let dec = PinyinDecoder {
             dict: &dict,
+            english: &english_dict,
             aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,

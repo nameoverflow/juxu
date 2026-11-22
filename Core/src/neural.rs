@@ -1139,12 +1139,85 @@ impl<'a> NeuralView<'a> {
         }
     }
 
+    /// Fast self-normalized log-probability `log P(tok | state)` (`~0.02 µs`).
+    #[inline]
+    pub fn score_next_token(&self, state: &RwkvState, tok: usize) -> f32 {
+        let tok = if tok < self.offs.summary.vocab_size {
+            tok
+        } else {
+            TOK_UNK
+        };
+        let (e_row, e_sc, ub) = self.emb_row(tok);
+        int8_dot_row(e_row, e_sc, &state.p1_q, state.p1_scale) + ub
+    }
+
     /// Fast self-normalized log-probability `log P(ch | state)` (`~0.02 µs` — single `r=128` dot product!).
     #[inline]
     pub fn score_next_char(&self, state: &RwkvState, ch: char) -> f32 {
         let tok = self.char_to_token(ch);
-        let (e_row, e_sc, ub) = self.emb_row(tok);
-        int8_dot_row(e_row, e_sc, &state.p1_q, state.p1_scale) + ub
+        self.score_next_token(state, tok)
+    }
+
+    /// Fast zero-unroll estimate of `log P(latin_word | state)` for beam-search ranking.
+    /// Works seamlessly on both `WBLM0002` (native 4,096 ASCII subword Trie) and `WBLM0001` (`<ENG_NUM>`).
+    pub fn estimate_latin_logp(&self, state: &RwkvState, word: &str) -> f32 {
+        if word.is_empty() {
+            return 0.0;
+        }
+        if let Some(ref trie) = self.offs.ascii_trie {
+            let mut toks = Vec::with_capacity(4);
+            trie.encode_ascii(word.as_bytes(), &mut toks);
+            if let Some(&first_tok) = toks.first() {
+                let lp1 = self.score_next_token(state, first_tok);
+                if toks.len() == 1 {
+                    return lp1;
+                }
+                let extra: f32 = toks[1..]
+                    .iter()
+                    .map(|&t| self.emb_row(t).2.clamp(-10.0, 0.0))
+                    .sum();
+                return (lp1 + 0.55 * extra) / (toks.len() as f32).powf(0.45);
+            }
+        }
+        if self.offs.has_eng_num_token {
+            return self.score_next_token(state, TOK_ENG_NUM);
+        }
+        -3.2
+    }
+
+    /// Score and step a Latin/English word through the RWKV recurrent state.
+    pub fn score_and_step_latin(
+        &self,
+        base_state: &RwkvState,
+        word: &str,
+        compute_mtp: bool,
+        compute_key1: bool,
+    ) -> (f32, RwkvState) {
+        let mut st = base_state.clone();
+        if word.is_empty() {
+            return (0.0, st);
+        }
+        if let Some(ref trie) = self.offs.ascii_trie {
+            let mut toks = Vec::with_capacity(6);
+            trie.encode_ascii(word.as_bytes(), &mut toks);
+            if !toks.is_empty() {
+                let mut sum_lp = 0.0f32;
+                let last_idx = toks.len() - 1;
+                for (i, &tok) in toks.iter().enumerate() {
+                    sum_lp += self.score_next_token(&st, tok);
+                    let is_last = i == last_idx;
+                    self.step_token_heads(tok, &mut st, compute_mtp && is_last, compute_key1 && is_last);
+                }
+                let norm_lp = sum_lp / (toks.len() as f32).powf(0.45);
+                return (norm_lp, st);
+            }
+        }
+        if self.offs.has_eng_num_token {
+            let lp = self.score_next_token(&st, TOK_ENG_NUM);
+            self.step_token_heads(TOK_ENG_NUM, &mut st, compute_mtp, compute_key1);
+            return (lp, st);
+        }
+        (-3.2, st)
     }
 
     /// Compute `(self_norm_score, log_z)` over the full vocabulary for calibration & exact-NLL evaluation.

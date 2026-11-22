@@ -1,6 +1,7 @@
 pub mod code;
 pub mod config;
 pub mod engine;
+pub mod english;
 pub mod eval_log;
 pub mod ffi;
 pub mod format;
@@ -899,5 +900,162 @@ mod tests {
         let multi_out = engine.select_abs_candidate(tail_prefix_idx, 320).unwrap();
         assert_eq!(multi_out.commit_text, format!("中{}", tail_text));
         assert!(!engine.is_composing());
+    }
+
+    #[test]
+    fn english_dict_morphology_and_prefix() {
+        let dict = crate::english::EnDictView::builtin_default();
+        assert_eq!(dict.lookup_exact("ios").unwrap().display, "iOS");
+        assert_eq!(dict.lookup_exact("rust").unwrap().display, "Rust");
+        assert_eq!(dict.lookup_exact("github").unwrap().display, "GitHub");
+
+        // Inflectional morphology fallback (`coding` -> `code` + `ing`, `bugs` -> `bug` + `s`)
+        assert_eq!(dict.lookup_with_morphology("coding").unwrap().0, "coding");
+        assert_eq!(dict.lookup_with_morphology("bugs").unwrap().0, "bugs");
+        assert_eq!(dict.lookup_with_morphology("worked").unwrap().0, "worked");
+
+        // Prefix info & completions (`pyth` -> `Python`)
+        let (max_w, has_longer) = dict.prefix_info("pyth").unwrap();
+        assert!(max_w >= 40_000 && has_longer);
+        let comps = dict.lookup_prefix("pyth", 3);
+        assert!(comps.iter().any(|e| e.display == "Python"));
+    }
+
+    #[test]
+    fn mixed_pinyin_sentence_dict_oov_upper_and_user_learning() {
+        use crate::pinyin_dict::{serialize_pydict, PinyinDictBuildInput, PinyinDictView};
+
+        let pblob = serialize_pydict(PinyinDictBuildInput {
+            chars: vec![
+                ("wo".into(), "我".into(), 9_000_000, 0),
+                ("men".into(), "们".into(), 8_000_000, 0),
+                ("yong".into(), "用".into(), 8_500_000, 0),
+                ("xie".into(), "写".into(), 7_500_000, 0),
+                ("le".into(), "了".into(), 9_000_000, 0),
+                ("shu".into(), "输".into(), 6_000_000, 0),
+                ("ru".into(), "入".into(), 6_000_000, 0),
+                ("fa".into(), "法".into(), 6_000_000, 0),
+            ],
+            phrases: vec![
+                (vec!["wo".into(), "men".into()], "我们".into(), 5_000_000, 0),
+                (vec!["shu".into(), "ru".into(), "fa".into()], "输入法".into(), 4_000_000, 0),
+            ],
+        });
+        let pdict = PinyinDictView::from_bytes(pblob).unwrap();
+
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::Pinyin;
+        let mut engine = JuxuEngine::new(cfg);
+        engine.load_pinyin_dict(pdict);
+
+        // 1. Dictionary English word inside a Chinese sentence: `woyongrustxiele` -> `我用Rust写了`
+        for (i, ch) in "woyongrustxiele".chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 100 + i as u64 * 20);
+        }
+        assert_eq!(engine.all_candidates()[0].text, "我用Rust写了");
+        engine.clear_composition();
+
+        // 2. OOV impossible-pinyin English word inside a Chinese sentence: `woyongworktreexie` -> `我用worktree写`
+        for (i, ch) in "woyongworktreexie".chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 500 + i as u64 * 20);
+        }
+        assert_eq!(engine.all_candidates()[0].text, "我用worktree写");
+        engine.clear_composition();
+
+        // 3. Explicit uppercase OOV anchor inside a Chinese sentence (`'` boundary or CamelCase):
+        //    `woyongJuxu'xie` -> `我用Juxu写`
+        for (i, ch) in "woyongJuxu'xie".chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 900 + i as u64 * 20);
+        }
+        assert_eq!(engine.all_candidates()[0].text, "我用Juxu写");
+        engine.clear_composition();
+
+        // 4. Enter-to-commit OOV learning (`Juxu`), then lowercase mixed sentence without `'` (`woyongjuxuxie` -> `我用Juxu写`)
+        for (i, ch) in "Juxu".chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 1200 + i as u64 * 20);
+        }
+        let ret = engine.handle_key_event(crate::engine::KEY_RETURN, Some('\r'), false, 1300);
+        assert_eq!(ret.commit_text, "Juxu");
+        assert!(engine.user.lookup_english_exact("juxu").is_some());
+
+        for (i, ch) in "woyongjuxuxie".chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 1400 + i as u64 * 20);
+        }
+        assert_eq!(engine.all_candidates()[0].text, "我用Juxu写");
+        engine.clear_composition();
+
+        // 5. Pure Chinese & initial abbreviation sanity check (zero regression!)
+        for (i, ch) in "women".chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 1800 + i as u64 * 20);
+        }
+        assert_eq!(engine.all_candidates()[0].text, "我们");
+        engine.clear_composition();
+
+        for (i, ch) in "srf".chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 2000 + i as u64 * 20);
+        }
+        assert_eq!(engine.all_candidates()[0].text, "输入法");
+    }
+
+    #[test]
+    fn wubi_fixed_code_english_anti_premature_commit_and_upper_anchor() {
+        let mut entries = vec![
+            (PackedCode::from_ascii("lwgl").unwrap(), "输入".to_string(), 650_000_000, 0),
+            // Unique 4-code Wubi char that collides with the English word `rust`
+            (PackedCode::from_ascii("rust").unwrap(), "搎".to_string(), 50_000, ENTRY_FLAG_SINGLE_CHAR),
+        ];
+        entries.sort_by_key(|e| e.0);
+        let blob = serialize_wbdict(DictBuildInput {
+            schema_id: 86,
+            entries,
+            char_metas: Vec::new(),
+        });
+        let dict = DictView::from_bytes(blob).unwrap();
+
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::Wubi86;
+        cfg.fourth_code_auto_commit = true;
+        cfg.fifth_code_push_commit = true;
+        cfg.fourth_empty_behavior = FourthEmptyBehavior::Block;
+        let mut engine = JuxuEngine::new(cfg);
+        engine.load_dict(InputSchema::Wubi86, dict);
+
+        // 1. Normal 4-code Wubi word `lwgl` still auto-commits immediately at 4th key
+        let mut last_out = Default::default();
+        for (i, ch) in "lwgl".chars().enumerate() {
+            last_out = engine.handle_key_event(0, Some(ch), false, 100 + i as u64 * 20);
+        }
+        assert_eq!(last_out.commit_text, "输入");
+        assert!(!engine.is_composing());
+
+        // 2. Typing `rust` (collides with unique 4-code Wubi char) does NOT prematurely auto-commit!
+        for (i, ch) in "rust".chars().enumerate() {
+            last_out = engine.handle_key_event(0, Some(ch), false, 300 + i as u64 * 20);
+        }
+        assert!(last_out.commit_text.is_empty(), "rust must not prematurely auto-commit as Wubi");
+        assert!(engine.is_composing());
+        assert!(engine.all_candidates().iter().any(|c| c.text == "Rust"));
+        assert!(engine.all_candidates().iter().any(|c| c.text == "搎"));
+        engine.clear_composition();
+
+        // 3. Typing 6-letter `python` (`pyth` is empty in Wubi) does NOT block at 4th key or push-commit at 5th key!
+        for (i, ch) in "python".chars().enumerate() {
+            last_out = engine.handle_key_event(0, Some(ch), false, 500 + i as u64 * 20);
+            assert!(!last_out.bell, "python must not ring empty-code bell at char '{}'", ch);
+            assert!(last_out.commit_text.is_empty(), "python must not push-commit at char '{}'", ch);
+        }
+        assert_eq!(engine.all_candidates()[0].text, "Python");
+        let sp = engine.handle_key_event(KEY_SPACE, Some(' '), false, 700);
+        assert_eq!(sp.commit_text, "Python");
+
+        // 4. Uppercase OOV word `Juxu` in Wubi skips all auto-commit/block/push-commit and learns into UserStore
+        for (i, ch) in "Juxu".chars().enumerate() {
+            last_out = engine.handle_key_event(0, Some(ch), false, 900 + i as u64 * 20);
+            assert!(last_out.commit_text.is_empty());
+        }
+        assert_eq!(engine.all_candidates()[0].text, "Juxu");
+        let sp2 = engine.handle_key_event(KEY_SPACE, Some(' '), false, 1000);
+        assert_eq!(sp2.commit_text, "Juxu");
+        assert!(engine.user.lookup_english_exact("juxu").is_some());
     }
 }

@@ -651,6 +651,10 @@ public final class JuxuBridge: ObservableObject {
                         auxDictLoaded = true
                     }
                 }
+                let pEn = dir.appendingPathComponent("english.endict").path
+                if FileManager.default.fileExists(atPath: pEn) {
+                    _ = pEn.withCString { juxu_engine_load_english_dict_mmap(h, $0) }
+                }
                 #if os(macOS)
                 for sid: UInt32 in [86, 98, 6, 10, 33, 35, 36] {
                     ensureDictionaryLoaded(for: sid)
