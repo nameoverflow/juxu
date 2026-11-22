@@ -440,6 +440,10 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     var onKeySwipeUp: ((String) -> Void)?
     var onBackspaceSwipeArmed: ((IOSKeySpec, Bool) -> Void)?
     var onBackspaceSwipeUp: (() -> Void)?
+    var onBackspaceSwipeDownArmed: ((IOSKeySpec, Bool) -> Void)?
+    var onBackspaceSwipeDown: (() -> Void)?
+    /// Set on backspace touch-down: whether a cleared line can be restored at the cursor.
+    var canUndoLineClear: Bool = false
     var onAlternatesBegin: ((IOSKeySpec) -> Void)?
     var onAlternatesMove: ((CGPoint) -> Void)?
     var onAlternatesEnd: ((Bool) -> Void)?
@@ -463,6 +467,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
         let startedOnSpace: Bool
         var committedByRollover: Bool = false
         var swipeUpActive: Bool = false
+        var swipeDownActive: Bool = false
         var alternatesActive: Bool = false
     }
 
@@ -580,7 +585,11 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
         if state.alternatesActive {
             onAlternatesEnd?(true)
         } else if state.initialKey.kind == .backspace {
-            onKeyTouchUp?(state.initialKey, state.initialPoint)
+            if state.swipeUpActive || state.swipeDownActive {
+                onKeyTouchCancel?()
+            } else {
+                onKeyTouchUp?(state.initialKey, state.initialPoint)
+            }
         } else if state.swipeUpActive, let symbol = state.initialKey.swipeUpSymbol {
             onKeySwipeUp?(symbol)
         } else {
@@ -842,6 +851,16 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                     state.swipeUpActive = armed
                     onBackspaceSwipeArmed?(state.initialKey, armed)
                 }
+                let armedDown = canUndoLineClear && !armed && IOSSwipeUp.isActive(
+                    from: CGPoint(x: state.initialPoint.x, y: -state.initialPoint.y),
+                    to: CGPoint(x: pt.x, y: -pt.y),
+                    keyHeight: state.initialKey.frame.height * 1.4,
+                    wasActive: state.swipeDownActive
+                )
+                if armedDown != state.swipeDownActive {
+                    state.swipeDownActive = armedDown
+                    onBackspaceSwipeDownArmed?(state.initialKey, armedDown)
+                }
                 trackedTouches[id] = state
                 continue
             }
@@ -1060,6 +1079,11 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
             if state.initialKey.kind == .backspace, state.swipeUpActive {
                 syncKeycapPressStates()
                 onBackspaceSwipeUp?()
+                continue
+            }
+            if state.initialKey.kind == .backspace, state.swipeDownActive {
+                syncKeycapPressStates()
+                onBackspaceSwipeDown?()
                 continue
             }
 

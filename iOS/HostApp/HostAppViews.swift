@@ -415,7 +415,7 @@ public struct IOSHostRootView: View {
                         Divider()
                         iosToggleRow("长按弹出更多字符", sub: "长按字母键后左右滑动，选择声调字母、大小写、数字或符号", isOn: binding(\.keyLongPressAlternates))
                         Divider()
-                        iosToggleRow("退格键上滑清空本行", sub: "在退格键上滑，删除光标左侧到行首的内容；正在输入拼音时只清空拼音", isOn: binding(\.backspaceSwipeClear))
+                        iosToggleRow("退格键上滑清空本行", sub: "上滑删除光标左侧到行首的内容，下滑依次撤回；正在输入拼音时只清空拼音", isOn: binding(\.backspaceSwipeClear))
                     }
                     .padding(14)
                     .background(iosCardBackground)

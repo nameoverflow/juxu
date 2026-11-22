@@ -136,6 +136,45 @@ public enum IOSLineClear {
     }
 }
 
+/// Undo history for backspace line clears. A record is only restorable in the same document with the
+/// cursor back where the clear left it, so typing or moving elsewhere can never insert text in the wrong place.
+public struct IOSLineClearUndo: Equatable {
+    public struct Record: Equatable {
+        public let text: String
+        public let contextAfter: String
+        public let documentID: UUID?
+    }
+
+    public static let maxRecords = 8
+    public private(set) var records: [Record] = []
+
+    public init() {}
+
+    public mutating func push(text: String, contextBefore: String, documentID: UUID?) {
+        guard !text.isEmpty else { return }
+        records.append(Record(text: text, contextAfter: String(contextBefore.suffix(32)), documentID: documentID))
+        if records.count > Self.maxRecords {
+            records.removeFirst(records.count - Self.maxRecords)
+        }
+    }
+
+    public func restorableIndex(before: String, documentID: UUID?) -> Int? {
+        records.lastIndex { record in
+            guard record.documentID == documentID else { return false }
+            return record.contextAfter.isEmpty ? before.isEmpty : before.hasSuffix(record.contextAfter)
+        }
+    }
+
+    public mutating func take(before: String, documentID: UUID?) -> String? {
+        guard let index = restorableIndex(before: before, documentID: documentID) else { return nil }
+        return records.remove(at: index).text
+    }
+
+    public mutating func removeAll() {
+        records.removeAll()
+    }
+}
+
 /// Long-press character strip: tone-marked letters, uppercase, the swipe-up symbol and lowercase.
 public enum IOSKeyAlternates {
     private static let accents: [UInt8: [String]] = [

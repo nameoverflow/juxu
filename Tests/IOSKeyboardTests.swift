@@ -571,6 +571,28 @@ struct IOSKeyboardTests {
         let whole = IOSLineClear.Expected(previous: "abc", removed: 3)
         assert(!whole.isSatisfied(by: "abc") && !whole.isSatisfied(by: "ab"))
         assert(whole.isSatisfied(by: "上一行\n"))
+        // Backspace swipe-down restores line clears in reverse order
+        let docA = UUID(), docB = UUID()
+        var undo = IOSLineClearUndo()
+        undo.push(text: "第二行", contextBefore: "第一行\n", documentID: docA)
+        undo.push(text: "第三行", contextBefore: "第一行\n第二行\n", documentID: docA)
+        assert(undo.restorableIndex(before: "第一行\n第二行\n", documentID: docB) == nil, "Must not restore into another field")
+        assert(undo.restorableIndex(before: "别的内容", documentID: docA) == nil, "Must not restore after the text changed")
+        assert(undo.take(before: "第一行\n第二行\n", documentID: docA) == "第三行")
+        assert(undo.take(before: "第一行\n", documentID: docA) == "第二行")
+        assert(undo.take(before: "第一行\n", documentID: docA) == nil)
+        var startUndo = IOSLineClearUndo()
+        startUndo.push(text: "整行", contextBefore: "", documentID: docA)
+        assert(startUndo.restorableIndex(before: "有字", documentID: docA) == nil, "Document-start record needs an empty context")
+        assert(startUndo.take(before: "", documentID: docA) == "整行")
+        startUndo.push(text: "", contextBefore: "", documentID: docA)
+        assert(startUndo.records.isEmpty)
+        for i in 0..<(IOSLineClearUndo.maxRecords + 3) {
+            startUndo.push(text: "\(i)", contextBefore: "x", documentID: docA)
+        }
+        assert(startUndo.records.count == IOSLineClearUndo.maxRecords)
+        assert(startUndo.take(before: "x", documentID: docA) == "\(IOSLineClearUndo.maxRecords + 2)")
+
         var featurePrefs = JuxuPreferences()
         assert(!featurePrefs.keySwipeUpInput && !featurePrefs.keyLongPressAlternates && !featurePrefs.backspaceSwipeClear, "Gesture features are opt-in")
         featurePrefs.keySwipeUpInput = true
