@@ -347,6 +347,7 @@ public struct JuxuPreferences: Equatable, Sendable {
     public var wubiKeycapRadicals: Bool = false
     public var keySwipeUpInput: Bool = false
     public var keyLongPressAlternates: Bool = false
+    public var backspaceSwipeClear: Bool = false
     public var evalLogging: Bool = true
 
     public var fourthCodeAutoCommit: Bool = true
@@ -421,6 +422,7 @@ public struct JuxuPreferences: Equatable, Sendable {
         wubi_keycap_radicals = \(wubiKeycapRadicals)
         key_swipe_up_input = \(keySwipeUpInput)
         key_long_press_alternates = \(keyLongPressAlternates)
+        backspace_swipe_clear = \(backspaceSwipeClear)
         eval_logging = \(evalLogging)
 
         [typing]
@@ -504,6 +506,8 @@ public struct JuxuPreferences: Equatable, Sendable {
                 p.keySwipeUpInput = boolVal
             case (_, "key_long_press_alternates"):
                 p.keyLongPressAlternates = boolVal
+            case (_, "backspace_swipe_clear"):
+                p.backspaceSwipeClear = boolVal
             case (_, "eval_logging"):
                 p.evalLogging = boolVal
             case (_, "fourth_code_auto_commit"):
@@ -785,6 +789,7 @@ public final class JuxuBridge: ObservableObject {
             loaded.wubiKeycapRadicals = uiPrefs.wubiKeycapRadicals
             loaded.keySwipeUpInput = uiPrefs.keySwipeUpInput
             loaded.keyLongPressAlternates = uiPrefs.keyLongPressAlternates
+            loaded.backspaceSwipeClear = uiPrefs.backspaceSwipeClear
         }
         self.prefs = loaded
         ensureDictionaryLoaded(for: loaded.schemaId)

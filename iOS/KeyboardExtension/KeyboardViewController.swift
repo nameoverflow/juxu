@@ -106,6 +106,7 @@ public final class KeyboardViewController: UIInputViewController {
 
     public override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        clearLineGeneration &+= 1
         hasAppeared = false
         stopBackspaceRepeat()
         keyCanvas.resetAllTouches()
@@ -287,6 +288,9 @@ public final class KeyboardViewController: UIInputViewController {
         syncProxyTraits()
     }
 
+    /// Bumped to abandon an in-flight line clear as soon as anything else happens.
+    private var clearLineGeneration: UInt64 = 0
+
     private func presentCalloutIfAppropriate(for spec: IOSKeySpec) {
         guard !layoutEngine.isTrackpadActive else {
             calloutView.hideImmediately()
@@ -321,6 +325,7 @@ public final class KeyboardViewController: UIInputViewController {
     private func wireCallbacks() {
         keyCanvas.onKeyTouchDown = { [weak self] spec in
             guard let self else { return }
+            self.clearLineGeneration &+= 1
             self.feedback.fireKeyDown()
             switch spec.kind {
             case .letter, .symbol:
@@ -383,6 +388,34 @@ public final class KeyboardViewController: UIInputViewController {
             self.insertSymbol(symbol)
             self.layoutEngine.consumeOneShotShiftIfNeeded()
             self.syncEngineToUI()
+        }
+
+        keyCanvas.onBackspaceSwipeArmed = { [weak self] spec, armed in
+            guard let self else { return }
+            if armed {
+                self.stopBackspaceRepeat()
+                self.feedback.fireSoftStep(playClick: false)
+                let frameInRoot = self.keyCanvas.convert(spec.frame, to: self.inputView)
+                let isDocked = self.calloutView.present(
+                    label: "清空",
+                    keyId: spec.id,
+                    over: frameInRoot,
+                    dark: self.isDarkAppearance
+                )
+                self.keyCanvas.coveredCalloutKeyId = isDocked ? spec.id : nil
+            } else {
+                self.calloutView.hideImmediately()
+                self.keyCanvas.coveredCalloutKeyId = nil
+            }
+        }
+
+        keyCanvas.onBackspaceSwipeUp = { [weak self] in
+            guard let self else { return }
+            self.calloutView.hideImmediately()
+            self.keyCanvas.coveredCalloutKeyId = nil
+            self.stopBackspaceRepeat()
+            self.feedback.fireSoftStep(playClick: true)
+            self.clearCurrentLineBeforeCursor()
         }
 
         keyCanvas.onAlternatesBegin = { [weak self] spec in
@@ -798,6 +831,76 @@ public final class KeyboardViewController: UIInputViewController {
         bridge.setContext("")
     }
 
+    /// Backspace swipe-up: drops an active composition, otherwise deletes leftward to the start of the line.
+    /// The proxy only exposes a window of context, so long lines are deleted in verified batches.
+    private func clearCurrentLineBeforeCursor() {
+        markUserTypedForClipboard()
+        if !bridge.state.preedit.isEmpty {
+            compositionBaseContext = nil
+            cancelMarkedCode()
+            bridge.clearComposition()
+            syncEngineToUI()
+            return
+        }
+        autoSpaceTracker.invalidate()
+        clearLineGeneration &+= 1
+        clearLineStep(generation: clearLineGeneration, deleted: 0, waitedTicks: 0, expected: nil)
+    }
+
+    private func clearLineStep(
+        generation: UInt64,
+        deleted: Int,
+        waitedTicks: Int,
+        expected: IOSLineClear.Expected?
+    ) {
+        guard generation == clearLineGeneration else { return }
+        let before = textDocumentProxy.documentContextBeforeInput ?? ""
+        let finish = {
+            self.bridge.setContext(String((self.textDocumentProxy.documentContextBeforeInput ?? "").suffix(32)))
+            self.syncEngineToUI()
+        }
+        guard !before.isEmpty, deleted < 50_000 else {
+            finish()
+            return
+        }
+        // Never delete from a stale context: an old snapshot could cross the line break or another field.
+        if let expected, !expected.isSatisfied(by: before) {
+            guard waitedTicks < 8 else {
+                finish()
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.024) { [weak self] in
+                self?.clearLineStep(
+                    generation: generation,
+                    deleted: deleted,
+                    waitedTicks: waitedTicks + 1,
+                    expected: expected
+                )
+            }
+            return
+        }
+        let plan = IOSLineClear.plan(before: before, maxBatch: 128)
+        for _ in 0..<plan.deleteCount {
+            textDocumentProxy.deleteBackward()
+        }
+        guard !plan.reachesLineStart else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, generation == self.clearLineGeneration else { return }
+                finish()
+            }
+            return
+        }
+        let next = IOSLineClear.Expected(previous: before, removed: plan.deleteCount)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.024) { [weak self] in
+            self?.clearLineStep(
+                generation: generation,
+                deleted: deleted + plan.deleteCount,
+                waitedTicks: 0,
+                expected: next
+            )
+        }
+    }
+
     private func commitPendingFirstIfComposing() {
         guard !bridge.state.preedit.isEmpty else { return }
         let rawText = bridge.state.candidates.first?.text ?? bridge.state.preedit
@@ -1041,6 +1144,7 @@ public final class KeyboardViewController: UIInputViewController {
         layoutEngine.wubiKeycapRadicals = bridge.prefs.wubiKeycapRadicals
         layoutEngine.swipeUpInputEnabled = bridge.prefs.keySwipeUpInput
         keyCanvas.longPressAlternatesEnabled = bridge.prefs.keyLongPressAlternates
+        keyCanvas.backspaceSwipeClearEnabled = bridge.prefs.backspaceSwipeClear
         layoutEngine.isZLookupActive = bridge.prefs.isCangjieFamily
             && bridge.prefs.zOmnipotent
             && st.preedit.hasPrefix("z")

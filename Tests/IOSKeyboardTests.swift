@@ -557,12 +557,27 @@ struct IOSKeyboardTests {
         offLayout.swipeUpInputEnabled = false
         let offSnap = offLayout.computeLayout(in: CGSize(width: 440, height: 220))
         assert(offSnap.keys.allSatisfy { $0.swipeUpSymbol == nil }, "Switching swipe-up off must remove hints and gesture")
+        // Backspace swipe-up clears only the current line, left of the cursor
+        assert(IOSLineClear.plan(before: "第一行\n第二行", maxBatch: 128) == .init(deleteCount: 3, reachesLineStart: true))
+        assert(IOSLineClear.plan(before: "第一行\n", maxBatch: 128) == .init(deleteCount: 0, reachesLineStart: true), "Cursor at line start must not join lines")
+        assert(IOSLineClear.plan(before: "没有换行", maxBatch: 128) == .init(deleteCount: 4, reachesLineStart: false))
+        assert(IOSLineClear.plan(before: "a\r\nbc", maxBatch: 128) == .init(deleteCount: 2, reachesLineStart: true))
+        assert(IOSLineClear.plan(before: String(repeating: "字", count: 300), maxBatch: 128) == .init(deleteCount: 128, reachesLineStart: false))
+        assert(IOSLineClear.plan(before: "x\n" + String(repeating: "字", count: 200), maxBatch: 128).deleteCount == 128)
+        let partial = IOSLineClear.Expected(previous: "abcdef", removed: 2)
+        assert(partial.isSatisfied(by: "abcd") && partial.isSatisfied(by: "zzabcd"))
+        assert(!partial.isSatisfied(by: "abcdef") && !partial.isSatisfied(by: "abcde"), "Stale context must wait")
+        assert(!partial.isSatisfied(by: "other"), "Another field must not be deleted")
+        let whole = IOSLineClear.Expected(previous: "abc", removed: 3)
+        assert(!whole.isSatisfied(by: "abc") && !whole.isSatisfied(by: "ab"))
+        assert(whole.isSatisfied(by: "上一行\n"))
         var featurePrefs = JuxuPreferences()
-        assert(!featurePrefs.keySwipeUpInput && !featurePrefs.keyLongPressAlternates, "Gesture features are opt-in")
+        assert(!featurePrefs.keySwipeUpInput && !featurePrefs.keyLongPressAlternates && !featurePrefs.backspaceSwipeClear, "Gesture features are opt-in")
         featurePrefs.keySwipeUpInput = true
         featurePrefs.keyLongPressAlternates = true
+        featurePrefs.backspaceSwipeClear = true
         let featureRound = JuxuPreferences.fromTOML(featurePrefs.toTOML())
-        assert(featureRound.keySwipeUpInput && featureRound.keyLongPressAlternates)
+        assert(featureRound.keySwipeUpInput && featureRound.keyLongPressAlternates && featureRound.backspaceSwipeClear)
 
         print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi & T9 Pinyin tests passed!")
     }
