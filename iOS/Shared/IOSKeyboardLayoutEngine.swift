@@ -47,6 +47,8 @@ public enum IOSReturnKeyRole: Equatable {
 
 public enum IOSKeyKind: Equatable {
     case letter(UInt8) // 'a'..'z'
+    case t9Key(UInt8) // '1'..'9' ('1' = separator, '2'..'9' = T9 letter groups)
+    case t9Clear // 重输
     case symbol(String)
     case shift
     case backspace
@@ -110,6 +112,7 @@ public struct IOSKeyboardLayoutEngine: Equatable {
     public var shiftState: IOSShiftState = .lower
     public var asciiMode: Bool = false
     public var schemaId: UInt32 = 86
+    public var pinyinT9Layout: Bool = false
     public var cangjieKeycapRadicals: Bool = true
     public var wubiKeycapRadicals: Bool = false
     /// Temporarily show Latin `a..z` keycaps during Cangjie `z`+Pinyin reverse lookup.
@@ -125,6 +128,16 @@ public struct IOSKeyboardLayoutEngine: Equatable {
     public var nextKeyPriors: [UInt8] = Array(repeating: 100, count: 26)
     /// 52-element per-key adaptive touch offsets `[dx0, dy0, ..., dx25, dy25]` in normalized key-pitch units.
     public var touchOffsets: [Float] = Array(repeating: 0, count: 52)
+    /// 8-bit mask of valid next T9 keys (`'2'..='9'`, `0xFF` when unconstrained).
+    public var t9ValidNextMask: UInt8 = 0xFF
+    /// 8-element continuous neural prior weights for T9 keys `'2'..='9'`.
+    public var t9NextKeyPriors: [UInt8] = Array(repeating: 100, count: 8)
+    /// 16-element per-key adaptive touch offsets `[dx2, dy2, ..., dx9, dy9]` in normalized T9 key-pitch units.
+    public var t9TouchOffsets: [Float] = Array(repeating: 0, count: 16)
+
+    public var isT9PinyinActive: Bool {
+        plane == .letters && !asciiMode && schemaId == 20 && pinyinT9Layout
+    }
 
     private var lastShiftTapTime: TimeInterval = 0
 
@@ -170,7 +183,7 @@ public struct IOSKeyboardLayoutEngine: Equatable {
             return "EN"
         }
         switch schemaId {
-        case 20: return "拼"
+        case 20: return pinyinT9Layout ? "九" : "拼"
         case 21: return "双"
         case 10: return "鹤"
         case 33, 35, 36: return "仓"
@@ -187,6 +200,13 @@ public struct IOSKeyboardLayoutEngine: Equatable {
         public let pitchX: Float
         public let pitchY: Float
         public let bottomRowMinY: CGFloat
+        public let isT9Layout: Bool
+        public let t9SidebarFrame: CGRect
+        public let t9Centers16: [Float]
+        public let t9OriginX: Float
+        public let t9OriginY: Float
+        public let t9PitchX: Float
+        public let t9PitchY: Float
     }
 
     public func computeLayout(in size: CGSize) -> LayoutSnapshot {
@@ -220,6 +240,19 @@ public struct IOSKeyboardLayoutEngine: Equatable {
             topPad + pitchY * 2.0,
             topPad + pitchY * 3.0,
         ]
+
+        if isT9PinyinActive {
+            return computeT9Layout(
+                w: w,
+                h: h,
+                outerX: outerX,
+                gapX: gapX,
+                rowGap: rowGap,
+                keyH: keyH,
+                pitchY: pitchY,
+                rowY: rowY
+            )
+        }
 
         // Precompute exact Row 1 (`a..l`) x-origins because Row 2 (`z..m`) and Row 3 (`Space`/`Return`) lock to them!
         let row1StartX = outerX + pitchX * 0.5
@@ -472,7 +505,174 @@ public struct IOSKeyboardLayoutEngine: Equatable {
             originY: Float(qMidY),
             pitchX: Float(pitchX),
             pitchY: Float(pitchY),
-            bottomRowMinY: rowY[3]
+            bottomRowMinY: rowY[3],
+            isT9Layout: false,
+            t9SidebarFrame: .zero,
+            t9Centers16: Self.canonicalT9Centers16,
+            t9OriginX: 0,
+            t9OriginY: 0,
+            t9PitchX: 1,
+            t9PitchY: 1
+        )
+    }
+
+    private static let canonicalT9Centers16: [Float] = [
+        1, 0, // 2: ABC
+        2, 0, // 3: DEF
+        0, 1, // 4: GHI
+        1, 1, // 5: JKL
+        2, 1, // 6: MNO
+        0, 2, // 7: PQRS
+        1, 2, // 8: TUV
+        2, 2, // 9: WXYZ
+    ]
+
+    /// Native iOS 9-key T9 Pinyin 5-column × 4-row grid inside the fixed 220pt key canvas:
+    /// - Col 0 (left): Row 0..2 vertical punctuation/syllable filter sidebar (`t9SidebarFrame`), Row 3 `123`
+    /// - Col 1..3 (center 3x3): `1(分词)` `2(ABC)` `3(DEF)` / `4(GHI)` `5(JKL)` `6(MNO)` / `7(PQRS)` `8(TUV)` `9(WXYZ)`
+    ///   and Row 3: `中/英` (or `Globe`) + wide `空格`
+    /// - Col 4 (right): Row 0 `⌫`, Row 1 `重输`, Row 2..3 tall 2-row `Return`
+    private func computeT9Layout(
+        w: CGFloat,
+        h: CGFloat,
+        outerX: CGFloat,
+        gapX: CGFloat,
+        rowGap: CGFloat,
+        keyH: CGFloat,
+        pitchY: CGFloat,
+        rowY: [CGFloat]
+    ) -> LayoutSnapshot {
+        let usableW = w - outerX * 2.0 - gapX * 4.0
+        let sideW = floor(usableW * 0.175)
+        let midW = (usableW - sideW * 2.0) / 3.0
+        let col0X = outerX
+        let col1X = col0X + sideW + gapX
+        let col2X = col1X + midW + gapX
+        let col3X = col2X + midW + gapX
+        let col4X = col3X + midW + gapX
+        let midPitchX = midW + gapX
+
+        let sidebarFrame = CGRect(
+            x: col0X,
+            y: rowY[0],
+            width: sideW,
+            height: rowY[2] + keyH - rowY[0]
+        )
+
+        var specs: [IOSKeySpec] = []
+
+        // Center 3x3 T9 keypad
+        let t9Grid: [(UInt8, String, String, CGFloat, CGFloat)] = [
+            (UInt8(ascii: "1"), "分词", "", col1X, rowY[0]),
+            (UInt8(ascii: "2"), "ABC", "2", col2X, rowY[0]),
+            (UInt8(ascii: "3"), "DEF", "3", col3X, rowY[0]),
+            (UInt8(ascii: "4"), "GHI", "4", col1X, rowY[1]),
+            (UInt8(ascii: "5"), "JKL", "5", col2X, rowY[1]),
+            (UInt8(ascii: "6"), "MNO", "6", col3X, rowY[1]),
+            (UInt8(ascii: "7"), "PQRS", "7", col1X, rowY[2]),
+            (UInt8(ascii: "8"), "TUV", "8", col2X, rowY[2]),
+            (UInt8(ascii: "9"), "WXYZ", "9", col3X, rowY[2]),
+        ]
+        for (digit, label, sub, x, y) in t9Grid {
+            specs.append(
+                IOSKeySpec(
+                    id: "T9_\(digit)",
+                    kind: .t9Key(digit),
+                    frame: CGRect(x: x, y: y, width: midW, height: keyH),
+                    primaryLabel: isTrackpadActive ? "" : label,
+                    cornerSubscript: isTrackpadActive || sub.isEmpty ? nil : sub
+                )
+            )
+        }
+
+        // Right column: Backspace (Row 0), Clear/重输 (Row 1), Return (Row 2..3 tall)
+        specs.append(
+            IOSKeySpec(
+                id: "K_backspace",
+                kind: .backspace,
+                frame: CGRect(x: col4X, y: rowY[0], width: sideW, height: keyH),
+                primaryLabel: "",
+                systemSymbol: isTrackpadActive ? nil : "delete.backward"
+            )
+        )
+        specs.append(
+            IOSKeySpec(
+                id: "T9_clear",
+                kind: .t9Clear,
+                frame: CGRect(x: col4X, y: rowY[1], width: sideW, height: keyH),
+                primaryLabel: isTrackpadActive ? "" : "重输"
+            )
+        )
+        let useBlue = returnRole.isBlueProminent
+        specs.append(
+            IOSKeySpec(
+                id: "B_return",
+                kind: .returnKey,
+                frame: CGRect(x: col4X, y: rowY[2], width: sideW, height: keyH * 2.0 + rowGap),
+                primaryLabel: isTrackpadActive ? "" : (useBlue ? returnRole.title : ""),
+                systemSymbol: isTrackpadActive ? nil : (useBlue ? nil : "return.left"),
+                isBlueAccent: useBlue
+            )
+        )
+
+        // Bottom row: [123] [中/英 or Globe] [Space spanning Col 2..3]
+        specs.append(
+            IOSKeySpec(
+                id: "B_plane",
+                kind: .planeSwitch(.numbers, label: "123"),
+                frame: CGRect(x: col0X, y: rowY[3], width: sideW, height: keyH),
+                primaryLabel: isTrackpadActive ? "" : "123"
+            )
+        )
+        if showInlineGlobeKey {
+            specs.append(
+                IOSKeySpec(
+                    id: "B_globe",
+                    kind: .globe,
+                    frame: CGRect(x: col1X, y: rowY[3], width: midW, height: keyH),
+                    primaryLabel: "",
+                    systemSymbol: isTrackpadActive ? nil : "globe"
+                )
+            )
+        } else {
+            specs.append(
+                IOSKeySpec(
+                    id: "B_mode",
+                    kind: .modeToggle,
+                    frame: CGRect(x: col1X, y: rowY[3], width: midW, height: keyH),
+                    primaryLabel: isTrackpadActive ? "" : "中",
+                    secondaryInlineLabel: isTrackpadActive ? nil : "/英"
+                )
+            )
+        }
+        specs.append(
+            IOSKeySpec(
+                id: "B_space",
+                kind: .space,
+                frame: CGRect(x: col2X, y: rowY[3], width: midW * 2.0 + gapX, height: keyH),
+                primaryLabel: "",
+                cornerSubscript: spaceCornerTag
+            )
+        )
+
+        let k1MidX = col1X + midW * 0.5
+        let k1MidY = rowY[0] + keyH * 0.5
+        return LayoutSnapshot(
+            bounds: CGRect(origin: .zero, size: CGSize(width: w, height: h)),
+            keys: specs,
+            centers52: [Float](repeating: 0, count: 52),
+            originX: Float(k1MidX),
+            originY: Float(k1MidY),
+            pitchX: Float(midPitchX),
+            pitchY: Float(pitchY),
+            bottomRowMinY: rowY[3],
+            isT9Layout: true,
+            t9SidebarFrame: sidebarFrame,
+            t9Centers16: Self.canonicalT9Centers16,
+            t9OriginX: Float(k1MidX),
+            t9OriginY: Float(k1MidY),
+            t9PitchX: Float(midPitchX),
+            t9PitchY: Float(pitchY)
         )
     }
 
@@ -492,17 +692,20 @@ public struct IOSKeyboardLayoutEngine: Equatable {
         in snapshot: LayoutSnapshot,
         validNextMask: UInt32 = 0x03FF_FFFF,
         nextKeyPriors: [UInt8] = [],
-        touchOffsets: [Float] = []
+        touchOffsets: [Float] = [],
+        t9ValidNextMask: UInt8 = 0xFF,
+        t9NextKeyPriors: [UInt8] = [],
+        t9TouchOffsets: [Float] = []
     ) -> IOSKeySpec? {
         guard snapshot.bounds.insetBy(dx: -18, dy: -28).contains(point) else {
             return nil
         }
 
-        // 1. Functional keys (`Space`, `⌫`, `⇧`, `123`, `中/英`, `Globe`, `Return`) are checked against
-        //    unbiased `point` first so top-edge taps on `⌫`/`⇧`/`Space` are never pulled up into letters.
+        // 1. Functional keys (`Space`, `⌫`, `⇧`, `123`, `中/英`, `Globe`, `Return`, `重输`) are checked against
+        //    unbiased `point` first so top-edge taps on functional keys are never pulled up into letters/T9.
         for k in snapshot.keys {
             switch k.kind {
-            case .letter, .symbol:
+            case .letter, .t9Key, .symbol:
                 continue
             default:
                 if k.frame.contains(point) {
@@ -515,9 +718,15 @@ public struct IOSKeyboardLayoutEngine: Equatable {
         //    `Space`/`123`/`Return`, so top-edge Space taps never get pulled into `c`/`v`/`b`/`n`!).
         let qPt = compensatedLetterPoint(point, in: snapshot)
 
-        let hasMaskWeights = (validNextMask != 0x03FF_FFFF) && (validNextMask != 0)
-        let hasNeuralPriors = (nextKeyPriors.count == 26) && nextKeyPriors.contains(where: { $0 != 100 })
-        let hasTouchOffsets = (touchOffsets.count == 52) && touchOffsets.contains(where: { abs($0) > 1e-4 })
+        let hasMaskWeights = snapshot.isT9Layout
+            ? (t9ValidNextMask != 0xFF && t9ValidNextMask != 0)
+            : ((validNextMask != 0x03FF_FFFF) && (validNextMask != 0))
+        let hasNeuralPriors = snapshot.isT9Layout
+            ? ((t9NextKeyPriors.count == 8) && t9NextKeyPriors.contains(where: { $0 != 100 }))
+            : ((nextKeyPriors.count == 26) && nextKeyPriors.contains(where: { $0 != 100 }))
+        let hasTouchOffsets = snapshot.isT9Layout
+            ? ((t9TouchOffsets.count == 16) && t9TouchOffsets.contains(where: { abs($0) > 1e-4 }))
+            : ((touchOffsets.count == 52) && touchOffsets.contains(where: { abs($0) > 1e-4 }))
         let hasDynamicWeights = hasMaskWeights || hasNeuralPriors || hasTouchOffsets
 
         let personalShift: (UInt8) -> (CGFloat, CGFloat) = { ascii in
@@ -525,6 +734,13 @@ public struct IOSKeyboardLayoutEngine: Equatable {
             let idx = Int(ascii - 97)
             let dx = CGFloat(max(-0.20, min(0.20, touchOffsets[idx * 2]))) * CGFloat(snapshot.pitchX)
             let dy = CGFloat(max(-0.20, min(0.20, touchOffsets[idx * 2 + 1]))) * CGFloat(snapshot.pitchY)
+            return (dx, dy)
+        }
+        let personalT9Shift: (UInt8) -> (CGFloat, CGFloat) = { digit in
+            guard hasTouchOffsets, digit >= UInt8(ascii: "2"), digit <= UInt8(ascii: "9") else { return (0, 0) }
+            let idx = Int(digit - UInt8(ascii: "2"))
+            let dx = CGFloat(max(-0.20, min(0.20, t9TouchOffsets[idx * 2]))) * CGFloat(snapshot.t9PitchX)
+            let dy = CGFloat(max(-0.20, min(0.20, t9TouchOffsets[idx * 2 + 1]))) * CGFloat(snapshot.t9PitchY)
             return (dx, dy)
         }
 
@@ -542,6 +758,12 @@ public struct IOSKeyboardLayoutEngine: Equatable {
                 case .letter(let ascii):
                     let (px, py) = personalShift(ascii)
                     let core = k.frame.offsetBy(dx: px * 0.5, dy: py * 0.5).insetBy(dx: 3.0, dy: 2.6)
+                    if core.contains(qPt) {
+                        return k
+                    }
+                case .t9Key(let digit):
+                    let (px, py) = personalT9Shift(digit)
+                    let core = k.frame.offsetBy(dx: px * 0.5, dy: py * 0.5).insetBy(dx: 4.5, dy: 2.8)
                     if core.contains(qPt) {
                         return k
                     }
@@ -591,8 +813,31 @@ public struct IOSKeyboardLayoutEngine: Equatable {
                     width: k.frame.width,
                     height: k.frame.height + 12.0
                 )
-            case .shift, .backspace:
+            case .shift, .backspace, .t9Clear:
                 evalPt = point
+            case .t9Key(let digit) where hasDynamicWeights && digit >= UInt8(ascii: "2") && digit <= UInt8(ascii: "9"):
+                let (px, py) = personalT9Shift(digit)
+                effRect = effRect.offsetBy(dx: px, dy: py)
+                let idx = Int(digit - UInt8(ascii: "2"))
+                let bit = UInt8(1) << UInt8(idx)
+                let pVal = (t9NextKeyPriors.count == 8) ? Int(t9NextKeyPriors[idx]) : ((t9ValidNextMask & bit) != 0 ? 100 : 0)
+                if (hasMaskWeights && (t9ValidNextMask & bit) == 0) || pVal == 0 {
+                    effRect = effRect.insetBy(dx: 3.2, dy: 2.4)
+                    deadKeyPenalty = 4.2
+                } else {
+                    let bias = CGFloat(pVal - 100) / 25.0
+                    let expX: CGFloat = hasMaskWeights
+                        ? max(1.0, min(5.2, 3.6 + bias * 1.0))
+                        : max(-1.5, min(3.4, bias * 1.3))
+                    let expY: CGFloat = hasMaskWeights
+                        ? max(0.8, min(3.8, 2.8 + bias * 0.7))
+                        : max(-1.0, min(2.4, bias * 0.9))
+                    deadKeyPenalty = -bias * (hasMaskWeights ? 1.05 : 0.8)
+                    effRect = effRect.insetBy(dx: -expX, dy: -expY)
+                    if effRect.maxY > maxLetterBottomY {
+                        effRect.size.height = max(k.frame.height, maxLetterBottomY - effRect.minY)
+                    }
+                }
             case .letter(let ascii) where hasDynamicWeights && ascii >= 97 && ascii <= 122:
                 let (px, py) = personalShift(ascii)
                 effRect = effRect.offsetBy(dx: px, dy: py)

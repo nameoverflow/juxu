@@ -5,13 +5,14 @@ use crate::format::{AuxView, DictView, ENTRY_FLAG_SYMBOL};
 use crate::neural::{NeuralContextTracker, NeuralView, RwkvState};
 use crate::personalization::Context as PersonalContext;
 use crate::pinyin::{
-    pinyin_next_key_priors, shuangpin_next_key_priors, PinyinCandidate, PinyinDecoder, PinyinPath,
-    PinyinStream,
+    pinyin_next_key_priors, shuangpin_next_key_priors, t9_next_key_priors, t9_syllable_options,
+    PinyinCandidate, PinyinDecoder, PinyinPath, PinyinStream,
 };
 use crate::pinyin_dict::PinyinDictView;
 use crate::spaceless::{Decoder, Segment, Stream};
 use crate::typo::{
-    generate_hypotheses_with_options, softmax_confidences, CorrectionKind, KeyLayout, KeyObs,
+    generate_hypotheses_with_options, letter_to_t9_digit, softmax_confidences,
+    syllable_to_t9_digits, CorrectionKind, KeyLayout, KeyObs,
 };
 use crate::user_data::UserStore;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -134,6 +135,8 @@ pub struct JuxuEngine {
     pinyin_stream: PinyinStream,
     pinyin_candidates: Vec<PinyinCandidate>,
     pinyin_paths: Vec<PinyinPath>,
+    /// Locked prefix syllables selected from the T9 sidebar: `(consumed_key_count, syllable_str)`.
+    t9_locked_syls: Vec<(usize, String)>,
     committed_stream_codes: VecDeque<String>,
     observations: Vec<KeyObs>,
     candidates: Vec<Candidate>,
@@ -180,6 +183,7 @@ impl JuxuEngine {
             pinyin_stream: PinyinStream::default(),
             pinyin_candidates: Vec::new(),
             pinyin_paths: Vec::new(),
+            t9_locked_syls: Vec::new(),
             committed_stream_codes: VecDeque::new(),
             observations: Vec::new(),
             candidates: Vec::new(),
@@ -967,6 +971,96 @@ impl JuxuEngine {
         self.config.schema.is_pinyin() && self.pinyin_dict.is_some()
     }
 
+    #[inline]
+    pub fn is_t9_pinyin_mode(&self) -> bool {
+        self.config.schema == InputSchema::Pinyin
+            && self.config.pinyin_t9_layout
+            && self.pinyin_dict.is_some()
+    }
+
+    fn t9_locked_key_span(&self) -> usize {
+        let n = self.observations.len();
+        let mut pos = 0usize;
+        for (klen, _) in &self.t9_locked_syls {
+            while pos < n && self.observations[pos].ch == b'\'' {
+                pos += 1;
+            }
+            if pos >= n || *klen == 0 {
+                break;
+            }
+            pos = (pos + *klen).min(n);
+            if pos < n && self.observations[pos].ch == b'\'' {
+                pos += 1;
+            }
+        }
+        pos
+    }
+
+    pub fn t9_syllable_options(&self) -> Vec<String> {
+        if !self.is_t9_pinyin_mode() || self.observations.is_empty() {
+            return Vec::new();
+        }
+        let Some(ref pdict) = self.pinyin_dict else {
+            return Vec::new();
+        };
+        t9_syllable_options(
+            &self.observations,
+            &self.t9_locked_syls,
+            pdict,
+            &self.pinyin_paths,
+        )
+    }
+
+    pub fn t9_locked_prefix(&self) -> String {
+        self.t9_locked_syls
+            .iter()
+            .map(|(_, s)| s.as_str())
+            .collect::<Vec<_>>()
+            .join("'")
+    }
+
+    pub fn t9_next_key_mask_and_priors(&self) -> (u8, [u8; 8]) {
+        if !self.is_t9_pinyin_mode() || self.ascii_mode {
+            return (0xFF, [100u8; 8]);
+        }
+        let Some(ref pdict) = self.pinyin_dict else {
+            return (0xFF, [100u8; 8]);
+        };
+        let rwkv_starts = self.rwkv_pinyin_start_priors(pdict);
+        let locked_span = self.t9_locked_key_span();
+        t9_next_key_priors(&self.raw_code, locked_span, pdict, rwkv_starts.as_ref())
+    }
+
+    /// Lock a candidate syllable from the T9 left sidebar at the current unlocked position.
+    pub fn lock_t9_syllable(&mut self, syl: &str) -> EngineOutput {
+        if !self.is_t9_pinyin_mode() || self.observations.is_empty() {
+            return EngineOutput::default();
+        }
+        let Some(ref pdict) = self.pinyin_dict else {
+            return EngineOutput::default();
+        };
+        let clean = syl.trim().to_ascii_lowercase();
+        if pdict.lookup_syllable_id(&clean).is_none() {
+            return EngineOutput::default();
+        }
+        let klen = syllable_to_t9_digits(&clean).len();
+        if klen == 0 {
+            return EngineOutput::default();
+        }
+        let start = self.t9_locked_key_span();
+        if start + klen > self.observations.len() {
+            return EngineOutput::default();
+        }
+        self.t9_locked_syls.push((klen, clean));
+        self.page = 0;
+        self.rebuild_pinyin_candidates();
+        EngineOutput {
+            consumed: true,
+            preedit: self.preedit(),
+            ..Default::default()
+        }
+    }
+
     fn uses_spaceless(&self) -> bool {
         !self.config.schema.is_pinyin()
             && self.config.spaceless
@@ -1018,6 +1112,7 @@ impl JuxuEngine {
         self.pinyin_stream.clear();
         self.pinyin_candidates.clear();
         self.pinyin_paths.clear();
+        self.t9_locked_syls.clear();
         self.committed_stream_codes.clear();
         self.observations.clear();
         self.candidates.clear();
@@ -1192,7 +1287,56 @@ impl JuxuEngine {
                 self.recent_context.drain(..drain_n);
             }
             if self.config.typo.enabled && self.config.typo.touch_hitbox_adapt {
-                if !pc_boundaries.is_empty() {
+                if self.is_t9_pinyin_mode() {
+                    if !pc_boundaries.is_empty() {
+                        let mut seg_start = 0usize;
+                        for b in &pc_boundaries {
+                            let seg_end = b.keys.min(consumed);
+                            if seg_end > seg_start
+                                && (b.correction == CorrectionKind::Exact
+                                    || (explicit && b.correction != CorrectionKind::Transposition))
+                            {
+                                let target_digits: Vec<u8> = b
+                                    .syl_display
+                                    .bytes()
+                                    .filter_map(letter_to_t9_digit)
+                                    .collect();
+                                let seg_obs: Vec<&KeyObs> = self.observations[seg_start..seg_end]
+                                    .iter()
+                                    .filter(|o| (b'2'..=b'9').contains(&o.ch))
+                                    .collect();
+                                if target_digits.len() == seg_obs.len() {
+                                    for (obs, &target_digit) in
+                                        seg_obs.iter().zip(target_digits.iter())
+                                    {
+                                        if obs.has_touch {
+                                            let (cx, cy) = self.key_layout.t9_center_of(target_digit);
+                                            self.user.touch_profile.observe_t9(
+                                                target_digit,
+                                                obs.norm_x - cx,
+                                                obs.norm_y - cy,
+                                            );
+                                            self.user.dirty = true;
+                                        }
+                                    }
+                                }
+                            }
+                            seg_start = seg_end;
+                        }
+                    } else if pc_is_exact {
+                        for obs in self.observations.iter().take(consumed) {
+                            if obs.has_touch && (b'2'..=b'9').contains(&obs.ch) {
+                                let (cx, cy) = self.key_layout.t9_center_of(obs.ch);
+                                self.user.touch_profile.observe_t9(
+                                    obs.ch,
+                                    obs.norm_x - cx,
+                                    obs.norm_y - cy,
+                                );
+                                self.user.dirty = true;
+                            }
+                        }
+                    }
+                } else if !pc_boundaries.is_empty() {
                     // Learn touch offsets against the *corrected* syllable letters (not raw mis-tapped keys!)
                     let mut seg_start = 0usize;
                     for b in &pc_boundaries {
@@ -1239,6 +1383,19 @@ impl JuxuEngine {
                 }
             }
             if consumed > 0 && consumed < self.observations.len() {
+                // Trim consumed locked T9 prefix syllables if any
+                if !self.t9_locked_syls.is_empty() {
+                    let mut rem = consumed;
+                    while let Some((klen, _)) = self.t9_locked_syls.first() {
+                        if *klen <= rem {
+                            rem -= *klen;
+                            self.t9_locked_syls.remove(0);
+                        } else {
+                            self.t9_locked_syls.clear();
+                            break;
+                        }
+                    }
+                }
                 self.raw_code.drain(..consumed);
                 self.observations.drain(..consumed);
                 self.pinyin_stream.clear();
@@ -1728,6 +1885,46 @@ impl JuxuEngine {
         self.push_code_observation(obs)
     }
 
+    /// Push a T9 9-key Pinyin touch tap (`'2'..='9'` or `'\''` separator) with view/normalized coordinates.
+    pub fn push_touch_t9(
+        &mut self,
+        reported_ch: u8,
+        view_x: f32,
+        view_y: f32,
+        is_normalized: bool,
+        timestamp_ms: u64,
+    ) -> EngineOutput {
+        if reported_ch == b'\'' || reported_ch == b'1' {
+            if self.raw_code.is_empty() || self.raw_code.ends_with('\'') {
+                return EngineOutput {
+                    consumed: true,
+                    preedit: self.preedit(),
+                    ..Default::default()
+                };
+            }
+            let obs = KeyObs::physical(b'\'', timestamp_ms);
+            return self.push_code_observation(obs);
+        }
+        if !(b'2'..=b'9').contains(&reported_ch) {
+            return EngineOutput::default();
+        }
+        let (nx, ny) = if is_normalized {
+            (view_x, view_y)
+        } else {
+            self.key_layout.t9_view_to_norm(view_x, view_y)
+        };
+        let adapted = if !is_normalized {
+            reported_ch
+        } else if self.config.typo.enabled && self.config.typo.touch_hitbox_adapt {
+            self.key_layout
+                .nearest_t9_key(nx, ny, &self.user.touch_profile, true)
+        } else {
+            reported_ch
+        };
+        let obs = KeyObs::touch(adapted, nx, ny, timestamp_ms);
+        self.push_code_observation(obs)
+    }
+
     /// Unified macOS / physical keyboard event entry point.
     pub fn handle_key_event(
         &mut self,
@@ -1763,6 +1960,11 @@ impl JuxuEngine {
                 }
                 self.raw_code.pop();
                 self.observations.pop();
+                while !self.t9_locked_syls.is_empty()
+                    && self.t9_locked_key_span() > self.observations.len()
+                {
+                    self.t9_locked_syls.pop();
+                }
                 self.page = 0;
                 if self.raw_code.is_empty() {
                     self.clear_composition();
@@ -1794,6 +1996,11 @@ impl JuxuEngine {
                     self.user.break_single_burst();
                     self.clear_context();
                     return EngineOutput::default();
+                }
+                if self.is_t9_pinyin_mode() {
+                    if let Some(out) = self.select_page_candidate(0, timestamp_ms) {
+                        return out;
+                    }
                 }
                 let raw = self.raw_code.clone();
                 self.user.record_english_word(&raw);
@@ -1868,8 +2075,16 @@ impl JuxuEngine {
             let obs = KeyObs::physical(c as u8, timestamp_ms);
             return self.push_code_observation(obs);
         }
-        // Apostrophe syllable separator in Full Pinyin (e.g. xi'an)
-        if c == '\'' && self.is_pinyin_mode() && !self.raw_code.is_empty() {
+        // T9 9-key Pinyin physical digit keys ('2'..='9' and '1' separator)
+        if self.is_t9_pinyin_mode() && ('2'..='9').contains(&c) {
+            let obs = KeyObs::physical(c as u8, timestamp_ms);
+            return self.push_code_observation(obs);
+        }
+        // Apostrophe syllable separator in Full Pinyin (e.g. xi'an) or '1' in T9 Pinyin
+        if (c == '\'' || (c == '1' && self.is_t9_pinyin_mode()))
+            && self.is_pinyin_mode()
+            && !self.raw_code.is_empty()
+        {
             let obs = KeyObs::physical(b'\'', timestamp_ms);
             return self.push_code_observation(obs);
         }
@@ -2872,12 +3087,27 @@ impl JuxuEngine {
             context: &self.recent_context,
             layout: &self.key_layout,
         };
-        let (cands, paths) = self.pinyin_stream.update_and_decode(
-            &self.observations,
-            &self.raw_code,
-            &decoder,
-            &initial_state,
-        );
+        let (cands, paths) = if self.is_t9_pinyin_mode()
+            && self
+                .observations
+                .iter()
+                .any(|o| (b'2'..=b'9').contains(&o.ch))
+        {
+            self.pinyin_stream.update_and_decode_t9(
+                &self.observations,
+                &self.raw_code,
+                &self.t9_locked_syls,
+                &decoder,
+                &initial_state,
+            )
+        } else {
+            self.pinyin_stream.update_and_decode(
+                &self.observations,
+                &self.raw_code,
+                &decoder,
+                &initial_state,
+            )
+        };
         self.candidates = cands.iter().map(|pc| pc.candidate.clone()).collect();
         self.pinyin_candidates = cands;
         self.pinyin_paths = paths;

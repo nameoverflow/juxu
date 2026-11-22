@@ -268,6 +268,8 @@ pub struct JuxuConfig {
     pub enable_rare_charset: bool,
     /// 全拼声母简拼开关（如 srf -> 输入法）
     pub pinyin_initial_abbr: bool,
+    /// iOS 触屏全拼九宫格键盘（T9）布局开关
+    pub pinyin_t9_layout: bool,
     /// Shift 中英切换策略
     pub shift_toggle_mode: ShiftToggleMode,
     /// 每页候选词个数 (3..=9)
@@ -302,6 +304,7 @@ impl Default for JuxuConfig {
             auto_space_digits: true,
             enable_rare_charset: false,
             pinyin_initial_abbr: true,
+            pinyin_t9_layout: false,
             shift_toggle_mode: ShiftToggleMode::CommitCode,
             page_size: 5,
             orientation: CandidateOrientation::Horizontal,
@@ -345,7 +348,8 @@ impl JuxuConfig {
                 "auto_phrase_threshold = {}\n",
                 "z_omnipotent = {}\n",
                 "enable_rare_charset = {}\n",
-                "pinyin_initial_abbr = {}\n\n",
+                "pinyin_initial_abbr = {}\n",
+                "pinyin_t9_layout = {}\n\n",
                 "[typo_correction]\n",
                 "enabled = {}\n",
                 "touch_hitbox_adapt = {}\n",
@@ -377,6 +381,7 @@ impl JuxuConfig {
             self.z_omnipotent,
             self.enable_rare_charset,
             self.pinyin_initial_abbr,
+            self.pinyin_t9_layout,
             self.typo.enabled,
             self.typo.touch_hitbox_adapt,
             self.typo.promote_threshold,
@@ -443,6 +448,7 @@ impl JuxuConfig {
                 (_, "z_omnipotent") => cfg.z_omnipotent = parse_bool(val),
                 (_, "enable_rare_charset") => cfg.enable_rare_charset = parse_bool(val),
                 (_, "pinyin_initial_abbr") => cfg.pinyin_initial_abbr = parse_bool(val),
+                (_, "pinyin_t9_layout") => cfg.pinyin_t9_layout = parse_bool(val),
                 ("typo_correction", "enabled") | (_, "typo_enabled") => {
                     cfg.typo.enabled = parse_bool(val)
                 }

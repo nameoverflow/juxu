@@ -355,6 +355,14 @@ public struct IOSHostRootView: View {
 
                     VStack(spacing: 12) {
                         if bridge.prefs.isPinyinFamily {
+                            if bridge.prefs.schemaId == 20 {
+                                iosToggleRow(
+                                    "九宫格全拼键盘（T9）",
+                                    sub: "触屏中文全拼切为九宫格，支持键级高斯触点纠错、动态热区与左侧音节筛选；切英文自动恢复 26 键",
+                                    isOn: binding(\.pinyinT9Layout)
+                                )
+                                Divider()
+                            }
                             iosToggleRow(
                                 "声母简拼",
                                 sub: bridge.prefs.schemaId == 21

@@ -106,6 +106,38 @@ fn serialize_action_and_state(engine: &JuxuEngine, act: Option<&EngineOutput>) -
             j.push_str(&format!("{:.3},{:.3}", tk.dx, tk.dy));
         }
     }
+    let (t9_mask, t9_priors) = engine.t9_next_key_mask_and_priors();
+    j.push_str(&format!(
+        "],\"t9Mode\":{},\"t9ValidNextMask\":{},\"t9NextKeyPriors\":[",
+        engine.is_t9_pinyin_mode(),
+        t9_mask
+    ));
+    for (pi, &pv) in t9_priors.iter().enumerate() {
+        if pi > 0 {
+            j.push(',');
+        }
+        j.push_str(&pv.to_string());
+    }
+    j.push_str("],\"t9TouchOffsets\":[");
+    for (ti, tk) in engine.user.touch_profile.t9_keys.iter().enumerate() {
+        if ti > 0 {
+            j.push(',');
+        }
+        if tk.samples == 0 || (tk.dx.abs() < 1e-4 && tk.dy.abs() < 1e-4) {
+            j.push_str("0,0");
+        } else {
+            j.push_str(&format!("{:.3},{:.3}", tk.dx, tk.dy));
+        }
+    }
+    j.push_str("],\"t9LockedPrefix\":");
+    json_escape(&engine.t9_locked_prefix(), &mut j);
+    j.push_str(",\"t9Syllables\":[");
+    for (si, syl) in engine.t9_syllable_options().iter().enumerate() {
+        if si > 0 {
+            j.push(',');
+        }
+        json_escape(syl, &mut j);
+    }
     j.push_str("],\"candidates\":[");
 
     for (idx, c) in engine.page_candidates().iter().enumerate() {
@@ -427,6 +459,30 @@ pub extern "C" fn juxu_engine_set_key_layout(
 }
 
 #[no_mangle]
+pub extern "C" fn juxu_engine_set_t9_layout(
+    handle: *mut JuxuEngineHandle,
+    centers_xy_16: *const f32,
+    origin_x: f32,
+    origin_y: f32,
+    pitch_x: f32,
+    pitch_y: f32,
+) {
+    let Some(h) = (unsafe { handle.as_mut() }) else {
+        return;
+    };
+    h.inner.key_layout.t9_origin_x = origin_x;
+    h.inner.key_layout.t9_origin_y = origin_y;
+    h.inner.key_layout.t9_pitch_x = pitch_x;
+    h.inner.key_layout.t9_pitch_y = pitch_y;
+    if !centers_xy_16.is_null() {
+        let slice = unsafe { core::slice::from_raw_parts(centers_xy_16, 16) };
+        for i in 0..8 {
+            h.inner.key_layout.t9_centers[i] = (slice[i * 2], slice[i * 2 + 1]);
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn juxu_engine_reset_touch_profile(handle: *mut JuxuEngineHandle) {
     if let Some(h) = unsafe { handle.as_mut() } {
         h.inner.user.touch_profile.reset();
@@ -450,6 +506,29 @@ pub extern "C" fn juxu_engine_set_touch_profile(
         return;
     }
     h.inner.user.touch_profile.keys = std::array::from_fn(|i| TouchKeyOffset {
+        dx: offsets[i * 2].clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
+        dy: offsets[i * 2 + 1].clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
+        samples: counts[i],
+    });
+    h.inner.user.dirty = true;
+}
+
+#[no_mangle]
+pub extern "C" fn juxu_engine_set_t9_touch_profile(
+    handle: *mut JuxuEngineHandle,
+    offsets_xy_16: *const f32,
+    counts_8: *const u32,
+) {
+    let Some(h) = (unsafe { handle.as_mut() }) else { return };
+    if offsets_xy_16.is_null() || counts_8.is_null() {
+        return;
+    }
+    let offsets = unsafe { core::slice::from_raw_parts(offsets_xy_16, 16) };
+    let counts = unsafe { core::slice::from_raw_parts(counts_8, 8) };
+    if offsets.iter().any(|offset| !offset.is_finite()) {
+        return;
+    }
+    h.inner.user.touch_profile.t9_keys = std::array::from_fn(|i| TouchKeyOffset {
         dx: offsets[i * 2].clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
         dy: offsets[i * 2 + 1].clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
         samples: counts[i],
@@ -579,6 +658,39 @@ pub extern "C" fn juxu_engine_push_touch_json(
     let out = h
         .inner
         .push_touch_letter(reported_ascii, x, y, is_normalized, timestamp_ms);
+    into_c_string(serialize_action_and_state(&h.inner, Some(&out)))
+}
+
+#[no_mangle]
+pub extern "C" fn juxu_engine_push_t9_touch_json(
+    handle: *mut JuxuEngineHandle,
+    reported_digit: u8,
+    x: f32,
+    y: f32,
+    is_normalized: bool,
+    timestamp_ms: u64,
+) -> *mut c_char {
+    let Some(h) = (unsafe { handle.as_mut() }) else {
+        return into_c_string("{}".to_string());
+    };
+    let out = h
+        .inner
+        .push_touch_t9(reported_digit, x, y, is_normalized, timestamp_ms);
+    into_c_string(serialize_action_and_state(&h.inner, Some(&out)))
+}
+
+#[no_mangle]
+pub extern "C" fn juxu_engine_lock_t9_syllable_json(
+    handle: *mut JuxuEngineHandle,
+    syllable_utf8: *const c_char,
+) -> *mut c_char {
+    let Some(h) = (unsafe { handle.as_mut() }) else {
+        return into_c_string("{}".to_string());
+    };
+    let Some(syl) = cstr_to_str(syllable_utf8) else {
+        return into_c_string(serialize_action_and_state(&h.inner, None));
+    };
+    let out = h.inner.lock_t9_syllable(syl);
     into_c_string(serialize_action_and_state(&h.inner, Some(&out)))
 }
 

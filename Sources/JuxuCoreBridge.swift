@@ -128,6 +128,12 @@ public struct JuxuActionState: Codable, Equatable, Sendable {
     public let validNextMask: UInt32
     public let nextKeyPriors: [UInt8]
     public let touchOffsets: [Float]
+    public let t9Mode: Bool
+    public let t9ValidNextMask: UInt8
+    public let t9NextKeyPriors: [UInt8]
+    public let t9TouchOffsets: [Float]
+    public let t9LockedPrefix: String
+    public let t9Syllables: [String]
     public let candidates: [JuxuCandidateItem]
 
     /// Active inline preedit shown in the host text field (`markedText`):
@@ -163,6 +169,12 @@ public struct JuxuActionState: Codable, Equatable, Sendable {
         validNextMask: UInt32 = 0x03FF_FFFF,
         nextKeyPriors: [UInt8] = Array(repeating: 100, count: 26),
         touchOffsets: [Float] = Array(repeating: 0, count: 52),
+        t9Mode: Bool = false,
+        t9ValidNextMask: UInt8 = 0xFF,
+        t9NextKeyPriors: [UInt8] = Array(repeating: 100, count: 8),
+        t9TouchOffsets: [Float] = Array(repeating: 0, count: 16),
+        t9LockedPrefix: String = "",
+        t9Syllables: [String] = [],
         candidates: [JuxuCandidateItem]
     ) {
         self.consumed = consumed
@@ -182,13 +194,21 @@ public struct JuxuActionState: Codable, Equatable, Sendable {
         self.validNextMask = validNextMask
         self.nextKeyPriors = nextKeyPriors
         self.touchOffsets = touchOffsets
+        self.t9Mode = t9Mode
+        self.t9ValidNextMask = t9ValidNextMask
+        self.t9NextKeyPriors = t9NextKeyPriors
+        self.t9TouchOffsets = t9TouchOffsets
+        self.t9LockedPrefix = t9LockedPrefix
+        self.t9Syllables = t9Syllables
         self.candidates = candidates
     }
 
     private enum CodingKeys: String, CodingKey {
         case consumed, bell, asciiMode, schemaId, page, totalPages, vertical
         case schemaName, commitText, preedit, segmentedCode, notice, userPhraseCount, calibratedKeyCount
-        case validNextMask, nextKeyPriors, touchOffsets, candidates
+        case validNextMask, nextKeyPriors, touchOffsets
+        case t9Mode, t9ValidNextMask, t9NextKeyPriors, t9TouchOffsets, t9LockedPrefix, t9Syllables
+        case candidates
     }
 
     public init(from decoder: Decoder) throws {
@@ -210,6 +230,12 @@ public struct JuxuActionState: Codable, Equatable, Sendable {
         self.validNextMask = try c.decodeIfPresent(UInt32.self, forKey: .validNextMask) ?? 0x03FF_FFFF
         self.nextKeyPriors = try c.decodeIfPresent([UInt8].self, forKey: .nextKeyPriors) ?? Array(repeating: 100, count: 26)
         self.touchOffsets = try c.decodeIfPresent([Float].self, forKey: .touchOffsets) ?? Array(repeating: 0, count: 52)
+        self.t9Mode = try c.decodeIfPresent(Bool.self, forKey: .t9Mode) ?? false
+        self.t9ValidNextMask = try c.decodeIfPresent(UInt8.self, forKey: .t9ValidNextMask) ?? 0xFF
+        self.t9NextKeyPriors = try c.decodeIfPresent([UInt8].self, forKey: .t9NextKeyPriors) ?? Array(repeating: 100, count: 8)
+        self.t9TouchOffsets = try c.decodeIfPresent([Float].self, forKey: .t9TouchOffsets) ?? Array(repeating: 0, count: 16)
+        self.t9LockedPrefix = try c.decodeIfPresent(String.self, forKey: .t9LockedPrefix) ?? ""
+        self.t9Syllables = try c.decodeIfPresent([String].self, forKey: .t9Syllables) ?? []
         self.candidates = try c.decode([JuxuCandidateItem].self, forKey: .candidates)
     }
 
@@ -335,6 +361,7 @@ public struct JuxuPreferences: Equatable, Sendable {
     public var zOmnipotent: Bool = true
     public var enableRareCharset: Bool = false
     public var pinyinInitialAbbr: Bool = true
+    public var pinyinT9Layout: Bool = false
 
     public var typoEnabled: Bool = true
     public var touchHitboxAdapt: Bool = true
@@ -407,6 +434,7 @@ public struct JuxuPreferences: Equatable, Sendable {
         z_omnipotent = \(zOmnipotent)
         enable_rare_charset = \(enableRareCharset)
         pinyin_initial_abbr = \(pinyinInitialAbbr)
+        pinyin_t9_layout = \(pinyinT9Layout)
 
         [typo_correction]
         enabled = \(typoEnabled)
@@ -498,6 +526,8 @@ public struct JuxuPreferences: Equatable, Sendable {
                 p.enableRareCharset = boolVal
             case (_, "pinyin_initial_abbr"):
                 p.pinyinInitialAbbr = boolVal
+            case (_, "pinyin_t9_layout"):
+                p.pinyinT9Layout = boolVal
             case ("typo_correction", "enabled"):
                 p.typoEnabled = boolVal
             case (_, "touch_hitbox_adapt"):
@@ -799,6 +829,19 @@ public final class JuxuBridge: ObservableObject {
         }
     }
 
+    public func setT9Layout(
+        centers16: [Float],
+        originX: Float,
+        originY: Float,
+        pitchX: Float,
+        pitchY: Float
+    ) {
+        guard let h = handle, centers16.count == 16 else { return }
+        centers16.withUnsafeBufferPointer { buf in
+            juxu_engine_set_t9_layout(h, buf.baseAddress, originX, originY, pitchX, pitchY)
+        }
+    }
+
     public func flushUserDataIfNeeded(refreshPublishedLists: Bool = true) {
         guard let h = handle else { return }
         if juxu_engine_is_user_dirty(h) {
@@ -846,6 +889,34 @@ public final class JuxuBridge: ObservableObject {
         let decoded = decodeState(json)
         self.state = decoded
         drainEvalLogIfNeeded()
+        return decoded
+    }
+
+    public func pushT9Touch(
+        reportedDigit: UInt8,
+        x: Float,
+        y: Float,
+        isNormalized: Bool,
+        timestampMs: UInt64
+    ) -> JuxuActionState {
+        guard let h = handle else { return .empty }
+        if !juxu_engine_has_active_dict(h) {
+            ensureDictionaryLoaded(for: juxu_engine_get_schema(h))
+        }
+        let json = takeString(juxu_engine_push_t9_touch_json(h, reportedDigit, x, y, isNormalized, timestampMs))
+        let decoded = decodeState(json)
+        self.state = decoded
+        drainEvalLogIfNeeded()
+        return decoded
+    }
+
+    public func lockT9Syllable(_ syllable: String) -> JuxuActionState {
+        guard let h = handle else { return .empty }
+        let json = syllable.withCString { cStr in
+            takeString(juxu_engine_lock_t9_syllable_json(h, cStr))
+        }
+        let decoded = decodeState(json)
+        self.state = decoded
         return decoded
     }
 

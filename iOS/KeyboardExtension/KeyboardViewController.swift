@@ -9,6 +9,7 @@ public final class KeyboardViewController: UIInputViewController {
     private let glassBackdrop = UIView()
     private let ribbonView = IOSCandidateRibbonView()
     private let keyCanvas = IOSKeyCanvasView()
+    private let t9SidebarView = IOST9SidebarView()
     private let expandedGrid = IOSExpandedCandidateView()
     private let calloutView = IOSKeyCalloutView()
 
@@ -37,6 +38,7 @@ public final class KeyboardViewController: UIInputViewController {
         let shiftState: IOSShiftState
         let asciiMode: Bool
         let schemaId: UInt32
+        let pinyinT9Layout: Bool
         let cangjieKeycapRadicals: Bool
         let wubiKeycapRadicals: Bool
         let isZLookupActive: Bool
@@ -239,10 +241,12 @@ public final class KeyboardViewController: UIInputViewController {
         expandedGrid.translatesAutoresizingMaskIntoConstraints = false
 
         expandedGrid.isHidden = true
+        t9SidebarView.isHidden = true
         calloutView.isHidden = true
 
         inputView.addSubview(glassBackdrop)
         inputView.addSubview(keyCanvas)
+        inputView.addSubview(t9SidebarView)
         inputView.addSubview(ribbonView)
         inputView.addSubview(expandedGrid)
         inputView.addSubview(calloutView)
@@ -447,12 +451,37 @@ public final class KeyboardViewController: UIInputViewController {
             self.expandedGrid.isHidden.toggle()
             let isExp = !self.expandedGrid.isHidden
             self.keyCanvas.isHidden = isExp
+            self.updateT9SidebarVisibility()
             if isExp {
                 self.reloadExpandedGrid()
             } else {
                 self.expandedIdleWords = nil
             }
             self.ribbonView.setExpanded(isExp)
+        }
+
+        t9SidebarView.onSelectPunctuation = { [weak self] sym in
+            guard let self else { return }
+            self.keyCanvas.flushPendingTouches()
+            self.feedback.fireSoftStep(playClick: true)
+            self.markUserTypedForClipboard()
+            self.commitPendingFirstIfComposing()
+            self.autoSpaceTracker.recordPassthrough(
+                sym,
+                hostBefore: self.textDocumentProxy.documentContextBeforeInput,
+                hostBeforeIsAuthoritative: false
+            )
+            self.textDocumentProxy.insertText(sym)
+            self.bridge.setContext("")
+            self.syncEngineToUI()
+        }
+
+        t9SidebarView.onSelectSyllable = { [weak self] syl in
+            guard let self else { return }
+            self.keyCanvas.flushPendingTouches()
+            self.feedback.fireSoftStep(playClick: true)
+            let out = self.bridge.lockT9Syllable(syl)
+            self.applyEngineState(out)
         }
 
         expandedGrid.onSelectAbsCandidate = { [weak self] absIdx in
@@ -463,6 +492,7 @@ public final class KeyboardViewController: UIInputViewController {
             self.expandedIdleWords = nil
             self.expandedGrid.isHidden = true
             self.keyCanvas.isHidden = false
+            self.updateT9SidebarVisibility()
             self.ribbonView.setExpanded(false)
             if let idleWords, absIdx < idleWords.count {
                 let word = idleWords[absIdx]
@@ -481,6 +511,7 @@ public final class KeyboardViewController: UIInputViewController {
             self?.expandedIdleWords = nil
             self?.expandedGrid.isHidden = true
             self?.keyCanvas.isHidden = false
+            self?.updateT9SidebarVisibility()
             self?.ribbonView.setExpanded(false)
         }
 
@@ -509,6 +540,7 @@ public final class KeyboardViewController: UIInputViewController {
             self?.expandedIdleWords = nil
             self?.expandedGrid.isHidden = true
             self?.keyCanvas.isHidden = false
+            self?.updateT9SidebarVisibility()
             self?.ribbonView.setExpanded(false)
             self?.syncEngineToUI()
         }
@@ -519,6 +551,7 @@ public final class KeyboardViewController: UIInputViewController {
             self.expandedIdleWords = nil
             self.expandedGrid.isHidden = true
             self.keyCanvas.isHidden = false
+            self.updateT9SidebarVisibility()
             self.ribbonView.setExpanded(false)
             self.openHostAppSettings()
         }
@@ -595,6 +628,45 @@ public final class KeyboardViewController: UIInputViewController {
                     timestampMs: Self.nowMs()
                 )
                 applyEngineState(out)
+            }
+
+        case .t9Key(let digit):
+            markUserTypedForClipboard()
+            if digit == UInt8(ascii: "1") {
+                if !bridge.state.preedit.isEmpty {
+                    let out = bridge.pushT9Touch(
+                        reportedDigit: UInt8(ascii: "'"),
+                        x: 0,
+                        y: 0,
+                        isNormalized: true,
+                        timestampMs: Self.nowMs()
+                    )
+                    applyEngineState(out)
+                }
+            } else {
+                let sendPt: CGPoint
+                if let snap = keyCanvas.snapshot {
+                    sendPt = IOSKeyboardLayoutEngine.compensatedLetterPoint(pointInCanvas, in: snap)
+                } else {
+                    sendPt = pointInCanvas
+                }
+                let out = bridge.pushT9Touch(
+                    reportedDigit: digit,
+                    x: Float(sendPt.x),
+                    y: Float(sendPt.y),
+                    isNormalized: false,
+                    timestampMs: Self.nowMs()
+                )
+                applyEngineState(out)
+            }
+
+        case .t9Clear:
+            markUserTypedForClipboard()
+            if !bridge.state.preedit.isEmpty {
+                compositionBaseContext = nil
+                cancelMarkedCode()
+                bridge.clearComposition()
+                syncEngineToUI()
             }
 
         case .symbol(let sym):
@@ -898,6 +970,7 @@ public final class KeyboardViewController: UIInputViewController {
         if out.preedit.isEmpty && !expandedGrid.isHidden {
             expandedGrid.isHidden = true
             keyCanvas.isHidden = false
+            updateT9SidebarVisibility()
             ribbonView.setExpanded(false)
         }
         syncEngineToUI()
@@ -910,6 +983,7 @@ public final class KeyboardViewController: UIInputViewController {
         }
         layoutEngine.asciiMode = st.asciiMode
         layoutEngine.schemaId = st.schemaId
+        layoutEngine.pinyinT9Layout = bridge.prefs.pinyinT9Layout
         layoutEngine.cangjieKeycapRadicals = bridge.prefs.cangjieKeycapRadicals
         layoutEngine.wubiKeycapRadicals = bridge.prefs.wubiKeycapRadicals
         layoutEngine.isZLookupActive = bridge.prefs.isCangjieFamily
@@ -919,9 +993,20 @@ public final class KeyboardViewController: UIInputViewController {
         layoutEngine.validNextMask = st.validNextMask
         layoutEngine.nextKeyPriors = st.nextKeyPriors
         layoutEngine.touchOffsets = st.touchOffsets
+        layoutEngine.t9ValidNextMask = st.t9ValidNextMask
+        layoutEngine.t9NextKeyPriors = st.t9NextKeyPriors
+        layoutEngine.t9TouchOffsets = st.t9TouchOffsets
         keyCanvas.validNextMask = st.validNextMask
         keyCanvas.nextKeyPriors = st.nextKeyPriors
         keyCanvas.touchOffsets = st.touchOffsets
+        keyCanvas.t9ValidNextMask = st.t9ValidNextMask
+        keyCanvas.t9NextKeyPriors = st.t9NextKeyPriors
+        keyCanvas.t9TouchOffsets = st.t9TouchOffsets
+        t9SidebarView.update(
+            syllables: st.t9Syllables,
+            composing: !st.preedit.isEmpty,
+            dark: isDarkAppearance
+        )
         ribbonView.update(
             state: st,
             dark: isDarkAppearance,
@@ -950,6 +1035,20 @@ public final class KeyboardViewController: UIInputViewController {
         refreshKeyboardLayout()
     }
 
+    private func updateT9SidebarVisibility() {
+        let shouldShow = (keyCanvas.snapshot?.isT9Layout == true)
+            && !layoutEngine.isTrackpadActive
+            && expandedGrid.isHidden
+            && !keyCanvas.isHidden
+        t9SidebarView.isHidden = !shouldShow
+        if shouldShow, let snap = keyCanvas.snapshot {
+            let f = keyCanvas.convert(snap.t9SidebarFrame, to: inputView)
+            if t9SidebarView.frame != f {
+                t9SidebarView.frame = f
+            }
+        }
+    }
+
     private func refreshKeyboardLayout() {
         guard keyCanvas.bounds.width > 10, keyCanvas.bounds.height > 10 else { return }
         let sig = VisualLayoutSignature(
@@ -957,6 +1056,7 @@ public final class KeyboardViewController: UIInputViewController {
             shiftState: layoutEngine.shiftState,
             asciiMode: layoutEngine.asciiMode,
             schemaId: layoutEngine.schemaId,
+            pinyinT9Layout: layoutEngine.pinyinT9Layout,
             cangjieKeycapRadicals: layoutEngine.cangjieKeycapRadicals,
             wubiKeycapRadicals: layoutEngine.wubiKeycapRadicals,
             isZLookupActive: layoutEngine.isZLookupActive,
@@ -965,18 +1065,32 @@ public final class KeyboardViewController: UIInputViewController {
             isTrackpadActive: layoutEngine.isTrackpadActive,
             size: keyCanvas.bounds.size
         )
-        if lastVisualKeySignature == sig { return }
+        if lastVisualKeySignature == sig {
+            updateT9SidebarVisibility()
+            return
+        }
         lastVisualKeySignature = sig
 
         let snap = layoutEngine.computeLayout(in: keyCanvas.bounds.size)
         keyCanvas.updateSnapshot(snap)
-        bridge.setKeyLayout(
-            centers52: snap.centers52,
-            originX: snap.originX,
-            originY: snap.originY,
-            pitchX: snap.pitchX,
-            pitchY: snap.pitchY
-        )
+        if snap.isT9Layout {
+            bridge.setT9Layout(
+                centers16: snap.t9Centers16,
+                originX: snap.t9OriginX,
+                originY: snap.t9OriginY,
+                pitchX: snap.t9PitchX,
+                pitchY: snap.t9PitchY
+            )
+        } else {
+            bridge.setKeyLayout(
+                centers52: snap.centers52,
+                originX: snap.originX,
+                originY: snap.originY,
+                pitchX: snap.pitchX,
+                pitchY: snap.pitchY
+            )
+        }
+        updateT9SidebarVisibility()
     }
 
     /// Ensure no ancestor container gesture recognizer inside our extension window holds `delaysTouchesBegan`,

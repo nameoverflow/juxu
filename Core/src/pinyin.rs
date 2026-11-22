@@ -12,7 +12,10 @@ use crate::format::AuxView;
 use crate::neural::{NeuralView, RwkvState};
 use crate::personalization::Context as PersonalContext;
 use crate::pinyin_dict::{base_initial_id, PinyinDictView, SylConstraint};
-use crate::typo::{key_choices_for_obs, softmax_confidences, CorrectionKind, KeyLayout, KeyObs};
+use crate::typo::{
+    key_choices_for_obs, letter_to_t9_digit, softmax_confidences, syllable_to_t9_digits,
+    t9_key_choices_for_obs, t9_letters_for_digit, CorrectionKind, KeyLayout, KeyObs,
+};
 use crate::user_data::UserStore;
 use std::collections::{HashMap, HashSet};
 
@@ -746,6 +749,300 @@ fn build_lattice(
     edges_by_end
 }
 
+fn build_t9_syllable_map<'a>(dict: &'a PinyinDictView) -> HashMap<String, Vec<(u16, &'a str)>> {
+    let mut map: HashMap<String, Vec<(u16, &'a str)>> = HashMap::with_capacity(256);
+    for sid in 0..dict.syllable_count() {
+        let s = dict.syllable_str(sid as u16);
+        let digits = syllable_to_t9_digits(s);
+        if !digits.is_empty() {
+            map.entry(digits).or_default().push((sid as u16, s));
+        }
+    }
+    map
+}
+
+fn build_t9_lattice(
+    observations: &[KeyObs],
+    t9_locked_syls: &[(usize, String)],
+    decoder: &PinyinDecoder<'_>,
+) -> Vec<Vec<LatticeEdge>> {
+    let n = observations.len();
+    let mut edges_by_end = vec![Vec::<LatticeEdge>::new(); n + 1];
+    if n == 0 {
+        return edges_by_end;
+    }
+
+    // 1. Emit fixed edges for locked prefix syllables selected from the T9 sidebar
+    let mut unlock_start = 0usize;
+    for (klen, syl) in t9_locked_syls {
+        while unlock_start < n && observations[unlock_start].ch == b'\'' {
+            unlock_start += 1;
+        }
+        if unlock_start >= n || *klen == 0 {
+            break;
+        }
+        let end = (unlock_start + *klen).min(n);
+        let actual_end = if end < n && observations[end].ch == b'\'' {
+            end + 1
+        } else {
+            end
+        };
+        if let Some(sid) = decoder.dict.lookup_syllable_id(syl) {
+            edges_by_end[actual_end].push(LatticeEdge {
+                start: unlock_start,
+                end: actual_end,
+                syl: SylMatch::Full(sid),
+                spatial_logp: 0.0,
+                kind_cost: 1.35 * (*klen as f32) + 2.0,
+                correction: CorrectionKind::Exact,
+                display_syl: syl.clone(),
+            });
+            unlock_start = actual_end;
+        } else {
+            break;
+        }
+    }
+    while unlock_start < n && observations[unlock_start].ch == b'\'' {
+        unlock_start += 1;
+    }
+
+    let t9_map = build_t9_syllable_map(decoder.dict);
+    let per_pos_choices: Vec<Vec<(u8, f32, bool, bool)>> = observations
+        .iter()
+        .map(|obs| {
+            if (b'2'..=b'9').contains(&obs.ch) {
+                t9_key_choices_for_obs(obs, decoder.layout, &decoder.user.touch_profile, &decoder.config.typo)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+
+    for start in unlock_start..n {
+        if !(b'2'..=b'9').contains(&observations[start].ch) {
+            continue;
+        }
+        let max_len = (n - start).min(MAX_SYL_LEN);
+        for len in 1..=max_len {
+            let end = start + len;
+            if observations[start..end]
+                .iter()
+                .any(|o| !(b'2'..=b'9').contains(&o.ch))
+            {
+                break;
+            }
+            let exact_bytes: Vec<u8> = observations[start..end].iter().map(|o| o.ch).collect();
+            let exact_str = String::from_utf8_lossy(&exact_bytes).into_owned();
+            let exact_lp: f32 = (start..end)
+                .map(|i| {
+                    per_pos_choices[i]
+                        .iter()
+                        .find(|c| c.2)
+                        .map_or(0.0, |c| c.1)
+                })
+                .sum();
+            let actual_end = if end < n && observations[end].ch == b'\'' {
+                end + 1
+            } else {
+                end
+            };
+
+            let mut had_exact_full = false;
+            if let Some(syls) = t9_map.get(&exact_str) {
+                had_exact_full = true;
+                for &(sid, syl_str) in syls {
+                    edges_by_end[actual_end].push(LatticeEdge {
+                        start,
+                        end: actual_end,
+                        syl: SylMatch::Full(sid),
+                        spatial_logp: exact_lp,
+                        kind_cost: 1.35 * (len as f32),
+                        correction: CorrectionKind::Exact,
+                        display_syl: syl_str.to_owned(),
+                    });
+                }
+            }
+
+            if decoder.config.typo.enabled {
+                // Single-position 2D Gaussian boundary / neighbor key substitution
+                for pos in 0..len {
+                    let obs_idx = start + pos;
+                    for &(alt_digit, lp, is_exact, is_boundary) in &per_pos_choices[obs_idx] {
+                        if is_exact {
+                            continue;
+                        }
+                        // Require genuine key-boundary proximity for short 1..=2 key spans to prevent T9 ambiguity blowup
+                        if len <= 2 && !is_boundary {
+                            continue;
+                        }
+                        let mut b = exact_bytes.clone();
+                        b[pos] = alt_digit;
+                        let cand_digits = String::from_utf8_lossy(&b);
+                        let Some(syls) = t9_map.get(cand_digits.as_ref()) else {
+                            continue;
+                        };
+                        let other_lp: f32 = (start..end)
+                            .enumerate()
+                            .filter(|&(j, _)| j != pos)
+                            .map(|(_, idx)| {
+                                per_pos_choices[idx]
+                                    .iter()
+                                    .find(|c| c.2)
+                                    .map_or(0.0, |c| c.1)
+                            })
+                            .sum();
+                        let (kind, kind_cost) = if is_boundary {
+                            (CorrectionKind::TouchBoundary, -0.85)
+                        } else {
+                            (CorrectionKind::NeighborKey, -5.2)
+                        };
+                        for &(sid, syl_str) in syls {
+                            edges_by_end[actual_end].push(LatticeEdge {
+                                start,
+                                end: actual_end,
+                                syl: SylMatch::Full(sid),
+                                spatial_logp: other_lp + lp,
+                                kind_cost,
+                                correction: kind,
+                                display_syl: syl_str.to_owned(),
+                            });
+                        }
+                    }
+                }
+
+                // Conservative adjacent key transposition (higher penalty than 26-key due to T9 density)
+                if len >= 2 {
+                    for pos in 0..(len - 1) {
+                        if exact_bytes[pos] == exact_bytes[pos + 1] {
+                            continue;
+                        }
+                        let dt = observations[start + pos + 1]
+                            .timestamp_ms
+                            .saturating_sub(observations[start + pos].timestamp_ms);
+                        if len == 2 && !(observations[start + pos + 1].timestamp_ms > 0 && dt <= 65) {
+                            continue;
+                        }
+                        let mut b = exact_bytes.clone();
+                        b.swap(pos, pos + 1);
+                        let cand_digits = String::from_utf8_lossy(&b);
+                        let Some(syls) = t9_map.get(cand_digits.as_ref()) else {
+                            continue;
+                        };
+                        let trans_lp =
+                            if observations[start + pos + 1].timestamp_ms > 0 && dt <= 65 {
+                                -3.2
+                            } else {
+                                -4.2
+                            };
+                        for &(sid, syl_str) in syls {
+                            edges_by_end[actual_end].push(LatticeEdge {
+                                start,
+                                end: actual_end,
+                                syl: SylMatch::Full(sid),
+                                spatial_logp: trans_lp,
+                                kind_cost: -4.2,
+                                correction: CorrectionKind::Transposition,
+                                display_syl: syl_str.to_owned(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Initial-only abbreviations (`len == 1` single initial, `len == 2` zh/ch/sh)
+            if decoder.config.pinyin_initial_abbr {
+                if len == 1 {
+                    for &ch in t9_letters_for_digit(exact_bytes[0]) {
+                        let s = (ch as char).to_string();
+                        let init_id = base_initial_id(&s);
+                        if init_id > 0 {
+                            edges_by_end[actual_end].push(LatticeEdge {
+                                start,
+                                end: actual_end,
+                                syl: SylMatch::Initial(init_id, false),
+                                spatial_logp: exact_lp,
+                                kind_cost: -2.8,
+                                correction: CorrectionKind::Exact,
+                                display_syl: s,
+                            });
+                        }
+                    }
+                } else if len == 2 {
+                    let digraph: Option<&str> = match (exact_bytes[0], exact_bytes[1]) {
+                        (b'9', b'4') => Some("zh"),
+                        (b'2', b'4') => Some("ch"),
+                        (b'7', b'4') => Some("sh"),
+                        _ => None,
+                    };
+                    if let Some(dg) = digraph {
+                        let init_id = base_initial_id(dg);
+                        if init_id > 0 {
+                            edges_by_end[actual_end].push(LatticeEdge {
+                                start,
+                                end: actual_end,
+                                syl: SylMatch::Initial(init_id, true),
+                                spatial_logp: exact_lp,
+                                kind_cost: -2.2,
+                                correction: CorrectionKind::Exact,
+                                display_syl: dg.to_owned(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Trailing partial-syllable prefix completion at end of input buffer
+            if actual_end == n && !had_exact_full && len >= 2 {
+                let mut prefixes: HashSet<String> = HashSet::new();
+                for (digits_key, syls) in &t9_map {
+                    if digits_key.len() > len && digits_key.starts_with(&exact_str) {
+                        for &(_, syl_str) in syls {
+                            if let Some(pref) = syl_str.get(..len) {
+                                prefixes.insert(pref.to_owned());
+                            }
+                        }
+                    }
+                }
+                for pref in prefixes.into_iter().take(6) {
+                    edges_by_end[actual_end].push(LatticeEdge {
+                        start,
+                        end: actual_end,
+                        syl: SylMatch::Prefix(pref.clone()),
+                        spatial_logp: exact_lp,
+                        kind_cost: -3.5,
+                        correction: CorrectionKind::Exact,
+                        display_syl: pref,
+                    });
+                }
+            }
+        }
+    }
+
+    // Prune and deduplicate edges per `end` (slightly wider cap than 26-key for T9 branching)
+    for list in &mut edges_by_end {
+        list.sort_by(|a, b| {
+            (b.spatial_logp + b.kind_cost)
+                .partial_cmp(&(a.spatial_logp + a.kind_cost))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut deduped: Vec<LatticeEdge> = Vec::with_capacity(32);
+        for edge in list.drain(..) {
+            if !deduped
+                .iter()
+                .any(|e| e.start == edge.start && e.syl == edge.syl)
+            {
+                deduped.push(edge);
+                if deduped.len() >= 32 {
+                    break;
+                }
+            }
+        }
+        *list = deduped;
+    }
+
+    edges_by_end
+}
+
 /// Inject English dictionary, personal English, uppercase-anchored, and impossible-pinyin OOV
 /// `SylMatch::Latin` edges into the syllable lattice for mixed Chinese-English sentence decoding.
 fn add_latin_lattice_edges(
@@ -1059,6 +1356,46 @@ impl PinyinStream {
                 self.layers.push(next_paths);
             }
             // Evict heavy RWKV recurrent tensors from layers older than the active phrase window
+            if self.layers.len() > STREAM_STATE_WINDOW + 1 {
+                let evict_idx = self.layers.len() - STREAM_STATE_WINDOW - 1;
+                if evict_idx > 0 {
+                    for p in &mut self.layers[evict_idx] {
+                        if !p.state.mat_state.is_empty() {
+                            p.state = RwkvState::default();
+                        }
+                    }
+                }
+            }
+        }
+        build_pinyin_candidates(n, raw_code, &lattice, &self.layers, decoder)
+    }
+
+    /// T9 9-key Pinyin decode entry point with optional locked prefix syllables.
+    pub fn update_and_decode_t9(
+        &mut self,
+        observations: &[KeyObs],
+        raw_code: &str,
+        t9_locked_syls: &[(usize, String)],
+        decoder: &PinyinDecoder<'_>,
+        initial_state: &RwkvState,
+    ) -> (Vec<PinyinCandidate>, Vec<PinyinPath>) {
+        let n = observations.len();
+        self.layers.clear();
+        if n == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        self.layers.push(vec![PinyinPath {
+            text: String::new(),
+            score: 0.0,
+            boundaries: Vec::new(),
+            state: initial_state.clone(),
+            personal_context: PersonalContext::with_chars(decoder.context.iter().copied()),
+            any_corrected: false,
+        }]);
+        let lattice = build_t9_lattice(observations, t9_locked_syls, decoder);
+        for end in 1..=n {
+            let next_paths = extend_pinyin_layer(end, &lattice, &self.layers, decoder);
+            self.layers.push(next_paths);
             if self.layers.len() > STREAM_STATE_WINDOW + 1 {
                 let evict_idx = self.layers.len() - STREAM_STATE_WINDOW - 1;
                 if evict_idx > 0 {
@@ -2132,4 +2469,171 @@ pub fn pinyin_next_key_priors(
         }
     }
     (mask, priors)
+}
+
+/// Compute the candidate Pinyin syllables at the current unlocked T9 cursor position
+/// for the iOS T9 left sidebar filter column (ordered by top-beam relevance, length, and char weight).
+pub fn t9_syllable_options(
+    observations: &[KeyObs],
+    t9_locked_syls: &[(usize, String)],
+    dict: &PinyinDictView,
+    top_paths: &[PinyinPath],
+) -> Vec<String> {
+    let n = observations.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut start = 0usize;
+    for (klen, _) in t9_locked_syls {
+        while start < n && observations[start].ch == b'\'' {
+            start += 1;
+        }
+        if start >= n || *klen == 0 {
+            break;
+        }
+        start = (start + *klen).min(n);
+        if start < n && observations[start].ch == b'\'' {
+            start += 1;
+        }
+    }
+    while start < n && observations[start].ch == b'\'' {
+        start += 1;
+    }
+    if start >= n {
+        return Vec::new();
+    }
+
+    let t9_map = build_t9_syllable_map(dict);
+
+    // Collect top-beam preferred syllable at `start` to surface it first
+    let mut beam_preferred: Vec<String> = Vec::new();
+    for path in top_paths.iter().take(4) {
+        let mut seg_s = 0usize;
+        for b in &path.boundaries {
+            while seg_s < n && observations[seg_s].ch == b'\'' {
+                seg_s += 1;
+            }
+            if seg_s == start {
+                if let Some(first_syl) = b.syl_display.split('\'').next() {
+                    if dict.lookup_syllable_id(first_syl).is_some()
+                        && !beam_preferred.iter().any(|x| x == first_syl)
+                    {
+                        beam_preferred.push(first_syl.to_owned());
+                    }
+                }
+                break;
+            }
+            seg_s = b.keys;
+        }
+    }
+
+    let max_len = (n - start).min(MAX_SYL_LEN);
+    let mut items: Vec<(String, usize, u32, bool)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for len in (1..=max_len).rev() {
+        let end = start + len;
+        if observations[start..end]
+            .iter()
+            .any(|o| !(b'2'..=b'9').contains(&o.ch))
+        {
+            continue;
+        }
+        let digits: String = observations[start..end]
+            .iter()
+            .map(|o| o.ch as char)
+            .collect();
+        if let Some(syls) = t9_map.get(&digits) {
+            for &(sid, syl_str) in syls {
+                if seen.insert(syl_str.to_owned()) {
+                    let top_w = dict
+                        .lookup_chars(sid, false)
+                        .first()
+                        .map_or(0, |e| e.weight);
+                    let in_beam = beam_preferred.iter().any(|x| x == syl_str);
+                    items.push((syl_str.to_owned(), len, top_w, in_beam));
+                }
+            }
+        }
+    }
+
+    items.sort_by(|a, b| {
+        b.3.cmp(&a.3)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    items.into_iter().take(12).map(|x| x.0).collect()
+}
+
+/// Compute 8-bit `t9ValidNextMask` (bits 0..7 => keys `'2'..='9'`) and 8-key `t9NextKeyPriors`
+/// by aggregating valid T9 continuations and `Micro-RWKV-7` 26-letter syllable-start priors.
+pub fn t9_next_key_priors(
+    raw_code: &str,
+    locked_keys: usize,
+    dict: &PinyinDictView,
+    rwkv_start_priors: Option<&[f32; 26]>,
+) -> (u8, [u8; 8]) {
+    let mut mask = 0u8;
+    let mut scores = [0.0f32; 8];
+
+    let unlocked = raw_code.get(locked_keys.min(raw_code.len())..).unwrap_or("");
+    let tail = unlocked.rsplit('\'').next().unwrap_or(unlocked);
+    let max_tail = tail.len().min(MAX_SYL_LEN);
+    let t9_map = build_t9_syllable_map(dict);
+
+    let mut can_end_syllable = tail.is_empty();
+    for l in 1..=max_tail {
+        let sub = &tail[tail.len() - l..];
+        if !sub.bytes().all(|b| (b'2'..=b'9').contains(&b)) {
+            continue;
+        }
+        if t9_map.contains_key(sub) {
+            can_end_syllable = true;
+        }
+        for digits_key in t9_map.keys() {
+            if digits_key.len() > sub.len() && digits_key.starts_with(sub) {
+                if let Some(&next_b) = digits_key.as_bytes().get(sub.len()) {
+                    if (b'2'..=b'9').contains(&next_b) {
+                        let idx = (next_b - b'2') as usize;
+                        mask |= 1u8 << idx;
+                        scores[idx] += 2.0;
+                    }
+                }
+            }
+        }
+    }
+
+    if can_end_syllable || mask == 0 {
+        let syl_starts: &[u8] = b"abcdefghjklmnopqrstwxyz";
+        let mut rwkv_t9 = [0.0f32; 8];
+        for &b in syl_starts {
+            if let Some(d) = letter_to_t9_digit(b) {
+                let idx = (d - b'2') as usize;
+                mask |= 1u8 << idx;
+                let w = rwkv_start_priors.map_or(0.0, |p| p[(b - b'a') as usize]);
+                if w > rwkv_t9[idx] {
+                    rwkv_t9[idx] = w;
+                }
+            }
+        }
+        for idx in 0..8 {
+            if (mask & (1u8 << idx)) != 0 {
+                scores[idx] += 1.0 + 4.5 * rwkv_t9[idx];
+            }
+        }
+    }
+
+    let max_s = scores.iter().copied().fold(0.0f32, f32::max);
+    let mut priors = [100u8; 8];
+    if max_s > 0.0 {
+        for i in 0..8 {
+            if (mask & (1u8 << i)) != 0 {
+                let norm = (scores[i] / max_s).clamp(0.0, 1.0);
+                priors[i] = (65.0 + 115.0 * norm).round().clamp(54.0, 180.0) as u8;
+            } else {
+                priors[i] = 0;
+            }
+        }
+    }
+    (if mask == 0 { 0xFF } else { mask }, priors)
 }

@@ -38,11 +38,8 @@ impl KeyObs {
     }
 }
 
-/// Canonical 26-key layout geometry in key-pitch units (`pitch_x = 1.0`, `pitch_y = 1.0`).
-/// Defaults to Apple's symmetric 26-key iOS/macOS QWERTY geometry:
-/// - Row 0 (`q..p`): `y = 0.0, x = 0.0 .. 9.0`
-/// - Row 1 (`a..l`): `y = 1.0, x = 0.5 .. 8.5`
-/// - Row 2 (`z..m`): `y = 2.0, x = 1.5 .. 7.5`
+/// Canonical 26-key layout geometry in key-pitch units (`pitch_x = 1.0`, `pitch_y = 1.0`),
+/// plus canonical 3x3 T9 keypad geometry (`'2'..='9'` in T9 key-pitch units, with `'1'` at `(0, 0)`).
 #[derive(Clone, Debug)]
 pub struct KeyLayout {
     pub centers: [(f32, f32); 26],
@@ -51,6 +48,13 @@ pub struct KeyLayout {
     pub origin_y: f32,
     pub pitch_x: f32,
     pub pitch_y: f32,
+    /// T9 keypad centers for `'2'..='9'` in normalized T9 pitch units:
+    /// `2=(1,0), 3=(2,0), 4=(0,1), 5=(1,1), 6=(2,1), 7=(0,2), 8=(1,2), 9=(2,2)`
+    pub t9_centers: [(f32, f32); 8],
+    pub t9_origin_x: f32,
+    pub t9_origin_y: f32,
+    pub t9_pitch_x: f32,
+    pub t9_pitch_y: f32,
 }
 
 impl Default for KeyLayout {
@@ -71,8 +75,65 @@ impl Default for KeyLayout {
             origin_y: 0.0,
             pitch_x: 1.0,
             pitch_y: 1.0,
+            t9_centers: [
+                (1.0, 0.0), // 2: abc
+                (2.0, 0.0), // 3: def
+                (0.0, 1.0), // 4: ghi
+                (1.0, 1.0), // 5: jkl
+                (2.0, 1.0), // 6: mno
+                (0.0, 2.0), // 7: pqrs
+                (1.0, 2.0), // 8: tuv
+                (2.0, 2.0), // 9: wxyz
+            ],
+            t9_origin_x: 0.0,
+            t9_origin_y: 0.0,
+            t9_pitch_x: 1.0,
+            t9_pitch_y: 1.0,
         }
     }
+}
+
+/// Map T9 physical key `'2'..='9'` to its lowercase ASCII letters.
+#[inline]
+pub fn t9_letters_for_digit(digit: u8) -> &'static [u8] {
+    match digit {
+        b'2' => b"abc",
+        b'3' => b"def",
+        b'4' => b"ghi",
+        b'5' => b"jkl",
+        b'6' => b"mno",
+        b'7' => b"pqrs",
+        b'8' => b"tuv",
+        b'9' => b"wxyz",
+        _ => b"",
+    }
+}
+
+/// Map a lowercase ASCII letter `'a'..='z'` to its T9 physical key `'2'..='9'`.
+#[inline]
+pub fn letter_to_t9_digit(ch: u8) -> Option<u8> {
+    match ch.to_ascii_lowercase() {
+        b'a'..=b'c' => Some(b'2'),
+        b'd'..=b'f' => Some(b'3'),
+        b'g'..=b'i' => Some(b'4'),
+        b'j'..=b'l' => Some(b'5'),
+        b'm'..=b'o' => Some(b'6'),
+        b'p'..=b's' => Some(b'7'),
+        b't'..=b'v' => Some(b'8'),
+        b'w'..=b'z' => Some(b'9'),
+        _ => None,
+    }
+}
+
+/// Encode an ASCII Pinyin syllable (e.g. `"zhong"`) into its T9 digit string (`"94664"`).
+pub fn syllable_to_t9_digits(syl: &str) -> String {
+    let mut out = String::with_capacity(syl.len());
+    for b in syl.bytes() {
+        if let Some(d) = letter_to_t9_digit(b) {
+            out.push(d as char);
+        }
+    }
+    out
 }
 
 impl KeyLayout {
@@ -80,6 +141,15 @@ impl KeyLayout {
     pub fn center_of(&self, key_byte: u8) -> (f32, f32) {
         if key_byte.is_ascii_lowercase() {
             self.centers[(key_byte - b'a') as usize]
+        } else {
+            (0.0, 0.0)
+        }
+    }
+
+    #[inline]
+    pub fn t9_center_of(&self, digit_byte: u8) -> (f32, f32) {
+        if (b'2'..=b'9').contains(&digit_byte) {
+            self.t9_centers[(digit_byte - b'2') as usize]
         } else {
             (0.0, 0.0)
         }
@@ -98,6 +168,42 @@ impl KeyLayout {
             1.0
         };
         ((view_x - self.origin_x) / px, (view_y - self.origin_y) / py)
+    }
+
+    #[inline]
+    pub fn t9_view_to_norm(&self, view_x: f32, view_y: f32) -> (f32, f32) {
+        let px = if self.t9_pitch_x.abs() > 1e-4 {
+            self.t9_pitch_x
+        } else {
+            1.0
+        };
+        let py = if self.t9_pitch_y.abs() > 1e-4 {
+            self.t9_pitch_y
+        } else {
+            1.0
+        };
+        ((view_x - self.t9_origin_x) / px, (view_y - self.t9_origin_y) / py)
+    }
+
+    /// Find the closest T9 digit key (`'2'..='9'`) to normalized T9 coordinates `(nx, ny)`.
+    pub fn nearest_t9_key(&self, nx: f32, ny: f32, profile: &TouchProfile, adapt: bool) -> u8 {
+        let mut best_k = b'5';
+        let mut best_d2 = f32::MAX;
+        for idx in 0..8u8 {
+            let k = b'2' + idx;
+            let (cx, cy) = self.t9_centers[idx as usize];
+            let (dx, dy) = if adapt {
+                profile.offset_for_t9(k)
+            } else {
+                (0.0, 0.0)
+            };
+            let d2 = (nx - (cx + dx)).powi(2) + (ny - (cy + dy)).powi(2);
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best_k = k;
+            }
+        }
+        best_k
     }
 
     /// Find the closest letter key ('a'..='z') to normalized coordinates `(nx, ny)`
@@ -143,7 +249,81 @@ pub struct CodeHypothesis {
 
 const SIGMA_X: f32 = 0.34;
 const SIGMA_Y: f32 = 0.36;
+const T9_SIGMA_X: f32 = 0.28;
+const T9_SIGMA_Y: f32 = 0.30;
 const MAX_BEAM: usize = 24;
+
+/// Generate per-keystroke candidate T9 physical keys `(digit_ascii_2_to_9, rel_logp, is_pressed_key, is_boundary)`.
+/// Uses tighter 2D Gaussian spatial likelihood over the 8 physical T9 keys (`'2'..='9'`) with
+/// independent personal `t9_keys` offsets so boundary slips between adjacent big keys are rescued
+/// without exploding T9 ambiguity.
+pub fn t9_key_choices_for_obs(
+    obs: &KeyObs,
+    layout: &KeyLayout,
+    profile: &TouchProfile,
+    cfg: &TypoConfig,
+) -> Vec<(u8, f32, bool, bool)> {
+    let mut choices = Vec::<(u8, f32, bool, bool)>::new();
+    if !(b'2'..=b'9').contains(&obs.ch) {
+        return choices;
+    }
+    if obs.has_touch {
+        let mut raw_scores = [(0u8, f32::NEG_INFINITY); 8];
+        let mut max_lp = f32::NEG_INFINITY;
+        for idx in 0..8u8 {
+            let k = b'2' + idx;
+            let (cx, cy) = layout.t9_center_of(k);
+            let (ox, oy) = if cfg.touch_hitbox_adapt {
+                profile.offset_for_t9(k)
+            } else {
+                (0.0, 0.0)
+            };
+            let dx = obs.norm_x - (cx + ox);
+            let dy = obs.norm_y - (cy + oy);
+            let lp = -(dx * dx) / (2.0 * T9_SIGMA_X * T9_SIGMA_X)
+                - (dy * dy) / (2.0 * T9_SIGMA_Y * T9_SIGMA_Y);
+            raw_scores[idx as usize] = (k, lp);
+            if lp > max_lp {
+                max_lp = lp;
+            }
+        }
+        raw_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(core::cmp::Ordering::Equal));
+        let second_rel = raw_scores[1].1 - max_lp;
+        let near_border = second_rel >= -1.10;
+
+        for &(k, lp) in raw_scores.iter().take(3) {
+            let rel = lp - max_lp;
+            if rel >= -3.6 || k == obs.ch {
+                let is_pressed = k == obs.ch;
+                choices.push((k, rel, is_pressed, !is_pressed && near_border && rel >= -1.35));
+            }
+        }
+        if !choices.iter().any(|x| x.0 == obs.ch) {
+            let pressed_lp = raw_scores
+                .iter()
+                .find(|x| x.0 == obs.ch)
+                .map(|x| x.1 - max_lp)
+                .unwrap_or(-3.8);
+            choices.push((obs.ch, pressed_lp, true, false));
+        }
+    } else {
+        let (cx0, cy0) = layout.t9_center_of(obs.ch);
+        choices.push((obs.ch, 0.0, true, false));
+        for idx in 0..8u8 {
+            let k = b'2' + idx;
+            if k == obs.ch {
+                continue;
+            }
+            let (cx, cy) = layout.t9_center_of(k);
+            let dx = (cx - cx0).abs();
+            let dy = (cy - cy0).abs();
+            if (dx <= 1.05 && dy < 0.1) || (dy <= 1.05 && dx < 0.1) {
+                choices.push((k, -3.60, false, false));
+            }
+        }
+    }
+    choices
+}
 
 /// Generate ranked code hypotheses (`'a'..='y'`, or `'a'..='z'` when `allow_z` is true)
 /// for `observations` (`len = 1..=4`).

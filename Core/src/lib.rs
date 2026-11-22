@@ -1159,4 +1159,108 @@ mod tests {
         assert_eq!(sp2.commit_text, "Juxu");
         assert!(engine.user.lookup_english_exact("juxu").is_some());
     }
+
+    #[test]
+    fn t9_pinyin_sentence_lock_gaussian_typo_and_adaptive_hitbox() {
+        use crate::pinyin_dict::{serialize_pydict, PinyinDictBuildInput, PinyinDictView};
+
+        let pblob = serialize_pydict(PinyinDictBuildInput {
+            chars: vec![
+                ("ni".to_string(), "你".to_string(), 900_000, 0),
+                ("mi".to_string(), "米".to_string(), 500_000, 0),
+                ("hao".to_string(), "好".to_string(), 900_000, 0),
+                ("gao".to_string(), "高".to_string(), 400_000, 0),
+                ("zhong".to_string(), "中".to_string(), 900_000, 0),
+                ("guo".to_string(), "国".to_string(), 900_000, 0),
+                ("xi".to_string(), "西".to_string(), 700_000, 0),
+                ("an".to_string(), "安".to_string(), 700_000, 0),
+                ("xian".to_string(), "先".to_string(), 800_000, 0),
+            ],
+            phrases: vec![
+                (vec!["ni".to_string(), "hao".to_string()], "你好".to_string(), 950_000, 0),
+                (vec!["mi".to_string(), "gao".to_string()], "米糕".to_string(), 300_000, 0),
+                (vec!["zhong".to_string(), "guo".to_string()], "中国".to_string(), 990_000, 0),
+                (vec!["xi".to_string(), "an".to_string()], "西安".to_string(), 850_000, 0),
+            ],
+        });
+        let pdict = PinyinDictView::from_bytes(pblob).unwrap();
+
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::Pinyin;
+        cfg.pinyin_t9_layout = true;
+        cfg.typo.enabled = true;
+        cfg.typo.touch_hitbox_adapt = true;
+        let toml_rt = JuxuConfig::from_toml_str(&cfg.to_toml_string());
+        assert!(toml_rt.pinyin_t9_layout);
+
+        let mut engine = JuxuEngine::new(cfg);
+        engine.load_pinyin_dict(pdict);
+        assert!(engine.is_t9_pinyin_mode());
+
+        // 1. Standard T9 sentence decoding: 64426 -> ni'hao -> "你好"
+        for (i, ch) in "64426".bytes().enumerate() {
+            let (cx, cy) = engine.key_layout.t9_center_of(ch);
+            let _ = engine.push_touch_t9(ch, cx, cy, true, 100 + i as u64 * 40);
+        }
+        assert_eq!(engine.all_candidates()[0].text, "你好");
+        let syls = engine.t9_syllable_options();
+        assert!(syls.contains(&"ni".to_string()));
+        assert!(syls.contains(&"mi".to_string()));
+
+        // 2. Sidebar syllable lock: locking "mi" switches top candidate to "米糕"
+        let _ = engine.lock_t9_syllable("mi");
+        assert_eq!(engine.t9_locked_prefix(), "mi");
+        assert_eq!(engine.all_candidates()[0].text, "米糕");
+        let next_syls = engine.t9_syllable_options();
+        assert!(next_syls.contains(&"gao".to_string()));
+        engine.clear_composition();
+
+        // 3. '1' separator splits xi'an (94'26) instead of xian (9426 -> 先)
+        for (i, ch) in "94126".bytes().enumerate() {
+            let (cx, cy) = if ch == b'1' {
+                (0.0, 0.0)
+            } else {
+                engine.key_layout.t9_center_of(ch)
+            };
+            let _ = engine.push_touch_t9(ch, cx, cy, true, 400 + i as u64 * 40);
+        }
+        assert_eq!(engine.all_candidates()[0].text, "西安");
+        engine.clear_composition();
+
+        // 4. 2D Gaussian key-boundary typo rescue on T9 big keys:
+        //    "zhongguo" = 94664486; slip key #3 ('6' at (2,1)) to border of '5' at (1.42, 1.0), reported as '5'.
+        let target_seq = b"94664486";
+        for (i, &ch) in target_seq.iter().enumerate() {
+            let (cx, cy) = engine.key_layout.t9_center_of(ch);
+            if i == 2 {
+                // Reported '5' near the right border toward '6'
+                let _ = engine.push_touch_t9(b'5', 1.44, 1.0, true, 800 + i as u64 * 40);
+            } else {
+                // Slight consistent rightward bias (+0.08) to verify T9 adaptive TouchProfile learning
+                let _ = engine.push_touch_t9(ch, cx + 0.08, cy, true, 800 + i as u64 * 40);
+            }
+        }
+        assert!(
+            engine.all_candidates().iter().take(3).any(|c| c.text == "中国"),
+            "2D Gaussian T9 boundary typo should rescue '中国', got {:?}",
+            engine.all_candidates().iter().take(5).map(|c| &c.text).collect::<Vec<_>>()
+        );
+        let idx = engine
+            .all_candidates()
+            .iter()
+            .position(|c| c.text == "中国")
+            .unwrap();
+        let out = engine.select_abs_candidate(idx, 1200).unwrap();
+        assert_eq!(out.commit_text, "中国");
+
+        // 5. Independent T9 TouchProfile learned offsets without polluting 26-key profile!
+        assert!(engine.user.touch_profile.t9_keys[(b'9' - b'2') as usize].samples > 0);
+        assert!(engine.user.touch_profile.offset_for_t9(b'9').0 > 0.0);
+        assert!(engine.user.touch_profile.keys.iter().all(|k| k.samples == 0));
+
+        // 6. T9 next-key mask & priors aggregation returns valid 8-key weights
+        let (t9_mask, t9_priors) = engine.t9_next_key_mask_and_priors();
+        assert_ne!(t9_mask, 0);
+        assert!(t9_priors.iter().any(|&p| p > 0));
+    }
 }

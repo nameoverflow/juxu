@@ -324,6 +324,12 @@ private final class IOSKeycapNodeView: UIView {
                     let isUpper = first?.isUppercase ?? false
                     fontSize = isNonASCII ? 20.5 : (isUpper ? 22.5 : 24.5)
                     weight = .regular
+                case .t9Key(let digit):
+                    fontSize = (digit == UInt8(ascii: "1")) ? 14.5 : 16.5
+                    weight = (digit == UInt8(ascii: "1")) ? .regular : .medium
+                case .t9Clear:
+                    fontSize = 15.0
+                    weight = .regular
                 case .symbol(let s):
                     fontSize = s.count > 1 ? 16.5 : 21.5
                     weight = .regular
@@ -433,6 +439,9 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     var validNextMask: UInt32 = 0x03FF_FFFF
     var nextKeyPriors: [UInt8] = Array(repeating: 100, count: 26)
     var touchOffsets: [Float] = Array(repeating: 0, count: 52)
+    var t9ValidNextMask: UInt8 = 0xFF
+    var t9NextKeyPriors: [UInt8] = Array(repeating: 100, count: 8)
+    var t9TouchOffsets: [Float] = Array(repeating: 0, count: 16)
     /// ID of Row-0 key whose glyph is seamlessly covered by the docked callout silhouette.
     var coveredCalloutKeyId: String? {
         didSet {
@@ -660,7 +669,10 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                       in: snap,
                       validNextMask: validNextMask,
                       nextKeyPriors: nextKeyPriors,
-                      touchOffsets: touchOffsets
+                      touchOffsets: touchOffsets,
+                      t9ValidNextMask: t9ValidNextMask,
+                      t9NextKeyPriors: t9NextKeyPriors,
+                      t9TouchOffsets: t9TouchOffsets
                   ) else {
                 continue
             }
@@ -775,7 +787,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
             // 3. Functional keys (`Shift`, `中/英`, `Globe`, `Return`) stay locked to their own keycap
             //    so lift-off thumb roll never converts them into adjacent letters or vice versa.
             switch state.initialKey.kind {
-            case .letter, .symbol:
+            case .letter, .t9Key, .symbol:
                 break
             default:
                 trackedTouches[id] = state
@@ -814,13 +826,22 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 continue
             }
 
-            if let hit = IOSKeyboardLayoutEngine.hitTest(point: pt, in: snap, validNextMask: validNextMask, nextKeyPriors: nextKeyPriors, touchOffsets: touchOffsets),
+            if let hit = IOSKeyboardLayoutEngine.hitTest(
+                point: pt,
+                in: snap,
+                validNextMask: validNextMask,
+                nextKeyPriors: nextKeyPriors,
+                touchOffsets: touchOffsets,
+                t9ValidNextMask: t9ValidNextMask,
+                t9NextKeyPriors: t9NextKeyPriors,
+                t9TouchOffsets: t9TouchOffsets
+            ),
                hit.id != state.currentKey.id {
                 // Character touches may slide only onto character keys — never onto `⌫` (which would silently
                 // drop the key in `onKeyTouchUp`), `⇧`, `Space`, `123`, `中/英`, or `Return`!
                 let isCharacterTarget: Bool
                 switch hit.kind {
-                case .letter, .symbol: isCharacterTarget = true
+                case .letter, .t9Key, .symbol: isCharacterTarget = true
                 default: isCharacterTarget = false
                 }
                 if isCharacterTarget {
@@ -1210,6 +1231,128 @@ final class IOSKeyCalloutView: UIView {
         p.addQuadCurve(to: CGPoint(x: headLeft + rT, y: 0), controlPoint: CGPoint(x: headLeft, y: 0))
         p.close()
         return p.cgPath
+    }
+}
+/// Native iOS T9 left sidebar: vertical scrollable punctuation column when idle,
+/// switching seamlessly to candidate Pinyin syllable filters when composing.
+@MainActor
+final class IOST9SidebarView: UIView {
+    var onSelectPunctuation: ((String) -> Void)?
+    var onSelectSyllable: ((String) -> Void)?
+
+    private static let idlePunctuations = ["，", "。", "？", "！", "、", "……", "“", "”"]
+
+    private let scrollView = UIScrollView()
+    private let stackView = UIStackView()
+    private var currentItems: [String] = []
+    private var isSyllableMode = false
+    private var isDark = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        layer.cornerRadius = IOSKeyboardLayoutEngine.keyCornerRadius
+        layer.cornerCurve = .continuous
+        clipsToBounds = true
+
+        scrollView.showsVerticalScrollIndicator = false
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.alwaysBounceVertical = true
+        scrollView.delaysContentTouches = false
+        addSubview(scrollView)
+
+        stackView.axis = .vertical
+        stackView.distribution = .fill
+        stackView.alignment = .fill
+        stackView.spacing = 0
+        scrollView.addSubview(stackView)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        scrollView.frame = bounds
+        layoutRows()
+    }
+
+    func update(syllables: [String], composing: Bool, dark: Bool) {
+        let nextMode = composing && !syllables.isEmpty
+        let nextItems = nextMode ? syllables : Self.idlePunctuations
+        let needsRebuild = (nextMode != isSyllableMode) || (nextItems != currentItems) || (dark != isDark)
+        isSyllableMode = nextMode
+        currentItems = nextItems
+        isDark = dark
+
+        backgroundColor = dark
+            ? UIColor(white: 1.0, alpha: 0.13)
+            : UIColor(red: 229.0 / 255.0, green: 231.0 / 255.0, blue: 236.0 / 255.0, alpha: 1.0)
+
+        guard needsRebuild else { return }
+        for v in stackView.arrangedSubviews {
+            stackView.removeArrangedSubview(v)
+            v.removeFromSuperview()
+        }
+
+        let fg: UIColor = dark ? .white : .black
+        let sepColor: UIColor = dark
+            ? UIColor(white: 1.0, alpha: 0.12)
+            : UIColor(white: 0.0, alpha: 0.09)
+
+        for (idx, item) in nextItems.enumerated() {
+            let btn = UIButton(type: .system)
+            btn.setTitle(item, for: .normal)
+            btn.setTitleColor(fg, for: .normal)
+            btn.titleLabel?.font = nextMode
+                ? .systemFont(ofSize: 15.0, weight: .medium)
+                : .systemFont(ofSize: 18.0, weight: .regular)
+            btn.titleLabel?.adjustsFontSizeToFitWidth = true
+            btn.titleLabel?.minimumScaleFactor = 0.72
+            btn.tag = idx
+            btn.addTarget(self, action: #selector(handleRowTap(_:)), for: .touchUpInside)
+
+            if idx > 0 {
+                let sep = UIView()
+                sep.backgroundColor = sepColor
+                sep.isUserInteractionEnabled = false
+                sep.translatesAutoresizingMaskIntoConstraints = false
+                btn.addSubview(sep)
+                NSLayoutConstraint.activate([
+                    sep.topAnchor.constraint(equalTo: btn.topAnchor),
+                    sep.leadingAnchor.constraint(equalTo: btn.leadingAnchor, constant: 8),
+                    sep.trailingAnchor.constraint(equalTo: btn.trailingAnchor, constant: -8),
+                    sep.heightAnchor.constraint(equalToConstant: 0.5),
+                ])
+            }
+            stackView.addArrangedSubview(btn)
+        }
+        scrollView.setContentOffset(.zero, animated: false)
+        layoutRows()
+    }
+
+    private func layoutRows() {
+        let w = bounds.width
+        let h = bounds.height
+        guard w > 4, h > 4 else { return }
+        let rowH: CGFloat = max(36.0, floor(h / 4.0))
+        let totalH = max(h, rowH * CGFloat(currentItems.count))
+        stackView.frame = CGRect(x: 0, y: 0, width: w, height: totalH)
+        for v in stackView.arrangedSubviews {
+            v.constraints.filter { $0.firstAttribute == .height && $0.secondItem == nil }.forEach { v.removeConstraint($0) }
+            v.heightAnchor.constraint(equalToConstant: rowH).isActive = true
+        }
+        scrollView.contentSize = CGSize(width: w, height: totalH)
+    }
+
+    @objc private func handleRowTap(_ sender: UIButton) {
+        guard sender.tag >= 0, sender.tag < currentItems.count else { return }
+        let item = currentItems[sender.tag]
+        if isSyllableMode {
+            onSelectSyllable?(item)
+        } else {
+            onSelectPunctuation?(item)
+        }
     }
 }
 #endif

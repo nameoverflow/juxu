@@ -456,6 +456,59 @@ struct IOSKeyboardTests {
         wbPrefs.wubiKeycapRadicals = true
         assert(JuxuPreferences.fromTOML(wbPrefs.toTOML()).wubiKeycapRadicals == true)
 
-        print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie & Wubi keycaps & idle prediction tests passed!")
+        // 19. T9 9-key Pinyin layout geometry, ASCII fallback to 26-key, dynamic neural priors & personal T9 touchOffsets
+        var t9Layout = IOSKeyboardLayoutEngine()
+        t9Layout.schemaId = 20
+        t9Layout.pinyinT9Layout = true
+        assert(t9Layout.isT9PinyinActive)
+        let t9Snap = t9Layout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(t9Snap.isT9Layout)
+        assert(t9Snap.t9SidebarFrame.width > 55 && t9Snap.t9SidebarFrame.height > 140)
+        assert(t9Snap.keys.filter { if case .t9Key = $0.kind { return true } else { return false } }.count == 9)
+        assert(t9Snap.keys.first(where: { $0.kind == .space })?.cornerSubscript == "九")
+        assert(t9Snap.keys.contains(where: { $0.kind == .t9Clear }))
+        // Verify no T9 key overlaps the left sidebar or escapes 220pt canvas
+        for k in t9Snap.keys {
+            assert(!k.frame.intersects(t9Snap.t9SidebarFrame), "T9 key \(k.id) overlaps sidebar")
+            assert(k.frame.maxY <= 220.0, "T9 key \(k.id) exceeds 220pt canvas height")
+        }
+        // Dynamic neural prior tie-breaker on the gutter between T9 key '5'(JKL) and '6'(MNO)
+        let k5 = t9Snap.keys.first(where: { $0.kind == .t9Key(UInt8(ascii: "5")) })!
+        let k6 = t9Snap.keys.first(where: { $0.kind == .t9Key(UInt8(ascii: "6")) })!
+        let k56Gutter = CGPoint(x: (k5.frame.maxX + k6.frame.minX) * 0.5, y: k5.frame.midY + IOSKeyboardLayoutEngine.ergonomicThumbYBias)
+        var t9Priors = Array(repeating: UInt8(100), count: 8)
+        t9Priors[Int(UInt8(ascii: "5") - UInt8(ascii: "2"))] = 78
+        t9Priors[Int(UInt8(ascii: "6") - UInt8(ascii: "2"))] = 165
+        let t9Hit6 = IOSKeyboardLayoutEngine.hitTest(
+            point: k56Gutter,
+            in: t9Snap,
+            t9ValidNextMask: 0xFF,
+            t9NextKeyPriors: t9Priors
+        )
+        assert(t9Hit6?.kind == .t9Key(UInt8(ascii: "6")), "T9 neural prior should arbitrate 5/6 gutter toward '6'")
+        // Personal T9 touchOffset shifts 5/6 gutter toward '5'
+        var t9Offsets = Array(repeating: Float(0), count: 16)
+        t9Offsets[Int(UInt8(ascii: "5") - UInt8(ascii: "2")) * 2] = 0.16
+        let t9PersonalHit5 = IOSKeyboardLayoutEngine.hitTest(
+            point: k56Gutter,
+            in: t9Snap,
+            t9ValidNextMask: 0xFF,
+            t9NextKeyPriors: Array(repeating: UInt8(100), count: 8),
+            t9TouchOffsets: t9Offsets
+        )
+        assert(t9PersonalHit5?.kind == .t9Key(UInt8(ascii: "5")), "Personal T9 touchOffset should arbitrate 5/6 gutter toward '5'")
+        // Switching to ASCII automatically restores 26-key QWERTY layout
+        t9Layout.asciiMode = true
+        assert(!t9Layout.isT9PinyinActive)
+        let t9AsciiSnap = t9Layout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(!t9AsciiSnap.isT9Layout)
+        assert(t9AsciiSnap.keys.filter { if case .letter = $0.kind { return true } else { return false } }.count == 26)
+        // Preferences TOML roundtrip
+        var t9Prefs = JuxuPreferences()
+        assert(t9Prefs.pinyinT9Layout == false)
+        t9Prefs.pinyinT9Layout = true
+        assert(JuxuPreferences.fromTOML(t9Prefs.toTOML()).pinyinT9Layout == true)
+
+        print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi & T9 Pinyin tests passed!")
     }
 }

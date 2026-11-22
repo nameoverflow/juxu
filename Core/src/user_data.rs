@@ -24,12 +24,15 @@ pub struct TouchKeyOffset {
 #[derive(Clone, Debug)]
 pub struct TouchProfile {
     pub keys: [TouchKeyOffset; 26],
+    /// Independent adaptive touch offsets for 9-key T9 Pinyin physical keys `'2'..='9'`.
+    pub t9_keys: [TouchKeyOffset; 8],
 }
 
 impl Default for TouchProfile {
     fn default() -> Self {
         Self {
             keys: [TouchKeyOffset::default(); 26],
+            t9_keys: [TouchKeyOffset::default(); 8],
         }
     }
 }
@@ -55,14 +58,43 @@ impl TouchProfile {
         entry.samples = entry.samples.saturating_add(1);
     }
 
+    /// Update personal touch center offset for T9 physical key `'2'..='9'`.
+    pub fn observe_t9(&mut self, digit_byte: u8, residual_x: f32, residual_y: f32) {
+        if !(b'2'..=b'9').contains(&digit_byte) {
+            return;
+        }
+        if residual_x.abs() > 0.70 || residual_y.abs() > 0.70 {
+            return;
+        }
+        let idx = (digit_byte - b'2') as usize;
+        let entry = &mut self.t9_keys[idx];
+        let alpha = if entry.samples < 10 { 0.14 } else { 0.06 };
+        entry.dx = ((1.0 - alpha) * entry.dx + alpha * residual_x)
+            .clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET);
+        entry.dy = ((1.0 - alpha) * entry.dy + alpha * residual_y)
+            .clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET);
+        entry.samples = entry.samples.saturating_add(1);
+    }
+
     pub fn reset(&mut self) {
         self.keys = [TouchKeyOffset::default(); 26];
+        self.t9_keys = [TouchKeyOffset::default(); 8];
     }
 
     #[inline]
     pub fn offset_for(&self, key_byte: u8) -> (f32, f32) {
         if key_byte.is_ascii_lowercase() {
             let e = self.keys[(key_byte - b'a') as usize];
+            (e.dx, e.dy)
+        } else {
+            (0.0, 0.0)
+        }
+    }
+
+    #[inline]
+    pub fn offset_for_t9(&self, digit_byte: u8) -> (f32, f32) {
+        if (b'2'..=b'9').contains(&digit_byte) {
+            let e = self.t9_keys[(digit_byte - b'2') as usize];
             (e.dx, e.dy)
         } else {
             (0.0, 0.0)
@@ -763,6 +795,15 @@ impl UserStore {
                 ));
             }
         }
+        for (i, t) in self.touch_profile.t9_keys.iter().enumerate() {
+            if t.samples > 0 {
+                let ch = (b'2' + i as u8) as char;
+                out.push_str(&format!(
+                    "TOUCH_T9\t{}\t{:.5}\t{:.5}\t{}\n",
+                    ch, t.dx, t.dy, t.samples
+                ));
+            }
+        }
         let mut phrases: Vec<&UserPhrase> = self.phrases.values().collect();
         phrases.sort_by(|a, b| b.count.cmp(&a.count));
         for p in phrases.into_iter().take(5000) {
@@ -837,6 +878,21 @@ impl UserStore {
                             let dy: f32 = parts[3].parse().unwrap_or(0.0);
                             let samples: u32 = parts[4].parse().unwrap_or(0);
                             store.touch_profile.keys[idx] = TouchKeyOffset {
+                                dx: dx.clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
+                                dy: dy.clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
+                                samples,
+                            };
+                        }
+                    }
+                }
+                "TOUCH_T9" if parts.len() >= 5 => {
+                    if let Some(ch) = parts[1].bytes().next() {
+                        if (b'2'..=b'9').contains(&ch) {
+                            let idx = (ch - b'2') as usize;
+                            let dx: f32 = parts[2].parse().unwrap_or(0.0);
+                            let dy: f32 = parts[3].parse().unwrap_or(0.0);
+                            let samples: u32 = parts[4].parse().unwrap_or(0);
+                            store.touch_profile.t9_keys[idx] = TouchKeyOffset {
                                 dx: dx.clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
                                 dy: dy.clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
                                 samples,

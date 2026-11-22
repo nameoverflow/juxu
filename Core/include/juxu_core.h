@@ -45,12 +45,26 @@ void juxu_engine_set_key_layout(
     float pitch_x,
     float pitch_y
 );
+void juxu_engine_set_t9_layout(
+    JuxuEngineHandle *handle,
+    const float *centers_xy_16,
+    float origin_x,
+    float origin_y,
+    float pitch_x,
+    float pitch_y
+);
 void juxu_engine_reset_touch_profile(JuxuEngineHandle *handle);
 // Offsets and sample counts are indexed by key, from 'a' to 'z'.
 void juxu_engine_set_touch_profile(
     JuxuEngineHandle *handle,
     const float *offsets_xy_52,
     const uint32_t *counts_26
+);
+// Offsets and sample counts are indexed by T9 physical key, from '2' to '9'.
+void juxu_engine_set_t9_touch_profile(
+    JuxuEngineHandle *handle,
+    const float *offsets_xy_16,
+    const uint32_t *counts_8
 );
 
 char *juxu_engine_add_user_phrase(JuxuEngineHandle *handle, const char *phrase);
@@ -75,6 +89,20 @@ char *juxu_engine_push_touch_json(
     float y,
     bool is_normalized,
     uint64_t timestamp_ms
+);
+
+char *juxu_engine_push_t9_touch_json(
+    JuxuEngineHandle *handle,
+    uint8_t reported_digit,
+    float x,
+    float y,
+    bool is_normalized,
+    uint64_t timestamp_ms
+);
+
+char *juxu_engine_lock_t9_syllable_json(
+    JuxuEngineHandle *handle,
+    const char *syllable_utf8
 );
 
 char *juxu_engine_select_candidate_json(
