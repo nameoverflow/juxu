@@ -39,6 +39,7 @@ public final class KeyboardViewController: UIInputViewController {
         let schemaId: UInt32
         let cangjieKeycapRadicals: Bool
         let wubiKeycapRadicals: Bool
+        let isZLookupActive: Bool
         let showInlineGlobeKey: Bool
         let returnRole: IOSReturnKeyRole
         let isTrackpadActive: Bool
@@ -904,6 +905,9 @@ public final class KeyboardViewController: UIInputViewController {
         layoutEngine.schemaId = st.schemaId
         layoutEngine.cangjieKeycapRadicals = bridge.prefs.cangjieKeycapRadicals
         layoutEngine.wubiKeycapRadicals = bridge.prefs.wubiKeycapRadicals
+        layoutEngine.isZLookupActive = bridge.prefs.isCangjieFamily
+            && bridge.prefs.zOmnipotent
+            && st.preedit.hasPrefix("z")
         layoutEngine.isComposing = !st.preedit.isEmpty
         layoutEngine.validNextMask = st.validNextMask
         layoutEngine.nextKeyPriors = st.nextKeyPriors
@@ -948,6 +952,7 @@ public final class KeyboardViewController: UIInputViewController {
             schemaId: layoutEngine.schemaId,
             cangjieKeycapRadicals: layoutEngine.cangjieKeycapRadicals,
             wubiKeycapRadicals: layoutEngine.wubiKeycapRadicals,
+            isZLookupActive: layoutEngine.isZLookupActive,
             showInlineGlobeKey: layoutEngine.showInlineGlobeKey,
             returnRole: layoutEngine.returnRole,
             isTrackpadActive: layoutEngine.isTrackpadActive,

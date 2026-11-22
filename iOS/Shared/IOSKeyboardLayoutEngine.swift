@@ -112,6 +112,8 @@ public struct IOSKeyboardLayoutEngine: Equatable {
     public var schemaId: UInt32 = 86
     public var cangjieKeycapRadicals: Bool = true
     public var wubiKeycapRadicals: Bool = false
+    /// Temporarily show Latin `a..z` keycaps during Cangjie `z`+Pinyin reverse lookup.
+    public var isZLookupActive: Bool = false
     /// True only on Home-button devices where system does not draw its own bottom Globe bar.
     public var showInlineGlobeKey: Bool = false
     public var returnRole: IOSReturnKeyRole = .normal
@@ -690,6 +692,7 @@ public struct IOSKeyboardLayoutEngine: Equatable {
         cangjieKeycapRadicals
             && !asciiMode
             && !shiftState.isUppercase
+            && !isZLookupActive
             && (schemaId == 33 || schemaId == 35 || schemaId == 36)
     }
 

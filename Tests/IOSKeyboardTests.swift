@@ -421,6 +421,10 @@ struct IOSKeyboardTests {
         let cjAsciiSnap = cjLayout.computeLayout(in: CGSize(width: 440, height: 220))
         assert(cjAsciiSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "q")
         cjLayout.asciiMode = false
+        cjLayout.isZLookupActive = true
+        let cjZLookupSnap = cjLayout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(cjZLookupSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "q")
+        cjLayout.isZLookupActive = false
         cjLayout.cangjieKeycapRadicals = false
         let cjOffSnap = cjLayout.computeLayout(in: CGSize(width: 440, height: 220))
         assert(cjOffSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "q")

@@ -258,11 +258,13 @@ public struct SettingsRootView: View {
                                 : "拥有首选简码的单字在输入\(maxCodeLabel)码全码时后置",
                             isOn: binding(\.strictShortcode)
                         )
-                        if bridge.prefs.isWubiFamily {
+                        if bridge.prefs.isWubiFamily || isCangjie {
                             Divider()
                             toggleRow(
-                                title: "z 键万能通配与拼音反查",
-                                subtitle: "第 2–4 位输 z 通配任意码元；首字母输 z 接拼音反查当前版本的五笔码",
+                                title: isCangjie ? "z 键拼音反查" : "z 键万能通配与拼音反查",
+                                subtitle: isCangjie
+                                    ? "首字母输 z 接拼音反查当前仓颉版本的字根与编码（如 zmian → 面 一田尸中 mwsl）"
+                                    : "第 2–4 位输 z 通配任意码元；首字母输 z 接拼音反查当前版本的五笔码",
                                 isOn: binding(\.zOmnipotent)
                             )
                         }

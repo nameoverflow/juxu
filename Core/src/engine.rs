@@ -923,7 +923,11 @@ impl JuxuEngine {
         } else if self.uses_spaceless() {
             self.stream.preview(&self.raw_code)
         } else if self.config.schema.is_cangjie() {
-            cangjie_radicals_str(&self.raw_code)
+            if self.config.z_omnipotent && self.raw_code.starts_with('z') {
+                self.raw_code.clone()
+            } else {
+                cangjie_radicals_str(&self.raw_code)
+            }
         } else {
             self.raw_code.clone()
         }
@@ -958,7 +962,7 @@ impl JuxuEngine {
             && self.config.spaceless
             && self.active_dict().is_some()
             && self.aux.as_ref().is_some_and(AuxView::has_neural)
-            && !(self.config.schema.is_wubi()
+            && !(self.config.schema.supports_z_pinyin()
                 && self.config.z_omnipotent
                 && self.raw_code.starts_with('z'))
     }
@@ -1388,6 +1392,7 @@ impl JuxuEngine {
         if bytes.is_empty()
             || bytes.len() >= max_len
             || (self.config.schema.is_wubi() && bytes.contains(&b'z'))
+            || (self.config.schema.is_cangjie() && self.config.z_omnipotent && bytes.starts_with(b"z"))
         {
             return ALL_26;
         }
@@ -1431,7 +1436,7 @@ impl JuxuEngine {
         if mask == 0 {
             return ALL_26;
         }
-        if self.config.schema.is_wubi() && self.config.z_omnipotent {
+        if self.config.schema.supports_z_pinyin() && self.config.z_omnipotent {
             mask |= 1u32 << 25;
         }
         mask
@@ -1569,7 +1574,10 @@ impl JuxuEngine {
         }
         let bytes = self.raw_code.as_bytes();
         let max_len = self.config.schema.max_code_len();
-        if bytes.len() >= max_len || (self.config.schema.is_wubi() && bytes.contains(&b'z')) {
+        if bytes.len() >= max_len
+            || (self.config.schema.is_wubi() && bytes.contains(&b'z'))
+            || (self.config.schema.is_cangjie() && self.config.z_omnipotent && bytes.starts_with(b"z"))
+        {
             return (ALL_26, out);
         }
 
@@ -1970,7 +1978,7 @@ impl JuxuEngine {
         let mut commit_prefix = String::new();
         let mut notice = String::new();
         if self.uses_spaceless() && obs.ch.is_ascii_lowercase() {
-            if obs.ch != b'z' || !self.config.z_omnipotent || !self.config.schema.is_wubi() {
+            if obs.ch != b'z' || !self.config.z_omnipotent || !self.config.schema.supports_z_pinyin() {
                 return self.push_spaceless(obs);
             }
             if self.is_composing() {
@@ -1980,7 +1988,7 @@ impl JuxuEngine {
             }
         }
 
-        let is_z_pinyin_mode = self.config.schema.is_wubi()
+        let is_z_pinyin_mode = self.config.schema.supports_z_pinyin()
             && self.config.z_omnipotent
             && self.raw_code.starts_with('z')
             && !self.raw_code.starts_with("zz");
@@ -2021,7 +2029,7 @@ impl JuxuEngine {
         }
 
         // Check max-code behaviors (4th code for Wubi/Xiaohe, 5th code for Cangjie; not z+pinyin)!
-        let now_z_pinyin = self.config.schema.is_wubi()
+        let now_z_pinyin = self.config.schema.supports_z_pinyin()
             && self.config.z_omnipotent
             && self.raw_code.starts_with('z')
             && !self.raw_code.starts_with("zz");
@@ -2644,8 +2652,8 @@ impl JuxuEngine {
             return;
         }
 
-        // Branch 1: `z` omnipotent mode (Wubi only: z-prompt, zz-symbols, z+pinyin reverse lookup)
-        if self.config.schema.is_wubi()
+        // Branch 1: `z` omnipotent mode (Wubi & Cangjie: z-prompt, zz-symbols, z+pinyin reverse lookup)
+        if self.config.schema.supports_z_pinyin()
             && self.config.z_omnipotent
             && self.raw_code.starts_with('z')
         {
@@ -2669,8 +2677,13 @@ impl JuxuEngine {
     fn build_z_mode_candidates(&mut self, slot: usize) {
         let dict = self.dicts[slot].as_ref().unwrap();
         if self.raw_code == "z" {
+            let prompt = if self.config.schema.is_cangjie() {
+                "输拼音反查仓颉 · zz特殊符号"
+            } else {
+                "输拼音反查五笔 · zz特殊符号"
+            };
             for (sym, desc) in [
-                ("，", "输拼音反查五笔 · zz特殊符号"),
+                ("，", prompt),
                 ("。", "句号"),
                 ("？", "问号"),
                 ("！", "叹号"),
@@ -2738,7 +2751,14 @@ impl JuxuEngine {
                     if let Some(meta) = dict.char_meta(ch) {
                         let short_s = meta.shortest_code.as_string();
                         let full_s = meta.full_code.as_string();
-                        let code_desc = if !short_s.is_empty() && short_s != full_s {
+                        let code_desc = if self.config.schema.is_cangjie() {
+                            let rad_full = cangjie_radicals_str(&full_s);
+                            if py_disp.is_empty() {
+                                format!("{} {}", rad_full, full_s)
+                            } else {
+                                format!("{} {} ({})", rad_full, full_s, py_disp)
+                            }
+                        } else if !short_s.is_empty() && short_s != full_s {
                             if py_disp.is_empty() {
                                 format!("{} · {}", short_s, full_s)
                             } else {

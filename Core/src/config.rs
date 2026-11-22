@@ -122,6 +122,11 @@ impl InputSchema {
     pub fn allows_z_code(self) -> bool {
         !self.is_wubi()
     }
+
+    #[inline]
+    pub fn supports_z_pinyin(self) -> bool {
+        self.is_wubi() || self.is_cangjie()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

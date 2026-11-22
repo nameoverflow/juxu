@@ -381,9 +381,15 @@ public struct IOSHostRootView: View {
                                     : "有首选简码的单字在\(maxCodeLabel)码全码时后置",
                                 isOn: binding(\.strictShortcode)
                             )
-                            if bridge.prefs.isWubiFamily {
+                            if bridge.prefs.isWubiFamily || isCangjie {
                                 Divider()
-                                iosToggleRow("z 键通配与拼音反查", sub: "z 查码 + 输拼音反查五笔拆码", isOn: binding(\.zOmnipotent))
+                                iosToggleRow(
+                                    isCangjie ? "z 键拼音反查" : "z 键通配与拼音反查",
+                                    sub: isCangjie
+                                        ? "首键按重(z)后自动切字母键帽，输拼音反查当前仓颉拆码"
+                                        : "z 查码 + 输拼音反查五笔拆码",
+                                    isOn: binding(\.zOmnipotent)
+                                )
                             }
                             Divider()
                         }

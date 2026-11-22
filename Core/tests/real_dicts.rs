@@ -978,4 +978,32 @@ fn real_dicts_cangjie_3_5_6_input_and_five_code_rules() {
         engine.all_candidates().iter().any(|c| c.text == "面"),
         "expected '面' at 'mws' in Cangjie 6"
     );
+    engine.clear_composition();
+
+    // 5. Verify `z` + Pinyin reverse lookup across Cangjie 3, 5, and 6
+    for (schema, expected_rad, expected_ascii) in [
+        (InputSchema::Cangjie3, "一田卜中", "mwyl"),
+        (InputSchema::Cangjie5, "一田尸中", "mwsl"),
+        (InputSchema::Cangjie6, "一田尸", "mws"),
+    ] {
+        engine.set_schema(schema);
+        for ch in "zmian".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 900);
+        }
+        assert_eq!(engine.preedit(), "zmian", "z-pinyin lookup preedit should remain ASCII");
+        let hit = engine
+            .all_candidates()
+            .iter()
+            .find(|c| c.text == "面")
+            .expect("expected '面' in Cangjie z-pinyin lookup for 'zmian'");
+        assert!(
+            hit.comment.contains(expected_rad) && hit.comment.contains(expected_ascii),
+            "expected comment containing '{} {}' for {:?}, got '{}'",
+            expected_rad,
+            expected_ascii,
+            schema,
+            hit.comment
+        );
+        engine.clear_composition();
+    }
 }
