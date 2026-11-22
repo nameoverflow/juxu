@@ -1,37 +1,32 @@
 #!/usr/bin/env python3
 """
-Juxu (句序) V4 Expanded Multi-Domain Chinese Corpus Pipeline
-===========================================================
-Drop-in upgrade over V3 `corpus.py` (same `prepare(directory, seed)` interface,
-same `clean.txt` / `tokens.bin` / `vocab.json` / `corpus.json` artifacts,
-same `<COMMA>=2`, `<PERIOD>=3`, `<ENG_NUM>=4` multi-clause tokenization).
+Juxu (句序) V4 Mixed Chinese-English Multi-Domain Corpus Pipeline (`WBLM0002`)
+=============================================================================
+Builds a ~1.1B-char bilingual/mixed Chinese-English corpus + 12,288-token
+mini-RWKV-World vocabulary:
+  - `0`           : <BOS>
+  - `1`           : <UNK> (including rare CJK outside top-8,188 / CJK Ext-B..I)
+  - `2`           : <COMMA>
+  - `3`           : <PERIOD>
+  - `4..8191`     : Top 8,188 Simplified CJK characters (O(1) char-level LUT)
+  - `8192..8286`  : All 95 visible ASCII bytes (0x20..=0x7E) -> zero <UNK> for English/digits
+  - `8287..12287` : 4,001 corpus-mined English/numeric subwords (greedy longest-match Trie)
 
-Key expansions over V3 (989M):
-  1. Recent (2024-2026) internet chat, comments, and forum posts (~18% of corpus,
-     trimming legacy pre-2020 LCCC from 26% -> 12%):
-     - KrisTHL181/tieba-sunxiaochuan-ruozhi (2024-2026 posts & comments shards)
-     - Orphanage/Baidu_Tieba_SunXiaochuan (deduplicated thread titles + replies)
-     - alexxhchen/comap-weibo-bilibili-data (2024-2026 Weibo & Bilibili discussions)
-     - theblackcat102/bilibili_comments_sharegpt (Bilibili comment threads)
-     - FreshCrawl/rednote-xiaohongshu-notes (lifestyle/consumer notes)
-     - tiagozip/bilibili (optional daily 2026 Bilibili comments when HF_TOKEN is set)
-  2. Chinese technical articles & developer blogs (~18% of corpus):
-     - BAAI/IndustryCorpus2_computer_programming_code (chinese/high)
-     - BAAI/IndustryCorpus2_artificial_intelligence_machine_learning (chinese/high)
-     - BAAI/IndustryCorpus2_computer_communication (chinese/high)
-     - liwu/MNBVC (blog/ai_blog & blog/it_blog, skipping early 2013-2016 VC news stubs)
+Domain budget (~1.1B chars):
+  - ~28% Colloquial & recent 2024-2026 social/comments (LCCC trimmed to 120M;
+         Tieba 2024-2026, Weibo/Bilibili 2026, Bilibili comments, Xiaohongshu, DuplexConv)
+  - ~18% Chinese technical articles & dev blogs (rich in natural CJK + English code-switching:
+         IndustryCorpus2 programming/AI/comm `chinese/high` + MNBVC AI/IT blogs)
+  - ~22% Modern 2024-2026 Zhihu Q&A
+  - ~22% Formal Chinese web & Wikipedia (Fineweb-Edu + zhwiki capped at 7%)
+  - ~10% High-quality English tech & general prose (IndustryCorpus2 programming/AI/news/film
+         `english/high`) so all 4,096 English/ASCII subwords are thoroughly trained
 
 Cleaning policy:
-  - NO profanity or content censorship: real everyday colloquialisms, complaints, and
-    swearing are preserved intact so the IME faithfully matches what users type.
-  - Only strip non-natural noise: commercial spam templates, platform UI boilerplate,
-    fenced code blocks, URLs/HTML tags, and extreme single-char repetition spam.
-
-Modes:
-  - Full Cloud GPU build:
-      python3 Scripts/corpus_v4.py --out-dir /path/to/out --seed-dir /path/to/seed
-  - Local lightweight streaming audit (<15 MB total traffic):
-      python3 Scripts/corpus_v4.py --sample-audit --out-dir ./v4_audit
+  - NO profanity or content censorship.
+  - Only strip commercial spam, platform UI boilerplate, fenced code blocks, URLs/HTML,
+    and extreme single-char repetition spam.
+  - Real English/numbers are preserved verbatim (no longer collapsed to a single `E` token).
 """
 from __future__ import annotations
 
@@ -44,6 +39,7 @@ import io
 import json
 import os
 import re
+import struct
 import subprocess
 import tarfile
 import time
@@ -53,16 +49,19 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Tokenization & Normalization (100% compatible with Juxu V3 / WBLM0001)
+# Vocabulary Layout (12,288 tokens = 128-aligned for GPU Tensor Cores)
 # ---------------------------------------------------------------------------
-VOCAB = 8192
+CJK_VOCAB_LIMIT = 8192
+EXT_BASE_ID = 8192
+EXT_VOCAB_SIZE = 4096   # 95 visible ASCII chars + 4,001 frequent ASCII subwords
+VOCAB = EXT_BASE_ID + EXT_VOCAB_SIZE  # 12,288
+
 TOK_BOS = 0
 TOK_UNK = 1
-TOK_COMMA = 2    # ',' in clean.txt
-TOK_PERIOD = 3   # '.' in clean.txt
-TOK_ENG_NUM = 4  # 'E' in clean.txt
-FIRST_CJK_ID = 5
-MAX_PARA_CHARS = 220
+TOK_COMMA = 2
+TOK_PERIOD = 3
+FIRST_CJK_ID = 4
+MAX_PARA_CHARS = 260
 
 START_RECENT_TS = 1704067200  # 2024-01-01 UTC
 START_ZHIHU_TS = 1717200000   # 2024-06-01 UTC
@@ -92,14 +91,14 @@ RE_WIKI_STUB = re.compile(
 )
 RE_INTER_CJK_SPACE = re.compile(r"(?<=[\u3400-\u9fff])[ \t]+(?=[\u3400-\u9fff])")
 RE_INLINE_TAG = re.compile(r"<[^<>]+>|\[[^\[\]]+\]")
-CLAUSE_TOK = re.compile(r"[\u3400-\u9fff]+|[A-Za-z0-9][A-Za-z0-9._+-]*|[，,、;；:：——…]+|[。.？?！!\n]+")
+RE_ASCII_WORD = re.compile(r" ?[A-Za-z0-9][A-Za-z0-9._+-]{0,23}")
+RE_MULTI_SPACE = re.compile(r"[ \t]+")
 HAN = re.compile(r"[\u3400-\u9fff]+")
-DUP_SOUND = re.compile(r"^(.)\1{5,}$")
+DUP_SOUND = re.compile(r"(.)\1{5,}")
 RE_CODE_LINE = re.compile(
     r"^\s*(?:def |class |import |from |#include|public |private |const |let |var |func |fn |SELECT |INSERT |UPDATE |\{\s*$|\}\s*$)"
 )
 
-# Only commercial spam / promo boilerplate — NEVER profanity or slang
 SPAM_KW = (
     "购物礼金", "优惠礼包", "京东首页搜", "淘宝搜", "加微信", "私信领",
     "扫码领", "点我头像", "点击下方链接", "复制这条信息", "打开淘宝", "领券下单",
@@ -107,11 +106,12 @@ SPAM_KW = (
 )
 WIKI_CUTS = ("\n参考文献\n", "\n外部链接\n", "\n参见\n", "\n参考资料\n", "\n外部连结\n")
 
-# Target ~1.0B clean CJK chars:
-#   ~30% colloquial & recent 2024-2026 social/comments (LCCC trimmed to 12%)
-#   ~18% Chinese technical articles & developer blogs
-#   ~24% recent 2024-2026 Zhihu Q&A
-#   ~28% formal web & Wikipedia (wiki capped at 8%)
+# Target ~1.1B clean chars (CJK + English):
+#   ~28% colloquial & recent 2024-2026 social/comments (~300M)
+#   ~18% Chinese tech articles & blogs with dense English code-switching (~190M)
+#   ~22% recent 2024-2026 Zhihu Q&A (~240M)
+#   ~22% formal Chinese web & Wikipedia (~250M, wiki <=7%)
+#   ~10% high-quality English tech & news/entertainment prose (~110M)
 GROUP_CAPS = {
     "lccc": 120_000_000,
     "duplex": 20_000_000,
@@ -119,22 +119,30 @@ GROUP_CAPS = {
     "weibo_bili_2026": 50_000_000,
     "bilibili_sharegpt": 25_000_000,
     "xhs_notes": 15_000_000,
-    "bilibili_2026_gated": 20_000_000,
-    "tech_code": 50_000_000,
+    "tech_code": 55_000_000,
     "tech_ai": 45_000_000,
-    "tech_comm": 50_000_000,
+    "tech_comm": 55_000_000,
     "tech_blog": 35_000_000,
     "zhihu": 240_000_000,
-    "fineweb_high": 140_000_000,
-    "fineweb_mid": 60_000_000,
-    "wiki": 80_000_000,
+    "fineweb_high": 130_000_000,
+    "fineweb_mid": 45_000_000,
+    "wiki": 75_000_000,
+    # Pure English high-quality prose so all 4,096 English subwords train thoroughly
+    "en_tech_code": 35_000_000,
+    "en_tech_ai": 25_000_000,
+    "en_news": 25_000_000,
+    "en_entertainment": 25_000_000,
 }
 
-TECH_GROUPS = {"tech_code", "tech_ai", "tech_comm", "tech_blog"}
-SKIP_OPENCC = {"lccc", "duplex", "tieba_recent", "weibo_bili_2026"}
+TECH_GROUPS = {"tech_code", "tech_ai", "tech_comm", "tech_blog", "en_tech_code", "en_tech_ai"}
+ENGLISH_GROUPS = {"en_tech_code", "en_tech_ai", "en_news", "en_entertainment"}
+SKIP_OPENCC = {"lccc", "duplex", "tieba_recent", "weibo_bili_2026"} | ENGLISH_GROUPS
 
 
-def clean_text(text: str, is_tech: bool = False) -> str:
+# ---------------------------------------------------------------------------
+# Text Cleaning & Mixed Chinese-English Normalization (Preserves Real ASCII!)
+# ---------------------------------------------------------------------------
+def clean_text(text: str, is_tech: bool = False, is_english: bool = False) -> str:
     if not text:
         return ""
     text = RE_MD_CODE.sub(" ", text)
@@ -159,45 +167,81 @@ def clean_text(text: str, is_tech: bool = False) -> str:
                 continue
             if RE_CODE_LINE.match(s):
                 continue
-            cjk_n = sum(1 for c in s if "\u3400" <= c <= "\u9fff")
-            if cjk_n < 3:
-                continue
+            if not is_english:
+                cjk_n = sum(1 for c in s if "\u3400" <= c <= "\u9fff")
+                if cjk_n < 3:
+                    continue
+            else:
+                alpha_n = sum(1 for c in s if c.isascii() and c.isalpha())
+                if alpha_n < 12 or alpha_n / max(len(s), 1) < 0.45:
+                    continue
             kept_lines.append(s)
         text = "\n".join(kept_lines)
     return text
 
 
-def normalize_to_multiclause(text: str) -> str:
-    """Convert raw text into CJK chars plus ',' (<COMMA>), '.' (<PERIOD>), and 'E' (<ENG_NUM>)."""
-    out = []
-    last_punct = True
-    last_eng = False
-    for m in CLAUSE_TOK.finditer(text):
-        tok = m.group(0)
-        ch0 = tok[0]
-        if "\u3400" <= ch0 <= "\u9fff":
-            if DUP_SOUND.fullmatch(tok):
-                continue
-            out.append(tok)
-            last_punct = False
-            last_eng = False
-        elif ch0.isascii() and ch0.isalnum():
-            if not last_eng:
-                out.append("E")
-                last_eng = True
-                last_punct = False
-        elif not last_punct:
-            if ch0 in "。.？?！!\n":
-                out.append(".")
-            else:
+def normalize_mixed_text(text: str) -> str:
+    """
+    Normalize raw mixed Chinese-English text into clean lines preserving real ASCII words/digits,
+    collapsing Chinese/sentence-level punctuation into ',' and '.' (matching Rust `encode_mixed_str`).
+    """
+    out: list[str] = []
+    ascii_buf: list[str] = []
+    prev_punct: str | None = None
+
+    def flush_ascii():
+        nonlocal prev_punct
+        if not ascii_buf:
+            return
+        s = RE_MULTI_SPACE.sub(" ", "".join(ascii_buf)).strip()
+        ascii_buf.clear()
+        if s:
+            s = DUP_SOUND.sub(lambda m: m.group(1) * 3, s)
+            out.append(s)
+            prev_punct = None
+
+    n = len(text)
+    for i, ch in enumerate(text):
+        u = ord(ch)
+        if 0x3400 <= u < 0xA000:
+            flush_ascii()
+            out.append(ch)
+            prev_punct = None
+        elif (0xF900 <= u <= 0xFAFF) or (0x20000 <= u <= 0x3FFFF):
+            flush_ascii()
+            out.append(ch)
+            prev_punct = None
+        elif ch in "，、；：—":
+            flush_ascii()
+            if prev_punct != ",":
                 out.append(",")
-            last_punct = True
-            last_eng = False
-    while out and out[-1] in (",", ".", "E"):
-        out.pop()
-    while out and out[0] in (",", ".", "E"):
-        out.pop(0)
-    return "".join(out)
+                prev_punct = ","
+        elif ch in "。？！\n":
+            flush_ascii()
+            if prev_punct != ".":
+                out.append(".")
+                prev_punct = "."
+        elif 0x20 <= u <= 0x7E:
+            next_is_alnum = (i + 1 < n) and text[i + 1].isascii() and text[i + 1].isalnum()
+            if ch in ",;:" and not next_is_alnum:
+                flush_ascii()
+                if prev_punct != ",":
+                    out.append(",")
+                    prev_punct = ","
+            elif ch in ".?!" and not next_is_alnum:
+                flush_ascii()
+                if prev_punct != ".":
+                    out.append(".")
+                    prev_punct = "."
+            else:
+                ascii_buf.append(ch)
+        elif ch.isspace():
+            if ascii_buf:
+                ascii_buf.append(" ")
+    flush_ascii()
+    res = "".join(out)
+    res = DUP_SOUND.sub(lambda m: m.group(1) * 3, res)
+    return res.strip(",. ")
 
 
 def split_paragraphs(seq: str, max_chars: int = MAX_PARA_CHARS) -> list[str]:
@@ -212,38 +256,225 @@ def split_paragraphs(seq: str, max_chars: int = MAX_PARA_CHARS) -> list[str]:
             cut = seq.rfind(".", start + max_chars // 2, end)
             if cut == -1:
                 cut = seq.rfind(",", start + max_chars // 2, end)
+            if cut == -1:
+                cut = seq.rfind(" ", start + max_chars // 2, end)
             if cut != -1:
                 end = cut
-        part = seq[start:end].strip(",.")
-        if len(part) >= 2:
+        part = seq[start:end].strip(",. ")
+        if len(part) >= 4:
             chunks.append(part)
-        start = end + (1 if end < n and seq[end] in ",." else 0)
+        start = end + (1 if end < n and seq[end] in ",. " else 0)
     return chunks
 
 
-def load_eval(path: Path):
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if "\t" in line and not line.startswith("#"):
-            group, s = line.split("\t", 1)
-            for part in HAN.findall(s):
-                if len(part) >= 2:
-                    yield group, part
+# ---------------------------------------------------------------------------
+# Mini-RWKV-World ASCII Subword Vocab Builder & Greedy Longest-Match Trie
+# ---------------------------------------------------------------------------
+class AsciiTrie:
+    """Bit-exact Python twin of Rust `Core/src/neural.rs::AsciiTrie`."""
+
+    def __init__(self, ext_base_id: int, entries: list[str]):
+        self.ext_base_id = ext_base_id
+        self.entries = entries
+        self.root: dict[int, dict] = {}
+        self.single_ascii = [TOK_UNK] * 95
+        for idx, s in enumerate(entries):
+            b = s.encode("ascii")
+            tok = ext_base_id + idx
+            if len(b) == 1 and 0x20 <= b[0] <= 0x7E:
+                self.single_ascii[b[0] - 0x20] = tok
+            node = self.root
+            for ch_b in b:
+                nxt = node.get(ch_b)
+                if nxt is None:
+                    nxt = {}
+                    node[ch_b] = nxt
+                node = nxt
+            node[-1] = tok
+
+    def encode_ascii(self, data: bytes) -> list[int]:
+        out: list[int] = []
+        i = 0
+        n = len(data)
+        root = self.root
+        single = self.single_ascii
+        while i < n:
+            node = root
+            best_tok = 0
+            best_len = 0
+            j = i
+            while j < n:
+                nxt = node.get(data[j])
+                if nxt is None:
+                    break
+                node = nxt
+                j += 1
+                t = node.get(-1)
+                if t is not None:
+                    best_tok = t
+                    best_len = j - i
+            if best_len > 0:
+                out.append(best_tok)
+                i += best_len
+            else:
+                b = data[i]
+                out.append(single[b - 0x20] if 0x20 <= b <= 0x7E else TOK_UNK)
+                i += 1
+        return out
 
 
-def extract_eval_candidates(norm: str) -> list[str]:
-    out = []
-    for seg in norm.split("."):
-        seg = seg.strip(",E")
-        cjk = sum(1 for c in seg if "\u3400" <= c <= "\u9fff")
-        if 12 <= cjk <= 44 and len(seg) <= 56:
-            cjk_only = "".join(c for c in seg if "\u3400" <= c <= "\u9fff")
-            if len(set(cjk_only)) >= max(7, len(cjk_only) // 3):
-                out.append(seg)
+def build_ascii_subword_vocab(ascii_word_counts: Counter[str], target_size: int = EXT_VOCAB_SIZE) -> list[str]:
+    """
+    Build a 4,096-entry ASCII subword vocabulary:
+      - First 95 entries: all visible ASCII single bytes (0x20..=0x7E)
+      - Remaining 4,001 entries: BPE-mined frequent English/numeric words & subwords
+    """
+    base_chars = [chr(c) for c in range(0x20, 0x7F)]
+    seen = set(base_chars)
+    subwords: list[str] = list(base_chars)
+    need = target_size - len(subwords)
+    if need <= 0 or not ascii_word_counts:
+        return subwords[:target_size]
+
+    # Seed with top-25k frequent ASCII words/tokens for fast BPE merge mining
+    vocab_seqs: list[tuple[list[str], int]] = []
+    for w, cnt in ascii_word_counts.most_common(25000):
+        if cnt < 2 or not w:
+            continue
+        if all(0x20 <= ord(c) <= 0x7E for c in w):
+            vocab_seqs.append((list(w), cnt))
+
+    # Fast iterative BPE pair merges (batch top non-overlapping merges per round for speed)
+    while len(subwords) < target_size and vocab_seqs:
+        pair_counts: Counter[tuple[str, str]] = Counter()
+        for seq, cnt in vocab_seqs:
+            for k in range(len(seq) - 1):
+                pair_counts[(seq[k], seq[k + 1])] += cnt
+        if not pair_counts:
+            break
+        # Pick up to 64 top non-overlapping pairs per round so 4,000 merges take ~2-4 seconds
+        batch_pairs: dict[tuple[str, str], str] = {}
+        used_syms: set[str] = set()
+        for (a, b), c in pair_counts.most_common(256):
+            if c < 2:
+                break
+            merged = a + b
+            if len(merged) > 16 or merged in seen:
+                continue
+            if a in used_syms or b in used_syms:
+                continue
+            batch_pairs[(a, b)] = merged
+            used_syms.add(a)
+            used_syms.add(b)
+            seen.add(merged)
+            subwords.append(merged)
+            if len(subwords) >= target_size or len(batch_pairs) >= 64:
+                break
+        if not batch_pairs:
+            break
+        new_seqs = []
+        for seq, cnt in vocab_seqs:
+            out_s: list[str] = []
+            k = 0
+            ln = len(seq)
+            while k < ln:
+                if k + 1 < ln:
+                    m = batch_pairs.get((seq[k], seq[k + 1]))
+                    if m is not None:
+                        out_s.append(m)
+                        k += 2
+                        continue
+                out_s.append(seq[k])
+                k += 1
+            if len(out_s) > 1:
+                new_seqs.append((out_s, cnt))
+        vocab_seqs = new_seqs
+
+    return subwords[:target_size]
+
+
+def encode_mixed_line(text: str, cjk_lut: dict[int, int], trie: AsciiTrie) -> list[int]:
+    """Bit-exact Python twin of Rust `NeuralView::encode_mixed_str`."""
+    out: list[int] = []
+    ascii_buf: list[int] = []
+    prev_punct: int | None = None
+
+    def flush_ascii():
+        nonlocal prev_punct
+        if not ascii_buf:
+            return
+        norm: list[int] = []
+        last_sp = True
+        for b in ascii_buf:
+            if b == 0x20:
+                if not last_sp:
+                    norm.append(0x20)
+                    last_sp = True
+            else:
+                norm.append(b)
+                last_sp = False
+        while norm and norm[-1] == 0x20:
+            norm.pop()
+        ascii_buf.clear()
+        if norm:
+            out.extend(trie.encode_ascii(bytes(norm)))
+            prev_punct = None
+
+    n = len(text)
+    for i, ch in enumerate(text):
+        u = ord(ch)
+        if 0x3400 <= u < 0xA000:
+            flush_ascii()
+            out.append(cjk_lut.get(u, TOK_UNK))
+            prev_punct = None
+        elif (0xF900 <= u <= 0xFAFF) or (0x20000 <= u <= 0x3FFFF):
+            flush_ascii()
+            out.append(TOK_UNK)
+            prev_punct = None
+        elif ch in "，、；：—":
+            flush_ascii()
+            if prev_punct != TOK_COMMA:
+                out.append(TOK_COMMA)
+                prev_punct = TOK_COMMA
+        elif ch in "。？！\n":
+            flush_ascii()
+            if prev_punct != TOK_PERIOD:
+                out.append(TOK_PERIOD)
+                prev_punct = TOK_PERIOD
+        elif 0x20 <= u <= 0x7E:
+            next_is_alnum = (i + 1 < n) and text[i + 1].isascii() and text[i + 1].isalnum()
+            if ch in ",;:" and not next_is_alnum:
+                flush_ascii()
+                if prev_punct != TOK_COMMA:
+                    out.append(TOK_COMMA)
+                    prev_punct = TOK_COMMA
+            elif ch in ".?!" and not next_is_alnum:
+                flush_ascii()
+                if prev_punct != TOK_PERIOD:
+                    out.append(TOK_PERIOD)
+                    prev_punct = TOK_PERIOD
+            else:
+                ascii_buf.append(u)
+        elif ch.isspace():
+            if ascii_buf:
+                ascii_buf.append(0x20)
+    flush_ascii()
     return out
 
 
+def pack_wblm0002_ext_vocab_bytes(ext_base_id: int, ext_vocab: list[str]) -> bytes:
+    """Serialize trailing `EXT_VOCAB` section for `WBLM0002` binary export."""
+    buf = bytearray(struct.pack("<II", ext_base_id, len(ext_vocab)))
+    for s in ext_vocab:
+        b = s.encode("ascii")
+        assert 1 <= len(b) <= 255
+        buf.append(len(b))
+        buf.extend(b)
+    return bytes(buf)
+
+
 # ---------------------------------------------------------------------------
-# Record Parsers
+# Record Parsers & Cloud GPU Sources List
 # ---------------------------------------------------------------------------
 def parse_tieba_sxc_jsonl(lines) -> list[str]:
     seen_titles: set[str] = set()
@@ -360,9 +591,6 @@ def parse_wubi86_char_keys(yaml_path: Path) -> dict[int, int]:
     return char_first_key
 
 
-# ---------------------------------------------------------------------------
-# Full Cloud GPU Corpus Builder (compatible with V3 trainer)
-# ---------------------------------------------------------------------------
 def build_sources_list(api=None) -> list[tuple[str, str, str, str | None, bool]]:
     fineweb = "opencsg/Fineweb-Edu-Chinese-V2.1"
     sources: list[tuple[str, str, str, str | None, bool]] = [
@@ -380,7 +608,7 @@ def build_sources_list(api=None) -> list[tuple[str, str, str, str | None, bool]]
         ("bilibili_sharegpt", "theblackcat102/bilibili_comments_sharegpt", "train.jsonl", None, False),
         ("duplex", "qualialabsAI/DuplexConv", "none_Edu/jsons.tar.gz", "0bb99da7ab7a2f6f86d6b23df92c9383e711d09a", False),
         ("lccc", "silver/lccc", "lccc_large.jsonl.gz", None, False),
-        # 2. Chinese technical articles & developer blogs
+        # 2. Chinese technical articles & dev blogs (dense CJK + English code-switching)
         ("tech_code", "BAAI/IndustryCorpus2_computer_programming_code", "chinese/high/rank_00025.parquet", None, False),
         ("tech_ai", "BAAI/IndustryCorpus2_artificial_intelligence_machine_learning", "chinese/high/rank_00011.parquet", None, False),
         ("tech_ai", "BAAI/IndustryCorpus2_artificial_intelligence_machine_learning", "chinese/high/rank_00012.parquet", None, False),
@@ -396,26 +624,30 @@ def build_sources_list(api=None) -> list[tuple[str, str, str, str | None, bool]]
             ("tech_blog", "liwu/MNBVC", f"blog/it_blog/20230923/{i:03d}.jsonl.gz", None, False)
             for i in range(1, 6)
         ],
-        # 3. Modern 2024-2026 Zhihu Q&A
+        # 3. High-quality English tech & news/entertainment prose (~10% of total corpus)
+        ("en_tech_code", "BAAI/IndustryCorpus2_computer_programming_code", "english/high/rank_00864.parquet", None, False),
+        ("en_tech_ai", "BAAI/IndustryCorpus2_artificial_intelligence_machine_learning", "english/high/rank_00785.parquet", None, False),
+        ("en_news", "BAAI/IndustryCorpus2_news_media", "english/high/rank_01332.parquet", None, False),
+        ("en_entertainment", "BAAI/IndustryCorpus2_film_entertainment", "english/high/rank_00961.parquet", None, False),
+        # 4. Modern 2024-2026 Zhihu Q&A
         *[
             ("zhihu", "KrisTHL181/zhihu-qa", f"shards/part-{i:06d}.jsonl.zst", None, False)
             for i in range(93, 34, -1)
         ],
-        # 4. Formal web & Wikipedia
+        # 5. Formal Chinese web & Wikipedia
         *[
             ("fineweb_high", fineweb, f"4_5/{i:06d}.parquet", "a5b574efa48beb3a8f6887ef0b093becf004328b", False)
-            for i in range(48)
+            for i in range(44)
         ],
         *[
             ("fineweb_mid", fineweb, f"3_4/{i:06d}.parquet", "a5b574efa48beb3a8f6887ef0b093becf004328b", False)
-            for i in range(5)
+            for i in range(4)
         ],
         *[
             ("wiki", "wikimedia/wikipedia", f"20231101.zh/train-{i:05d}-of-00006.parquet", None, False)
             for i in (2, 1, 0, 3, 4, 5)
         ],
     ]
-    # Dynamically add recent 2026 Weibo & Bilibili CSV files if HfApi is available
     if api is not None:
         try:
             files = api.list_repo_files("alexxhchen/comap-weibo-bilibili-data", repo_type="dataset")
@@ -428,6 +660,15 @@ def build_sources_list(api=None) -> list[tuple[str, str, str, str | None, bool]]
         except Exception as e:
             print(f"[corpus] warn: unable to list weibo/bilibili CSVs: {e}", flush=True)
     return sources
+
+
+def load_eval(path: Path):
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if "\t" in line and not line.startswith("#"):
+            group, s = line.split("\t", 1)
+            for part in HAN.findall(s):
+                if len(part) >= 2:
+                    yield group, part
 
 
 def iter_records(group: str, path: Path):
@@ -510,7 +751,7 @@ def iter_records(group: str, path: Path):
                         body = body[:pos]
                 yield f"{row.get('title') or ''}。{body}"
     else:
-        min_len = 120 if group in ("fineweb_high", "tech_code", "tech_ai", "tech_comm") else 80
+        min_len = 120 if group in ("fineweb_high",) | TECH_GROUPS | ENGLISH_GROUPS else 80
         for batch in ParquetFile(path).iter_batches(batch_size=512, columns=["text"]):
             for row in batch.to_pylist():
                 text = row.get("text") or ""
@@ -549,48 +790,47 @@ class CorpusWriter:
         if any(kw in data for kw in SPAM_KW):
             stats["spam_docs"] += 1
             return
-        text = clean_text(data, is_tech=(source in TECH_GROUPS))
+        is_en = source in ENGLISH_GROUPS
+        text = clean_text(data, is_tech=(source in TECH_GROUPS), is_english=is_en)
         if source == "wiki":
             head_s = self.simplifier.convert(text[:360])
             if RE_WIKI_STUB.search(head_s):
                 stats["wiki_stub_docs"] += 1
                 return
-        norm = normalize_to_multiclause(text)
-        if len(norm) < 2:
+        norm = normalize_mixed_text(text)
+        if len(norm) < 4:
             return
         if source not in SKIP_OPENCC:
             norm = self.simplifier.convert(norm)
-        cjk_skel = norm.replace(",", "").replace(".", "").replace("E", "")
-        if len(cjk_skel) < 2:
+        cjk_skel = "".join(c for c in norm if "\u3400" <= c <= "\u9fff")
+        if not is_en and len(cjk_skel) < 2:
             return
         if len(cjk_skel) >= 10 and next(self.guard.iter(cjk_skel), None) is not None:
             stats["eval_overlap_docs"] += 1
-            stats["eval_overlap_chars"] += len(cjk_skel)
             return
-        if cjk_skel in self.test_exact:
+        if cjk_skel and cjk_skel in self.test_exact:
             stats["eval_overlap_docs"] += 1
             return
-        if len(cjk_skel) >= 8:
-            sig = hashlib.blake2b(cjk_skel[:512].encode(), digest_size=12).digest()
+        sig_src = cjk_skel[:512] if len(cjk_skel) >= 8 else norm[:512]
+        if len(sig_src) >= 8:
+            sig = hashlib.blake2b(sig_src.encode(), digest_size=12).digest()
             if sig in self.doc_seen:
-                stats["duplicate_doc_chars"] += len(cjk_skel)
+                stats["duplicate_doc_chars"] += len(norm)
                 return
             self.doc_seen.add(sig)
 
         retained = []
         for para in split_paragraphs(norm, MAX_PARA_CHARS):
-            p_cjk = len(para) - para.count(",") - para.count(".") - para.count("E")
-            if p_cjk < 2:
+            if len(para) < 4:
                 continue
-            if p_cjk >= 12:
+            if len(para) >= 16:
                 key = hash(para)
                 if key in self.para_seen:
-                    stats["duplicate_para_chars"] += p_cjk
+                    stats["duplicate_para_chars"] += len(para)
                     continue
                 if len(self.para_seen) < 12_000_000:
                     self.para_seen.add(key)
-            stats["chars"] += p_cjk
-            stats["puncts"] += len(para) - p_cjk
+            stats["chars"] += len(para)
             stats["paras"] += 1
             retained.append(para)
         if retained:
@@ -604,62 +844,81 @@ class CorpusWriter:
 def pack(directory: Path, seed: Path):
     import numpy as np
 
-    chars = directory / "clean.txt"
-    counts = np.zeros(0xA000, dtype=np.int64)
-    outside = 0
-    with chars.open(encoding="utf-8") as f:
-        for text in iter(lambda: f.read(1 << 22), ""):
-            points = np.frombuffer(text.encode("utf-32-le"), dtype="<u4")
-            in_range = points < len(counts)
-            outside += int((~in_range).sum())
-            counts += np.bincount(points[in_range], minlength=len(counts))
+    clean_path = directory / "clean.txt"
+    cjk_counts = np.zeros(0xA000, dtype=np.int64)
+    ascii_words: Counter[str] = Counter()
+    total_lines = 0
+    with clean_path.open(encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            total_lines += 1
+            for ch in s:
+                u = ord(ch)
+                if 0x3400 <= u < 0xA000:
+                    cjk_counts[u] += 1
+            for m in RE_ASCII_WORD.finditer(s):
+                ascii_words[m.group(0)] += 1
+            if len(ascii_words) > 400_000:
+                ascii_words = Counter(dict(ascii_words.most_common(120_000)))
 
     char_keys = parse_wubi86_char_keys(seed / "wubi86.dict.yaml")
-    ranked = sorted(
+    ranked_cjk = sorted(
         range(0x3400, 0xA000),
-        key=lambda cp: (-(counts[cp] + 50 * (cp in char_keys)), cp),
-    )[: VOCAB - FIRST_CJK_ID]
-    vocab = sorted(ranked)
-    lookup = np.ones(0xA000, dtype="<u2")
-    lookup[10] = TOK_BOS
-    lookup[44] = TOK_COMMA
-    lookup[46] = TOK_PERIOD
-    lookup[69] = TOK_ENG_NUM
-    lookup[vocab] = np.arange(FIRST_CJK_ID, VOCAB, dtype=np.uint16)
+        key=lambda cp: (-(int(cjk_counts[cp]) + 50 * (cp in char_keys)), cp),
+    )[: CJK_VOCAB_LIMIT - FIRST_CJK_ID]
+    vocab_cjk = sorted(ranked_cjk)
+    cjk_lut_arr = np.ones(0xA000 - 0x3400, dtype="<u2")
+    cjk_lut_map: dict[int, int] = {}
+    for idx, cp in enumerate(vocab_cjk):
+        tid = FIRST_CJK_ID + idx
+        cjk_lut_arr[cp - 0x3400] = tid
+        cjk_lut_map[cp] = tid
 
+    ext_vocab = build_ascii_subword_vocab(ascii_words, target_size=EXT_VOCAB_SIZE)
+    trie = AsciiTrie(EXT_BASE_ID, ext_vocab)
+    vocab_total = EXT_BASE_ID + len(ext_vocab)
+
+    tok_counts = np.ones(vocab_total, dtype=np.int64)
     packed = directory / "tokens.bin"
-    with packed.open("wb") as out_f, chars.open(encoding="utf-8") as in_f:
-        for text in iter(lambda: in_f.read(1 << 22), ""):
-            points = np.frombuffer(text.encode("utf-32-le"), dtype="<u4")
-            selected = points < len(lookup)
-            ids = np.full(points.shape, TOK_UNK, dtype="<u2")
-            ids[selected] = lookup[points[selected]]
-            ids.tofile(out_f)
-    np.save(directory / "lut.npy", lookup[0x3400:].copy())
+    total_tokens = 0
+    with packed.open("wb") as out_f, clean_path.open(encoding="utf-8") as in_f:
+        buf = bytearray()
+        for line in in_f:
+            s = line.strip()
+            if not s:
+                continue
+            ids = [TOK_BOS] + encode_mixed_line(s, cjk_lut_map, trie)
+            for tid in ids:
+                tok_counts[tid] += 1
+            buf.extend(struct.pack(f"<{len(ids)}H", *ids))
+            if len(buf) >= 4 * 1024 * 1024:
+                out_f.write(buf)
+                total_tokens += len(buf) // 2
+                buf.clear()
+        if buf:
+            out_f.write(buf)
+            total_tokens += len(buf) // 2
 
-    all_cjk = int(counts[0x3400:].sum()) + outside
-    used = int(counts[vocab].sum())
-    n_comma = int(counts[44])
-    n_period = int(counts[46])
-    n_eng = int(counts[69])
-    distribution = [1, max(1, all_cjk - used), max(1, n_comma), max(1, n_period), max(1, n_eng)] + [
-        int(counts[i]) + 1 for i in vocab
-    ]
-    scale = float(sum(distribution))
+    np.save(directory / "lut.npy", cjk_lut_arr)
+    scale = float(tok_counts.sum())
+    key1 = [255] * vocab_total
+    for idx, cp in enumerate(vocab_cjk):
+        key1[FIRST_CJK_ID + idx] = char_keys.get(cp, 255)
+
     labels = {
-        "vocab": VOCAB,
-        "chars": all_cjk,
-        "commas": n_comma,
-        "periods": n_period,
-        "eng_nums": n_eng,
-        "bos": int(counts[10]),
-        "tokens": packed.stat().st_size // 2,
-        "oov_chars": all_cjk - used,
-        "outside_lut": outside,
-        "uni_logp": np.log(np.asarray(distribution) / scale).tolist(),
-        "key1": [255, 255, 255, 255, 255] + [char_keys.get(cp, 255) for cp in vocab],
+        "format": "WBLM0002",
+        "vocab": vocab_total,
+        "cjk_vocab": len(vocab_cjk),
+        "ext_base_id": EXT_BASE_ID,
+        "ext_vocab": ext_vocab,
+        "lines": total_lines,
+        "tokens": total_tokens,
+        "uni_logp": np.log(tok_counts / scale).tolist(),
+        "key1": key1,
     }
-    (directory / "vocab.json").write_text(json.dumps(labels) + "\n")
+    (directory / "vocab.json").write_text(json.dumps(labels, ensure_ascii=False) + "\n", encoding="utf-8")
     return labels
 
 
@@ -748,24 +1007,12 @@ def prepare(directory: Path, seed: Path):
 
     stats = writer.close()
     result = pack(directory, seed)
-    stats_by_source = {}
-    for name, row in stats.items():
-        d = dict(row)
-        d["avg_para_chars"] = round(d.get("chars", 0) / max(1, d.get("paras", 0)), 2)
-        stats_by_source[name] = d
-    overall_para = result["chars"] / max(1, result["bos"])
     manifest = {
+        "format": "WBLM0002",
         "sources": use,
-        "groups": stats_by_source,
-        "chars": result["chars"],
-        "commas": result["commas"],
-        "periods": result["periods"],
-        "eng_nums": result["eng_nums"],
-        "bos": result["bos"],
+        "groups": {k: dict(v) for k, v in stats.items()},
         "tokens": result["tokens"],
-        "avg_para_chars": round(overall_para, 2),
-        "oov_chars": result["oov_chars"],
-        "outside_lut_chars": result["outside_lut"],
+        "vocab": result["vocab"],
         "prepare_seconds": round(time.monotonic() - started),
     }
     (directory / "corpus.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
@@ -773,7 +1020,7 @@ def prepare(directory: Path, seed: Path):
 
 
 # ---------------------------------------------------------------------------
-# Lightweight Streaming Sample Audit (<15 MB total network traffic)
+# Lightweight Local Streaming Audit (verifies mixed CJK+English vocab & Trie)
 # ---------------------------------------------------------------------------
 def http_range_bytes(url: str, nbytes: int) -> bytes:
     for attempt in range(3):
@@ -802,130 +1049,76 @@ def http_get_json(url: str):
 
 def run_sample_audit(out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
-    eval_social: list[tuple[str, str]] = []
-    eval_tech: list[tuple[str, str]] = []
-    report: dict[str, dict] = {}
+    all_norm_lines: list[str] = []
+    ascii_words: Counter[str] = Counter()
 
-    def audit_stream(name: str, is_tech: bool, raw_iter, eval_bucket: list, max_docs: int = 500):
-        stats = Counter()
+    def collect(name: str, is_tech: bool, is_en: bool, raw_iter, max_docs: int = 200):
+        cnt = 0
+        chars = 0
         samples = []
-        seen = set()
         for doc in raw_iter:
-            if stats["accepted_docs"] >= max_docs:
+            if cnt >= max_docs:
                 break
-            stats["raw_docs"] += 1
             if not doc or any(kw in doc for kw in SPAM_KW):
-                stats["spam_dropped"] += 1
                 continue
-            cleaned = clean_text(doc, is_tech=is_tech)
-            norm = normalize_to_multiclause(cleaned)
-            cjk_n = sum(1 for c in norm if "\u3400" <= c <= "\u9fff")
-            if cjk_n < 4:
-                stats["short_dropped"] += 1
+            cl = clean_text(doc, is_tech=is_tech, is_english=is_en)
+            norm = normalize_mixed_text(cl)
+            if len(norm) < 8:
                 continue
-            sig = hashlib.blake2b(norm[:256].encode("utf-8"), digest_size=8).digest()
-            if sig in seen:
-                stats["dedup_dropped"] += 1
-                continue
-            seen.add(sig)
-            paras = split_paragraphs(norm, MAX_PARA_CHARS)
-            stats["accepted_docs"] += 1
-            for p in paras:
-                pc = sum(1 for c in p if "\u3400" <= c <= "\u9fff")
-                stats["chars"] += pc
-                stats["eng_tokens"] += p.count("E")
-                stats["commas"] += p.count(",")
-                stats["periods"] += p.count(".")
-                stats["paras"] += 1
-            if len(samples) < 3 and cjk_n >= 12:
-                samples.append({"raw": doc[:120].replace("\n", " "), "norm": paras[0][:120]})
-            if stats["eval_added"] < 40:
-                for cand in extract_eval_candidates(norm):
-                    eval_bucket.append((name, cand))
-                    stats["eval_added"] += 1
-                    break
-        avg_para = round(stats["chars"] / max(1, stats["paras"]), 1)
-        eng_per_1k = round(1000.0 * stats["eng_tokens"] / max(1, stats["chars"]), 1)
-        report[name] = {
-            "raw_docs": stats["raw_docs"],
-            "accepted_docs": stats["accepted_docs"],
-            "dedup_dropped": stats["dedup_dropped"],
-            "spam_dropped": stats["spam_dropped"],
-            "chars": stats["chars"],
-            "avg_para_chars": avg_para,
-            "eng_per_1k_cjk": eng_per_1k,
-            "samples": samples,
-        }
-        print(
-            f"[audit] {name:22s}: docs={stats['accepted_docs']:4d}/{stats['raw_docs']:4d}, "
-            f"chars={stats['chars']:7,d}, avg_para={avg_para:5.1f}, E/1k={eng_per_1k:4.1f}",
-            flush=True,
-        )
+            cnt += 1
+            chars += len(norm)
+            all_norm_lines.append(norm)
+            for m in RE_ASCII_WORD.finditer(norm):
+                ascii_words[m.group(0)] += 1
+            if len(samples) < 2:
+                samples.append(norm[:110])
+        print(f"[audit] {name:20s}: docs={cnt:3d}, chars={chars:7,d} | ex: {samples[0] if samples else ''}", flush=True)
 
     b = http_range_bytes(
         "https://huggingface.co/datasets/Orphanage/Baidu_Tieba_SunXiaochuan/resolve/main/No_train_validation_split.jsonl",
-        1_500_000,
+        800_000,
     )
-    audit_stream("tieba_sunxiaochuan", False, parse_tieba_sxc_jsonl(b.decode("utf-8", errors="ignore").splitlines()[:-1]), eval_social)
+    collect("tieba_sxc", False, False, parse_tieba_sxc_jsonl(b.decode("utf-8", errors="ignore").splitlines()[:-1]), 200)
 
     b = http_range_bytes(
-        "https://huggingface.co/datasets/KrisTHL181/tieba-sunxiaochuan-ruozhi/resolve/main/shards/posts/part-00007.jsonl.zst",
-        1_500_000,
+        "https://huggingface.co/datasets/liwu/MNBVC/resolve/main/blog/ai_blog/20230923/000.jsonl.gz",
+        1_200_000,
     )
-    p = subprocess.run(["zstd", "-d", "-c"], input=b, capture_output=True)
-    audit_stream(
-        "tieba_kris_2025",
-        False,
-        parse_tieba_kris_jsonl(p.stdout.decode("utf-8", errors="ignore").splitlines()[:-1], min_ts=START_RECENT_TS),
-        eval_social,
-    )
-
-    weibo_docs = []
-    for fn in [
-        "weibo/processed/weibo_hot_search_20121213-20261122_ac.csv",
-        "weibo/processed/weibo_hot_search_20121124-20261109_ac.csv",
-    ]:
-        b = http_range_bytes(f"https://huggingface.co/datasets/alexxhchen/comap-weibo-bilibili-data/resolve/main/{fn}", 500_000)
-        weibo_docs.extend(parse_weibo_bili_csv(io.StringIO(b.decode("utf-8-sig", errors="ignore")), min_year=2024))
-    audit_stream("weibo_2026", False, weibo_docs, eval_social)
-
-    b = http_range_bytes(
-        "https://huggingface.co/datasets/FreshCrawl/rednote-xiaohongshu-notes/resolve/main/rednote_notes.csv",
-        1_500_000,
-    )
-    audit_stream("xhs_notes", False, parse_xhs_csv(io.StringIO(b.decode("utf-8-sig", errors="ignore"))), eval_social)
-
-    for tag, sub in [
-        ("mnbvc_ai_blog", "blog/ai_blog/20230923/000.jsonl.gz"),
-        ("mnbvc_it_blog", "blog/it_blog/20230923/001.jsonl.gz"),
-    ]:
-        b = http_range_bytes(f"https://huggingface.co/datasets/liwu/MNBVC/resolve/main/{sub}", 1_500_000)
-        p = subprocess.run(["gzip", "-dc"], input=b, capture_output=True)
-        audit_stream(tag, True, parse_mnbvc_blog_jsonl(p.stdout.decode("utf-8", errors="ignore").splitlines()[:-1]), eval_tech, max_docs=300)
+    p = subprocess.run(["gzip", "-dc"], input=b, capture_output=True)
+    collect("mnbvc_ai_blog", True, False, parse_mnbvc_blog_jsonl(p.stdout.decode("utf-8", errors="ignore").splitlines()[:-1]), 120)
 
     try:
         data = http_get_json(
-            "https://datasets-server.huggingface.co/rows?dataset=BAAI/IndustryCorpus2_computer_programming_code&config=default&split=train&offset=0&length=100"
+            "https://datasets-server.huggingface.co/rows?dataset=BAAI/IndustryCorpus2_computer_programming_code&config=default&split=train&offset=0&length=80"
         )
-        audit_stream("ic2_programming", True, [r["row"].get("text", "") for r in data.get("rows", [])], eval_tech, max_docs=100)
+        collect("ic2_zh_code", True, False, [r["row"].get("text", "") for r in data.get("rows", [])], 80)
     except Exception as e:
-        print(f"[audit] ic2_programming: SKIP ({e})", flush=True)
+        print(f"[audit] ic2_zh_code: SKIP ({e})", flush=True)
 
-    (out_dir / "audit_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    with (out_dir / "recent_social_2526.tsv").open("w", encoding="utf-8") as f:
-        for dom, sent in eval_social:
-            f.write(f"{dom}\t{sent}\n")
-    with (out_dir / "tech_articles.tsv").open("w", encoding="utf-8") as f:
-        for dom, sent in eval_tech:
-            f.write(f"{dom}\t{sent}\n")
-    print(f"\n[audit DONE] eval_social={len(eval_social)}, eval_tech={len(eval_tech)}", flush=True)
+    ext_vocab = build_ascii_subword_vocab(ascii_words, target_size=EXT_VOCAB_SIZE)
+    trie = AsciiTrie(EXT_BASE_ID, ext_vocab)
+    test_spans = [
+        b"Rust", b"Python", b"iPhone 17 Pro", b"v2.1", b"asyncio", b"JavaScript",
+        b"TensorFlow", b"Kubernetes", b"399.9", b"Git PR",
+    ]
+    total_bytes = sum(len(s) for s in test_spans)
+    total_toks = 0
+    unks = 0
+    print(f"\n[vocab] built ext_vocab={len(ext_vocab)} (top multi-char: {ext_vocab[95:115]})")
+    for sp in test_spans:
+        ids = trie.encode_ascii(sp)
+        total_toks += len(ids)
+        unks += sum(1 for t in ids if t == TOK_UNK)
+        pieces = [ext_vocab[t - EXT_BASE_ID] for t in ids]
+        print(f"  {sp.decode():16s} -> {len(ids)} toks: {pieces}")
+    print(f"[compression] {total_bytes} ASCII bytes -> {total_toks} tokens ({total_bytes/max(1,total_toks):.2f} chars/tok), UNKs={unks}")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample-audit", action="store_true")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--seed-dir", help="Seed directory with wubi86.dict.yaml and held-out *.tsv eval sets (for full build)")
+    ap.add_argument("--seed-dir")
     args = ap.parse_args()
     if args.sample_audit:
         run_sample_audit(Path(args.out_dir))

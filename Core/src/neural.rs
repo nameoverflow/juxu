@@ -11,6 +11,7 @@
 use std::io;
 
 pub const WBLM_MAGIC: &[u8; 8] = b"WBLM0001";
+pub const WBLM_MAGIC_V2: &[u8; 8] = b"WBLM0002";
 pub const TOK_BOS: usize = 0;
 pub const TOK_UNK: usize = 1;
 pub const TOK_COMMA: usize = 2;
@@ -20,6 +21,97 @@ pub const CJK_LUT_BASE: u32 = 0x3400;
 pub const CJK_LUT_LEN: usize = 0xA000 - 0x3400; // 27,648 BMP CJK codepoints (0x3400..=0x9FFF)
 const HEADER_LEN: usize = 64;
 const HEAD_DIM: usize = 32;
+
+#[derive(Clone, Default)]
+struct TrieNode {
+    tok: u16, // 0 means no terminal token at this node (valid ext tokens are >= 4)
+    edges: Vec<(u8, u32)>,
+}
+
+/// Compact greedy longest-match Trie for ASCII/English subwords (`WBLM0002`, RWKV-World style).
+#[derive(Clone)]
+pub struct AsciiTrie {
+    nodes: Vec<TrieNode>,
+    single_ascii: [u16; 95], // 0x20..=0x7E fallback so visible ASCII never produces <UNK>
+    pub ext_base_id: usize,
+    pub ext_count: usize,
+}
+
+impl AsciiTrie {
+    pub fn build(ext_base_id: usize, entries: &[&[u8]]) -> Self {
+        let mut trie = Self {
+            nodes: vec![TrieNode::default()],
+            single_ascii: [0u16; 95],
+            ext_base_id,
+            ext_count: entries.len(),
+        };
+        for (idx, bytes) in entries.iter().enumerate() {
+            if bytes.is_empty() {
+                continue;
+            }
+            let tok = (ext_base_id + idx) as u16;
+            if bytes.len() == 1 && (0x20..=0x7E).contains(&bytes[0]) {
+                trie.single_ascii[(bytes[0] - 0x20) as usize] = tok;
+            }
+            let mut cur = 0usize;
+            for &b in *bytes {
+                if let Some(&(_, next)) = trie.nodes[cur].edges.iter().find(|&&(eb, _)| eb == b) {
+                    cur = next as usize;
+                } else {
+                    let next = trie.nodes.len() as u32;
+                    trie.nodes.push(TrieNode::default());
+                    trie.nodes[cur].edges.push((b, next));
+                    cur = next as usize;
+                }
+            }
+            trie.nodes[cur].tok = tok;
+        }
+        for node in &mut trie.nodes {
+            node.edges.sort_unstable_by_key(|&(b, _)| b);
+        }
+        trie
+    }
+
+    /// Encode a contiguous visible ASCII slice using greedy longest-prefix match.
+    pub fn encode_ascii(&self, bytes: &[u8], out: &mut Vec<usize>) {
+        let mut i = 0usize;
+        let n = bytes.len();
+        while i < n {
+            let mut cur = 0usize;
+            let mut best_tok = 0u16;
+            let mut best_len = 0usize;
+            let mut j = i;
+            while j < n {
+                let b = bytes[j];
+                let edges = &self.nodes[cur].edges;
+                if let Ok(pos) = edges.binary_search_by_key(&b, |&(eb, _)| eb) {
+                    cur = edges[pos].1 as usize;
+                    j += 1;
+                    let t = self.nodes[cur].tok;
+                    if t != 0 {
+                        best_tok = t;
+                        best_len = j - i;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if best_len > 0 {
+                out.push(best_tok as usize);
+                i += best_len;
+            } else {
+                let b = bytes[i];
+                if (0x20..=0x7E).contains(&b) {
+                    let fb = self.single_ascii[(b - 0x20) as usize];
+                    out.push(if fb != 0 { fb as usize } else { TOK_UNK });
+                } else {
+                    out.push(TOK_UNK);
+                }
+                i += 1;
+            }
+        }
+    }
+}
 
 #[inline]
 fn read_u16(b: &[u8], off: usize) -> u16 {
@@ -365,6 +457,7 @@ pub struct NeuralOffsets {
     pub tok_to_char: Vec<char>,
     pub has_punct_tokens: bool,
     pub has_eng_num_token: bool,
+    pub ascii_trie: Option<AsciiTrie>,
     pub(crate) profile_id: u64,
     lut_off: usize,
     emb_w_off: usize,
@@ -381,9 +474,13 @@ pub struct NeuralOffsets {
 
 impl NeuralOffsets {
     pub fn parse(blob: &[u8]) -> io::Result<Self> {
-        if blob.len() < HEADER_LEN || &blob[0..8] != WBLM_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid WBLM0001 magic"));
-        }
+        let is_v2 = if blob.len() >= HEADER_LEN && &blob[0..8] == WBLM_MAGIC_V2 {
+            true
+        } else if blob.len() >= HEADER_LEN && &blob[0..8] == WBLM_MAGIC {
+            false
+        } else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid WBLM0001/WBLM0002 magic"));
+        };
         let vocab_size = read_u32(blob, 8) as usize;
         let rank = read_u32(blob, 12) as usize;
         let d_model = read_u32(blob, 16) as usize;
@@ -487,7 +584,39 @@ impl NeuralOffsets {
         let has_punct_tokens = vocab_size > TOK_PERIOD
             && tok_to_char[TOK_COMMA] == '\0'
             && tok_to_char[TOK_PERIOD] == '\0';
-        let has_eng_num_token = has_punct_tokens
+
+        // Optional trailing EXT_VOCAB table in WBLM0002:
+        // [u32 ext_base_id][u32 ext_count] followed by ext_count records of [u8 len][len bytes].
+        let ascii_trie = if is_v2 {
+            let hdr_off = take(&mut cur, total, 8)?;
+            let ext_base_id = read_u32(blob, hdr_off) as usize;
+            let ext_count = read_u32(blob, hdr_off + 4) as usize;
+            if ext_base_id + ext_count > vocab_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WBLM0002 ext_vocab exceeds vocab_size",
+                ));
+            }
+            let mut entries: Vec<&[u8]> = Vec::with_capacity(ext_count);
+            for _ in 0..ext_count {
+                if cur >= total {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated WBLM0002 ext_vocab"));
+                }
+                let blen = blob[cur] as usize;
+                cur += 1;
+                if cur + blen > total {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated WBLM0002 ext_vocab entry"));
+                }
+                entries.push(&blob[cur..cur + blen]);
+                cur += blen;
+            }
+            Some(AsciiTrie::build(ext_base_id, &entries))
+        } else {
+            None
+        };
+
+        let has_eng_num_token = !is_v2
+            && has_punct_tokens
             && vocab_size > TOK_ENG_NUM
             && tok_to_char[TOK_ENG_NUM] == '\0';
 
@@ -503,6 +632,7 @@ impl NeuralOffsets {
             tok_to_char,
             has_punct_tokens,
             has_eng_num_token,
+            ascii_trie,
             profile_id: blob.iter().step_by((blob.len() / 64).max(1)).fold(
                 blob.len() as u64,
                 |hash, &byte| (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3),
@@ -616,6 +746,18 @@ impl NeuralContextTracker {
     }
 
     fn step_context_str(&mut self, nv: &NeuralView<'_>, text: &str) {
+        if nv.offs.ascii_trie.is_some() {
+            let mut toks = Vec::with_capacity(text.len());
+            nv.encode_mixed_str(text, &mut toks);
+            for tok in toks {
+                if tok == TOK_BOS {
+                    self.reset_to_bos(Some(nv));
+                } else {
+                    nv.step_token(tok, &mut self.active);
+                }
+            }
+            return;
+        }
         let mut prev_special: Option<usize> = None;
         for ch in text.chars() {
             let u = ch as u32;
@@ -675,6 +817,97 @@ impl NeuralContextTracker {
 }
 
 impl<'a> NeuralView<'a> {
+    /// Mixed Chinese (char-level LUT) + ASCII/English (greedy longest-match Trie) tokenizer (`WBLM0002`).
+    /// Must stay bit-exact with `Scripts/corpus_v4.py::encode_mixed_line`.
+    pub fn encode_mixed_str(&self, text: &str, out: &mut Vec<usize>) {
+        let Some(ref trie) = self.offs.ascii_trie else {
+            return;
+        };
+        let mut ascii_buf: Vec<u8> = Vec::new();
+        let mut prev_punct: Option<usize> = None;
+
+        let flush_ascii = |buf: &mut Vec<u8>, out: &mut Vec<usize>, prev_punct: &mut Option<usize>| {
+            if buf.is_empty() {
+                return;
+            }
+            // Collapse runs of spaces and trim outer spaces
+            let mut norm: Vec<u8> = Vec::with_capacity(buf.len());
+            let mut last_sp = true;
+            for &b in buf.iter() {
+                if b == b' ' {
+                    if !last_sp {
+                        norm.push(b' ');
+                        last_sp = true;
+                    }
+                } else {
+                    norm.push(b);
+                    last_sp = false;
+                }
+            }
+            while norm.last() == Some(&b' ') {
+                norm.pop();
+            }
+            buf.clear();
+            if !norm.is_empty() {
+                trie.encode_ascii(&norm, out);
+                *prev_punct = None;
+            }
+        };
+
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        for i in 0..n {
+            let ch = chars[i];
+            let u = ch as u32;
+            if (CJK_LUT_BASE..0xA000).contains(&u) {
+                flush_ascii(&mut ascii_buf, out, &mut prev_punct);
+                out.push(self.char_to_token(ch));
+                prev_punct = None;
+            } else if (0xF900..=0xFAFF).contains(&u) || (0x20000..=0x3FFFF).contains(&u) {
+                // Rare CJK Compatibility / Extension B..I ideographs: step <UNK> instead of dropping context
+                flush_ascii(&mut ascii_buf, out, &mut prev_punct);
+                out.push(TOK_UNK);
+                prev_punct = None;
+            } else if matches!(ch, '，' | '、' | '；' | '：' | '—') {
+                flush_ascii(&mut ascii_buf, out, &mut prev_punct);
+                if prev_punct != Some(TOK_COMMA) {
+                    out.push(TOK_COMMA);
+                    prev_punct = Some(TOK_COMMA);
+                }
+            } else if matches!(ch, '。' | '？' | '！' | '\n') {
+                flush_ascii(&mut ascii_buf, out, &mut prev_punct);
+                if prev_punct != Some(TOK_PERIOD) {
+                    out.push(TOK_PERIOD);
+                    prev_punct = Some(TOK_PERIOD);
+                }
+            } else if ch.is_ascii() && (0x20..=0x7E).contains(&u) {
+                // Keep '.' / ',' inside numbers or identifiers like "v2.1", "3.14", "node.js";
+                // map sentence-level ASCII punctuation (not followed by ASCII alnum) to TOK_COMMA/TOK_PERIOD.
+                let next_is_alnum = i + 1 < n && chars[i + 1].is_ascii_alphanumeric();
+                if matches!(ch, ',' | ';' | ':') && !next_is_alnum {
+                    flush_ascii(&mut ascii_buf, out, &mut prev_punct);
+                    if prev_punct != Some(TOK_COMMA) {
+                        out.push(TOK_COMMA);
+                        prev_punct = Some(TOK_COMMA);
+                    }
+                } else if matches!(ch, '.' | '?' | '!') && !next_is_alnum {
+                    flush_ascii(&mut ascii_buf, out, &mut prev_punct);
+                    if prev_punct != Some(TOK_PERIOD) {
+                        out.push(TOK_PERIOD);
+                        prev_punct = Some(TOK_PERIOD);
+                    }
+                } else {
+                    ascii_buf.push(ch as u8);
+                }
+            } else if ch.is_whitespace() {
+                if !ascii_buf.is_empty() {
+                    ascii_buf.push(b' ');
+                }
+            }
+        }
+        flush_ascii(&mut ascii_buf, out, &mut prev_punct);
+    }
+
     #[inline]
     pub fn punct_to_token(&self, ch: char) -> Option<usize> {
         if !self.offs.has_punct_tokens {
@@ -1042,5 +1275,112 @@ impl<'a> NeuralView<'a> {
             count += 1;
         }
         sum_lp / (count as f32).powf(0.65)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_tiny_wblm0002(ext_vocab: &[&[u8]]) -> Vec<u8> {
+        let vocab_size: usize = 32 + ext_vocab.len();
+        let rank: usize = 16;
+        let d_model: usize = 32;
+        let n_heads: usize = 1;
+        let n_layers: usize = 1;
+        let ffn_dim: usize = 32;
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(WBLM_MAGIC_V2);
+        for v in [vocab_size, rank, d_model, n_heads, n_layers, ffn_dim] {
+            blob.extend_from_slice(&(v as u32).to_le_bytes());
+        }
+        blob.resize(HEADER_LEN, 0);
+
+        let align4 = |b: &mut Vec<u8>| {
+            while b.len() % 4 != 0 {
+                b.push(0);
+            }
+        };
+        let push_zeros = |b: &mut Vec<u8>, n: usize| {
+            align4(b);
+            b.resize(b.len() + n, 0);
+        };
+        let push_qmat = |b: &mut Vec<u8>, rows: usize, cols: usize, has_bias: bool| {
+            push_zeros(b, rows * cols);
+            push_zeros(b, rows * 4);
+            if has_bias {
+                push_zeros(b, rows * 4);
+            }
+        };
+
+        // CJK LUT (map '用'=4, '写'=5, '好'=6)
+        align4(&mut blob);
+        let lut_start = blob.len();
+        blob.resize(lut_start + CJK_LUT_LEN * 2, 0);
+        for i in 0..CJK_LUT_LEN {
+            let off = lut_start + i * 2;
+            blob[off..off + 2].copy_from_slice(&(TOK_UNK as u16).to_le_bytes());
+        }
+        for (ch, tok) in [('用', 4u16), ('写', 5u16), ('好', 6u16)] {
+            let idx = (ch as u32 - CJK_LUT_BASE) as usize;
+            let off = lut_start + idx * 2;
+            blob[off..off + 2].copy_from_slice(&tok.to_le_bytes());
+        }
+
+        push_zeros(&mut blob, vocab_size * rank);
+        push_zeros(&mut blob, vocab_size * 4);
+        push_zeros(&mut blob, vocab_size * 4);
+        push_qmat(&mut blob, d_model, rank, false);
+        for _ in 0..n_layers {
+            push_zeros(&mut blob, d_model * 4);
+            push_zeros(&mut blob, d_model * 4);
+            push_qmat(&mut blob, 6 * d_model, d_model, true);
+            push_zeros(&mut blob, d_model * 4);
+            push_qmat(&mut blob, d_model, d_model, false);
+            push_zeros(&mut blob, d_model * 4);
+            push_zeros(&mut blob, d_model * 4);
+            push_qmat(&mut blob, ffn_dim, d_model, true);
+            push_qmat(&mut blob, d_model, ffn_dim, false);
+        }
+        push_zeros(&mut blob, d_model * 4);
+        push_qmat(&mut blob, rank, d_model, true);
+        push_qmat(&mut blob, rank, d_model, true);
+        push_qmat(&mut blob, rank, rank, false);
+        push_qmat(&mut blob, 25, d_model, true);
+
+        // Trailing WBLM0002 EXT_VOCAB section
+        align4(&mut blob);
+        blob.extend_from_slice(&(32u32).to_le_bytes());
+        blob.extend_from_slice(&(ext_vocab.len() as u32).to_le_bytes());
+        for entry in ext_vocab {
+            blob.push(entry.len() as u8);
+            blob.extend_from_slice(entry);
+        }
+        blob
+    }
+
+    #[test]
+    fn wblm0002_mixed_trie_and_rare_cjk() {
+        let mut ext: Vec<Vec<u8>> = (0x20u8..=0x7Eu8).map(|b| vec![b]).collect();
+        let rust_id = 32 + ext.len();
+        ext.push(b"Rust".to_vec());
+        let v21_id = 32 + ext.len();
+        ext.push(b"v2.1".to_vec());
+        let ext_refs: Vec<&[u8]> = ext.iter().map(|v| v.as_slice()).collect();
+
+        let blob = build_tiny_wblm0002(&ext_refs);
+        let offs = NeuralOffsets::parse(&blob).expect("parse WBLM0002");
+        assert!(offs.ascii_trie.is_some());
+        assert!(!offs.has_eng_num_token);
+        let nv = NeuralView { blob: &blob, offs: &offs };
+
+        let mut toks = Vec::new();
+        nv.encode_mixed_str("用 Rust 写 v2.1，𠮷好。", &mut toks);
+        assert_eq!(toks, vec![4, rust_id, 5, v21_id, TOK_COMMA, TOK_UNK, 6, TOK_PERIOD]);
+
+        let mut tracker = NeuralContextTracker::default();
+        tracker.set_context_str(&nv, "用 Rust 写 v2.1，𠮷好。");
+        assert!(tracker.is_ready());
     }
 }
