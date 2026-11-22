@@ -844,4 +844,60 @@ mod tests {
         let mask = engine.valid_next_mask();
         assert_ne!(mask & (1u32 << (b's' - b'a')), 0);
     }
+
+    #[test]
+    fn spaceless_wubi_shows_and_commits_prefix_completions() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dict_path = manifest_dir.join("../Resources/Dicts/wubi86.wbdict");
+        let aux_path = manifest_dir.join("../Resources/Dicts/wubi_aux.wbaux");
+        if !dict_path.exists() || !aux_path.exists() {
+            return;
+        }
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::Wubi86;
+        cfg.spaceless = true;
+        cfg.page_size = 9;
+        let mut engine = JuxuEngine::new(cfg);
+        engine.load_dict(InputSchema::Wubi86, DictView::open_mmap(&dict_path).unwrap());
+        engine.set_aux(AuxView::open_mmap(&aux_path).unwrap());
+
+        // 1. Single-key shortcode `q` should keep "我" first and append longer `q*` prefix completions.
+        let _ = engine.handle_key_event(0, Some('q'), false, 100);
+        let cands: Vec<_> = engine.page_candidates().to_vec();
+        assert_eq!(cands[0].text, "我");
+        assert!(cands.len() > 1, "expected prefix completions after '我', got {:?}", cands);
+        let prefix_idx = cands
+            .iter()
+            .position(|c| c.matched_code.len() > 1 && c.matched_code.as_string().starts_with('q'))
+            .expect("expected at least one longer q* prefix candidate");
+        let chosen_text = cands[prefix_idx].text.clone();
+        assert!(cands[prefix_idx].comment.starts_with('…'));
+
+        // Committing the prefix completion should commit that candidate cleanly without underflow.
+        let out = engine.select_abs_candidate(prefix_idx, 120).unwrap();
+        assert_eq!(out.commit_text, chosen_text);
+        assert!(!engine.is_composing());
+
+        // 2. Multi-segment spaceless input ending in a short tail (`khlq` -> "中" + "罗" (`kh` + `lq`)):
+        //    prefix completions for trailing `lq` should commit `<prefix_segments><chosen_tail>`.
+        for (i, ch) in "khlq".chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 200 + i as u64 * 20);
+        }
+        let mut all_multi = Vec::new();
+        loop {
+            all_multi.extend_from_slice(engine.page_candidates());
+            if !engine.page_next() {
+                break;
+            }
+        }
+        assert_eq!(all_multi[0].text, "中罗");
+        let tail_prefix_idx = all_multi
+            .iter()
+            .position(|c| c.matched_code.len() > 2 && c.matched_code.as_string().starts_with("lq"))
+            .expect("expected trailing lq* prefix completion in multi-segment spaceless mode");
+        let tail_text = all_multi[tail_prefix_idx].text.clone();
+        let multi_out = engine.select_abs_candidate(tail_prefix_idx, 320).unwrap();
+        assert_eq!(multi_out.commit_text, format!("中{}", tail_text));
+        assert!(!engine.is_composing());
+    }
 }

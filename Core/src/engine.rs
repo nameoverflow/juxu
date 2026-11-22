@@ -135,6 +135,7 @@ pub struct JuxuEngine {
     committed_stream_codes: VecDeque<String>,
     observations: Vec<KeyObs>,
     candidates: Vec<Candidate>,
+    spaceless_candidate_starts: Vec<Option<usize>>,
     page: usize,
     last_committed: String,
     recent_context: Vec<char>,
@@ -179,6 +180,7 @@ impl JuxuEngine {
             committed_stream_codes: VecDeque::new(),
             observations: Vec::new(),
             candidates: Vec::new(),
+            spaceless_candidate_starts: Vec::new(),
             page: 0,
             last_committed: String::new(),
             recent_context: Vec::with_capacity(8),
@@ -1005,6 +1007,7 @@ impl JuxuEngine {
         self.committed_stream_codes.clear();
         self.observations.clear();
         self.candidates.clear();
+        self.spaceless_candidate_starts.clear();
         self.page = 0;
         self.hold_fourth_for_split = false;
         self.pending_empty_split = None;
@@ -1263,11 +1266,18 @@ impl JuxuEngine {
             Vec::new()
         };
         let commit_text = if self.uses_spaceless() {
+            let tail_start = self
+                .spaceless_candidate_starts
+                .get(abs_idx)
+                .copied()
+                .flatten();
             let segments = if cand.matched_code.is_empty() {
                 let path = self.stream.paths().iter().find(|path| path.text == cand.text)?;
                 path.segments(self.raw_code.len())
             } else {
-                let start = self.raw_code.len() - cand.matched_code.len();
+                let start = tail_start.unwrap_or_else(|| {
+                    self.raw_code.len().saturating_sub(cand.matched_code.len())
+                });
                 let mut segments = if start == 0 {
                     Vec::new()
                 } else {
@@ -2139,23 +2149,28 @@ impl JuxuEngine {
     fn show_spaceless_candidates(&mut self) {
         let paths = self.stream.paths();
         let scores: Vec<f32> = paths.iter().map(|path| path.score).collect();
-        self.candidates = paths
+        let mut entries: Vec<(Candidate, Option<usize>)> = paths
             .iter()
             .zip(softmax_confidences(&scores))
             .map(|(path, confidence)| {
                 let comment = path.correction_hint(self.raw_code.len());
                 let is_exact = comment.is_empty();
-                Candidate {
-                    text: path.text.clone(),
-                    matched_code: PackedCode::EMPTY,
-                    comment,
-                    badge: if is_exact { CandidateBadge::None } else { CandidateBadge::TypoCorrected },
-                    confidence,
-                    is_exact,
-                }
+                (
+                    Candidate {
+                        text: path.text.clone(),
+                        matched_code: PackedCode::EMPTY,
+                        comment,
+                        badge: if is_exact { CandidateBadge::None } else { CandidateBadge::TypoCorrected },
+                        confidence,
+                        is_exact,
+                    },
+                    None,
+                )
             })
             .collect();
         let Some(dict) = self.dicts[self.config.schema.slot_index()].as_ref() else {
+            self.candidates = entries.into_iter().map(|(c, _)| c).collect();
+            self.spaceless_candidate_starts = vec![None; self.candidates.len()];
             return;
         };
         // Retain exact single-character choices independently of the sentence beam.
@@ -2169,37 +2184,133 @@ impl JuxuEngine {
         let exact = PackedCode::from_ascii(&self.raw_code)
             .map(|code| (code, lookup_singles(code)))
             .filter(|(_, hits)| !hits.is_empty());
-        let Some((code, hits)) = exact.or_else(|| {
+        if let Some((code, hits)) = exact.or_else(|| {
             let start = paths.first()?.tail_start();
             if start == 0 {
                 return None;
             }
             let code = PackedCode::from_ascii(&self.raw_code[start..])?;
             Some((code, lookup_singles(code)))
-        }) else {
-            return;
-        };
-        let start = self.raw_code.len() - code.len();
-        let comment = paths.first().map_or_else(String::new, |path| path.correction_hint(start));
-        let is_exact = comment.is_empty();
-        let mut singles: Vec<_> = hits.into_iter()
-            .filter(|hit| self.candidates.first().is_none_or(|first| first.text != hit.text))
-            .map(|hit| Candidate {
-                text: hit.text.to_owned(),
-                matched_code: code,
-                comment: comment.clone(),
-                badge: if is_exact { CandidateBadge::None } else { CandidateBadge::TypoCorrected },
-                confidence: 0.0,
-                is_exact,
-            })
-            .collect();
-        let lead = usize::from(!self.candidates.is_empty());
-        let mut alternatives = self.candidates.split_off(lead);
-        alternatives.retain(|candidate| !singles.iter().any(|single| single.text == candidate.text));
-        let visible = singles.len().min(2);
-        self.candidates.extend(singles.drain(..visible));
-        self.candidates.extend(alternatives);
-        self.candidates.extend(singles);
+        }) {
+            let start = self.raw_code.len() - code.len();
+            let comment = paths.first().map_or_else(String::new, |path| path.correction_hint(start));
+            let is_exact = comment.is_empty();
+            let mut singles: Vec<(Candidate, Option<usize>)> = hits
+                .into_iter()
+                .filter(|hit| entries.first().is_none_or(|(first, _)| first.text != hit.text))
+                .map(|hit| {
+                    (
+                        Candidate {
+                            text: hit.text.to_owned(),
+                            matched_code: code,
+                            comment: comment.clone(),
+                            badge: if is_exact {
+                                CandidateBadge::None
+                            } else {
+                                CandidateBadge::TypoCorrected
+                            },
+                            confidence: 0.0,
+                            is_exact,
+                        },
+                        Some(start),
+                    )
+                })
+                .collect();
+            let lead = usize::from(!entries.is_empty());
+            let mut alternatives = entries.split_off(lead);
+            alternatives.retain(|(candidate, _)| {
+                !singles.iter().any(|(single, _)| single.text == candidate.text)
+            });
+            let visible = singles.len().min(2);
+            entries.extend(singles.drain(..visible));
+            entries.extend(alternatives);
+            entries.extend(singles);
+        }
+
+        // Prefix completions for short codes (e.g. typing `q` shows `qe`, `qw`, ... after exact/beam hits),
+        // falling back to the trailing segment when composing a multi-segment sentence.
+        const PREFIX_CANDIDATE_TARGET: usize = 15;
+        let schema_max_len = self.config.schema.max_code_len();
+        if entries.len() < PREFIX_CANDIDATE_TARGET && !self.raw_code.is_empty() {
+            let need = PREFIX_CANDIDATE_TARGET - entries.len();
+            let mut seen: HashSet<String> = entries.iter().map(|(c, _)| c.text.clone()).collect();
+            let mut prefix_targets: Vec<(usize, PackedCode)> = Vec::with_capacity(2);
+            if self.raw_code.len() < schema_max_len {
+                if let Some(code) = PackedCode::from_ascii(&self.raw_code) {
+                    prefix_targets.push((0, code));
+                }
+            }
+            if let Some(tail_start) = paths.first().map(|p| p.tail_start()).filter(|&s| s > 0) {
+                let tail_slice = &self.raw_code[tail_start..];
+                if !tail_slice.is_empty() && tail_slice.len() < schema_max_len {
+                    if let Some(code) = PackedCode::from_ascii(tail_slice) {
+                        prefix_targets.push((tail_start, code));
+                    }
+                }
+            }
+
+            for (prefix_start, prefix_code) in prefix_targets {
+                let before_len = entries.len();
+                for (pcode, utext, _) in self.user.lookup_prefix(prefix_code, 4) {
+                    if entries.len() >= PREFIX_CANDIDATE_TARGET {
+                        break;
+                    }
+                    if seen.insert(utext.to_string()) {
+                        let full_str = pcode.as_string();
+                        let tail = full_str.get(prefix_code.len()..).unwrap_or("");
+                        entries.push((
+                            Candidate {
+                                text: utext.to_string(),
+                                matched_code: pcode,
+                                comment: if tail.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("…{}", tail)
+                                },
+                                badge: CandidateBadge::UserPhrase,
+                                confidence: 0.0,
+                                is_exact: true,
+                            },
+                            Some(prefix_start),
+                        ));
+                    }
+                }
+                for e in dict.lookup_longer_prefix(prefix_code, need, false) {
+                    if entries.len() >= PREFIX_CANDIDATE_TARGET {
+                        break;
+                    }
+                    if seen.insert(e.text.to_string()) {
+                        let full_str = e.code.as_string();
+                        let tail = full_str.get(prefix_code.len()..).unwrap_or("");
+                        entries.push((
+                            Candidate {
+                                text: e.text.to_string(),
+                                matched_code: e.code,
+                                comment: if tail.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("…{}", tail)
+                                },
+                                badge: CandidateBadge::None,
+                                confidence: 0.0,
+                                is_exact: true,
+                            },
+                            Some(prefix_start),
+                        ));
+                    }
+                }
+                if entries.len() > before_len {
+                    break;
+                }
+            }
+        }
+
+        self.candidates = Vec::with_capacity(entries.len());
+        self.spaceless_candidate_starts = Vec::with_capacity(entries.len());
+        for (cand, start) in entries {
+            self.candidates.push(cand);
+            self.spaceless_candidate_starts.push(start);
+        }
     }
 
     fn push_spaceless(&mut self, obs: KeyObs) -> EngineOutput {
