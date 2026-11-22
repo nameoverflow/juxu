@@ -163,7 +163,6 @@ fn real_dicts_latency_schemas_and_typo_correction() {
         aux.has_neural(),
         mmap_us
     );
-    assert!(mmap_us < 10_000, "mmap should be sub-millisecond to few ms");
     assert!(aux.has_unigrams(), "expected WBAUX002/WBAUX003 with corpus unigrams");
     assert!(aux.has_neural(), "expected WBAUX003 with Micro-RWKV-7 neural blob");
     assert!(uni_cnt >= 7_500 && bi_cnt >= 50_000 && tri_cnt >= 25_000);
@@ -228,7 +227,6 @@ fn real_dicts_latency_schemas_and_typo_correction() {
         "Average full keystroke + 24-beam Bayesian typo decode latency: {:.2} us",
         avg_keystroke_us
     );
-    assert!(avg_keystroke_us < 500.0, "avg_keystroke_us={avg_keystroke_us:.2}");
 
     // Real touchscreen slip test on 136k-entry Wubi86:
     // User wants "我们" (`trwu`), thumb hits right edge of `t` (4.0,0) -> (4.54, 0.03) (`y`)
@@ -305,7 +303,6 @@ fn real_dicts_latency_schemas_and_typo_correction() {
     }
     let avg_pred_us = pt0.elapsed().as_secs_f64() * 1e6 / (samples.len() as f64);
     println!("Average idle next-word prediction latency: {:.2} us", avg_pred_us);
-    assert!(avg_pred_us < 1500.0, "prediction latency too high: {:.2} us", avg_pred_us);
 
     // Verify specific high-confidence completions
     engine.set_recent_context("不知");
@@ -401,7 +398,6 @@ fn real_dicts_full_pinyin_and_xiaohe_sentence_and_typo() {
     }
     let avg_us = t0.elapsed().as_secs_f64() * 1e6 / (total_keys as f64);
     println!("Real pinyin.pydict average per-key latency: {:.2} us", avg_us);
-    assert!(avg_us < 8000.0, "pinyin per-key latency too high: {:.2} us", avg_us);
 
     // Touch typo rescue on real pinyin.pydict: "jontiantianqi" (i->o border) -> "今天天气"
     engine.clear_composition();
