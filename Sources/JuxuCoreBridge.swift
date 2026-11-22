@@ -345,6 +345,7 @@ public struct JuxuPreferences: Equatable, Sendable {
     public var clipboardSuggestion: Bool = true
     public var cangjieKeycapRadicals: Bool = true
     public var wubiKeycapRadicals: Bool = false
+    public var keySwipeUpInput: Bool = true
     public var evalLogging: Bool = true
 
     public var fourthCodeAutoCommit: Bool = true
@@ -417,6 +418,7 @@ public struct JuxuPreferences: Equatable, Sendable {
         clipboard_suggestion = \(clipboardSuggestion)
         cangjie_keycap_radicals = \(cangjieKeycapRadicals)
         wubi_keycap_radicals = \(wubiKeycapRadicals)
+        key_swipe_up_input = \(keySwipeUpInput)
         eval_logging = \(evalLogging)
 
         [typing]
@@ -496,6 +498,8 @@ public struct JuxuPreferences: Equatable, Sendable {
                 p.cangjieKeycapRadicals = boolVal
             case (_, "wubi_keycap_radicals"):
                 p.wubiKeycapRadicals = boolVal
+            case (_, "key_swipe_up_input"):
+                p.keySwipeUpInput = boolVal
             case (_, "eval_logging"):
                 p.evalLogging = boolVal
             case (_, "fourth_code_auto_commit"):
@@ -775,6 +779,7 @@ public final class JuxuBridge: ObservableObject {
             loaded.clipboardSuggestion = uiPrefs.clipboardSuggestion
             loaded.cangjieKeycapRadicals = uiPrefs.cangjieKeycapRadicals
             loaded.wubiKeycapRadicals = uiPrefs.wubiKeycapRadicals
+            loaded.keySwipeUpInput = uiPrefs.keySwipeUpInput
         }
         self.prefs = loaded
         ensureDictionaryLoaded(for: loaded.schemaId)

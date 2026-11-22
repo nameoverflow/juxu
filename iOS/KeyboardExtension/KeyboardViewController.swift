@@ -41,6 +41,7 @@ public final class KeyboardViewController: UIInputViewController {
         let pinyinT9Layout: Bool
         let cangjieKeycapRadicals: Bool
         let wubiKeycapRadicals: Bool
+        let swipeUpInputEnabled: Bool
         let isZLookupActive: Bool
         let showInlineGlobeKey: Bool
         let returnRole: IOSReturnKeyRole
@@ -300,7 +301,7 @@ public final class KeyboardViewController: UIInputViewController {
                 dark: isDarkAppearance
             )
             keyCanvas.coveredCalloutKeyId = isDocked ? spec.id : nil
-        case .symbol(let sym) where sym.count <= 2:
+        case .symbol(let sym) where sym.count <= 3:
             let frameInRoot = keyCanvas.convert(spec.frame, to: inputView)
             let isDocked = calloutView.present(
                 label: spec.primaryLabel,
@@ -369,6 +370,16 @@ public final class KeyboardViewController: UIInputViewController {
             self.calloutView.releasePreview()
             self.stopBackspaceRepeat()
             self.handleKeyRelease(spec: spec, pointInCanvas: rawPointInCanvas)
+        }
+
+        keyCanvas.onKeySwipeUp = { [weak self] symbol in
+            guard let self else { return }
+            self.keyCanvas.coveredCalloutKeyId = nil
+            self.calloutView.releasePreview()
+            self.stopBackspaceRepeat()
+            self.markUserTypedForClipboard()
+            self.insertSymbol(symbol)
+            self.syncEngineToUI()
         }
 
         keyCanvas.onTrackpadStateChanged = { [weak self] active in
@@ -671,18 +682,7 @@ public final class KeyboardViewController: UIInputViewController {
 
         case .symbol(let sym):
             markUserTypedForClipboard()
-            commitPendingFirstIfComposing()
-            if AutoSpaceFormatter.isAutoSpaceRightTrigger(sym, options: AutoSpaceOptions(prefs: bridge.prefs)) {
-                insertTextWithAutoSpace(sym, splitInternal: false)
-            } else {
-                autoSpaceTracker.recordPassthrough(
-                    sym,
-                    hostBefore: textDocumentProxy.documentContextBeforeInput,
-                    hostBeforeIsAuthoritative: false
-                )
-                textDocumentProxy.insertText(sym)
-            }
-            bridge.setContext("")
+            insertSymbol(sym)
             if IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol(sym, on: layoutEngine.plane) {
                 layoutEngine.switchPlane(.letters)
             }
@@ -743,6 +743,21 @@ public final class KeyboardViewController: UIInputViewController {
                 applyEngineState(out)
             }
         }
+    }
+
+    private func insertSymbol(_ sym: String) {
+        commitPendingFirstIfComposing()
+        if AutoSpaceFormatter.isAutoSpaceRightTrigger(sym, options: AutoSpaceOptions(prefs: bridge.prefs)) {
+            insertTextWithAutoSpace(sym, splitInternal: false)
+        } else {
+            autoSpaceTracker.recordPassthrough(
+                sym,
+                hostBefore: textDocumentProxy.documentContextBeforeInput,
+                hostBeforeIsAuthoritative: false
+            )
+            textDocumentProxy.insertText(sym)
+        }
+        bridge.setContext("")
     }
 
     private func commitPendingFirstIfComposing() {
@@ -986,6 +1001,7 @@ public final class KeyboardViewController: UIInputViewController {
         layoutEngine.pinyinT9Layout = bridge.prefs.pinyinT9Layout
         layoutEngine.cangjieKeycapRadicals = bridge.prefs.cangjieKeycapRadicals
         layoutEngine.wubiKeycapRadicals = bridge.prefs.wubiKeycapRadicals
+        layoutEngine.swipeUpInputEnabled = bridge.prefs.keySwipeUpInput
         layoutEngine.isZLookupActive = bridge.prefs.isCangjieFamily
             && bridge.prefs.zOmnipotent
             && st.preedit.hasPrefix("z")
@@ -1059,6 +1075,7 @@ public final class KeyboardViewController: UIInputViewController {
             pinyinT9Layout: layoutEngine.pinyinT9Layout,
             cangjieKeycapRadicals: layoutEngine.cangjieKeycapRadicals,
             wubiKeycapRadicals: layoutEngine.wubiKeycapRadicals,
+            swipeUpInputEnabled: layoutEngine.swipeUpInputEnabled,
             isZLookupActive: layoutEngine.isZLookupActive,
             showInlineGlobeKey: layoutEngine.showInlineGlobeKey,
             returnRole: layoutEngine.returnRole,
