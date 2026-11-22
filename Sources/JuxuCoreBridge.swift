@@ -1001,6 +1001,19 @@ public final class JuxuBridge: ObservableObject {
         refreshState()
     }
 
+    public func abandonComposition(timestampMs: UInt64) {
+        guard let h = handle else { return }
+        juxu_engine_abandon(h, timestampMs)
+        drainEvalLogIfNeeded()
+        refreshState()
+    }
+
+    public func notifyPostCommitBackspace(timestampMs: UInt64) {
+        guard let h = handle else { return }
+        juxu_engine_notify_post_commit_backspace(h, timestampMs)
+        drainEvalLogIfNeeded()
+    }
+
     public func setContext(_ text: String) {
         guard let h = handle else { return }
         text.withCString { juxu_engine_set_context(h, $0) }

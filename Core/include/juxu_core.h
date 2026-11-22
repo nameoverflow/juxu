@@ -73,6 +73,8 @@ bool juxu_engine_remove_user_phrase(JuxuEngineHandle *handle, const char *phrase
 char *juxu_engine_list_user_phrases_json(const JuxuEngineHandle *handle);
 
 void juxu_engine_clear(JuxuEngineHandle *handle);
+void juxu_engine_abandon(JuxuEngineHandle *handle, uint64_t timestamp_ms);
+void juxu_engine_notify_post_commit_backspace(JuxuEngineHandle *handle, uint64_t timestamp_ms);
 bool juxu_engine_is_composing(const JuxuEngineHandle *handle);
 
 char *juxu_engine_handle_key_json(

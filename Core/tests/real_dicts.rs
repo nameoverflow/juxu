@@ -1073,3 +1073,193 @@ fn real_dicts_full_pinyin_orthographic_mappings_and_enword_resilience() {
         assert!(!engine.is_composing(), "'{}' must consume full buffer without leftover preedit '{}'", keys, engine.preedit());
     }
 }
+
+#[test]
+fn real_dicts_log_driven_strategy_regressions_pinyin_and_spaceless_wubi98() {
+    use juxu_core::pinyin_dict::PinyinDictView;
+
+    let base = dicts_dir();
+    let pdict = PinyinDictView::from_file(base.join("pinyin.pydict")).expect("open pinyin.pydict");
+    let wb98 = DictView::open_mmap(base.join("wubi98.wbdict")).expect("open wubi98.wbdict");
+    let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
+
+    let mut cfg = JuxuConfig::default();
+    cfg.schema = InputSchema::Pinyin;
+    cfg.eval_logging = true;
+    let mut engine = JuxuEngine::new(cfg.clone());
+    engine.load_pinyin_dict(pdict);
+    engine.load_dict(InputSchema::Wubi98, wb98);
+    engine.set_aux(aux);
+
+    // Simulate heavily inflated single-char UNI counts from real phone user_data.tsv:
+    // 的=417, 了=270, 是=254, 这=168, 个=158, 好=48, 在=95, 定=25
+    for (ch, cnt) in [
+        ("的", 417u32),
+        ("了", 270),
+        ("是", 254),
+        ("这", 168),
+        ("个", 158),
+        ("在", 95),
+        ("好", 48),
+        ("定", 25),
+    ] {
+        engine.user.unigram_counts.insert(ch.to_string(), cnt);
+    }
+
+    // P0-1a: `haoshi` must rank genuine words (`好事`/`耗时`) above function-char glue `好是`/`号是`!
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "haoshi".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 1000 + i as u64 * 30);
+    }
+    let haoshi_top3: Vec<String> = engine.all_candidates().iter().take(3).map(|c| c.text.clone()).collect();
+    assert!(
+        haoshi_top3[0] == "好事" || haoshi_top3[0] == "耗时",
+        "expected genuine word at #1 for 'haoshi', got top3={:?}",
+        haoshi_top3
+    );
+    assert!(
+        !haoshi_top3.contains(&"好是".to_string()) && !haoshi_top3.contains(&"号是".to_string()),
+        "function-char glue '好是'/'号是' must not pollute top-3 for 'haoshi': {:?}",
+        haoshi_top3
+    );
+
+    // P0-1b: `zhez` must rank `这种`/`正在` above `这在`/`这这`!
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "zhez".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 1500 + i as u64 * 30);
+    }
+    let zhez_top3: Vec<String> = engine.all_candidates().iter().take(3).map(|c| c.text.clone()).collect();
+    assert!(
+        !zhez_top3.contains(&"这这".to_string()) && zhez_top3[0] != "这在",
+        "expected '这这'/'这在' suppressed on 'zhez', got top3={:?}",
+        zhez_top3
+    );
+
+    // P0-1c: `dianjingboli` must decode exact 4-char `dian'jing'bo'li` (`电竞玻璃` in top-2) instead of `点进个玻璃`!
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "dianjingboli".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 2000 + i as u64 * 30);
+    }
+    let dj_top3: Vec<String> = engine.all_candidates().iter().take(3).map(|c| c.text.clone()).collect();
+    assert!(
+        dj_top3.iter().take(2).any(|t| t == "电竞玻璃") && !dj_top3.iter().any(|t| t.contains('个')),
+        "expected '电竞玻璃' in top-2 without '点进个玻璃' split for 'dianjingboli', got {:?}",
+        dj_top3
+    );
+
+    // P0-1d: `cel` must keep `策略` on first screen instead of flooding #1..#4 with `测了/册了/侧了/策了`!
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "cel".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 2500 + i as u64 * 30);
+    }
+    let cel_top5: Vec<String> = engine.all_candidates().iter().take(5).map(|c| c.text.clone()).collect();
+    assert!(
+        cel_top5.contains(&"策略".to_string()),
+        "expected '策略' in top-5 for 'cel', got {:?}",
+        cel_top5
+    );
+
+    // P0-1e: `xiandingzhe` after `哈基米你` must NOT rank `先定这` at #1 over `先盯着`/`先顶着`!
+    engine.clear_composition();
+    engine.set_recent_context("哈基米你");
+    for (i, ch) in "xiandingzhe".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 2800 + i as u64 * 30);
+    }
+    let xdz_top2: Vec<String> = engine.all_candidates().iter().take(2).map(|c| c.text.clone()).collect();
+    assert!(
+        xdz_top2[0] != "先定这" && xdz_top2.iter().any(|t| t == "先盯着" || t == "先顶着"),
+        "expected '先盯着'/'先顶着' above '先定这' after '哈基米你', got {:?}",
+        xdz_top2
+    );
+
+    // P1-4: Long Pinyin `zhuoweiboli` must surface Tier-3 first-syllable single char `卓` within top 10 (was #22)!
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "zhuoweiboli".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 3000 + i as u64 * 30);
+    }
+    let idx_zhuo = engine
+        .all_candidates()
+        .iter()
+        .position(|c| c.text == "卓")
+        .expect("expected '卓' in candidates for 'zhuoweiboli'");
+    assert!(
+        idx_zhuo < 12,
+        "expected single-char '卓' within top-12 for 'zhuoweiboli' (was #22), got #{}",
+        idx_zhuo + 1
+    );
+    // P2-6: Partial prefix selection must emit `partial_commit` with `lm_overruled:false` and mean per-char NLL!
+    let _ = engine.drain_eval_log_jsonl();
+    let out_partial = engine.select_abs_candidate(idx_zhuo, 3500).unwrap();
+    assert_eq!(out_partial.commit_text, "卓");
+    let partial_log = engine.drain_eval_log_jsonl();
+    assert!(partial_log.contains("\"event\":\"partial_commit\""));
+    assert!(
+        !partial_log.contains("\"lm_overruled\":true"),
+        "partial_commit must not set lm_overruled=true due to length mismatch: {}",
+        partial_log
+    );
+
+    // P1-3: Spaceless Wubi 98 real-world log misses!
+    let mut cfg98 = cfg.clone();
+    cfg98.schema = InputSchema::Wubi98;
+    cfg98.spaceless = true;
+    engine.set_config(cfg98);
+
+    // Case 3a: ctx="像英国这种", keys="tgoatabmgurjfwhbnptc" -> must commit "制度长出来的时候也这么" instead of "牛粪..."!
+    engine.clear_composition();
+    engine.set_recent_context("像英国这种");
+    for (i, ch) in "tgoatabmgurjfwhbnptc".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 4000 + i as u64 * 25);
+    }
+    let top_zhidu = engine.all_candidates()[0].text.clone();
+    assert_eq!(
+        top_zhidu,
+        "制度长出来的时候也这么",
+        "expected '制度长出来的时候也这么' over '牛粪...' on Wubi98 spaceless, got '{}'",
+        top_zhidu
+    );
+
+    // Case 3b: ctx="出来的时候也这么", keys="wysk" -> must prefer full-code 4-key word "依赖" over 2-segment "集中"!
+    engine.clear_composition();
+    engine.set_recent_context("出来的时候也这么");
+    for (i, ch) in "wysk".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 5000 + i as u64 * 25);
+    }
+    assert_eq!(
+        engine.all_candidates()[0].text,
+        "依赖",
+        "expected 4-code '依赖' over split '集+中' after '出来的时候也这么', got {:?}",
+        engine.all_candidates().iter().take(4).map(|c| &c.text).collect::<Vec<_>>()
+    );
+
+    // Case 3c: ctx="既然", keys="fhvptkmptcxk" -> must prefer "超额这么强" over rare "超宇航员这么强"!
+    engine.clear_composition();
+    engine.set_recent_context("既然");
+    for (i, ch) in "fhvptkmptcxk".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 6000 + i as u64 * 25);
+    }
+    assert_eq!(
+        engine.all_candidates()[0].text,
+        "超额这么强",
+        "expected '超额这么强' over '超宇航员这么强', got {:?}",
+        engine.all_candidates().iter().take(4).map(|c| &c.text).collect::<Vec<_>>()
+    );
+
+    // Case 3d: ctx="在哪代皇帝", keys="akftjfdw" -> must prefer 4+4 "或者时期" over 3-segment "或者其"!
+    engine.clear_composition();
+    engine.set_recent_context("在哪代皇帝");
+    for (i, ch) in "akftjfdw".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 7000 + i as u64 * 25);
+    }
+    assert_eq!(
+        engine.all_candidates()[0].text,
+        "或者时期",
+        "expected '或者时期' over '或者其', got {:?}",
+        engine.all_candidates().iter().take(4).map(|c| &c.text).collect::<Vec<_>>()
+    );
+}

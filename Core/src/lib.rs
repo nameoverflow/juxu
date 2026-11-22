@@ -1264,4 +1264,76 @@ mod tests {
         assert_ne!(t9_mask, 0);
         assert!(t9_priors.iter().any(|&p| p > 0));
     }
+
+    #[test]
+    fn strategy_p0_p2_auto_phrase_boundary_edge_touch_and_eval_log() {
+        // 1. P0-2: Auto-phrase must align strictly with commit boundaries and reject particles/AA stutters.
+        let mut store = crate::user_data::UserStore::default();
+        let dict = build_sample_dict_86();
+
+        // Mid-word slice: committing 2-char "我们" + "好" must NEVER slice "们好" (non-initial '们')!
+        for round in 0..3u64 {
+            store.break_single_burst();
+            let t = 1000 + round * 1000;
+            let _ = store.record_commit_with_surprisal("", "我们", t, true, 2, Some(&dict), None, Some(2.0));
+            let _ = store.record_commit_with_surprisal("我们", "好", t + 100, true, 2, Some(&dict), None, Some(2.0));
+        }
+        assert!(
+            !store.phrases.contains_key("们好"),
+            "mid-word slice '们好' must be rejected, got {:?}",
+            store.phrases.keys().collect::<Vec<_>>()
+        );
+
+        // Grammatical boundary particles ("好" + "的" -> "好的", "是" + "是" -> "是是") must NEVER auto-compose!
+        for round in 0..3u64 {
+            store.break_single_burst();
+            let t = 5000 + round * 1000;
+            let _ = store.record_commit_with_surprisal("", "好", t, true, 2, Some(&dict), None, Some(1.5));
+            let _ = store.record_commit_with_surprisal("好", "的", t + 100, true, 2, Some(&dict), None, Some(1.5));
+            store.break_single_burst();
+            let _ = store.record_commit_with_surprisal("", "是", t + 300, true, 2, Some(&dict), None, Some(1.5));
+            let _ = store.record_commit_with_surprisal("是", "是", t + 400, true, 2, Some(&dict), None, Some(1.5));
+        }
+        assert!(!store.phrases.contains_key("好的"), "trailing particle '的' must not auto-compose");
+        assert!(!store.phrases.contains_key("是是"), "AA stutter '是是' must not auto-compose");
+        assert!(!crate::user_data::is_valid_auto_phrase_text("么样"));
+        assert!(!crate::user_data::is_valid_auto_phrase_text("印花税是"));
+        assert!(crate::user_data::is_valid_auto_phrase_text("技术专家"));
+
+        // 2. P2-5: Outer-edge keys ('a'/'q' left, 'l'/'p' right) allow up to 0.32 offset while interior clamps at 0.20.
+        let mut tp = crate::user_data::TouchProfile::default();
+        for _ in 0..60 {
+            tp.observe(b'a', -0.30, 0.02);
+            tp.observe(b'l', 0.30, -0.02);
+            tp.observe(b'g', -0.30, 0.30);
+        }
+        let (ax, _) = tp.offset_for(b'a');
+        let (lx, _) = tp.offset_for(b'l');
+        let (gx, gy) = tp.offset_for(b'g');
+        assert!(ax < -0.25 && ax >= -0.32, "expected outer left 'a' offset < -0.25, got {}", ax);
+        assert!(lx > 0.25 && lx <= 0.32, "expected outer right 'l' offset > 0.25, got {}", lx);
+        assert!((gx - (-0.20)).abs() < 0.02 && (gy - 0.20).abs() < 0.02, "interior 'g' must clamp at ±0.20, got ({}, {})", gx, gy);
+
+        // 3. P2-6: abandon_composition + notify_post_commit_backspace record telemetry cleanly.
+        let mut eng = JuxuEngine::new(JuxuConfig {
+            schema: InputSchema::Wubi86,
+            eval_logging: true,
+            fourth_code_auto_commit: false,
+            ..Default::default()
+        });
+        eng.load_dict(InputSchema::Wubi86, dict);
+        eng.handle_key_event(0, Some('q'), false, 10_000);
+        let out = eng.handle_key_event(KEY_SPACE, Some(' '), false, 10_050);
+        assert_eq!(out.commit_text, "我");
+        eng.notify_post_commit_backspace(10_500);
+        eng.handle_key_event(0, Some('t'), false, 11_000);
+        eng.handle_key_event(0, Some('r'), false, 11_050);
+        eng.abandon_composition(11_200);
+        assert!(!eng.is_composing());
+        let log = eng.drain_eval_log_jsonl();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 3, "expected commit + backspace_after_commit + abandon, got:\n{}", log);
+        assert!(lines[1].contains("\"event\":\"backspace_after_commit\""));
+        assert!(lines[2].contains("\"event\":\"abandon\""));
+    }
 }

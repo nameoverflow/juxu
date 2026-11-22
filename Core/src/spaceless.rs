@@ -352,6 +352,7 @@ impl Stream {
                     let hits = decoder
                         .dict
                         .lookup_exact(key, decoder.config.enable_rare_charset);
+                    let top_weight = hits.first().map_or(1, |e| e.weight.max(1));
                     let users = decoder.user.lookup_exact(key);
                     let limit = if exact { [1, 2, 4, 6][len - 1] } else { 2 };
                     hits.into_iter()
@@ -374,42 +375,66 @@ impl Stream {
                                 })
                         })
                         .take(limit + 2)
-                        .map(|(rank, entry)| (rank, entry.text, entry.weight, false))
+                        .map(move |(rank, entry)| (rank, entry.text, entry.weight, top_weight, false))
                         .chain(
                             users
                                 .into_iter()
                                 .take(if exact { 4 } else { 2 })
                                 .enumerate()
-                                .map(|(rank, (text, _, _))| (rank, text, 500, true)),
+                                .map(|(rank, (text, _, _))| (rank, text, 500, 500, true)),
                         )
                         .map(move |entry| (entry, key, correction, penalty))
                 });
-            for ((rank, text, weight, custom), code, correction, penalty) in entries {
+            for ((rank, text, weight, top_weight, custom), code, correction, penalty) in entries {
                 let mut chars = text.chars();
                 let Some(first) = chars.next() else { continue };
                 let second = chars.next();
                 let n_chars = 1 + usize::from(second.is_some()) + chars.count();
-                let mut bias = n_chars as f32 * 0.3 - 0.2 - penalty;
-                if decoder.config.strict_shortcode && n_chars == 1 {
+                let mut bias = (n_chars.min(2) as f32) * 0.32 - 0.40 - penalty;
+                let mut has_shorter_primary = false;
+                if n_chars == 1 {
                     if let Some(meta) = decoder.dict.char_meta(first) {
                         let short_len = meta.primary_short_code.len();
                         if short_len > 0 && short_len < len {
-                            // Keep longer codes available, but prefer the user's normal short-code path.
-                            bias -= 2.5 + 0.5 * (len - short_len - 1) as f32;
+                            has_shorter_primary = true;
+                            if decoder.config.strict_shortcode {
+                                // Keep longer codes available, but prefer the user's normal short-code path.
+                                bias -= 2.5 + 0.5 * (len - short_len - 1) as f32;
+                            } else {
+                                // Mild preference for primary shortcode over redundant full code in spaceless segmentation.
+                                bias -= 0.75 + 0.35 * (len - short_len - 1) as f32;
+                            }
                         }
                     }
                 }
+                let log_gap = if !custom && top_weight >= 10_000 {
+                    (((top_weight as f32) + 1_000.0) / ((weight as f32) + 1_000.0))
+                        .ln()
+                        .max(0.0)
+                } else {
+                    0.0
+                };
                 bias -= if len <= 2 {
                     1.6 * rank as f32
+                } else if top_weight >= 10_000 && log_gap <= 1.8 {
+                    0.68 * (rank as f32).ln_1p()
                 } else {
                     0.8 * (rank as f32).ln_1p()
                 };
-                bias -= if weight < 50 {
-                    2.5
-                } else if weight < 500 {
-                    0.8
-                } else {
+                bias -= if custom {
                     0.0
+                } else if top_weight < 10_000 {
+                    if weight < 50 {
+                        2.5
+                    } else if weight < 500 {
+                        0.8
+                    } else {
+                        0.0
+                    }
+                } else {
+                    let cliff = 0.72 * (log_gap - 0.9).max(0.0).min(6.5);
+                    let rare_tail = if weight < 50_000 { 1.2 } else { 0.0 };
+                    cliff + rare_tail
                 };
                 bias -= 6.0
                     * text
@@ -419,8 +444,8 @@ impl Stream {
                 if let Some(second) = second {
                     // Light tie-breaking cohesion since RWKV V2 provides primary contextual LM in nats
                     bias += 0.02 * decoder.aux.bigram_boost(first, second);
-                    if len == MAX_CODE_LEN && rank == 0 {
-                        bias += 0.45;
+                    if len == max_code_len && (rank == 0 || log_gap <= 1.5) {
+                        bias += if rank == 0 { 0.72 } else { 0.32 };
                     }
                 }
                 if custom {
@@ -438,6 +463,45 @@ impl Stream {
                         contextual_bias += 0.05 * decoder.aux.bigram_boost(prev, first);
                         if let Some(prev2) = preceding.next() {
                             contextual_bias += 0.05 * decoder.aux.trigram_boost(prev2, prev, first);
+                        }
+                    }
+                    // Anti-redundant split in spaceless shape typing: when `first` already has a shorter
+                    // primary shortcode (e.g. `ftjf` "者" vs 3-key `ftj`), spending > max_code_len keys across
+                    // two single-char segments (`ak` + `ftjf` = 6 keys) to spell a common 4-key phrase ("或者" = `akft`)
+                    // is strictly redundant and steals keys from the following word (`jfdw` "时期").
+                    if n_chars == 1 && has_shorter_primary {
+                        if let Some(b_last) = parent.boundaries.last() {
+                            let prev_k0 = parent
+                                .boundaries
+                                .iter()
+                                .rev()
+                                .nth(1)
+                                .map_or(0, |b| b.keys);
+                            let prev_b0 = parent
+                                .boundaries
+                                .iter()
+                                .rev()
+                                .nth(1)
+                                .map_or(0, |b| b.text_bytes);
+                            let prev_keys = b_last.keys.saturating_sub(prev_k0);
+                            if prev_keys + len > max_code_len {
+                                let prev_seg = &parent.text[prev_b0..b_last.text_bytes];
+                                let mut pc = prev_seg.chars();
+                                if let (Some(c0), None) = (pc.next(), pc.next()) {
+                                    let mut pair_buf = [0u8; 8];
+                                    let n0 = c0.encode_utf8(&mut pair_buf).len();
+                                    let n1 = first.encode_utf8(&mut pair_buf[n0..]).len();
+                                    if let Ok(pair_s) = core::str::from_utf8(&pair_buf[..n0 + n1]) {
+                                        if decoder
+                                            .dict
+                                            .contains_exact_word(pair_s)
+                                            .is_some_and(|w| w >= 500_000)
+                                        {
+                                            contextual_bias -= 5.0;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     let raw_lp1 = decoder.model.score_next_char(&parent.state, first);

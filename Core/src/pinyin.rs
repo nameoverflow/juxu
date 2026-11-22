@@ -1681,8 +1681,17 @@ fn extend_pinyin_layer(
                 shared_bias += (if has_neural { 0.015 } else { 0.04 }) * aux.bigram_boost(first, sec);
             }
 
-            if decoder.config.dynamic_word_freq {
+            if n_chars >= 2 && decoder.config.dynamic_word_freq {
                 shared_bias += 1.2 * decoder.user.unigram_boost(&text);
+            } else if n_chars == 1 {
+                // Only apply personal unigram boost to single-syllable standalone lookups (e.g. `ju` -> `橘`),
+                // never to multi-syllable 1-char glues (`好`+`是`, `这`+`这`, `点进`+`个`+`玻璃`) unless
+                // `dynamic_char_freq` is explicitly enabled.
+                if chain_start == 0 && end + 1 == lattice.len() && decoder.config.dynamic_word_freq {
+                    shared_bias += 0.85 * decoder.user.unigram_boost(&text);
+                } else if decoder.config.dynamic_char_freq {
+                    shared_bias += 0.25 * decoder.user.unigram_boost(&text);
+                }
             }
             for (parent_idx, parent) in parents.iter().enumerate() {
                 let in_sentence = !parent.text.is_empty();
@@ -2200,12 +2209,18 @@ fn build_pinyin_candidates(
             })
     });
     let mut prefix_words_added = 0usize;
-    let max_prefix_words = 16usize;
+    let max_prefix_words = if is_long_sentence { 5usize } else { 8usize };
+    let mut per_span_counts: HashMap<(usize, usize), usize> = HashMap::new();
     for pw in prefix_words {
         if prefix_words_added >= max_prefix_words {
             break;
         }
+        let span_cnt = per_span_counts.entry((pw.consumed, pw.char_len)).or_insert(0);
+        if *span_cnt >= 2 {
+            continue;
+        }
         if seen.insert(pw.text.clone()) {
+            *span_cnt += 1;
             out.push(PinyinCandidate {
                 candidate: Candidate {
                     text: pw.text,
@@ -2258,8 +2273,10 @@ fn build_pinyin_candidates(
                         sc += 0.35 * nv.score_next_char(st, ch);
                     }
                 }
-                if decoder.config.dynamic_word_freq {
-                    sc += 1.2 * decoder.user.unigram_boost(e.text);
+                if edge.end == n && decoder.config.dynamic_word_freq {
+                    sc += 0.85 * decoder.user.unigram_boost(e.text);
+                } else if decoder.config.dynamic_char_freq {
+                    sc += 0.30 * decoder.user.unigram_boost(e.text);
                 }
                 let hint = if is_corr {
                     format!("{}({})", e.text, syl_s)
@@ -2279,6 +2296,7 @@ fn build_pinyin_candidates(
 
     single_items.sort_by(|a, b| {
         a.3.cmp(&b.3)
+            .then_with(|| b.1.cmp(&a.1))
             .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
     });
     for (text, consumed, _, corr, hint) in single_items {

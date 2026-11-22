@@ -236,12 +236,15 @@ impl JuxuEngine {
         let schema = self.config.schema.as_tag();
         let ctx = crate::eval_log::scrub_numeric_context(&self.eval_context_string());
         let lm_top1 = if rank > 0 || chosen != top1 {
-            self.compute_rwkv_surprisal(top1)
+            self.compute_rwkv_mean_nll(top1)
         } else {
             lm_chosen
         };
+        // Only mark `lm_overruled` on full-buffer commits where `chosen` and `top1` cover the same input!
         let lm_overruled = match (lm_chosen, lm_top1) {
-            (Some(c), Some(t)) if rank > 0 && chosen != top1 => c + 0.05 < t,
+            (Some(c), Some(t)) if event_kind == "commit" && rank > 0 && chosen != top1 => {
+                c + 0.05 < t
+            }
             _ => false,
         };
         let ev = crate::eval_log::EvalEvent {
@@ -1217,8 +1220,9 @@ impl JuxuEngine {
             let first_choice = (learn && explicit && abs_idx > 0)
                 .then(|| self.candidates.first().map(|c| c.text.clone()))
                 .flatten();
-            // Compute RWKV surprisal BEFORE advancing neural_tracker so auto-phrase & eval log can gate on it
+            // Compute RWKV cohesion surprisal (for auto-phrase) & full mean per-char NLL (for eval log)
             let surprisal = self.compute_rwkv_surprisal(&commit_text);
+            let eval_lm_chosen = self.compute_rwkv_mean_nll(&commit_text);
             if self.config.eval_logging {
                 let top1 = self
                     .candidates
@@ -1259,7 +1263,7 @@ impl JuxuEngine {
                     &commit_text,
                     &top1,
                     eval_typo,
-                    surprisal,
+                    eval_lm_chosen,
                     eval_cands,
                 );
             }
@@ -1294,11 +1298,14 @@ impl JuxuEngine {
                         notice = format!("自动成词：{}", new_word);
                     }
                 }
-                // Also record individual CJK characters of a committed word so subsequent single-char lookup (e.g. ju -> 橘 after 橘子) boosts them!
+                // Lightly seed constituent characters (capped at 3) so single-syllable homophone lookup
+                // (e.g. `ju` -> `橘` after `橘子`) surfaces recently used characters without inflating common chars.
                 if commit_text.chars().count() >= 2 {
                     for ch in commit_text.chars() {
                         let s = ch.to_string();
-                        let _ = self.user.record_commit("", &s, timestamp_ms, false, 2, None);
+                        if self.user.unigram_counts.get(&s).copied().unwrap_or(0) < 3 {
+                            let _ = self.user.record_commit("", &s, timestamp_ms, false, 2, None);
+                        }
                     }
                 }
             }
@@ -2924,7 +2931,22 @@ impl JuxuEngine {
         }
     }
 
-    /// Compute mean per-character RWKV surprisal (`-log P_rwkv(c_i | ctx)`) before advancing context.
+    /// Explicitly abandon the active composition (e.g. iOS Clear button) and record eval log if `>= 2` keys.
+    pub fn abandon_composition(&mut self, timestamp_ms: u64) {
+        self.log_abandon_event(timestamp_ms);
+        self.clear_composition();
+        self.user.break_single_burst();
+    }
+
+    /// Record a post-commit backspace from a touchscreen host (where empty-preedit Backspace deletes directly via `UITextDocumentProxy`).
+    pub fn notify_post_commit_backspace(&mut self, timestamp_ms: u64) {
+        self.log_backspace_after_commit_if_recent(timestamp_ms);
+        self.user.break_single_burst();
+        let nv = self.aux.as_ref().and_then(|a| a.neural_view());
+        self.neural_tracker.pop_commit_or_reset(nv.as_ref());
+    }
+
+    /// Compute internal transition surprisal (`-log P_rwkv(c_i | c_<i)`) for auto-phrase cohesion gating.
     fn compute_rwkv_surprisal(&self, text: &str) -> Option<f32> {
         let nv = self.aux.as_ref()?.neural_view()?;
         if !self.neural_tracker.is_ready() {
@@ -2947,6 +2969,31 @@ impl JuxuEngine {
             nv.step_token(nv.char_to_token(ch), &mut st);
         }
         Some(sum_surp / count)
+    }
+
+    /// Compute full mean per-character RWKV NLL `(-lp_1 - lp_2 - ... - lp_n) / n` from active context for `eval_log`.
+    fn compute_rwkv_mean_nll(&self, text: &str) -> Option<f32> {
+        let nv = self.aux.as_ref()?.neural_view()?;
+        if !self.neural_tracker.is_ready() {
+            return None;
+        }
+        let mut chars = text.chars().filter(|&c| is_cjk_char(c));
+        let c1 = chars.next()?;
+        let mut sum_nll = -nv.score_next_char(&self.neural_tracker.active, c1).clamp(-13.5, -0.01);
+        let mut count = 1.0f32;
+        let mut st = self.neural_tracker.active.clone();
+        let mut peek = chars.peekable();
+        if peek.peek().is_some() {
+            nv.step_token(nv.char_to_token(c1), &mut st);
+            while let Some(ch) = peek.next() {
+                sum_nll += -nv.score_next_char(&st, ch).clamp(-13.5, -0.01);
+                count += 1.0;
+                if peek.peek().is_some() {
+                    nv.step_token(nv.char_to_token(ch), &mut st);
+                }
+            }
+        }
+        Some(sum_nll / count)
     }
 
     fn finalize_commit(

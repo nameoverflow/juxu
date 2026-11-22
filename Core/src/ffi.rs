@@ -3,7 +3,7 @@ use crate::engine::{EngineOutput, JuxuEngine};
 use crate::english::EnDictView;
 use crate::format::{AuxView, DictView};
 use crate::pinyin_dict::PinyinDictView;
-use crate::user_data::{TouchKeyOffset, UserStore, MAX_TOUCH_OFFSET};
+use crate::user_data::{clamp_key_touch_offset, TouchKeyOffset, UserStore, MAX_TOUCH_OFFSET};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
@@ -525,10 +525,13 @@ pub extern "C" fn juxu_engine_set_touch_profile(
     if offsets.iter().any(|offset| !offset.is_finite()) {
         return;
     }
-    h.inner.user.touch_profile.keys = std::array::from_fn(|i| TouchKeyOffset {
-        dx: offsets[i * 2].clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
-        dy: offsets[i * 2 + 1].clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
-        samples: counts[i],
+    h.inner.user.touch_profile.keys = std::array::from_fn(|i| {
+        let (cdx, cdy) = clamp_key_touch_offset(b'a' + i as u8, offsets[i * 2], offsets[i * 2 + 1]);
+        TouchKeyOffset {
+            dx: cdx,
+            dy: cdy,
+            samples: counts[i],
+        }
     });
     h.inner.user.dirty = true;
 }
@@ -631,6 +634,23 @@ pub extern "C" fn juxu_engine_list_user_phrases_json(
 pub extern "C" fn juxu_engine_clear(handle: *mut JuxuEngineHandle) {
     if let Some(h) = unsafe { handle.as_mut() } {
         h.inner.clear_composition();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn juxu_engine_abandon(handle: *mut JuxuEngineHandle, timestamp_ms: u64) {
+    if let Some(h) = unsafe { handle.as_mut() } {
+        h.inner.abandon_composition(timestamp_ms);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn juxu_engine_notify_post_commit_backspace(
+    handle: *mut JuxuEngineHandle,
+    timestamp_ms: u64,
+) {
+    if let Some(h) = unsafe { handle.as_mut() } {
+        h.inner.notify_post_commit_backspace(timestamp_ms);
     }
 }
 

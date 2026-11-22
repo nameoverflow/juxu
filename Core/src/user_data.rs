@@ -12,7 +12,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static USER_DATA_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
-pub const MAX_TOUCH_OFFSET: f32 = 0.20; // Clamp adaptive hitbox shift to ±0.20 key-pitch
+pub const MAX_TOUCH_OFFSET: f32 = 0.20; // Clamp interior adaptive hitbox shift to ±0.20 key-pitch
+pub const MAX_OUTER_EDGE_TOUCH_OFFSET: f32 = 0.32; // Unbounded outer keyboard margins ('a'/'q' left, 'l'/'p' right)
+
+/// Asymmetric 26-key hitbox offset clamp: keys at an unbounded horizontal edge (`a`/`q` leftward,
+/// `l`/`p` rightward) allow up to `0.32` pitch shift into the margin without encroaching on neighbors.
+#[inline]
+pub fn clamp_key_touch_offset(key_byte: u8, dx: f32, dy: f32) -> (f32, f32) {
+    let (min_x, max_x) = match key_byte.to_ascii_lowercase() {
+        b'a' | b'q' => (-MAX_OUTER_EDGE_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
+        b'l' | b'p' => (-MAX_TOUCH_OFFSET, MAX_OUTER_EDGE_TOUCH_OFFSET),
+        _ => (-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
+    };
+    (
+        dx.clamp(min_x, max_x),
+        dy.clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
+    )
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TouchKeyOffset {
@@ -51,10 +67,11 @@ impl TouchProfile {
         let idx = (key_byte - b'a') as usize;
         let entry = &mut self.keys[idx];
         let alpha = if entry.samples < 10 { 0.14 } else { 0.06 };
-        entry.dx = ((1.0 - alpha) * entry.dx + alpha * residual_x)
-            .clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET);
-        entry.dy = ((1.0 - alpha) * entry.dy + alpha * residual_y)
-            .clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET);
+        let raw_dx = (1.0 - alpha) * entry.dx + alpha * residual_x;
+        let raw_dy = (1.0 - alpha) * entry.dy + alpha * residual_y;
+        let (cdx, cdy) = clamp_key_touch_offset(key_byte, raw_dx, raw_dy);
+        entry.dx = cdx;
+        entry.dy = cdy;
         entry.samples = entry.samples.saturating_add(1);
     }
 
@@ -124,9 +141,11 @@ pub struct UserStore {
     pub english_words: HashMap<String, (String, u32, u64)>,
     pub(crate) continuations: PersonalContinuations,
     pub touch_profile: TouchProfile,
-    /// Rolling buffer of recent consecutive CJK characters `(ch, timestamp_ms, rwkv_surprisal, commit_id)`
-    /// across both single-char and multi-char commits so 3-4 char words (e.g. "哈基" + "米" -> "哈基米") compose cleanly!
-    recent_singles: Vec<(char, u64, Option<f32>, u64)>,
+    /// Rolling buffer of recent consecutive CJK characters
+    /// `(ch, timestamp_ms, rwkv_surprisal, commit_id, is_commit_start, is_commit_end)`
+    /// across both single-char and multi-char commits so 3-4 char words (e.g. "哈基" + "米" -> "哈基米")
+    /// compose cleanly while never slicing mid-word!
+    recent_singles: Vec<(char, u64, Option<f32>, u64, bool, bool)>,
     /// Candidate consecutive n-grams waiting to reach `auto_phrase_threshold`
     pending_ngrams: HashMap<String, u8>,
     pub dirty: bool,
@@ -490,13 +509,21 @@ impl UserStore {
             return None;
         }
 
-        if let Some(&(_, last_ts, _, _)) = self.recent_singles.last() {
+        if let Some(&(_, last_ts, _, _, _, _)) = self.recent_singles.last() {
             if timestamp_ms > 0 && last_ts > 0 && timestamp_ms.saturating_sub(last_ts) > 5000 {
                 self.recent_singles.clear();
             }
         }
-        for &ch in &committed_chars {
-            self.recent_singles.push((ch, timestamp_ms, surprisal, seq));
+        let clen = committed_chars.len();
+        for (idx, &ch) in committed_chars.iter().enumerate() {
+            self.recent_singles.push((
+                ch,
+                timestamp_ms,
+                surprisal,
+                seq,
+                idx == 0,
+                idx + 1 == clen,
+            ));
         }
         if self.recent_singles.len() > 6 {
             let drain_n = self.recent_singles.len() - 6;
@@ -508,7 +535,8 @@ impl UserStore {
         }
 
         // Check longest suffix FIRST (4 -> 3 -> 2 chars) so a 3-char word like "哈基米" is NEVER
-        // short-circuited by its 2-char tail "基米", and require spanning >= 2 distinct commits!
+        // short-circuited by its 2-char tail "基米", require spanning >= 2 distinct commits,
+        // and require strict alignment with commit start & commit end boundaries (never tear words in half!).
         let n = self.recent_singles.len();
         let mut promoted: Option<String> = None;
         for cand_len in [4usize, 3usize, 2usize] {
@@ -516,6 +544,10 @@ impl UserStore {
                 continue;
             }
             let slice = &self.recent_singles[n - cand_len..n];
+            // Must start at the beginning of a committed token and end at the end of a committed token
+            if !slice[0].4 || !slice[cand_len - 1].5 {
+                continue;
+            }
             let first_cid = slice[0].3;
             let last_cid = slice[cand_len - 1].3;
             if first_cid == last_cid {
@@ -523,6 +555,10 @@ impl UserStore {
                 continue;
             }
             let cand: String = slice.iter().map(|x| x.0).collect();
+            if !is_valid_auto_phrase_text(&cand) {
+                continue;
+            }
+            let all_single_commits = slice.iter().all(|x| x.4 && x.5);
             let mut sum_s = 0.0f32;
             let mut cnt_s = 0usize;
             for item in &slice[1..] {
@@ -532,8 +568,15 @@ impl UserStore {
                 }
             }
             let mean_surp = (cnt_s > 0).then(|| sum_s / (cnt_s as f32));
-            if let Some(word) = self.bump_pending_ngram(&cand, auto_threshold, dict, pdict, mean_surp)
-            {
+            let allow_fast_promote = cand_len == 2 && all_single_commits;
+            if let Some(word) = self.bump_pending_ngram(
+                &cand,
+                auto_threshold,
+                dict,
+                pdict,
+                mean_surp,
+                allow_fast_promote,
+            ) {
                 promoted = Some(word);
                 // If a longer 3-4 char phrase just promoted, stop so we don't also pollute with its shorter tail!
                 break;
@@ -557,10 +600,13 @@ impl UserStore {
             return None;
         }
         let len = phrase.chars().count();
-        if !(2..=4).contains(&len) || !phrase.chars().all(is_cjk_ideograph) {
+        if !(2..=4).contains(&len)
+            || !phrase.chars().all(is_cjk_ideograph)
+            || !is_valid_auto_phrase_text(phrase)
+        {
             return None;
         }
-        self.bump_pending_ngram(phrase, auto_threshold, dict, pdict, mean_surprisal)
+        self.bump_pending_ngram(phrase, auto_threshold, dict, pdict, mean_surprisal, len == 2)
     }
 
     fn bump_pending_ngram(
@@ -570,6 +616,7 @@ impl UserStore {
         dict: Option<&DictView>,
         pdict: Option<&PinyinDictView>,
         mean_surprisal: Option<f32>,
+        allow_fast_promote: bool,
     ) -> Option<String> {
         if self.phrases.contains_key(phrase) {
             return None;
@@ -586,13 +633,11 @@ impl UserStore {
                 return None;
             }
         }
-        // Pure probability + repeat gating (no hardcoded function-word blacklist!):
-        // - High RWKV cohesion (`surp < 4.0`, e.g. "微信" missing from Wubi86 dict):
-        //   strong evidence of a real missing modern word -> accelerate promotion (+2)!
-        // - Otherwise (e.g. coined terms like "哈基米" / "星锚" or accidental pairs):
-        //   standard +1 so it promotes cleanly once repeated `threshold` times!
-        let bump: u8 = if let Some(surp) = mean_surprisal {
-            if surp < 4.0 {
+        // Only allow 1-shot promotion (`bump = 2`) for 2-char words formed from two single-char commits
+        // with strong RWKV cohesion (`surp < 3.8`, e.g. "微"+"信" -> "微信" when missing from Wubi86).
+        // Longer 3-4 char spans or multi-word glues always require real repetition (`bump = 1`).
+        let bump: u8 = if allow_fast_promote {
+            if mean_surprisal.is_some_and(|surp| surp < 3.8) {
                 2
             } else {
                 1
@@ -877,9 +922,10 @@ impl UserStore {
                             let dx: f32 = parts[2].parse().unwrap_or(0.0);
                             let dy: f32 = parts[3].parse().unwrap_or(0.0);
                             let samples: u32 = parts[4].parse().unwrap_or(0);
+                            let (cdx, cdy) = clamp_key_touch_offset(ch, dx, dy);
                             store.touch_profile.keys[idx] = TouchKeyOffset {
-                                dx: dx.clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
-                                dy: dy.clamp(-MAX_TOUCH_OFFSET, MAX_TOUCH_OFFSET),
+                                dx: cdx,
+                                dy: cdy,
                                 samples,
                             };
                         }
@@ -905,6 +951,9 @@ impl UserStore {
                     let count: u32 = parts[2].parse().unwrap_or(1);
                     let last_seq: u64 = parts[3].parse().unwrap_or(1);
                     let auto_composed = parts[4] == "1";
+                    if auto_composed && count <= 1 && !is_valid_auto_phrase_text(&text) {
+                        continue;
+                    }
                     store.phrases.insert(
                         text.clone(),
                         UserPhrase {
@@ -958,4 +1007,29 @@ fn escape_tab(s: &str) -> String {
 fn is_cjk_ideograph(ch: char) -> bool {
     let u = ch as u32;
     (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u)
+}
+
+/// Reject grammatical clause fragments (modal particles, structural `的/了/着`, pronouns, prepositions,
+/// and accidental single-char stutters like `"是是"`) from automatic dictionary promotion.
+/// Manual `add_phrase` is unrestricted.
+pub fn is_valid_auto_phrase_text(phrase: &str) -> bool {
+    let chars: Vec<char> = phrase.chars().collect();
+    let n = chars.len();
+    if !(2..=4).contains(&n) {
+        return false;
+    }
+    if n == 2 && chars[0] == chars[1] {
+        return false;
+    }
+    const BOUNDARY_PARTICLES: &[char] = &[
+        '的', '了', '吗', '呢', '吧', '啊', '呀', '哦', '嘛', '着', '过', '地', '得', '我', '你',
+        '他', '她', '它', '这', '那', '哪', '是', '在', '和', '与', '或', '把', '被', '给', '让',
+        '也', '都', '就', '还', '但', '而', '个',
+    ];
+    let first = chars[0];
+    let last = chars[n - 1];
+    if BOUNDARY_PARTICLES.contains(&first) || BOUNDARY_PARTICLES.contains(&last) || first == '么' {
+        return false;
+    }
+    true
 }

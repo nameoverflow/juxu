@@ -671,7 +671,7 @@ public final class KeyboardViewController: UIInputViewController {
             self?.feedback.fireSoftStep(playClick: true)
             self?.compositionBaseContext = nil
             self?.cancelMarkedCode()
-            self?.bridge.clearComposition()
+            self?.bridge.abandonComposition(timestampMs: Self.nowMs())
             self?.expandedIdleWords = nil
             self?.expandedGrid.isHidden = true
             self?.keyCanvas.isHidden = false
@@ -1078,6 +1078,9 @@ public final class KeyboardViewController: UIInputViewController {
         }
         guard acceleratedChunk, let before = textDocumentProxy.documentContextBeforeInput, !before.isEmpty else {
             let before = textDocumentProxy.documentContextBeforeInput ?? ""
+            if !before.isEmpty {
+                bridge.notifyPostCommitBackspace(timestampMs: Self.nowMs())
+            }
             autoSpaceTracker.willDeleteBackward(
                 hostBefore: before,
                 hostBeforeIsAuthoritative: false
