@@ -100,6 +100,57 @@ public enum IOSSwipeUp {
     }
 }
 
+/// Long-press character strip: tone-marked letters, uppercase, the swipe-up symbol and lowercase.
+public enum IOSKeyAlternates {
+    private static let accents: [UInt8: [String]] = [
+        UInt8(ascii: "a"): ["ā", "á", "ǎ", "à"],
+        UInt8(ascii: "e"): ["ē", "é", "ě", "è"],
+        UInt8(ascii: "i"): ["ī", "í", "ǐ", "ì"],
+        UInt8(ascii: "o"): ["ō", "ó", "ǒ", "ò"],
+        UInt8(ascii: "u"): ["ū", "ú", "ǔ", "ù"],
+        UInt8(ascii: "v"): ["ǖ", "ǘ", "ǚ", "ǜ", "ü"],
+    ]
+
+    /// `defaultIndex` points at the digit/symbol, which is what a plain long-press release enters.
+    public static func options(for letter: UInt8, asciiMode: Bool) -> (items: [String], defaultIndex: Int) {
+        let lower = String(UnicodeScalar(letter))
+        var items = accents[letter] ?? []
+        items.append(lower.uppercased())
+        var defaultIndex = items.count - 1
+        if let symbol = IOSSwipeUp.symbol(for: letter, asciiMode: asciiMode) {
+            items.append(symbol)
+            defaultIndex = items.count - 1
+        }
+        items.append(lower)
+        return (items, defaultIndex)
+    }
+
+    public static func cellWidth(count: Int, containerWidth: CGFloat) -> CGFloat {
+        min(42.0, (containerWidth - 8.0) / CGFloat(max(count, 1)))
+    }
+
+    /// Strip frame centered on the default cell over the key, clamped inside the keyboard.
+    public static func stripFrame(
+        keyFrame: CGRect,
+        count: Int,
+        defaultIndex: Int,
+        containerWidth: CGFloat,
+        height: CGFloat = 50.0
+    ) -> CGRect {
+        let cell = cellWidth(count: count, containerWidth: containerWidth)
+        let width = cell * CGFloat(count)
+        let idealX = keyFrame.midX - cell * (CGFloat(defaultIndex) + 0.5)
+        let x = min(max(4.0, idealX), max(4.0, containerWidth - width - 4.0))
+        return CGRect(x: x, y: max(2.0, keyFrame.minY - height - 5.0), width: width, height: height)
+    }
+
+    public static func index(atX x: CGFloat, in strip: CGRect, count: Int) -> Int {
+        guard count > 0, strip.width > 0 else { return 0 }
+        let raw = Int(floor((x - strip.minX) / (strip.width / CGFloat(count))))
+        return min(max(0, raw), count - 1)
+    }
+}
+
 public struct IOSKeySpec: Identifiable, Equatable {
     public let id: String
     public let kind: IOSKeyKind

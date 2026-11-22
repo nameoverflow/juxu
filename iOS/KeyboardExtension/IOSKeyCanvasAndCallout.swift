@@ -438,6 +438,10 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     var onRestorePlane: (() -> Void)?
     var onTrackpadMove: ((Int, Int) -> Void)?
     var onKeySwipeUp: ((String) -> Void)?
+    var onAlternatesBegin: ((IOSKeySpec) -> Void)?
+    var onAlternatesMove: ((CGPoint) -> Void)?
+    var onAlternatesEnd: ((Bool) -> Void)?
+    var longPressAlternatesEnabled: Bool = false
 
     private struct TrackedTouch {
         weak var touch: UITouch?
@@ -456,6 +460,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
         let startedOnSpace: Bool
         var committedByRollover: Bool = false
         var swipeUpActive: Bool = false
+        var alternatesActive: Bool = false
     }
 
     private(set) var snapshot: IOSKeyboardLayoutEngine.LayoutSnapshot?
@@ -486,6 +491,8 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     private var trackedTouches: [ObjectIdentifier: TrackedTouch] = [:]
     private var spaceHoldTimer: Timer?
     private var spaceHoldTouchId: ObjectIdentifier?
+    private var longPressTimer: Timer?
+    private var longPressTouchId: ObjectIdentifier?
     private var trackpad = SpaceTrackpadAccumulator()
     private var isDark: Bool = false
 
@@ -521,6 +528,10 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     }
 
     func resetAllTouches() {
+        cancelLongPressTimer()
+        if trackedTouches.values.contains(where: { $0.alternatesActive && !$0.committedByRollover }) {
+            onAlternatesEnd?(false)
+        }
         spaceHoldTimer?.invalidate()
         spaceHoldTimer = nil
         spaceHoldTouchId = nil
@@ -561,7 +572,10 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
 
     /// A later touch landed first: finish this one as its swipe symbol or normal key.
     private func commitRolledOver(_ state: TrackedTouch) {
-        if state.initialKey.kind == .backspace {
+        cancelLongPressTimer()
+        if state.alternatesActive {
+            onAlternatesEnd?(true)
+        } else if state.initialKey.kind == .backspace {
             onKeyTouchUp?(state.initialKey, state.initialPoint)
         } else if state.swipeUpActive, let symbol = state.initialKey.swipeUpSymbol {
             onKeySwipeUp?(symbol)
@@ -571,6 +585,34 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 : state.currentPoint
             onKeyTouchUp?(state.currentKey, cleanPt)
         }
+    }
+
+    private func cancelLongPressTimer(for id: ObjectIdentifier? = nil) {
+        if let id, longPressTouchId != id { return }
+        longPressTimer?.invalidate()
+        longPressTimer = nil
+        longPressTouchId = nil
+    }
+
+    private func startLongPressTimer(for id: ObjectIdentifier) {
+        cancelLongPressTimer()
+        longPressTouchId = id
+        let timer = Timer(timeInterval: 0.40, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.longPressTouchId == id else { return }
+                self.longPressTimer = nil
+                self.longPressTouchId = nil
+                guard var state = self.trackedTouches[id],
+                      !state.committedByRollover,
+                      !state.swipeUpActive,
+                      state.currentKey.id == state.initialKey.id else { return }
+                state.alternatesActive = true
+                self.trackedTouches[id] = state
+                self.onAlternatesBegin?(state.initialKey)
+            }
+        }
+        longPressTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func swipePreviewSpec(for key: IOSKeySpec, symbol: String) -> IOSKeySpec {
@@ -745,6 +787,9 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
 
             syncKeycapPressStates()
             onKeyTouchDown?(hit)
+            if longPressAlternatesEnabled, case .letter = hit.kind {
+                startLongPressTimer(for: id)
+            }
         }
     }
 
@@ -767,6 +812,15 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 hypot(pt.x - state.initialPoint.x, pt.y - state.initialPoint.y)
             )
             state.maxAbsDeltaY = max(state.maxAbsDeltaY, abs(pt.y - state.initialPoint.y))
+
+            if state.alternatesActive {
+                trackedTouches[id] = state
+                onAlternatesMove?(pt)
+                continue
+            }
+            if state.maxMovedDistance > 12.0 {
+                cancelLongPressTimer(for: id)
+            }
 
             if state.initialKey.kind == .backspace {
                 trackedTouches[id] = state
@@ -910,6 +964,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
             let id = ObjectIdentifier(touch)
             guard let state = trackedTouches.removeValue(forKey: id) else { continue }
             let pt = touch.location(in: self)
+            cancelLongPressTimer(for: id)
 
             if spaceHoldTouchId == id {
                 spaceHoldTimer?.invalidate()
@@ -919,6 +974,13 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
 
             if state.committedByRollover {
                 syncKeycapPressStates()
+                continue
+            }
+
+            if state.alternatesActive {
+                onAlternatesMove?(pt)
+                syncKeycapPressStates()
+                onAlternatesEnd?(true)
                 continue
             }
 
@@ -1002,10 +1064,16 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
         for touch in ordered {
             let id = ObjectIdentifier(touch)
             guard let state = trackedTouches.removeValue(forKey: id) else { continue }
+            cancelLongPressTimer(for: id)
             if spaceHoldTouchId == id {
                 spaceHoldTimer?.invalidate()
                 spaceHoldTimer = nil
                 spaceHoldTouchId = nil
+            }
+            if state.alternatesActive && !state.committedByRollover {
+                onAlternatesEnd?(false)
+                rescuedAny = true
+                continue
             }
             if state.isPlaneSlide {
                 if state.didSlideToSymbol {
@@ -1060,6 +1128,89 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
         if !rescuedAny && trackedTouches.values.allSatisfy(\.committedByRollover) {
             onKeyTouchCancel?()
         }
+    }
+}
+
+/// Long-press strip of alternate characters; the finger slides horizontally to choose one.
+final class IOSKeyAlternatesView: UIView {
+    private var labels: [UILabel] = []
+    private let highlight = UIView()
+    private var items: [String] = []
+    private(set) var selectedIndex: Int = 0
+
+    var selectedText: String? {
+        items.indices.contains(selectedIndex) ? items[selectedIndex] : nil
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        isHidden = true
+        layer.cornerRadius = 13.0
+        layer.cornerCurve = .continuous
+        layer.shadowColor = UIColor.black.cgColor
+        layer.shadowOffset = CGSize(width: 0, height: 3.5)
+        layer.shadowRadius = 11.0
+        highlight.backgroundColor = .systemBlue
+        highlight.layer.cornerRadius = 9.0
+        highlight.layer.cornerCurve = .continuous
+        addSubview(highlight)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func present(items: [String], defaultIndex: Int, over keyFrame: CGRect, containerWidth: CGFloat, dark: Bool) {
+        self.items = items
+        labels.forEach { $0.removeFromSuperview() }
+        frame = IOSKeyAlternates.stripFrame(
+            keyFrame: keyFrame,
+            count: items.count,
+            defaultIndex: defaultIndex,
+            containerWidth: containerWidth
+        )
+        backgroundColor = dark ? UIColor(red: 0.29, green: 0.29, blue: 0.30, alpha: 1.0) : .white
+        layer.shadowOpacity = dark ? 0.34 : 0.16
+        let cell = bounds.width / CGFloat(max(items.count, 1))
+        labels = items.enumerated().map { idx, text in
+            let label = UILabel(frame: CGRect(x: CGFloat(idx) * cell, y: 0, width: cell, height: bounds.height))
+            label.text = text
+            label.textAlignment = .center
+            label.font = .systemFont(ofSize: 23.0)
+            label.adjustsFontSizeToFitWidth = true
+            label.minimumScaleFactor = 0.5
+            addSubview(label)
+            return label
+        }
+        isHidden = false
+        isDarkStyle = dark
+        select(defaultIndex)
+    }
+
+    private var isDarkStyle = false
+
+    /// Returns `true` when the highlighted character changed.
+    @discardableResult
+    func update(xInSuperview x: CGFloat) -> Bool {
+        let idx = IOSKeyAlternates.index(atX: x, in: frame, count: items.count)
+        guard idx != selectedIndex else { return false }
+        select(idx)
+        return true
+    }
+
+    private func select(_ idx: Int) {
+        selectedIndex = idx
+        guard labels.indices.contains(idx) else { return }
+        highlight.frame = labels[idx].frame.insetBy(dx: 2.0, dy: 4.0)
+        for (i, label) in labels.enumerated() {
+            label.textColor = i == idx ? .white : (isDarkStyle ? .white : .black)
+        }
+    }
+
+    func hide() {
+        isHidden = true
+        items = []
     }
 }
 

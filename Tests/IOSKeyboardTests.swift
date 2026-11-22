@@ -535,15 +535,34 @@ struct IOSKeyboardTests {
         assert(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 88), keyHeight: 45, wasActive: true), "Hysteresis keeps an armed swipe")
         assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 92), keyHeight: 45, wasActive: true), "Sliding back cancels")
 
+        // Long-press alternates
+        let uAlt = IOSKeyAlternates.options(for: UInt8(ascii: "u"), asciiMode: false)
+        assert(uAlt.items == ["ū", "ú", "ǔ", "ù", "U", "7", "u"])
+        assert(uAlt.items[uAlt.defaultIndex] == "7")
+        let vAlt = IOSKeyAlternates.options(for: UInt8(ascii: "v"), asciiMode: true)
+        assert(vAlt.items.contains("ü") && vAlt.items[vAlt.defaultIndex] == "&")
+        let bAlt = IOSKeyAlternates.options(for: UInt8(ascii: "b"), asciiMode: false)
+        assert(bAlt.items == ["B", "？", "b"] && bAlt.defaultIndex == 1)
+        for key in swipeSnap.keys {
+            guard case .letter(let ascii) = key.kind else { continue }
+            let o = IOSKeyAlternates.options(for: ascii, asciiMode: false)
+            let strip = IOSKeyAlternates.stripFrame(keyFrame: key.frame, count: o.items.count, defaultIndex: o.defaultIndex, containerWidth: 440)
+            assert(strip.minX >= 4.0 && strip.maxX <= 436.0, "Alternates strip must stay inside the keyboard")
+            assert(IOSKeyAlternates.index(atX: strip.minX - 50, in: strip, count: o.items.count) == 0)
+            assert(IOSKeyAlternates.index(atX: strip.maxX + 50, in: strip, count: o.items.count) == o.items.count - 1)
+        }
+        let narrow = IOSKeyAlternates.stripFrame(keyFrame: CGRect(x: 300, y: 60, width: 30, height: 42), count: 8, defaultIndex: 6, containerWidth: 320)
+        assert(narrow.minX >= 4.0 && narrow.maxX <= 316.0)
         var offLayout = IOSKeyboardLayoutEngine()
         offLayout.swipeUpInputEnabled = false
         let offSnap = offLayout.computeLayout(in: CGSize(width: 440, height: 220))
         assert(offSnap.keys.allSatisfy { $0.swipeUpSymbol == nil }, "Switching swipe-up off must remove hints and gesture")
         var featurePrefs = JuxuPreferences()
-        assert(!featurePrefs.keySwipeUpInput, "Swipe-up input is opt-in")
+        assert(!featurePrefs.keySwipeUpInput && !featurePrefs.keyLongPressAlternates, "Gesture features are opt-in")
         featurePrefs.keySwipeUpInput = true
+        featurePrefs.keyLongPressAlternates = true
         let featureRound = JuxuPreferences.fromTOML(featurePrefs.toTOML())
-        assert(featureRound.keySwipeUpInput)
+        assert(featureRound.keySwipeUpInput && featureRound.keyLongPressAlternates)
 
         print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi & T9 Pinyin tests passed!")
     }
