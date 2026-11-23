@@ -106,6 +106,9 @@ public final class KeyboardViewController: UIInputViewController {
 
     public override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        clearLineGeneration &+= 1
+        lineClearUndo.removeAll()
+        backspaceTapDeferred = false
         hasAppeared = false
         stopBackspaceRepeat()
         keyCanvas.resetAllTouches()
@@ -287,6 +290,15 @@ public final class KeyboardViewController: UIInputViewController {
         syncProxyTraits()
     }
 
+    private var lineClearUndo = IOSLineClearUndo()
+    /// Text removed so far by the backspace press in progress.
+    private var backspaceSessionDeleted = ""
+    /// A tap's deletion waits for release while a swipe-down undo is possible.
+    private var backspaceTapDeferred = false
+
+    /// Bumped to abandon an in-flight line clear as soon as anything else happens.
+    private var clearLineGeneration: UInt64 = 0
+
     private func presentCalloutIfAppropriate(for spec: IOSKeySpec) {
         guard !layoutEngine.isTrackpadActive else {
             calloutView.hideImmediately()
@@ -321,6 +333,7 @@ public final class KeyboardViewController: UIInputViewController {
     private func wireCallbacks() {
         keyCanvas.onKeyTouchDown = { [weak self] spec in
             guard let self else { return }
+            self.clearLineGeneration &+= 1
             self.feedback.fireKeyDown()
             switch spec.kind {
             case .letter, .symbol:
@@ -335,7 +348,19 @@ public final class KeyboardViewController: UIInputViewController {
             case .backspace:
                 self.calloutView.hideImmediately()
                 self.keyCanvas.coveredCalloutKeyId = nil
-                self.performBackspace()
+                self.backspaceSessionDeleted = ""
+                // While a clear can be undone here, wait for release so a swipe-down deletes nothing first.
+                let canUndo = self.bridge.prefs.backspaceSwipeClear
+                    && self.bridge.state.preedit.isEmpty
+                    && self.lineClearUndo.restorableIndex(
+                        before: self.textDocumentProxy.documentContextBeforeInput ?? "",
+                        documentID: self.textDocumentProxy.documentIdentifier
+                    ) != nil
+                self.keyCanvas.canUndoLineClear = canUndo
+                self.backspaceTapDeferred = canUndo
+                if !canUndo {
+                    self.performBackspace()
+                }
                 self.startBackspaceRepeat()
             default:
                 self.calloutView.hideImmediately()
@@ -364,6 +389,7 @@ public final class KeyboardViewController: UIInputViewController {
             self?.calloutView.hideImmediately()
             self?.keyCanvas.coveredCalloutKeyId = nil
             self?.stopBackspaceRepeat()
+            self?.backspaceTapDeferred = false
         }
 
         keyCanvas.onKeyTouchUp = { [weak self] spec, rawPointInCanvas in
@@ -371,6 +397,9 @@ public final class KeyboardViewController: UIInputViewController {
             self.keyCanvas.coveredCalloutKeyId = nil
             self.calloutView.releasePreview()
             self.stopBackspaceRepeat()
+            if spec.kind == .backspace, self.backspaceTapDeferred {
+                self.performBackspace()
+            }
             self.handleKeyRelease(spec: spec, pointInCanvas: rawPointInCanvas)
         }
 
@@ -383,6 +412,64 @@ public final class KeyboardViewController: UIInputViewController {
             self.insertSymbol(symbol)
             self.layoutEngine.consumeOneShotShiftIfNeeded()
             self.syncEngineToUI()
+        }
+
+        keyCanvas.onBackspaceSwipeArmed = { [weak self] spec, armed in
+            guard let self else { return }
+            if armed {
+                self.stopBackspaceRepeat()
+                self.feedback.fireSoftStep(playClick: false)
+                let frameInRoot = self.keyCanvas.convert(spec.frame, to: self.inputView)
+                let isDocked = self.calloutView.present(
+                    label: "清空",
+                    keyId: spec.id,
+                    over: frameInRoot,
+                    dark: self.isDarkAppearance
+                )
+                self.keyCanvas.coveredCalloutKeyId = isDocked ? spec.id : nil
+            } else {
+                self.calloutView.hideImmediately()
+                self.keyCanvas.coveredCalloutKeyId = nil
+            }
+        }
+
+        keyCanvas.onBackspaceSwipeUp = { [weak self] in
+            guard let self else { return }
+            self.calloutView.hideImmediately()
+            self.keyCanvas.coveredCalloutKeyId = nil
+            self.stopBackspaceRepeat()
+            self.feedback.fireSoftStep(playClick: true)
+            self.backspaceTapDeferred = false
+            self.clearCurrentLineBeforeCursor()
+        }
+
+        keyCanvas.onBackspaceSwipeDownArmed = { [weak self] spec, armed in
+            guard let self else { return }
+            if armed {
+                self.stopBackspaceRepeat()
+                self.feedback.fireSoftStep(playClick: false)
+                let frameInRoot = self.keyCanvas.convert(spec.frame, to: self.inputView)
+                let isDocked = self.calloutView.present(
+                    label: "撤回",
+                    keyId: spec.id,
+                    over: frameInRoot,
+                    dark: self.isDarkAppearance
+                )
+                self.keyCanvas.coveredCalloutKeyId = isDocked ? spec.id : nil
+            } else {
+                self.calloutView.hideImmediately()
+                self.keyCanvas.coveredCalloutKeyId = nil
+            }
+        }
+
+        keyCanvas.onBackspaceSwipeDown = { [weak self] in
+            guard let self else { return }
+            self.calloutView.hideImmediately()
+            self.keyCanvas.coveredCalloutKeyId = nil
+            self.stopBackspaceRepeat()
+            self.backspaceTapDeferred = false
+            self.feedback.fireSoftStep(playClick: true)
+            self.restoreClearedLine()
         }
 
         keyCanvas.onAlternatesBegin = { [weak self] spec in
@@ -798,6 +885,123 @@ public final class KeyboardViewController: UIInputViewController {
         bridge.setContext("")
     }
 
+    /// Remembers what the current backspace press already removed, so a swipe can account for it.
+    private func noteBackspaceDeleted(_ text: String) {
+        backspaceSessionDeleted = text + backspaceSessionDeleted
+    }
+
+    /// Backspace swipe-down: puts back the most recent clear made at this cursor position.
+    private func restoreClearedLine() {
+        guard bridge.state.preedit.isEmpty,
+              let text = lineClearUndo.take(
+                  before: textDocumentProxy.documentContextBeforeInput ?? "",
+                  documentID: textDocumentProxy.documentIdentifier
+              ) else { return }
+        clearLineGeneration &+= 1
+        autoSpaceTracker.invalidate()
+        textDocumentProxy.insertText(text)
+        bridge.setContext(String(text.suffix(16)))
+        syncEngineToUI()
+    }
+
+    /// Backspace swipe-up: drops an active composition, otherwise deletes leftward to the start of the line.
+    /// The proxy only exposes a window of context, so long lines are deleted in verified batches.
+    private func clearCurrentLineBeforeCursor() {
+        markUserTypedForClipboard()
+        if !bridge.state.preedit.isEmpty {
+            compositionBaseContext = nil
+            cancelMarkedCode()
+            bridge.clearComposition()
+            syncEngineToUI()
+            return
+        }
+        autoSpaceTracker.invalidate()
+        // Touch-down at a line start removed only the line break: put it back instead of joining lines.
+        // After a longer hold-delete, the text already removed stays removed.
+        if backspaceSessionDeleted.count == 1, backspaceSessionDeleted.first?.isNewline == true {
+            textDocumentProxy.insertText(backspaceSessionDeleted)
+            backspaceSessionDeleted = ""
+            bridge.setContext("")
+            syncEngineToUI()
+            return
+        }
+        clearLineGeneration &+= 1
+        clearLineStep(
+            generation: clearLineGeneration,
+            deleted: 0,
+            waitedTicks: 0,
+            expected: nil,
+            collected: backspaceSessionDeleted,
+            remaining: textDocumentProxy.documentContextBeforeInput ?? ""
+        )
+        backspaceSessionDeleted = ""
+    }
+
+    private func finishLineClear(collected: String, remaining: String) {
+        lineClearUndo.push(
+            text: collected,
+            contextBefore: remaining,
+            documentID: textDocumentProxy.documentIdentifier
+        )
+        bridge.setContext(String(remaining.suffix(32)))
+        syncEngineToUI()
+    }
+
+    private func clearLineStep(
+        generation: UInt64,
+        deleted: Int,
+        waitedTicks: Int,
+        expected: IOSLineClear.Expected?,
+        collected: String,
+        remaining: String
+    ) {
+        guard generation == clearLineGeneration else { return }
+        let before = textDocumentProxy.documentContextBeforeInput ?? ""
+        guard !before.isEmpty, deleted < 50_000 else {
+            finishLineClear(collected: collected, remaining: before.isEmpty ? "" : remaining)
+            return
+        }
+        // Never delete from a stale context: an old snapshot could cross the line break or another field.
+        if let expected, !expected.isSatisfied(by: before) {
+            guard waitedTicks < 8 else {
+                finishLineClear(collected: collected, remaining: remaining)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.024) { [weak self] in
+                self?.clearLineStep(
+                    generation: generation,
+                    deleted: deleted,
+                    waitedTicks: waitedTicks + 1,
+                    expected: expected,
+                    collected: collected,
+                    remaining: remaining
+                )
+            }
+            return
+        }
+        let plan = IOSLineClear.plan(before: before, maxBatch: 128)
+        let nowCollected = String(before.suffix(plan.deleteCount)) + collected
+        let nowRemaining = String(before.dropLast(plan.deleteCount))
+        for _ in 0..<plan.deleteCount {
+            textDocumentProxy.deleteBackward()
+        }
+        guard !plan.reachesLineStart else {
+            finishLineClear(collected: nowCollected, remaining: nowRemaining)
+            return
+        }
+        let next = IOSLineClear.Expected(previous: before, removed: plan.deleteCount)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.024) { [weak self] in
+            self?.clearLineStep(
+                generation: generation,
+                deleted: deleted + plan.deleteCount,
+                waitedTicks: 0,
+                expected: next,
+                collected: nowCollected,
+                remaining: nowRemaining
+            )
+        }
+    }
+
     private func commitPendingFirstIfComposing() {
         guard !bridge.state.preedit.isEmpty else { return }
         let rawText = bridge.state.candidates.first?.text ?? bridge.state.preedit
@@ -808,6 +1012,7 @@ public final class KeyboardViewController: UIInputViewController {
     }
 
     private func performBackspace(acceleratedChunk: Bool = false) {
+        backspaceTapDeferred = false
         markUserTypedForClipboard()
         if !bridge.state.preedit.isEmpty {
             let out = bridge.handleKey(keyCode: 0x33, scalar: 0, hasCmdOrCtrl: false, timestampMs: Self.nowMs())
@@ -820,6 +1025,7 @@ public final class KeyboardViewController: UIInputViewController {
                 hostBefore: before,
                 hostBeforeIsAuthoritative: false
             )
+            noteBackspaceDeleted(String(before.suffix(1)))
             textDocumentProxy.deleteBackward()
             let afterDel = before.isEmpty ? "" : String(before.dropLast())
             bridge.setContext(String(afterDel.suffix(16)))
@@ -829,6 +1035,7 @@ public final class KeyboardViewController: UIInputViewController {
         autoSpaceTracker.invalidate()
         // Native-style accelerated hold-delete: erase up to 3 characters without crossing a newline in one jump
         if before.last == "\n" {
+            noteBackspaceDeleted("\n")
             textDocumentProxy.deleteBackward()
             let afterDel = String(before.dropLast())
             bridge.setContext(String(afterDel.suffix(16)))
@@ -844,6 +1051,7 @@ public final class KeyboardViewController: UIInputViewController {
             }
         }
         let nDel = max(1, count)
+        noteBackspaceDeleted(String(before.suffix(nDel)))
         for _ in 0..<nDel {
             textDocumentProxy.deleteBackward()
         }
@@ -1041,6 +1249,7 @@ public final class KeyboardViewController: UIInputViewController {
         layoutEngine.wubiKeycapRadicals = bridge.prefs.wubiKeycapRadicals
         layoutEngine.swipeUpInputEnabled = bridge.prefs.keySwipeUpInput
         keyCanvas.longPressAlternatesEnabled = bridge.prefs.keyLongPressAlternates
+        keyCanvas.backspaceSwipeClearEnabled = bridge.prefs.backspaceSwipeClear
         layoutEngine.isZLookupActive = bridge.prefs.isCangjieFamily
             && bridge.prefs.zOmnipotent
             && st.preedit.hasPrefix("z")

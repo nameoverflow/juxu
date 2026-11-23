@@ -100,6 +100,81 @@ public enum IOSSwipeUp {
     }
 }
 
+/// Plans the backspace swipe-up: delete leftward from the cursor, stopping at the current line's start.
+public enum IOSLineClear {
+    public struct Plan: Equatable {
+        public let deleteCount: Int
+        /// True when this batch finishes the line (a line break is visible, or nothing is left to delete).
+        public let reachesLineStart: Bool
+    }
+
+    public static func plan(before: String, maxBatch: Int) -> Plan {
+        let lineLength = before.reversed().prefix(while: { !$0.isNewline }).count
+        let sawLineBreak = lineLength < before.count
+        if lineLength > maxBatch {
+            return Plan(deleteCount: maxBatch, reachesLineStart: false)
+        }
+        return Plan(deleteCount: lineLength, reachesLineStart: sawLineBreak)
+    }
+
+    /// What the host context must look like before the next batch may run.
+    public struct Expected: Equatable {
+        let previous: String
+        let remaining: String
+
+        public init(previous: String, removed: Int) {
+            self.previous = previous
+            self.remaining = String(previous.dropLast(removed))
+        }
+
+        public func isSatisfied(by before: String) -> Bool {
+            if remaining.isEmpty {
+                return !previous.hasPrefix(before)
+            }
+            return before.hasSuffix(remaining)
+        }
+    }
+}
+
+/// Undo history for backspace line clears. A record is only restorable in the same document with the
+/// cursor back where the clear left it, so typing or moving elsewhere can never insert text in the wrong place.
+public struct IOSLineClearUndo: Equatable {
+    public struct Record: Equatable {
+        public let text: String
+        public let contextAfter: String
+        public let documentID: UUID?
+    }
+
+    public static let maxRecords = 8
+    public private(set) var records: [Record] = []
+
+    public init() {}
+
+    public mutating func push(text: String, contextBefore: String, documentID: UUID?) {
+        guard !text.isEmpty else { return }
+        records.append(Record(text: text, contextAfter: String(contextBefore.suffix(32)), documentID: documentID))
+        if records.count > Self.maxRecords {
+            records.removeFirst(records.count - Self.maxRecords)
+        }
+    }
+
+    public func restorableIndex(before: String, documentID: UUID?) -> Int? {
+        records.lastIndex { record in
+            guard record.documentID == documentID else { return false }
+            return record.contextAfter.isEmpty ? before.isEmpty : before.hasSuffix(record.contextAfter)
+        }
+    }
+
+    public mutating func take(before: String, documentID: UUID?) -> String? {
+        guard let index = restorableIndex(before: before, documentID: documentID) else { return nil }
+        return records.remove(at: index).text
+    }
+
+    public mutating func removeAll() {
+        records.removeAll()
+    }
+}
+
 /// Long-press character strip: tone-marked letters, uppercase, the swipe-up symbol and lowercase.
 public enum IOSKeyAlternates {
     private static let accents: [UInt8: [String]] = [

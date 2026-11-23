@@ -438,9 +438,16 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     var onRestorePlane: (() -> Void)?
     var onTrackpadMove: ((Int, Int) -> Void)?
     var onKeySwipeUp: ((String) -> Void)?
+    var onBackspaceSwipeArmed: ((IOSKeySpec, Bool) -> Void)?
+    var onBackspaceSwipeUp: (() -> Void)?
+    var onBackspaceSwipeDownArmed: ((IOSKeySpec, Bool) -> Void)?
+    var onBackspaceSwipeDown: (() -> Void)?
+    /// Set on backspace touch-down: whether a cleared line can be restored at the cursor.
+    var canUndoLineClear: Bool = false
     var onAlternatesBegin: ((IOSKeySpec) -> Void)?
     var onAlternatesMove: ((CGPoint) -> Void)?
     var onAlternatesEnd: ((Bool) -> Void)?
+    var backspaceSwipeClearEnabled: Bool = false
     var longPressAlternatesEnabled: Bool = false
 
     private struct TrackedTouch {
@@ -460,6 +467,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
         let startedOnSpace: Bool
         var committedByRollover: Bool = false
         var swipeUpActive: Bool = false
+        var swipeDownActive: Bool = false
         var alternatesActive: Bool = false
     }
 
@@ -571,12 +579,17 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     }
 
     /// A later touch landed first: finish this one as its swipe symbol or normal key.
+    /// An armed backspace swipe is deliberately not executed here, so rollover can never clear text.
     private func commitRolledOver(_ state: TrackedTouch) {
         cancelLongPressTimer()
         if state.alternatesActive {
             onAlternatesEnd?(true)
         } else if state.initialKey.kind == .backspace {
-            onKeyTouchUp?(state.initialKey, state.initialPoint)
+            if state.swipeUpActive || state.swipeDownActive {
+                onKeyTouchCancel?()
+            } else {
+                onKeyTouchUp?(state.initialKey, state.initialPoint)
+            }
         } else if state.swipeUpActive, let symbol = state.initialKey.swipeUpSymbol {
             onKeySwipeUp?(symbol)
         } else {
@@ -823,6 +836,31 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
             }
 
             if state.initialKey.kind == .backspace {
+                guard backspaceSwipeClearEnabled else {
+                    trackedTouches[id] = state
+                    continue
+                }
+                // Clearing is destructive, so backspace needs a longer, deliberate swipe than letters.
+                let armed = IOSSwipeUp.isActive(
+                    from: state.initialPoint,
+                    to: pt,
+                    keyHeight: state.initialKey.frame.height * 1.4,
+                    wasActive: state.swipeUpActive
+                )
+                if armed != state.swipeUpActive {
+                    state.swipeUpActive = armed
+                    onBackspaceSwipeArmed?(state.initialKey, armed)
+                }
+                let armedDown = canUndoLineClear && !armed && IOSSwipeUp.isActive(
+                    from: CGPoint(x: state.initialPoint.x, y: -state.initialPoint.y),
+                    to: CGPoint(x: pt.x, y: -pt.y),
+                    keyHeight: state.initialKey.frame.height * 1.4,
+                    wasActive: state.swipeDownActive
+                )
+                if armedDown != state.swipeDownActive {
+                    state.swipeDownActive = armedDown
+                    onBackspaceSwipeDownArmed?(state.initialKey, armedDown)
+                }
                 trackedTouches[id] = state
                 continue
             }
@@ -1038,6 +1076,17 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 continue
             }
 
+            if state.initialKey.kind == .backspace, state.swipeUpActive {
+                syncKeycapPressStates()
+                onBackspaceSwipeUp?()
+                continue
+            }
+            if state.initialKey.kind == .backspace, state.swipeDownActive {
+                syncKeycapPressStates()
+                onBackspaceSwipeDown?()
+                continue
+            }
+
             // Re-evaluate at lift-off so a quick flick with few move events still counts.
             if state.currentKey.id == state.initialKey.id,
                let symbol = state.initialKey.swipeUpSymbol,
@@ -1237,6 +1286,8 @@ final class IOSKeyCalloutView: UIView {
 
         glyphLabel.font = .systemFont(ofSize: 36.5, weight: .regular)
         glyphLabel.textAlignment = .center
+        glyphLabel.adjustsFontSizeToFitWidth = true
+        glyphLabel.minimumScaleFactor = 0.45
         addSubview(glyphLabel)
     }
 
