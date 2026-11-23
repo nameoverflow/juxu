@@ -40,7 +40,7 @@ targets:
       properties:
         JuxuSettingsGroup: $(AppIdentifierPrefix)im.juxu.settings
         CFBundleDisplayName: 句序
-        CFBundleShortVersionString: "0.1.0"
+        CFBundleShortVersionString: "0.1.1"
         CFBundleVersion: "9"
         CFBundleURLTypes:
           - CFBundleURLName: im.juxu.app
@@ -90,7 +90,7 @@ targets:
       properties:
         JuxuSettingsGroup: $(AppIdentifierPrefix)im.juxu.settings
         CFBundleDisplayName: 句序
-        CFBundleShortVersionString: "0.1.0"
+        CFBundleShortVersionString: "0.1.1"
         CFBundleVersion: "9"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.keyboard-service
