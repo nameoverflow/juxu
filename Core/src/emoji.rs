@@ -76,6 +76,20 @@ impl EmojiTable {
     }
 }
 
+fn build_emoji_candidates(emoji: Vec<&str>) -> Vec<Candidate> {
+    emoji
+        .into_iter()
+        .map(|text| Candidate {
+            text: text.to_owned(),
+            matched_code: PackedCode::EMPTY,
+            comment: String::new(),
+            badge: CandidateBadge::Emoji,
+            confidence: 0.10,
+            is_exact: true,
+        })
+        .collect()
+}
+
 /// Inserts emoji right after the first leading candidate that covers all typed keys and has a match.
 /// The first candidate always stays first, so space-to-commit behaves exactly as before.
 pub fn inject(table: &EmojiTable, candidates: &mut Vec<PinyinCandidate>, total_keys: usize) {
@@ -88,22 +102,48 @@ pub fn inject(table: &EmojiTable, candidates: &mut Vec<PinyinCandidate>, total_k
         if emoji.is_empty() {
             continue;
         }
-        let items: Vec<PinyinCandidate> = emoji
+        let items: Vec<PinyinCandidate> = build_emoji_candidates(emoji)
             .into_iter()
-            .map(|text| PinyinCandidate {
-                candidate: Candidate {
-                    text: text.to_owned(),
-                    matched_code: PackedCode::EMPTY,
-                    comment: String::new(),
-                    badge: CandidateBadge::Emoji,
-                    confidence: 0.10,
-                    is_exact: true,
-                },
+            .map(|candidate| PinyinCandidate {
+                candidate,
                 consumed_keys: total_keys,
                 boundaries: Vec::new(),
             })
             .collect();
         candidates.splice(idx + 1..idx + 1, items);
+        return;
+    }
+}
+
+/// Inserts emoji right after the first leading candidate with a match (for fixed-code schemas).
+/// The first candidate always stays first.
+pub fn inject_candidates(table: &EmojiTable, candidates: &mut Vec<Candidate>) {
+    for idx in 0..candidates.len().min(SCAN_CANDIDATES) {
+        let emoji = table.lookup(&candidates[idx].text);
+        if emoji.is_empty() {
+            continue;
+        }
+        let items = build_emoji_candidates(emoji);
+        candidates.splice(idx + 1..idx + 1, items);
+        return;
+    }
+}
+
+/// Inserts emoji into spaceless candidate lists while keeping `starts` aligned.
+pub fn inject_spaceless_candidates(
+    table: &EmojiTable,
+    candidates: &mut Vec<Candidate>,
+    starts: &mut Vec<Option<usize>>,
+) {
+    for idx in 0..candidates.len().min(SCAN_CANDIDATES) {
+        let emoji = table.lookup(&candidates[idx].text);
+        if emoji.is_empty() {
+            continue;
+        }
+        let items = build_emoji_candidates(emoji);
+        let count = items.len();
+        candidates.splice(idx + 1..idx + 1, items);
+        starts.splice(idx + 1..idx + 1, std::iter::repeat_n(None, count));
         return;
     }
 }
@@ -220,5 +260,43 @@ mod tests {
         assert!(!cfg.emoji_candidates);
         cfg.emoji_candidates = true;
         assert!(JuxuConfig::from_toml_str(&cfg.to_toml_string()).emoji_candidates);
+    }
+
+    #[test]
+    fn fixed_code_wubi_gets_emoji_without_breaking_fourth_code_auto_commit() {
+        use crate::format::{serialize_wbdict, DictBuildInput, DictView};
+        let bytes = serialize_wbdict(DictBuildInput {
+            schema_id: 86,
+            entries: vec![
+                (PackedCode::from_ascii("lf").unwrap(), "思考".into(), 5000, 0),
+                (PackedCode::from_ascii("lfft").unwrap(), "思考".into(), 5000, 0),
+            ],
+            char_metas: vec![],
+        });
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::Wubi86;
+        cfg.emoji_candidates = true;
+        cfg.fourth_code_auto_commit = true;
+        cfg.eval_logging = false;
+        let mut e = JuxuEngine::new(cfg);
+        e.load_dict(InputSchema::Wubi86, DictView::from_bytes(bytes).unwrap());
+        e.load_emoji_table(table());
+
+        // 2-code prefix shows word first, emoji second, and committing emoji works cleanly
+        type_keys(&mut e, "lf");
+        let all = texts(&e);
+        assert_eq!(all[0], "思考");
+        assert_eq!(all[1], "🤔");
+        let out = e.select_abs_candidate(1, 2000).expect("wubi emoji commit");
+        assert_eq!(out.commit_text, "🤔");
+        assert!(e.raw_code().is_empty());
+
+        // Unique 4-code word still auto-commits despite emoji secondary candidate
+        let mut committed = String::new();
+        for (i, ch) in "lfft".chars().enumerate() {
+            let o = e.handle_key_event(0, Some(ch), false, 3000 + i as u64 * 40);
+            committed.push_str(&o.commit_text);
+        }
+        assert_eq!(committed, "思考");
     }
 }

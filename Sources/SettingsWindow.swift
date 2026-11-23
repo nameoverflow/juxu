@@ -678,7 +678,7 @@ public struct SettingsRootView: View {
                     Divider()
                     toggleRow(
                         title: "Emoji 候选",
-                        subtitle: "拼音输入时，在匹配的词语后显示 Emoji 作为次要候选（如 思考 → 🤔）",
+                        subtitle: "输入时，在匹配的词语后显示 Emoji 作为次要候选（如 思考 → 🤔）",
                         isOn: binding(\.emojiCandidates)
                     )
                     Divider()

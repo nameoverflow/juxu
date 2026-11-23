@@ -1492,6 +1492,24 @@ impl JuxuEngine {
             });
         }
         let cand = self.candidates.get(abs_idx)?.clone();
+        if cand.badge == CandidateBadge::Emoji {
+            let source = self.candidates[..abs_idx]
+                .iter()
+                .rev()
+                .find(|c| c.badge != CandidateBadge::Emoji)
+                .map(|c| c.text.clone());
+            self.clear_composition();
+            self.user.break_single_burst();
+            if let Some(source) = source {
+                self.last_committed = source.clone();
+                self.append_recent_context(&source);
+            }
+            return Some(EngineOutput {
+                consumed: true,
+                commit_text: cand.text,
+                ..Default::default()
+            });
+        }
         let learn = self.config.dynamic_word_freq && (explicit || cand.is_exact);
         let first_choice =
             (learn && explicit && abs_idx > 0).then(|| self.candidates[0].text.clone());
@@ -2619,8 +2637,12 @@ impl JuxuEngine {
         {
             return false;
         }
-        // Count exact candidates vs typo-corrected candidates
-        let exact_cands: Vec<&Candidate> = self.candidates.iter().filter(|c| c.is_exact).collect();
+        // Count exact candidates vs typo-corrected candidates (ignoring secondary emoji candidates)
+        let exact_cands: Vec<&Candidate> = self
+            .candidates
+            .iter()
+            .filter(|c| c.is_exact && c.badge != CandidateBadge::Emoji)
+            .collect();
         if exact_cands.len() == 1 {
             // Only auto-commit when #1 IS that unique exact candidate!
             if self.candidates[0].is_exact {
@@ -2628,8 +2650,13 @@ impl JuxuEngine {
             }
         }
         // If #1 is a typo-corrected candidate, respect `suppress_auto_commit_on_correction`!
+        let non_emoji_count = self
+            .candidates
+            .iter()
+            .filter(|c| c.badge != CandidateBadge::Emoji)
+            .count();
         if !self.candidates[0].is_exact && !self.config.typo.suppress_auto_commit_on_correction {
-            return self.candidates.len() == 1 || self.candidates[0].confidence >= 0.94;
+            return non_emoji_count == 1 || self.candidates[0].confidence >= 0.94;
         }
         false
     }
@@ -2825,6 +2852,13 @@ impl JuxuEngine {
         for (cand, start) in entries {
             self.candidates.push(cand);
             self.spaceless_candidate_starts.push(start);
+        }
+        if let Some(table) = self.emoji_table.as_ref().filter(|_| self.config.emoji_candidates) {
+            crate::emoji::inject_spaceless_candidates(
+                table,
+                &mut self.candidates,
+                &mut self.spaceless_candidate_starts,
+            );
         }
     }
 
@@ -3243,6 +3277,15 @@ impl JuxuEngine {
     }
 
     pub fn rebuild_candidates(&mut self) {
+        self.rebuild_candidates_inner();
+        if !self.is_pinyin_mode() && !self.uses_spaceless() {
+            if let Some(table) = self.emoji_table.as_ref().filter(|_| self.config.emoji_candidates) {
+                crate::emoji::inject_candidates(table, &mut self.candidates);
+            }
+        }
+    }
+
+    fn rebuild_candidates_inner(&mut self) {
         self.candidates.clear();
         self.pinyin_candidates.clear();
         self.pinyin_paths.clear();

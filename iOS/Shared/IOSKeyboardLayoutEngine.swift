@@ -84,7 +84,7 @@ public enum IOSSwipeUp {
 
     /// Upward travel needed to arm the gesture; light thumb roll during normal typing stays below it.
     public static func armDistance(keyHeight: CGFloat) -> CGFloat {
-        max(16.0, keyHeight * 0.40)
+        max(26.0, keyHeight * 0.60)
     }
 
     /// Mostly-vertical upward drag past the arm distance, with hysteresis so sliding back down cancels it.
@@ -96,7 +96,7 @@ public enum IOSSwipeUp {
     ) -> Bool {
         let up = start.y - current.y
         let threshold = armDistance(keyHeight: keyHeight) * (wasActive ? 0.6 : 1.0)
-        return up >= threshold && abs(current.x - start.x) <= up * 0.8
+        return up >= threshold && abs(current.x - start.x) <= up * 0.55
     }
 }
 

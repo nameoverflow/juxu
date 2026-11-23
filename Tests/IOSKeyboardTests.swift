@@ -528,12 +528,12 @@ struct IOSKeyboardTests {
         let swipeAscii = swipeLayout.computeLayout(in: CGSize(width: 440, height: 220))
         assert(swipeAscii.keys.first(where: { $0.kind == .letter(UInt8(ascii: "b")) })?.swipeUpSymbol == "?")
         let o = CGPoint(x: 100, y: 100)
-        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 101, y: 90), keyHeight: 45, wasActive: false), "Thumb roll must stay a tap")
-        assert(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 103, y: 80), keyHeight: 45, wasActive: false))
-        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 140, y: 75), keyHeight: 45, wasActive: false), "Diagonal slide is not a swipe-up")
-        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 120), keyHeight: 45, wasActive: false))
-        assert(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 88), keyHeight: 45, wasActive: true), "Hysteresis keeps an armed swipe")
-        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 92), keyHeight: 45, wasActive: true), "Sliding back cancels")
+        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 101, y: 80), keyHeight: 45, wasActive: false), "Thumb lift roll must stay a tap")
+        assert(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 103, y: 72), keyHeight: 45, wasActive: false))
+        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 120, y: 70), keyHeight: 45, wasActive: false), "Diagonal slide is not a swipe-up")
+        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 130), keyHeight: 45, wasActive: false))
+        assert(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 82), keyHeight: 45, wasActive: true), "Hysteresis keeps an armed swipe")
+        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 86), keyHeight: 45, wasActive: true), "Sliding back cancels")
 
         // Long-press alternates
         let uAlt = IOSKeyAlternates.options(for: UInt8(ascii: "u"), asciiMode: false)

@@ -144,6 +144,7 @@ private final class IOSKeycapNodeView: UIView {
     private var isDarkTheme = false
     private var isPressedState = false
     private var isGlyphCovered = false
+    private var hasAppliedPressVisuals = false
 
     private static var symbolCache: [String: UIImage] = [:]
 
@@ -212,6 +213,18 @@ private final class IOSKeycapNodeView: UIView {
             }
         }
 
+        if specOrThemeChanged || !hasAppliedPressVisuals || pressed != isPressedState || glyphCovered != isGlyphCovered {
+            applyPressVisuals(pressed: pressed, glyphCovered: glyphCovered, spec: spec, dark: dark, animatedRelease: !pressed && isPressedState)
+            hasAppliedPressVisuals = true
+            isPressedState = pressed
+            isGlyphCovered = glyphCovered
+        }
+    }
+
+    func updatePressState(pressed: Bool, glyphCovered: Bool, dark: Bool) {
+        guard hasAppliedPressVisuals, let spec = currentSpec else { return }
+        guard pressed != isPressedState || glyphCovered != isGlyphCovered || dark != isDarkTheme else { return }
+        isDarkTheme = dark
         applyPressVisuals(pressed: pressed, glyphCovered: glyphCovered, spec: spec, dark: dark, animatedRelease: !pressed && isPressedState)
         isPressedState = pressed
         isGlyphCovered = glyphCovered
@@ -408,8 +421,12 @@ private final class IOSKeycapNodeView: UIView {
             self.backgroundColor = targetBg
             self.transform = targetTransform
             self.primaryLabel.alpha = contentAlpha
-            self.radicalLabel.alpha = contentAlpha
-            self.swipeHintLabel.alpha = contentAlpha
+            if !self.radicalLabel.isHidden {
+                self.radicalLabel.alpha = contentAlpha
+            }
+            if !self.swipeHintLabel.isHidden {
+                self.swipeHintLabel.alpha = contentAlpha
+            }
         }
 
         if animatedRelease {
@@ -707,7 +724,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
             let node = keycapNodes[idx]
             let isPressed = pressedIds.contains(spec.id)
             let isCovered = isPressed && (coveredCalloutKeyId == spec.id)
-            node.configure(spec: spec, dark: isDark, pressed: isPressed, glyphCovered: isCovered)
+            node.updatePressState(pressed: isPressed, glyphCovered: isCovered, dark: isDark)
         }
     }
 
@@ -844,7 +861,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 let armed = IOSSwipeUp.isActive(
                     from: state.initialPoint,
                     to: pt,
-                    keyHeight: state.initialKey.frame.height * 1.4,
+                    keyHeight: state.initialKey.frame.height * 1.15,
                     wasActive: state.swipeUpActive
                 )
                 if armed != state.swipeUpActive {
@@ -854,7 +871,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 let armedDown = canUndoLineClear && !armed && IOSSwipeUp.isActive(
                     from: CGPoint(x: state.initialPoint.x, y: -state.initialPoint.y),
                     to: CGPoint(x: pt.x, y: -pt.y),
-                    keyHeight: state.initialKey.frame.height * 1.4,
+                    keyHeight: state.initialKey.frame.height * 1.15,
                     wasActive: state.swipeDownActive
                 )
                 if armedDown != state.swipeDownActive {
