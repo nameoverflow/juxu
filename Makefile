@@ -67,18 +67,35 @@ pkg: app
 	sh Scripts/build-macos-pkg.sh build/Juxu.app "$$ver" "build/Juxu-$$ver-macOS-arm64.pkg"
 
 install: app
-	mkdir -p "$$HOME/Library/Input Methods"
 	pkill -TERM -x Juxu || true
 	pkill -TERM -x PrisWubi || true
 	sleep 0.3
-	rm -rf "$$HOME/Library/Input Methods/Juxu.app"
-	cp -R build/Juxu.app "$$HOME/Library/Input Methods/Juxu.app"
-	"$(LSREGISTER)" -f -R -trusted "$$HOME/Library/Input Methods/Juxu.app"
-	"$$HOME/Library/Input Methods/Juxu.app/Contents/MacOS/Juxu" --register-and-enable
+	@if [ -d "$$HOME/Library/Input Methods/Juxu.app" ]; then \
+	  "$(LSREGISTER)" -u "$$HOME/Library/Input Methods/Juxu.app" 2>/dev/null || true; \
+	  rm -rf "$$HOME/Library/Input Methods/Juxu.app"; \
+	fi
+	@if [ -d "/Library/Input Methods/Juxu.app" ] && [ -w "/Library/Input Methods/Juxu.app" ]; then \
+	  rm -rf "/Library/Input Methods/Juxu.app/Contents"; \
+	  cp -R build/Juxu.app/Contents "/Library/Input Methods/Juxu.app/Contents"; \
+	  chmod -R ug+rwX,o+rX "/Library/Input Methods/Juxu.app" 2>/dev/null || true; \
+	elif [ -w "/Library/Input Methods" ]; then \
+	  rm -rf "/Library/Input Methods/Juxu.app"; \
+	  cp -R build/Juxu.app "/Library/Input Methods/Juxu.app"; \
+	  chmod -R ug+rwX,o+rX "/Library/Input Methods/Juxu.app" 2>/dev/null || true; \
+	elif [ -t 0 ] && sudo -v 2>/dev/null; then \
+	  sudo rm -rf "/Library/Input Methods/Juxu.app"; \
+	  sudo cp -R build/Juxu.app "/Library/Input Methods/Juxu.app"; \
+	  sudo chown -R root:staff "/Library/Input Methods/Juxu.app"; \
+	  sudo chmod -R ug+rwX,o+rX "/Library/Input Methods/Juxu.app"; \
+	else \
+	  osascript -e 'do shell script "rm -rf \"/Library/Input Methods/Juxu.app\" && cp -R \"" & (POSIX path of (POSIX file "build/Juxu.app")) & "\" \"/Library/Input Methods/Juxu.app\" && chown -R root:staff \"/Library/Input Methods/Juxu.app\" && chmod -R ug+rwX,o+rX \"/Library/Input Methods/Juxu.app\"" with administrator privileges'; \
+	fi
+	"$(LSREGISTER)" -f -R -trusted "/Library/Input Methods/Juxu.app"
+	"/Library/Input Methods/Juxu.app/Contents/MacOS/Juxu" --register-and-enable
 	killall imklaunchagent 2>/dev/null || true
 	sleep 0.3
-	open -g "$$HOME/Library/Input Methods/Juxu.app"
-	@echo "Installed and launched ~/Library/Input Methods/Juxu.app"
+	open -g "/Library/Input Methods/Juxu.app"
+	@echo "Installed and launched /Library/Input Methods/Juxu.app"
 
 rust-test:
 	cargo test --release --manifest-path Core/Cargo.toml

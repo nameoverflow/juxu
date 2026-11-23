@@ -10,7 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/nameoverflow/juxu/main/Scripts/install-macos.sh | sh
 ```
 
-自动校验 SHA-256、安装至 `~/Library/Input Methods/Juxu.app`、自动注册并启用到系统右上角输入法菜单，**无需手动找隐藏目录、无需注销或重启**，装完直接按 `Ctrl + Space`（或地球键 🌐）切换输入。
+自动校验 SHA-256、安装至 `/Library/Input Methods/Juxu.app`（首次写入需验证一次管理员密码/Touch ID，设为 `staff` 组可写后后续升级免密）并自动注册拉起启用确认，**无需手动找隐藏目录、无需注销或重启**，装完直接按 `Ctrl + Space`（或地球键 🌐）切换输入。
 
 ### 方式二：`.pkg` 安装向导
 
@@ -43,7 +43,7 @@ make dicts         # 从 Resources/RawTables/ 重新编译 Resources/Dicts/ 二�
 make test          # 运行 Rust 核心测试 + macOS Swift 桥接测试 + iOS 键盘几何与内联上屏测试
 make app           # 编译并签名 macOS 输入法 build/Juxu.app
 make pkg           # 构建 macOS 向导安装包 build/Juxu-*-macOS-arm64.pkg
-make install       # 安装并自动注册启用至 ~/Library/Input Methods/Juxu.app
+make install       # 安装并注册启用至 /Library/Input Methods/Juxu.app
 make ios-core      # 交叉编译 iOS 真机 (aarch64-apple-ios) 与模拟器静态库
 make ios-project   # 使用 XcodeGen 生成 iOS/Juxu.xcodeproj
 make previews      # 渲染 macOS 2x Retina 候选窗与设置页预览图

@@ -121,28 +121,43 @@ jobs:
           cat <<'EOF' > "dist/dmg-root/双击安装句序.command"
           #!/bin/sh
           set -eu
+          export COPYFILE_DISABLE=1
           SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-          USER_DIR="$HOME/Library/Input Methods"
-          DST_APP="$USER_DIR/Juxu.app"
+          SYS_APP="/Library/Input Methods/Juxu.app"
+          USER_APP="$HOME/Library/Input Methods/Juxu.app"
           LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
           pkill -TERM -x Juxu 2>/dev/null || true
           pkill -TERM -x PrisWubi 2>/dev/null || true
           sleep 0.3
-          mkdir -p "$USER_DIR"
-          rm -rf "$DST_APP"
-          cp -R "$SRC_DIR/Juxu.app" "$DST_APP"
-          xattr -cr "$DST_APP" 2>/dev/null || true
-          "$LSREGISTER" -f -R -trusted "$DST_APP" 2>/dev/null || true
-          "$DST_APP/Contents/MacOS/Juxu" --register-and-enable
+          if [ -d "$USER_APP" ]; then
+            "$LSREGISTER" -u "$USER_APP" 2>/dev/null || true
+            rm -rf "$USER_APP" 2>/dev/null || true
+          fi
+          if [ -d "$SYS_APP" ] && [ -w "$SYS_APP" ]; then
+            rm -rf "$SYS_APP/Contents"
+            cp -R "$SRC_DIR/Juxu.app/Contents" "$SYS_APP/Contents"
+          else
+            sudo rm -rf "$SYS_APP"
+            sudo cp -R "$SRC_DIR/Juxu.app" "$SYS_APP"
+            sudo chown -R root:staff "$SYS_APP"
+            sudo chmod -R ug+rwX,o+rX "$SYS_APP"
+          fi
+          xattr -cr "$SYS_APP" 2>/dev/null || true
+          "$LSREGISTER" -f -R -trusted "$SYS_APP" 2>/dev/null || true
+          "$SYS_APP/Contents/MacOS/Juxu" --register-and-enable
           killall imklaunchagent 2>/dev/null || true
           sleep 0.3
-          open -g "$DST_APP"
+          open -g "$SYS_APP"
           echo ""
-          echo "✓ 句序 (Juxu) 已安装并自动启用！无需注销，按 Ctrl+Space 或地球键即可开始输入。"
+          echo "✓ 句序 (Juxu) 已安装至 /Library/Input Methods/Juxu.app！无需注销，按 Ctrl+Space 或地球键即可开始输入。"
           EOF
           chmod 0755 "dist/dmg-root/双击安装句序.command"
-          hdiutil create -volname "Juxu ${VERSION}" -srcfolder dist/dmg-root -ov -format UDZO "dist/Juxu-${VERSION}-macOS-arm64.dmg"
+          for attempt in 1 2 3; do
+            hdiutil create -volname "Juxu ${VERSION}" -srcfolder dist/dmg-root -ov -format UDZO "dist/Juxu-${VERSION}-macOS-arm64.dmg" && break
+            echo "hdiutil create busy on attempt ${attempt}, retrying..."
+            sleep 3
+          done
 
           (cd dist && shasum -a 256 \
             "Juxu-${VERSION}-macOS-arm64.pkg" \
@@ -152,11 +167,11 @@ jobs:
           cat <<EOF > dist/RELEASE_NOTES.md
           ### macOS 快速安装 / 升级（Apple Silicon）
 
-          #### 方式一：一行命令全自动安装（推荐，免密码、免弹窗、免注销，5 秒即用）
+          #### 方式一：一行命令安装 / 升级（推荐，免 Gatekeeper 弹窗、免注销，后续升级免密码）
           \`\`\`sh
           curl -fsSL https://raw.githubusercontent.com/nameoverflow/juxu/main/Scripts/install-macos.sh | sh
           \`\`\`
-          > 自动下载并校验 SHA-256、安装至 \`~/Library/Input Methods/Juxu.app\`、注册并启用到右上角输入法菜单，装完直接按 \`Ctrl + Space\` / 🌐 切换使用。
+          > 自动下载并校验 SHA-256、安装至系统输入法目录 \`/Library/Input Methods/Juxu.app\`（首次写入需验证一次管理员密码/Touch ID，后续升级直接免密覆盖），首次安装会自动拉起输入法启用确认，**无需注销重启**，装完按 \`Ctrl + Space\` / 🌐 切换使用。
 
           #### 方式二：图形向导安装包（\`.pkg\`）
           1. 下载下方 **\`Juxu-${VERSION}-macOS-arm64.pkg\`**；

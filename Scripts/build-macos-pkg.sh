@@ -22,7 +22,7 @@ mkdir -p "$PAYLOAD_DIR/Library/Input Methods" "$SCRIPTS_DIR" "$RES_DIR" "$(dirna
 
 cp -R "$APP_PATH" "$PAYLOAD_DIR/Library/Input Methods/Juxu.app"
 xattr -cr "$PAYLOAD_DIR/Library/Input Methods/Juxu.app" 2>/dev/null || true
-chmod -R go+rX "$PAYLOAD_DIR/Library/Input Methods/Juxu.app"
+chmod -R ug+rwX,o+rX "$PAYLOAD_DIR/Library/Input Methods/Juxu.app"
 
 cat <<'EOF' > "$SCRIPTS_DIR/preinstall"
 #!/bin/sh
@@ -39,7 +39,8 @@ APP_DST="/Library/Input Methods/Juxu.app"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 xattr -cr "$APP_DST" 2>/dev/null || true
-chmod -R go+rX "$APP_DST" 2>/dev/null || true
+chown -R root:staff "$APP_DST" 2>/dev/null || true
+chmod -R ug+rwX,o+rX "$APP_DST" 2>/dev/null || true
 "$LSREGISTER" -f -R -trusted "$APP_DST" 2>/dev/null || true
 
 CONSOLE_USER="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
