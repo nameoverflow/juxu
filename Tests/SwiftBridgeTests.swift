@@ -376,6 +376,61 @@ struct SwiftBridgeTests {
         let closeWhisper = closeMicMeter.process(rms: rmsFromDB(-42), seconds: 0.1)
         precondition(closeWhisper > 0.05 && closeWhisper < closeNormal && closeNormal < closeLoud, "adaptive ceiling separates whisper, normal and loud speech on hot mics")
 
+        // Hold logic, fed synthetic events. The microphone is never started.
+        VoicePreferencesStore.shared.update({ $0.enabled = true; $0.triggerKey = .rightCommand }, persist: false)
+        let holdSession = VoiceSessionController.shared
+        var holdStarts = 0
+        var holdFinishes = 0
+        holdSession.startRecordingOverride = { holdStarts += 1 }
+        holdSession.finishRecordingOverride = { holdFinishes += 1 }
+        let command = { (down: Bool) -> NSEvent in
+            let e = CGEvent(keyboardEventSource: nil, virtualKey: 0x36, keyDown: down)!
+            e.type = .flagsChanged
+            e.flags = down ? .maskCommand : []
+            return NSEvent(cgEvent: e)!
+        }
+        let keyC: NSEvent = {
+            let e = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: true)!
+            e.flags = .maskCommand
+            return NSEvent(cgEvent: e)!
+        }()
+        let feed = { (event: NSEvent) in
+            _ = holdSession.handleEvent(event, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
+        }
+        // Capture starts on key-down with no delay.
+        feed(command(true))
+        precondition(holdStarts == 1 && holdSession.isCapturing, "pressing the voice key starts at once")
+        feed(command(true))
+        precondition(holdStarts == 1, "a repeated key-down does not start twice")
+        feed(command(false))
+        precondition(holdFinishes == 1 && !holdSession.isCapturing, "release finishes the dictation")
+        // A shortcut is dropped immediately and still reaches the app.
+        feed(command(true))
+        let chordConsumed = holdSession.handleEvent(keyC, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
+        precondition(!chordConsumed, "right-Command-C still reaches the app")
+        precondition(!holdSession.isCapturing, "a shortcut cancels at once")
+        feed(command(false))
+        precondition(holdStarts == 2 && holdFinishes == 1, "a cancelled shortcut never finishes into a transcription")
+        // Adding another modifier is a shortcut too.
+        let leftShift: NSEvent = {
+            let e = CGEvent(keyboardEventSource: nil, virtualKey: 0x38, keyDown: true)!
+            e.type = .flagsChanged
+            e.flags = [.maskCommand, .maskShift]
+            return NSEvent(cgEvent: e)!
+        }()
+        feed(command(true)); feed(leftShift)
+        precondition(!holdSession.isCapturing, "another modifier cancels at once")
+        feed(command(false))
+        precondition(holdStarts == 3 && holdFinishes == 1, "the release after a cancel does nothing")
+        // Leaving the app cancels capture.
+        feed(command(true)); holdSession.handleDeactivate()
+        precondition(!holdSession.isCapturing, "deactivation cancels capture"); feed(command(false))
+        precondition(holdStarts == 4 && holdFinishes == 1, "one press is exactly one dictation")
+        holdSession.startRecordingOverride = nil
+        holdSession.finishRecordingOverride = nil
+        VoicePreferencesStore.shared.update({ $0.enabled = false }, persist: false)
+        precondition(!VoiceSessionController.isLoaded, "turning voice off releases the session controller")
+
         // Verify legacy "rule_based" config migrates cleanly to local LLM (.qwen15B)
         let defaultVoiceLLM = VoicePreferences()
         assert(defaultVoiceLLM.localLLMPreset == .qwen15B)
