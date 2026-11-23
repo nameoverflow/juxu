@@ -143,6 +143,15 @@ public enum IOSPunctuationPairing {
         guard let last = openClosers.last, after?.first.map(String.init) != last else { return openClosers }
         return []
     }
+
+    /// True while the text right of the cursor is still the tracked closers (innermost first) followed by
+    /// what was there when the first pair opened. Compared over the visible window, which the host may trim.
+    public static func cursorStaysInPairs(_ openClosers: [String], tail: String, after: String?) -> Bool {
+        let expected = openClosers.reversed().joined() + tail
+        let visible = after ?? ""
+        let length = min(expected.count, visible.count)
+        return expected.prefix(length) == visible.prefix(length) && visible.count >= openClosers.count
+    }
 }
 
 /// Plans the backspace swipe-up: delete leftward from the cursor, stopping at the current line's start.

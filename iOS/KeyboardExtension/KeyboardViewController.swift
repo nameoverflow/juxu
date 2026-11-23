@@ -298,6 +298,8 @@ public final class KeyboardViewController: UIInputViewController {
     private var backspaceTapDeferred = false
     /// Closers auto-inserted by punctuation pairing that still sit right of the cursor, innermost last.
     private var autoPairClosers: [String] = []
+    /// Text right of the cursor when the outermost tracked pair was inserted.
+    private var autoPairTail = ""
 
     /// Bumped to abandon an in-flight line clear as soon as anything else happens.
     private var clearLineGeneration: UInt64 = 0
@@ -605,14 +607,7 @@ public final class KeyboardViewController: UIInputViewController {
             self.keyCanvas.flushPendingTouches()
             self.feedback.fireSoftStep(playClick: true)
             self.markUserTypedForClipboard()
-            self.commitPendingFirstIfComposing()
-            self.autoSpaceTracker.recordPassthrough(
-                sym,
-                hostBefore: self.textDocumentProxy.documentContextBeforeInput,
-                hostBeforeIsAuthoritative: false
-            )
-            self.textDocumentProxy.insertText(sym)
-            self.bridge.setContext("")
+            self.insertSymbol(sym)
             self.syncEngineToUI()
         }
 
@@ -883,7 +878,7 @@ public final class KeyboardViewController: UIInputViewController {
         var pairCloser: String?
         if isPunctuationPairingActive {
             let after = textDocumentProxy.documentContextAfterInput
-            autoPairClosers = IOSPunctuationPairing.pruned(autoPairClosers, after: after)
+            refreshAutoPairs(after: after)
             switch IOSPunctuationPairing.action(for: sym, after: after, openClosers: autoPairClosers) {
             case .skipClose:
                 textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
@@ -893,6 +888,9 @@ public final class KeyboardViewController: UIInputViewController {
                 return
             case .insertPair(let close):
                 pairCloser = close
+                if autoPairClosers.isEmpty {
+                    autoPairTail = after ?? ""
+                }
             case .plain:
                 break
             }
@@ -916,6 +914,14 @@ public final class KeyboardViewController: UIInputViewController {
             autoSpaceTracker.invalidate()
         }
         bridge.setContext("")
+    }
+
+    /// Forgets tracked pairs once the cursor has been moved away from them.
+    private func refreshAutoPairs(after: String?) {
+        autoPairClosers = IOSPunctuationPairing.pruned(autoPairClosers, after: after)
+        if !IOSPunctuationPairing.cursorStaysInPairs(autoPairClosers, tail: autoPairTail, after: after) {
+            autoPairClosers.removeAll()
+        }
     }
 
     /// Remembers what the current backspace press already removed, so a swipe can account for it.
@@ -1057,7 +1063,7 @@ public final class KeyboardViewController: UIInputViewController {
         if isPunctuationPairingActive, !autoPairClosers.isEmpty {
             let hostBefore = textDocumentProxy.documentContextBeforeInput
             let hostAfter = textDocumentProxy.documentContextAfterInput
-            autoPairClosers = IOSPunctuationPairing.pruned(autoPairClosers, after: hostAfter)
+            refreshAutoPairs(after: hostAfter)
             if IOSPunctuationPairing.shouldDeletePair(before: hostBefore, after: hostAfter, openClosers: autoPairClosers) {
                 noteBackspaceDeleted(String((hostBefore ?? "").suffix(1)) + (autoPairClosers.last ?? ""))
                 textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)

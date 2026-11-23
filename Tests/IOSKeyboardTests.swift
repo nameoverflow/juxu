@@ -612,6 +612,9 @@ struct IOSKeyboardTests {
         assert(IOSPunctuationPairing.pruned(["）", "”"], after: "”）") == ["）", "”"])
         assert(IOSPunctuationPairing.pruned(["”"], after: "别的") == [])
         assert(IOSPunctuationPairing.pruned(["”"], after: nil) == [])
+        assert(IOSPunctuationPairing.cursorStaysInPairs(["）", "”"], tail: "，后文", after: "”），后文"))
+        assert(IOSPunctuationPairing.cursorStaysInPairs(["”"], tail: "很长的后文", after: "”很长"), "A trimmed window still matches")
+        assert(!IOSPunctuationPairing.cursorStaysInPairs(["”"], tail: "，后文", after: "”别处的文字"), "Tapping before another closer must forget the pair")
         var featurePrefs = JuxuPreferences()
         assert(!featurePrefs.keySwipeUpInput && !featurePrefs.keyLongPressAlternates && !featurePrefs.backspaceSwipeClear, "Gesture features are opt-in")
         featurePrefs.keySwipeUpInput = true
