@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+export COPYFILE_DISABLE=1
 
 APP_PATH="${1:?usage: build-macos-pkg.sh <Juxu.app> <version> <output.pkg> [installer_sign_identity]}"
 VERSION="${2:?missing version}"
@@ -131,7 +132,7 @@ pkgbuild \
     --root "$PAYLOAD_DIR" \
     --component-plist "$COMPONENT_PLIST" \
     --scripts "$SCRIPTS_DIR" \
-    --identifier "com.hcyue.juxu.pkg" \
+    --identifier "im.juxu.pkg.inputmethod" \
     --version "$VERSION" \
     --install-location "/" \
     "$COMPONENT_PKG" >/dev/null
@@ -141,7 +142,7 @@ cat <<EOF > "$DIST_XML"
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
     <title>句序 (Juxu) ${VERSION}</title>
-    <organization>com.hcyue</organization>
+    <organization>im.juxu</organization>
     <options customize="never" require-scripts="true" hostArchitectures="arm64"/>
     <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
     <os-check script="pm_os_check();"/>
@@ -154,14 +155,14 @@ cat <<EOF > "$DIST_XML"
     <conclusion file="conclusion.html" mime-type="text/html"/>
     <choices-outline>
         <line choice="default">
-            <line choice="com.hcyue.juxu.pkg"/>
+            <line choice="im.juxu.pkg.inputmethod"/>
         </line>
     </choices-outline>
     <choice id="default"/>
-    <choice id="com.hcyue.juxu.pkg" visible="false">
-        <pkg-ref id="com.hcyue.juxu.pkg"/>
+    <choice id="im.juxu.pkg.inputmethod" visible="false">
+        <pkg-ref id="im.juxu.pkg.inputmethod"/>
     </choice>
-    <pkg-ref id="com.hcyue.juxu.pkg" version="${VERSION}" onConclusion="none">juxu-component.pkg</pkg-ref>
+    <pkg-ref id="im.juxu.pkg.inputmethod" version="${VERSION}" onConclusion="none">juxu-component.pkg</pkg-ref>
 </installer-gui-script>
 EOF
 

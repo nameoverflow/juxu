@@ -365,7 +365,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu.keyboard;
+				PRODUCT_BUNDLE_IDENTIFIER = im.juxu.app.keyboard;
 				PRODUCT_NAME = JuxuKeyboard;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -384,7 +384,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu;
+				PRODUCT_BUNDLE_IDENTIFIER = im.juxu.app;
 				PRODUCT_NAME = JuxuApp;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -402,7 +402,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu.uitests;
+				PRODUCT_BUNDLE_IDENTIFIER = im.juxu.app.uitests;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_TARGET_NAME = JuxuApp;
@@ -420,7 +420,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu.uitests;
+				PRODUCT_BUNDLE_IDENTIFIER = im.juxu.app.uitests;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_TARGET_NAME = JuxuApp;
@@ -439,7 +439,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu;
+				PRODUCT_BUNDLE_IDENTIFIER = im.juxu.app;
 				PRODUCT_NAME = JuxuApp;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -601,7 +601,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.hcyue.juxu.keyboard;
+				PRODUCT_BUNDLE_IDENTIFIER = im.juxu.app.keyboard;
 				PRODUCT_NAME = JuxuKeyboard;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";

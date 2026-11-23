@@ -4,8 +4,7 @@
 <dict>
 	<key>keychain-access-groups</key>
 	<array>
-		<string>$(AppIdentifierPrefix)com.hcyue.juxu.settings</string>
-		<string>$(AppIdentifierPrefix)com.hcyue.priswubi.settings</string>
+		<string>$(AppIdentifierPrefix)im.juxu.settings</string>
 	</array>
 </dict>
 </plist>

@@ -322,24 +322,31 @@ public enum VoiceKeychainAccount: String, Sendable {
 }
 
 public enum VoiceKeychainStore {
-    private static let service = "com.hcyue.juxu.voice"
+    private static let service = "im.juxu.voice"
+    private static let legacyService = "com.hcyue.juxu.voice"
 
     public static func read(_ account: VoiceKeychainAccount) -> String {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account.rawValue,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess,
-              let data = result as? Data,
-              let value = String(data: data, encoding: .utf8) else {
-            return ""
+        for svc in [service, legacyService] {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: svc,
+                kSecAttrAccount as String: account.rawValue,
+                kSecReturnData as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne,
+            ]
+            var result: CFTypeRef?
+            let status = SecItemCopyMatching(query as CFDictionary, &result)
+            if status == errSecSuccess,
+               let data = result as? Data,
+               let value = String(data: data, encoding: .utf8),
+               !value.isEmpty {
+                if svc != service {
+                    write(value, for: account)
+                }
+                return value
+            }
         }
-        return value
+        return ""
     }
 
     @discardableResult

@@ -14,7 +14,11 @@ private enum IOSSharedSettings {
     }
 
     static func read(account: String) -> Data? {
-        for (groupKey, service) in [("JuxuSettingsGroup", "Juxu"), ("PrisWubiSettingsGroup", "PrisWubi")] {
+        for (groupKey, service) in [
+            ("JuxuSettingsGroup", "Juxu"),
+            ("LegacyJuxuSettingsGroup", "Juxu"),
+            ("PrisWubiSettingsGroup", "PrisWubi"),
+        ] {
             if var q = query(account: account, groupKey: groupKey, service: service) {
                 q[kSecReturnData as String] = true
                 var result: CFTypeRef?
@@ -334,7 +338,7 @@ public struct InputSchemaOption: Identifiable, Equatable, Sendable {
 }
 
 public struct JuxuPreferences: Equatable, Sendable {
-    public static let appGroupIdentifier = "group.com.hcyue.juxu.shared"
+    public static let appGroupIdentifier = "group.im.juxu.shared"
 
     public var schemaId: UInt32 = 86
     public var pageSize: Int = 5
@@ -569,7 +573,7 @@ public struct JuxuPreferences: Equatable, Sendable {
 /// Serial background persistence worker keeping all file writes, `zlib` compression, and
 /// iOS Keychain (`SecItemCopyMatching` / `SecItemUpdate`) IPC off `@MainActor`.
 private final class JuxuPersistenceWorker: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "com.hcyue.juxu.persistence", qos: .utility)
+    private let queue = DispatchQueue(label: "im.juxu.persistence", qos: .utility)
     private let evalLogURL: URL
     private let userDataURL: URL
     private let inMemoryOnly: Bool

@@ -21,7 +21,7 @@
 	<key>CFBundleVersion</key>
 	<string>9</string>
 	<key>JuxuSettingsGroup</key>
-	<string>$(AppIdentifierPrefix)com.hcyue.juxu.settings</string>
+	<string>$(AppIdentifierPrefix)im.juxu.settings</string>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionAttributes</key>
@@ -40,7 +40,5 @@
 		<key>NSExtensionPrincipalClass</key>
 		<string>KeyboardViewController</string>
 	</dict>
-	<key>PrisWubiSettingsGroup</key>
-	<string>$(AppIdentifierPrefix)com.hcyue.priswubi.settings</string>
 </dict>
 </plist>

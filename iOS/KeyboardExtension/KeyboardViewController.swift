@@ -42,7 +42,7 @@ public final class KeyboardViewController: UIInputViewController {
     private var proxySink: ProxyDocumentSink { ProxyDocumentSink(proxy: textDocumentProxy) }
     private let clipboardStore = IOSClipboardSuggestionStore()
     private var clipboardGate = IOSClipboardVisibilityGate()
-    private let clipboardReadQueue = DispatchQueue(label: "com.hcyue.juxu.clipboard", qos: .userInitiated)
+    private let clipboardReadQueue = DispatchQueue(label: "im.juxu.clipboard", qos: .userInitiated)
     private var activeClipboardSuggestion: IOSClipboardSuggestion?
     private var inFlightClipboardChangeCount: Int?
     private var expandedIdleWords: [String]?
