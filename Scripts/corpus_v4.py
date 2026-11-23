@@ -751,7 +751,7 @@ def iter_records(group: str, path: Path):
                         body = body[:pos]
                 yield f"{row.get('title') or ''}。{body}"
     else:
-        min_len = 120 if group in ("fineweb_high",) | TECH_GROUPS | ENGLISH_GROUPS else 80
+        min_len = 120 if group in ({"fineweb_high"} | TECH_GROUPS | ENGLISH_GROUPS) else 80
         for batch in ParquetFile(path).iter_batches(batch_size=512, columns=["text"]):
             for row in batch.to_pylist():
                 text = row.get("text") or ""
