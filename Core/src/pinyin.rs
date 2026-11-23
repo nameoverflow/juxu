@@ -1284,20 +1284,22 @@ fn add_latin_lattice_edges(
                     .any(|b| matches!(b, b'a' | b'e' | b'i' | b'o' | b'u' | b'y'));
                 let has_impossible = has_vowel && (start..end).any(|p| !covered_by_any_full[p]);
                 // Don't treat a valid Chinese full-syllable prefix + 1..2 trailing initials
-                // (e.g. `shangp`, `woguor`, `heyiw`, `shurf`) or a span ending in a valid Chinese
-                // full syllable (e.g. `woyongrustxiele`) as an OOV English word.
+                // (e.g. `shangp`, `woguor`, `heyiw`, `shurf`) or a span dominated by valid Chinese
+                // full syllables (e.g. `nshitiganhuihaohend` = 17/19 Chinese) as an OOV English word.
                 let is_chinese_plus_tail_init = (end >= start + 2 && can_parse_exact_full(start, end - 1))
                     || (end >= start + 3 && can_parse_exact_full(start, end - 2));
+                let exact_covered_cnt = (start..end).filter(|&p| covered_by_exact_full[p]).count();
                 if has_impossible
                     && !can_parse_exact_full(start, end)
                     && !is_chinese_plus_tail_init
                     && !covered_by_exact_full[end - 1]
+                    && exact_covered_cnt * 2 <= len
                 {
                     // Only start/end on clean boundaries (0, n, or adjacent to exact-full-covered positions)
                     let left_clean = start == 0 || covered_by_exact_full[start - 1] || !covered_by_exact_full[start];
                     let right_clean = end == n || covered_by_exact_full[end] || !covered_by_exact_full[end - 1];
                     if left_clean && right_clean {
-                        let kind_cost = 0.45 * (len as f32) - 4.5;
+                        let kind_cost = 0.05 * (len as f32) - 3.2;
                         edges_by_end[actual_end].push(LatticeEdge {
                             start,
                             end: actual_end,
