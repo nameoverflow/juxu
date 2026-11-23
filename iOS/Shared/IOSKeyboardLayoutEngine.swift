@@ -309,6 +309,8 @@ public struct IOSKeySpec: Identifiable, Equatable {
     public let isBlueAccent: Bool
     /// Character entered by swiping up on this key (drawn as a small hint unless radicals occupy the cap).
     public let swipeUpSymbol: String?
+    /// Darker function-key fill, used by the WeChat-style bottom row.
+    public let usesFunctionFill: Bool
 
     public init(
         id: String,
@@ -320,7 +322,8 @@ public struct IOSKeySpec: Identifiable, Equatable {
         keycapRadicals: String? = nil,
         systemSymbol: String? = nil,
         isBlueAccent: Bool = false,
-        swipeUpSymbol: String? = nil
+        swipeUpSymbol: String? = nil,
+        usesFunctionFill: Bool = false
     ) {
         self.id = id
         self.kind = kind
@@ -332,6 +335,7 @@ public struct IOSKeySpec: Identifiable, Equatable {
         self.systemSymbol = systemSymbol
         self.isBlueAccent = isBlueAccent
         self.swipeUpSymbol = swipeUpSymbol
+        self.usesFunctionFill = usesFunctionFill
     }
 }
 
@@ -355,6 +359,8 @@ public struct IOSKeyboardLayoutEngine: Equatable {
     public var cangjieKeycapRadicals: Bool = true
     public var wubiKeycapRadicals: Bool = false
     public var swipeUpInputEnabled: Bool = false
+    /// Bottom-row comma key beside Space (tap `，`, swipe up `。`). Off restores the original 4-key row.
+    public var spaceCommaKeyEnabled: Bool = false
     /// Temporarily show Latin `a..z` keycaps during Cangjie `z`+Pinyin reverse lookup.
     public var isZLookupActive: Bool = false
     /// True only on Home-button devices where system does not draw its own bottom Globe bar.
@@ -651,72 +657,79 @@ public struct IOSKeyboardLayoutEngine: Equatable {
             )
         }
 
-        // Row 3: Exact iOS 26 4-Key Grid!
-        let leftPairSpan = (colRow1X[1] + stdKeyW) - outerX
-        let leftEachW = (leftPairSpan - gapX) * 0.5
+        // With the comma key on, every page uses the WeChat keyboard row so 中/英 never moves:
+        // `123 | ，(swipe 。) | Space | 中/英 | Return`, with Space also taking the comma slot off the letters page.
+        // With it off, Row 3 stays the original 4-key grid.
+        if spaceCommaKeyEnabled {
+            appendCommaBottomRow(w: w, outerX: outerX, gapX: gapX, pitchX: pitchX, keyW: stdKeyW, keyH: keyH, y: rowY[3], into: &specs)
+        } else {
+            // Row 3: Exact iOS 26 4-Key Grid!
+            let leftPairSpan = (colRow1X[1] + stdKeyW) - outerX
+            let leftEachW = (leftPairSpan - gapX) * 0.5
 
-        let targetPlane: IOSKeyPlane = (plane == .letters) ? .numbers : .letters
-        let planeLabel = (plane == .letters) ? "123" : "ABC"
-        specs.append(
-            IOSKeySpec(
-                id: "B_plane",
-                kind: .planeSwitch(targetPlane, label: planeLabel),
-                frame: CGRect(x: outerX, y: rowY[3], width: leftEachW, height: keyH),
-                primaryLabel: isTrackpadActive ? "" : planeLabel
-            )
-        )
-
-        let secondLeftX = outerX + leftEachW + gapX
-        if showInlineGlobeKey {
+            let targetPlane: IOSKeyPlane = (plane == .letters) ? .numbers : .letters
+            let planeLabel = (plane == .letters) ? "123" : "ABC"
             specs.append(
                 IOSKeySpec(
-                    id: "B_globe",
-                    kind: .globe,
-                    frame: CGRect(x: secondLeftX, y: rowY[3], width: leftEachW, height: keyH),
-                    primaryLabel: "",
-                    systemSymbol: isTrackpadActive ? nil : "globe"
+                    id: "B_plane",
+                    kind: .planeSwitch(targetPlane, label: planeLabel),
+                    frame: CGRect(x: outerX, y: rowY[3], width: leftEachW, height: keyH),
+                    primaryLabel: isTrackpadActive ? "" : planeLabel
                 )
             )
-        } else {
-            // Crisp typographic 中/英 mode indicator instead of jarring smiley icon
+
+            let secondLeftX = outerX + leftEachW + gapX
+            if showInlineGlobeKey {
+                specs.append(
+                    IOSKeySpec(
+                        id: "B_globe",
+                        kind: .globe,
+                        frame: CGRect(x: secondLeftX, y: rowY[3], width: leftEachW, height: keyH),
+                        primaryLabel: "",
+                        systemSymbol: isTrackpadActive ? nil : "globe"
+                    )
+                )
+            } else {
+                // Crisp typographic 中/英 mode indicator instead of jarring smiley icon
+                specs.append(
+                    IOSKeySpec(
+                        id: "B_mode",
+                        kind: .modeToggle,
+                        frame: CGRect(x: secondLeftX, y: rowY[3], width: leftEachW, height: keyH),
+                        primaryLabel: isTrackpadActive ? "" : (asciiMode ? "EN" : "中"),
+                        secondaryInlineLabel: isTrackpadActive ? nil : (asciiMode ? "/中" : "/英")
+                    )
+                )
+            }
+
+            // Spacebar: `colRow1X[2] .. (colRow1X[6] + stdKeyW)` (`d.minX .. j.maxX`)!
+            let spaceMinX = colRow1X[2]
+            let spaceMaxX = colRow1X[6] + stdKeyW
             specs.append(
                 IOSKeySpec(
-                    id: "B_mode",
-                    kind: .modeToggle,
-                    frame: CGRect(x: secondLeftX, y: rowY[3], width: leftEachW, height: keyH),
-                    primaryLabel: isTrackpadActive ? "" : (asciiMode ? "EN" : "中"),
-                    secondaryInlineLabel: isTrackpadActive ? nil : (asciiMode ? "/中" : "/英")
+                    id: "B_space",
+                    kind: .space,
+                    frame: CGRect(x: spaceMinX, y: rowY[3], width: spaceMaxX - spaceMinX, height: keyH),
+                    primaryLabel: "",
+                    cornerSubscript: spaceCornerTag
+                )
+            )
+
+            // Return Key: `colRow1X[7] .. (w - outerX)` (`k.minX .. p.maxX`)!
+            let returnMinX = colRow1X[7]
+            let returnMaxX = w - outerX
+            let useBlue = returnRole.isBlueProminent
+            specs.append(
+                IOSKeySpec(
+                    id: "B_return",
+                    kind: .returnKey,
+                    frame: CGRect(x: returnMinX, y: rowY[3], width: returnMaxX - returnMinX, height: keyH),
+                    primaryLabel: isTrackpadActive ? "" : (useBlue ? returnRole.title : ""),
+                    systemSymbol: isTrackpadActive ? nil : (useBlue ? nil : "return.left"),
+                    isBlueAccent: useBlue
                 )
             )
         }
-
-        // Spacebar: `colRow1X[2] .. (colRow1X[6] + stdKeyW)` (`d.minX .. j.maxX`)!
-        let spaceMinX = colRow1X[2]
-        let spaceMaxX = colRow1X[6] + stdKeyW
-        specs.append(
-            IOSKeySpec(
-                id: "B_space",
-                kind: .space,
-                frame: CGRect(x: spaceMinX, y: rowY[3], width: spaceMaxX - spaceMinX, height: keyH),
-                primaryLabel: "",
-                cornerSubscript: spaceCornerTag
-            )
-        )
-
-        // Return Key: `colRow1X[7] .. (w - outerX)` (`k.minX .. p.maxX`)!
-        let returnMinX = colRow1X[7]
-        let returnMaxX = w - outerX
-        let useBlue = returnRole.isBlueProminent
-        specs.append(
-            IOSKeySpec(
-                id: "B_return",
-                kind: .returnKey,
-                frame: CGRect(x: returnMinX, y: rowY[3], width: returnMaxX - returnMinX, height: keyH),
-                primaryLabel: isTrackpadActive ? "" : (useBlue ? returnRole.title : ""),
-                systemSymbol: isTrackpadActive ? nil : (useBlue ? nil : "return.left"),
-                isBlueAccent: useBlue
-            )
-        )
 
         // Compute exact 26-key normalized coordinates matching our actual Row 0/1/2 geometric centers.
         // Ergonomic thumb Y-bias is applied consistently via `compensatedLetterPoint(_:in:)` before
@@ -1048,6 +1061,14 @@ public struct IOSKeyboardLayoutEngine: Equatable {
                     width: k.frame.width + 2.0,
                     height: k.frame.height + 12.0
                 )
+            case .symbol where k.frame.minY >= snapshot.bottomRowMinY - 1.0:
+                evalPt = point
+                effRect = CGRect(
+                    x: k.frame.minX,
+                    y: k.frame.minY - 3.0,
+                    width: k.frame.width,
+                    height: k.frame.height + 12.0
+                )
             case .modeToggle, .globe, .returnKey:
                 evalPt = point
                 effRect = CGRect(
@@ -1137,6 +1158,11 @@ public struct IOSKeyboardLayoutEngine: Equatable {
             }
         }
         return best
+    }
+
+    /// Punctuation on the letters plane's bottom row, following the current Chinese/English mode.
+    public static func bottomRowPunctuation(asciiMode: Bool) -> (comma: String, period: String) {
+        asciiMode ? (",", ".") : ("，", "。")
     }
 
     /// Native iOS 26 Chinese keyboard stay-vs-return rules for `123` and `#+=` planes:
@@ -1311,6 +1337,99 @@ public struct IOSKeyboardLayoutEngine: Equatable {
         }
         let s = String(UnicodeScalar(ascii))
         return shiftState.isUppercase ? s.uppercased() : s.lowercased()
+    }
+
+    /// Key widths measured from the WeChat keyboard, in letter-key pitches. Space takes the remainder (about 3.6).
+    private static let commaRowSideWidth: CGFloat = 1.85
+    private static let commaRowModeWidth: CGFloat = 1.15
+
+    private func appendCommaBottomRow(
+        w: CGFloat,
+        outerX: CGFloat,
+        gapX: CGFloat,
+        pitchX: CGFloat,
+        keyW: CGFloat,
+        keyH: CGFloat,
+        y: CGFloat,
+        into specs: inout [IOSKeySpec]
+    ) {
+        let sideW = pitchX * Self.commaRowSideWidth
+        let modeW = pitchX * Self.commaRowModeWidth
+        let hasCommaKey = (plane == .letters)
+        let commaX = outerX + sideW + gapX
+        let spaceX = hasCommaKey ? commaX + keyW + gapX : commaX
+        let modeX = w - outerX - sideW - gapX - modeW
+        let spaceW = modeX - gapX - spaceX
+        let returnX = modeX + modeW + gapX
+        let targetPlane: IOSKeyPlane = hasCommaKey ? .numbers : .letters
+        let planeLabel = hasCommaKey ? "123" : "ABC"
+
+        specs.append(
+            IOSKeySpec(
+                id: "B_plane",
+                kind: .planeSwitch(targetPlane, label: planeLabel),
+                frame: CGRect(x: outerX, y: y, width: sideW, height: keyH),
+                primaryLabel: isTrackpadActive ? "" : planeLabel,
+                usesFunctionFill: true
+            )
+        )
+        if hasCommaKey {
+            // The swipe ignores `swipeUpInputEnabled`, otherwise the period would be unreachable from this plane.
+            let punctuation = Self.bottomRowPunctuation(asciiMode: asciiMode)
+            specs.append(
+                IOSKeySpec(
+                    id: "B_comma",
+                    kind: .symbol(punctuation.comma),
+                    frame: CGRect(x: commaX, y: y, width: keyW, height: keyH),
+                    primaryLabel: isTrackpadActive ? "" : punctuation.comma,
+                    swipeUpSymbol: isTrackpadActive ? nil : punctuation.period
+                )
+            )
+        }
+        specs.append(
+            IOSKeySpec(
+                id: "B_space",
+                kind: .space,
+                frame: CGRect(x: spaceX, y: y, width: spaceW, height: keyH),
+                primaryLabel: "",
+                cornerSubscript: spaceCornerTag
+            )
+        )
+        // Devices that need a system switch key show the globe in this slot, as the original row does.
+        let modeFrame = CGRect(x: modeX, y: y, width: modeW, height: keyH)
+        if showInlineGlobeKey {
+            specs.append(
+                IOSKeySpec(
+                    id: "B_globe",
+                    kind: .globe,
+                    frame: modeFrame,
+                    primaryLabel: "",
+                    systemSymbol: isTrackpadActive ? nil : "globe"
+                )
+            )
+        } else {
+            specs.append(
+                IOSKeySpec(
+                    id: "B_mode",
+                    kind: .modeToggle,
+                    frame: modeFrame,
+                    primaryLabel: isTrackpadActive ? "" : (asciiMode ? "英" : "中"),
+                    cornerSubscript: isTrackpadActive ? nil : (asciiMode ? "中" : "英")
+                )
+            )
+        }
+        let useBlue = returnRole.isBlueProminent
+        specs.append(
+            IOSKeySpec(
+                id: "B_return",
+                kind: .returnKey,
+                frame: CGRect(x: returnX, y: y, width: w - outerX - returnX, height: keyH),
+                primaryLabel: isTrackpadActive ? "" : (useBlue ? returnRole.title : ""),
+                systemSymbol: isTrackpadActive ? nil : (useBlue ? nil : "return.left"),
+                isBlueAccent: useBlue,
+                usesFunctionFill: true
+            )
+        )
     }
 
     private func appendTenRow(
