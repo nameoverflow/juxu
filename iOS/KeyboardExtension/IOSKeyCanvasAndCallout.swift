@@ -147,6 +147,8 @@ private final class IOSKeycapNodeView: UIView {
 
     private static var symbolCache: [String: UIImage] = [:]
 
+    private let swipeHintLabel = UILabel()
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = false
@@ -169,10 +171,16 @@ private final class IOSKeycapNodeView: UIView {
         subscriptLabel.textAlignment = .right
         subscriptLabel.isUserInteractionEnabled = false
 
+        swipeHintLabel.font = .systemFont(ofSize: 9.5, weight: .regular)
+        swipeHintLabel.textAlignment = .center
+        swipeHintLabel.isUserInteractionEnabled = false
+        swipeHintLabel.isHidden = true
+
         addSubview(primaryLabel)
         addSubview(radicalLabel)
         addSubview(symbolView)
         addSubview(subscriptLabel)
+        addSubview(swipeHintLabel)
     }
 
     required init?(coder: NSCoder) {
@@ -211,6 +219,7 @@ private final class IOSKeycapNodeView: UIView {
 
     private func layoutSublayersOfKeycap(spec: IOSKeySpec) {
         let b = bounds
+        swipeHintLabel.frame = CGRect(x: 0, y: 1.5, width: b.width, height: 11.0)
         if let rad = spec.keycapRadicals, !rad.isEmpty {
             let letterH = max(13.0, round(b.height * 0.34))
             primaryLabel.frame = CGRect(x: 0, y: 2.0, width: b.width, height: letterH)
@@ -230,7 +239,8 @@ private final class IOSKeycapNodeView: UIView {
             let first = spec.primaryLabel.first
             let isNonASCII = !(first?.isASCII ?? true)
             let isUpper = first?.isUppercase ?? false
-            yNudge = isNonASCII ? -0.5 : (isUpper ? -0.3 : -2.2)
+            let hintShift: CGFloat = spec.swipeUpSymbol == nil ? 0.0 : 2.0
+            yNudge = (isNonASCII ? -0.5 : (isUpper ? -0.3 : -2.2)) + hintShift
         case .symbol, .planeSwitch:
             yNudge = -0.8
         case .modeToggle:
@@ -353,6 +363,16 @@ private final class IOSKeycapNodeView: UIView {
             symbolView.isHidden = true
         }
 
+        if let hint = spec.swipeUpSymbol, spec.keycapRadicals?.isEmpty ?? true {
+            swipeHintLabel.isHidden = false
+            swipeHintLabel.text = hint
+            swipeHintLabel.textColor = dark
+                ? UIColor(white: 1.0, alpha: 0.48)
+                : UIColor(white: 0.0, alpha: 0.42)
+        } else {
+            swipeHintLabel.isHidden = true
+        }
+
         if let sub = spec.cornerSubscript, !sub.isEmpty {
             subscriptLabel.isHidden = false
             subscriptLabel.text = sub
@@ -389,6 +409,7 @@ private final class IOSKeycapNodeView: UIView {
             self.transform = targetTransform
             self.primaryLabel.alpha = contentAlpha
             self.radicalLabel.alpha = contentAlpha
+            self.swipeHintLabel.alpha = contentAlpha
         }
 
         if animatedRelease {
@@ -416,6 +437,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     var onTrackpadStateChanged: ((Bool) -> Void)?
     var onRestorePlane: (() -> Void)?
     var onTrackpadMove: ((Int, Int) -> Void)?
+    var onKeySwipeUp: ((String) -> Void)?
 
     private struct TrackedTouch {
         weak var touch: UITouch?
@@ -433,6 +455,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
         var didSlideToSymbol: Bool = false
         let startedOnSpace: Bool
         var committedByRollover: Bool = false
+        var swipeUpActive: Bool = false
     }
 
     private(set) var snapshot: IOSKeyboardLayoutEngine.LayoutSnapshot?
@@ -531,16 +554,27 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
             }
             oldState.committedByRollover = true
             trackedTouches[oldId] = oldState
-            if oldState.initialKey.kind == .backspace {
-                onKeyTouchUp?(oldState.initialKey, oldState.initialPoint)
-            } else {
-                let cleanPt = (oldState.currentKey.id == oldState.initialKey.id)
-                    ? oldState.initialPoint
-                    : oldState.currentPoint
-                onKeyTouchUp?(oldState.currentKey, cleanPt)
-            }
+            commitRolledOver(oldState)
         }
         syncKeycapPressStates()
+    }
+
+    /// A later touch landed first: finish this one as its swipe symbol or normal key.
+    private func commitRolledOver(_ state: TrackedTouch) {
+        if state.initialKey.kind == .backspace {
+            onKeyTouchUp?(state.initialKey, state.initialPoint)
+        } else if state.swipeUpActive, let symbol = state.initialKey.swipeUpSymbol {
+            onKeySwipeUp?(symbol)
+        } else {
+            let cleanPt = (state.currentKey.id == state.initialKey.id)
+                ? state.initialPoint
+                : state.currentPoint
+            onKeyTouchUp?(state.currentKey, cleanPt)
+        }
+    }
+
+    private func swipePreviewSpec(for key: IOSKeySpec, symbol: String) -> IOSKeySpec {
+        IOSKeySpec(id: key.id, kind: .symbol(symbol), frame: key.frame, primaryLabel: symbol)
     }
 
     private func purgeEndedOrOrphanTouches(referenceTimestamp: TimeInterval? = nil) {
@@ -651,14 +685,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 }
                 oldState.committedByRollover = true
                 trackedTouches[oldId] = oldState
-                if oldState.initialKey.kind == .backspace {
-                    onKeyTouchUp?(oldState.initialKey, oldState.initialPoint)
-                } else {
-                    let cleanPt = (oldState.currentKey.id == oldState.initialKey.id)
-                        ? oldState.initialPoint
-                        : oldState.currentPoint
-                    onKeyTouchUp?(oldState.currentKey, cleanPt)
-                }
+                commitRolledOver(oldState)
             }
 
             // 2. Hit-test new touch against freshly updated snapshot & dynamic validNextMask
@@ -794,6 +821,25 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 continue
             }
 
+            // Swipe up on a letter enters its secondary symbol; sliding back down restores the letter.
+            if state.currentKey.id == state.initialKey.id, let symbol = state.initialKey.swipeUpSymbol {
+                let active = IOSSwipeUp.isActive(
+                    from: state.initialPoint,
+                    to: pt,
+                    keyHeight: state.initialKey.frame.height,
+                    wasActive: state.swipeUpActive
+                )
+                if active != state.swipeUpActive {
+                    state.swipeUpActive = active
+                    trackedTouches[id] = state
+                    onKeySlidePreview?(active ? swipePreviewSpec(for: state.initialKey, symbol: symbol) : state.initialKey)
+                }
+                if active {
+                    trackedTouches[id] = state
+                    continue
+                }
+            }
+
             // 4. Sticky Press-Lock Hysteresis: ignore natural thumb lift-roll within expanded keep-zone
             //    around BOTH the keycap frame and `initialPoint` (protecting border/gutter strikes!).
             let keepRect = state.currentKey.frame.insetBy(dx: -10.5, dy: -13.5)
@@ -915,9 +961,32 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
             // Only cancel when deliberately dragged well outside the entire keyboard tray (`y < -72` after >=140ms);
             // rapid thumb flicks into the candidate ribbon (`y = -44..0`) ALWAYS commit cleanly!
             let dt = max(0, touch.timestamp - state.beganTimestamp)
-            if pt.y < -72 && dt >= 0.14 {
+            // An armed swipe-up on a top-row key legitimately travels past the ribbon, so it is not a cancel.
+            let isArmedSwipeUp = state.currentKey.id == state.initialKey.id
+                && state.initialKey.swipeUpSymbol != nil
+                && IOSSwipeUp.isActive(
+                    from: state.initialPoint,
+                    to: pt,
+                    keyHeight: state.initialKey.frame.height,
+                    wasActive: state.swipeUpActive
+                )
+            if pt.y < -72 && dt >= 0.14 && !isArmedSwipeUp {
                 syncKeycapPressStates()
                 onKeyTouchCancel?()
+                continue
+            }
+
+            // Re-evaluate at lift-off so a quick flick with few move events still counts.
+            if state.currentKey.id == state.initialKey.id,
+               let symbol = state.initialKey.swipeUpSymbol,
+               IOSSwipeUp.isActive(
+                   from: state.initialPoint,
+                   to: pt,
+                   keyHeight: state.initialKey.frame.height,
+                   wasActive: state.swipeUpActive
+               ) {
+                syncKeycapPressStates()
+                onKeySwipeUp?(symbol)
                 continue
             }
 
@@ -950,6 +1019,11 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 continue
             }
             if state.committedByRollover || state.initialKey.kind == .backspace {
+                continue
+            }
+            if state.swipeUpActive, !isHidden, let symbol = state.initialKey.swipeUpSymbol {
+                rescuedAny = true
+                onKeySwipeUp?(symbol)
                 continue
             }
 

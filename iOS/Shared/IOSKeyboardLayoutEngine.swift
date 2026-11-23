@@ -59,6 +59,47 @@ public enum IOSKeyKind: Equatable {
     case returnKey
 }
 
+/// Swipe-up secondary input on letter keys: digits on the top row, common punctuation below.
+public enum IOSSwipeUp {
+    private static let chinese: [UInt8: String] = table(
+        "qwertyuiopasdfghjklzxcvbnm",
+        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+         "-", "/", "：", "；", "（", "）", "～", "“", "”",
+         "@", "·", "#", "`", "？", "！", "…"]
+    )
+    private static let ascii: [UInt8: String] = table(
+        "qwertyuiopasdfghjklzxcvbnm",
+        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+         "-", "/", ":", ";", "(", ")", "~", "'", "\"",
+         "@", "_", "#", "&", "?", "!", "..."]
+    )
+
+    private static func table(_ keys: String, _ values: [String]) -> [UInt8: String] {
+        Dictionary(uniqueKeysWithValues: zip(Array(keys.utf8), values))
+    }
+
+    public static func symbol(for letter: UInt8, asciiMode: Bool) -> String? {
+        (asciiMode ? ascii : chinese)[letter]
+    }
+
+    /// Upward travel needed to arm the gesture; light thumb roll during normal typing stays below it.
+    public static func armDistance(keyHeight: CGFloat) -> CGFloat {
+        max(16.0, keyHeight * 0.40)
+    }
+
+    /// Mostly-vertical upward drag past the arm distance, with hysteresis so sliding back down cancels it.
+    public static func isActive(
+        from start: CGPoint,
+        to current: CGPoint,
+        keyHeight: CGFloat,
+        wasActive: Bool
+    ) -> Bool {
+        let up = start.y - current.y
+        let threshold = armDistance(keyHeight: keyHeight) * (wasActive ? 0.6 : 1.0)
+        return up >= threshold && abs(current.x - start.x) <= up * 0.8
+    }
+}
+
 public struct IOSKeySpec: Identifiable, Equatable {
     public let id: String
     public let kind: IOSKeyKind
@@ -72,6 +113,8 @@ public struct IOSKeySpec: Identifiable, Equatable {
     public let keycapRadicals: String?
     public let systemSymbol: String?
     public let isBlueAccent: Bool
+    /// Character entered by swiping up on this key (drawn as a small hint unless radicals occupy the cap).
+    public let swipeUpSymbol: String?
 
     public init(
         id: String,
@@ -82,7 +125,8 @@ public struct IOSKeySpec: Identifiable, Equatable {
         cornerSubscript: String? = nil,
         keycapRadicals: String? = nil,
         systemSymbol: String? = nil,
-        isBlueAccent: Bool = false
+        isBlueAccent: Bool = false,
+        swipeUpSymbol: String? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -93,6 +137,7 @@ public struct IOSKeySpec: Identifiable, Equatable {
         self.keycapRadicals = keycapRadicals
         self.systemSymbol = systemSymbol
         self.isBlueAccent = isBlueAccent
+        self.swipeUpSymbol = swipeUpSymbol
     }
 }
 
@@ -115,6 +160,7 @@ public struct IOSKeyboardLayoutEngine: Equatable {
     public var pinyinT9Layout: Bool = false
     public var cangjieKeycapRadicals: Bool = true
     public var wubiKeycapRadicals: Bool = false
+    public var swipeUpInputEnabled: Bool = false
     /// Temporarily show Latin `a..z` keycaps during Cangjie `z`+Pinyin reverse lookup.
     public var isZLookupActive: Bool = false
     /// True only on Home-button devices where system does not draw its own bottom Globe bar.
@@ -271,7 +317,8 @@ public struct IOSKeyboardLayoutEngine: Equatable {
                         kind: .letter(b),
                         frame: CGRect(x: x, y: rowY[0], width: stdKeyW, height: keyH),
                         primaryLabel: formatLetter(b),
-                        keycapRadicals: formatWubiRadicals(b)
+                        keycapRadicals: formatWubiRadicals(b),
+                        swipeUpSymbol: (isTrackpadActive || !swipeUpInputEnabled) ? nil : IOSSwipeUp.symbol(for: b, asciiMode: asciiMode)
                     )
                 )
             }
@@ -284,7 +331,8 @@ public struct IOSKeyboardLayoutEngine: Equatable {
                         kind: .letter(b),
                         frame: CGRect(x: colRow1X[c], y: rowY[1], width: stdKeyW, height: keyH),
                         primaryLabel: formatLetter(b),
-                        keycapRadicals: formatWubiRadicals(b)
+                        keycapRadicals: formatWubiRadicals(b),
+                        swipeUpSymbol: (isTrackpadActive || !swipeUpInputEnabled) ? nil : IOSSwipeUp.symbol(for: b, asciiMode: asciiMode)
                     )
                 )
             }
@@ -314,7 +362,8 @@ public struct IOSKeyboardLayoutEngine: Equatable {
                         kind: .letter(b),
                         frame: CGRect(x: colRow1X[c + 1], y: rowY[2], width: stdKeyW, height: keyH),
                         primaryLabel: formatLetter(b),
-                        keycapRadicals: formatWubiRadicals(b)
+                        keycapRadicals: formatWubiRadicals(b),
+                        swipeUpSymbol: (isTrackpadActive || !swipeUpInputEnabled) ? nil : IOSSwipeUp.symbol(for: b, asciiMode: asciiMode)
                     )
                 )
             }

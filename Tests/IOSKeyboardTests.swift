@@ -509,6 +509,42 @@ struct IOSKeyboardTests {
         t9Prefs.pinyinT9Layout = true
         assert(JuxuPreferences.fromTOML(t9Prefs.toTOML()).pinyinT9Layout == true)
 
+        // Swipe-up secondary input
+        assert(IOSSwipeUp.symbol(for: UInt8(ascii: "q"), asciiMode: false) == "1")
+        assert(IOSSwipeUp.symbol(for: UInt8(ascii: "p"), asciiMode: true) == "0")
+        assert(IOSSwipeUp.symbol(for: UInt8(ascii: "d"), asciiMode: false) == "：")
+        assert(IOSSwipeUp.symbol(for: UInt8(ascii: "d"), asciiMode: true) == ":")
+        assert(IOSSwipeUp.symbol(for: UInt8(ascii: "l"), asciiMode: true) == "\"")
+        for b in Array("abcdefghijklmnopqrstuvwxyz".utf8) {
+            assert(IOSSwipeUp.symbol(for: b, asciiMode: false) != nil)
+            assert(IOSSwipeUp.symbol(for: b, asciiMode: true) != nil)
+        }
+        var swipeLayout = IOSKeyboardLayoutEngine()
+        swipeLayout.swipeUpInputEnabled = true
+        let swipeSnap = swipeLayout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(swipeSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "w")) })?.swipeUpSymbol == "2")
+        assert(swipeSnap.keys.first(where: { $0.kind == .backspace })?.swipeUpSymbol == nil)
+        swipeLayout.asciiMode = true
+        let swipeAscii = swipeLayout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(swipeAscii.keys.first(where: { $0.kind == .letter(UInt8(ascii: "b")) })?.swipeUpSymbol == "?")
+        let o = CGPoint(x: 100, y: 100)
+        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 101, y: 90), keyHeight: 45, wasActive: false), "Thumb roll must stay a tap")
+        assert(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 103, y: 80), keyHeight: 45, wasActive: false))
+        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 140, y: 75), keyHeight: 45, wasActive: false), "Diagonal slide is not a swipe-up")
+        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 120), keyHeight: 45, wasActive: false))
+        assert(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 88), keyHeight: 45, wasActive: true), "Hysteresis keeps an armed swipe")
+        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 92), keyHeight: 45, wasActive: true), "Sliding back cancels")
+
+        var offLayout = IOSKeyboardLayoutEngine()
+        offLayout.swipeUpInputEnabled = false
+        let offSnap = offLayout.computeLayout(in: CGSize(width: 440, height: 220))
+        assert(offSnap.keys.allSatisfy { $0.swipeUpSymbol == nil }, "Switching swipe-up off must remove hints and gesture")
+        var featurePrefs = JuxuPreferences()
+        assert(!featurePrefs.keySwipeUpInput, "Swipe-up input is opt-in")
+        featurePrefs.keySwipeUpInput = true
+        let featureRound = JuxuPreferences.fromTOML(featurePrefs.toTOML())
+        assert(featureRound.keySwipeUpInput)
+
         print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi & T9 Pinyin tests passed!")
     }
 }
