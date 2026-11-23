@@ -415,10 +415,9 @@ impl UserStore {
             });
         let _ = entry;
         self.dirty = true;
-        if !auto_composed {
-            // Reflect explicit manual phrases directly into RWKV probability space as well.
-            self.continuations.observe(&[], text, true, Some(""), None);
-        }
+        // Reflect explicit & surprisal-promoted phrases directly into RWKV probability space
+        // so pure-neural Pinyin immediately ranks cross-mode / auto-promoted terms at #1!
+        self.continuations.observe(&[], text, true, Some(""), None);
         if let Some(pd) = pdict {
             self.index_phrase_pinyin(text, pd);
         }
