@@ -11,6 +11,7 @@ public final class JuxuInputController: IMKInputController {
     private var autoSpaceTracker = AutoSpaceContextTracker()
     private var lastExpectedAnchor: Int? = nil
     private var sawClientSupportForRanges: Bool = false
+    private var saveUserDataTimer: Timer?
 
     public override init!(server: IMKServer!, delegate: Any!, client inputClient: Any!) {
         super.init(server: server, delegate: delegate, client: inputClient)
@@ -50,8 +51,11 @@ public final class JuxuInputController: IMKInputController {
 
     public override func deactivateServer(_ sender: Any!) {
         VoiceSessionController.sharedIfLoaded?.handleDeactivate()
+        saveUserDataTimer?.invalidate()
+        saveUserDataTimer = nil
         commitPendingAndHide(sender)
-        JuxuBridge.shared.flushUserDataIfNeeded()
+        JuxuBridge.shared.flushUserDataAsync()
+        JuxuBridge.shared.flushPendingPersistence()
         autoSpaceTracker.invalidate()
         lastExpectedAnchor = nil
         sawClientSupportForRanges = false
@@ -59,8 +63,10 @@ public final class JuxuInputController: IMKInputController {
     }
 
     public override func commitComposition(_ sender: Any!) {
+        saveUserDataTimer?.invalidate()
+        saveUserDataTimer = nil
         commitPendingAndHide(sender)
-        JuxuBridge.shared.flushUserDataIfNeeded()
+        JuxuBridge.shared.flushUserDataAsync()
     }
 
     private func commitPendingAndHide(_ sender: Any!) {
@@ -178,7 +184,7 @@ public final class JuxuInputController: IMKInputController {
                 replacementRange: NSRange(location: NSNotFound, length: NSNotFound)
             )
             advanceExpectedAnchor(by: formatted.utf16.count)
-            JuxuBridge.shared.flushUserDataIfNeeded()
+            scheduleUserDataFlush()
         }
 
         let markedText = out.macOSPreedit
@@ -569,6 +575,15 @@ public final class JuxuInputController: IMKInputController {
     private func advanceExpectedAnchor(by utf16Count: Int) {
         if let anchor = lastExpectedAnchor {
             lastExpectedAnchor = anchor + utf16Count
+        }
+    }
+
+    private func scheduleUserDataFlush() {
+        saveUserDataTimer?.invalidate()
+        saveUserDataTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { _ in
+            MainActor.assumeIsolated {
+                JuxuBridge.shared.flushUserDataAsync()
+            }
         }
     }
 

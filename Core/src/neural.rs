@@ -379,6 +379,156 @@ fn int8_matvec(
     }
 }
 
+const BATCH_CHUNK: usize = 8;
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+unsafe fn int8_matmul_batch_sdot<const B: usize>(
+    w_u8: &[u8],
+    scales_bytes: &[u8],
+    bias_bytes: Option<&[u8]>,
+    x_qs: &[&[i8]; B],
+    x_scales: &[f32; B],
+    rows: usize,
+    cols: usize,
+    outs: &mut [&mut [f32]; B],
+) {
+    use core::arch::aarch64::*;
+    let w_ptr = w_u8.as_ptr() as *const i8;
+    let x_ptrs: [*const i8; B] = std::array::from_fn(|b| x_qs[b].as_ptr());
+    let mut r = 0usize;
+    while r + 2 <= rows {
+        let rp0 = w_ptr.add(r * cols);
+        let rp1 = w_ptr.add((r + 1) * cols);
+        let mut a0: [int32x4_t; B] = [vdupq_n_s32(0); B];
+        let mut a1: [int32x4_t; B] = [vdupq_n_s32(0); B];
+        let mut c = 0usize;
+        while c + 16 <= cols {
+            let w0 = vld1q_s8(rp0.add(c));
+            let w1 = vld1q_s8(rp1.add(c));
+            for b in 0..B {
+                let xb = vld1q_s8(x_ptrs[b].add(c));
+                a0[b] = sdot_i8x16(a0[b], w0, xb);
+                a1[b] = sdot_i8x16(a1[b], w1, xb);
+            }
+            c += 16;
+        }
+        let mut s0: [i32; B] = std::array::from_fn(|b| vaddvq_s32(a0[b]));
+        let mut s1: [i32; B] = std::array::from_fn(|b| vaddvq_s32(a1[b]));
+        while c < cols {
+            let w0v = *rp0.add(c) as i32;
+            let w1v = *rp1.add(c) as i32;
+            for b in 0..B {
+                let xv = *x_ptrs[b].add(c) as i32;
+                s0[b] += w0v * xv;
+                s1[b] += w1v * xv;
+            }
+            c += 1;
+        }
+        let w_sc0 = read_f32(scales_bytes, r * 4);
+        let w_sc1 = read_f32(scales_bytes, (r + 1) * 4);
+        let b0 = bias_bytes.map(|bb| read_f32(bb, r * 4)).unwrap_or(0.0);
+        let b1 = bias_bytes.map(|bb| read_f32(bb, (r + 1) * 4)).unwrap_or(0.0);
+        for b in 0..B {
+            *outs[b].get_unchecked_mut(r) = (s0[b] as f32) * w_sc0 * x_scales[b] + b0;
+            *outs[b].get_unchecked_mut(r + 1) = (s1[b] as f32) * w_sc1 * x_scales[b] + b1;
+        }
+        r += 2;
+    }
+    while r < rows {
+        let rp = w_ptr.add(r * cols);
+        let mut a0: [int32x4_t; B] = [vdupq_n_s32(0); B];
+        let mut c = 0usize;
+        while c + 16 <= cols {
+            let w0 = vld1q_s8(rp.add(c));
+            for b in 0..B {
+                let xb = vld1q_s8(x_ptrs[b].add(c));
+                a0[b] = sdot_i8x16(a0[b], w0, xb);
+            }
+            c += 16;
+        }
+        let mut s0: [i32; B] = std::array::from_fn(|b| vaddvq_s32(a0[b]));
+        while c < cols {
+            let w0v = *rp.add(c) as i32;
+            for b in 0..B {
+                s0[b] += w0v * (*x_ptrs[b].add(c) as i32);
+            }
+            c += 1;
+        }
+        let w_sc = read_f32(scales_bytes, r * 4);
+        let bias = bias_bytes.map(|bb| read_f32(bb, r * 4)).unwrap_or(0.0);
+        for b in 0..B {
+            *outs[b].get_unchecked_mut(r) = (s0[b] as f32) * w_sc * x_scales[b] + bias;
+        }
+        r += 1;
+    }
+}
+
+/// Batched INT8 matrix-vector multiply sharing a single pass over `w_u8` across `x_qs.len()` vectors.
+/// Cuts memory traffic and L2/DRAM cache energy by `B`x while remaining 100% bit-exact with `int8_matvec`.
+fn int8_matmul_slice(
+    w_u8: &[u8],
+    scales_bytes: &[u8],
+    bias_bytes: Option<&[u8]>,
+    x_qs: &[&[i8]],
+    x_scales: &[f32],
+    rows: usize,
+    cols: usize,
+    outs: &mut [&mut [f32]],
+) {
+    let b_len = x_qs.len();
+    if b_len == 0 {
+        return;
+    }
+    if b_len == 1 {
+        int8_matvec(w_u8, scales_bytes, bias_bytes, x_qs[0], x_scales[0], rows, cols, outs[0]);
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("dotprod") {
+        macro_rules! dispatch_b {
+            ($N:expr) => {{
+                let x_arr: [&[i8]; $N] = std::array::from_fn(|i| x_qs[i]);
+                let s_arr: [f32; $N] = std::array::from_fn(|i| x_scales[i]);
+                let mut rest = &mut outs[..$N];
+                let mut o_vec: Vec<&mut [f32]> = Vec::with_capacity($N);
+                while !rest.is_empty() {
+                    let (first, tail) = rest.split_first_mut().unwrap();
+                    o_vec.push(*first);
+                    rest = tail;
+                }
+                let mut o_arr: [&mut [f32]; $N] = o_vec.try_into().ok().unwrap();
+                unsafe {
+                    int8_matmul_batch_sdot::<$N>(
+                        w_u8,
+                        scales_bytes,
+                        bias_bytes,
+                        &x_arr,
+                        &s_arr,
+                        rows,
+                        cols,
+                        &mut o_arr,
+                    );
+                }
+                return;
+            }};
+        }
+        match b_len {
+            2 => dispatch_b!(2),
+            3 => dispatch_b!(3),
+            4 => dispatch_b!(4),
+            5 => dispatch_b!(5),
+            6 => dispatch_b!(6),
+            7 => dispatch_b!(7),
+            8 => dispatch_b!(8),
+            _ => {}
+        }
+    }
+    for b in 0..b_len {
+        int8_matvec(w_u8, scales_bytes, bias_bytes, x_qs[b], x_scales[b], rows, cols, outs[b]);
+    }
+}
+
 #[inline]
 fn int8_dot_row(row_u8: &[u8], row_scale: f32, x_q: &[i8], x_scale: f32) -> f32 {
     #[cfg(target_arch = "aarch64")]
@@ -686,11 +836,13 @@ impl RwkvState {
 
 const HISTORY_RING_CAP: usize = 8;
 
-/// Rolling sentence tracker with 8-step commit history for instant Backspace rollback.
+/// Rolling sentence tracker with 8-step commit history for instant Backspace rollback
+/// and token-sequence deduplication so `set_context_str` (`textDidChange`) skips redundant RWKV unrolls in `O(1)`.
 pub struct NeuralContextTracker {
     pub active: RwkvState,
+    active_tokens: Vec<u16>,
     bos_cached: Option<RwkvState>,
-    ring: Vec<RwkvState>,
+    ring: Vec<(Vec<u16>, RwkvState)>,
     dims: Option<NeuralLmSummary>,
 }
 
@@ -706,6 +858,7 @@ impl Default for NeuralContextTracker {
                 mtp_h: Vec::new(),
                 key1_logp: [-3.22f32; 25],
             },
+            active_tokens: Vec::new(),
             bos_cached: None,
             ring: Vec::with_capacity(HISTORY_RING_CAP),
             dims: None,
@@ -720,6 +873,7 @@ impl NeuralContextTracker {
         // Step token 0 (<BOS>) once and cache forever so sentence resets are O(1) memcpy!
         nv.step_token(0, &mut st);
         self.active = st.clone();
+        self.active_tokens.clear();
         self.bos_cached = Some(st);
         self.ring.clear();
         self.dims = Some(s);
@@ -730,58 +884,110 @@ impl NeuralContextTracker {
         self.bos_cached.is_some()
     }
 
+    fn copy_state_from(dst: &mut RwkvState, src: &RwkvState) {
+        if dst.mat_state.len() == src.mat_state.len()
+            && dst.prev_tm.len() == src.prev_tm.len()
+            && dst.p1_q.len() == src.p1_q.len()
+        {
+            dst.mat_state.copy_from_slice(&src.mat_state);
+            dst.prev_tm.copy_from_slice(&src.prev_tm);
+            dst.prev_cm.copy_from_slice(&src.prev_cm);
+            dst.p1_q.copy_from_slice(&src.p1_q);
+            dst.p1_scale = src.p1_scale;
+            dst.mtp_h.copy_from_slice(&src.mtp_h);
+            dst.key1_logp = src.key1_logp;
+        } else {
+            *dst = src.clone();
+        }
+    }
+
     pub fn reset_to_bos(&mut self, nv: Option<&NeuralView<'_>>) {
         if let Some(ref bos) = self.bos_cached {
-            self.active.mat_state.copy_from_slice(&bos.mat_state);
-            self.active.prev_tm.copy_from_slice(&bos.prev_tm);
-            self.active.prev_cm.copy_from_slice(&bos.prev_cm);
-            self.active.p1_q.copy_from_slice(&bos.p1_q);
-            self.active.p1_scale = bos.p1_scale;
-            self.active.mtp_h.copy_from_slice(&bos.mtp_h);
-            self.active.key1_logp = bos.key1_logp;
+            Self::copy_state_from(&mut self.active, bos);
+            self.active_tokens.clear();
             self.ring.clear();
         } else if let Some(v) = nv {
             self.init_with_model(v);
         }
     }
 
-    fn step_context_str(&mut self, nv: &NeuralView<'_>, text: &str) {
+    /// Encode `text` into the exact post-`<BOS>` token sequence `(tokens, saw_bos_reset)`.
+    pub fn encode_context_tokens(nv: &NeuralView<'_>, text: &str) -> (Vec<u16>, bool) {
+        let mut out: Vec<u16> = Vec::with_capacity(text.len());
+        let mut saw_reset = false;
         if nv.offs.ascii_trie.is_some() {
-            let mut toks = Vec::with_capacity(text.len());
-            nv.encode_mixed_str(text, &mut toks);
-            for tok in toks {
+            let mut raw_toks = Vec::with_capacity(text.len());
+            nv.encode_mixed_str(text, &mut raw_toks);
+            for tok in raw_toks {
                 if tok == TOK_BOS {
-                    self.reset_to_bos(Some(nv));
+                    out.clear();
+                    saw_reset = true;
                 } else {
-                    nv.step_token(tok, &mut self.active);
+                    out.push(tok as u16);
                 }
             }
-            return;
+            return (out, saw_reset);
         }
         let mut prev_special: Option<usize> = None;
         for ch in text.chars() {
             let u = ch as u32;
             if (CJK_LUT_BASE..0xA000).contains(&u) {
-                let tok = nv.char_to_token(ch);
-                nv.step_token(tok, &mut self.active);
+                out.push(nv.char_to_token(ch) as u16);
                 prev_special = None;
             } else if let Some(ptok) = nv.punct_to_token(ch) {
                 if prev_special != Some(ptok) {
-                    nv.step_token(ptok, &mut self.active);
+                    out.push(ptok as u16);
                     prev_special = Some(ptok);
                 }
             } else if nv.offs.has_eng_num_token && ch.is_ascii_alphanumeric() {
                 if prev_special != Some(TOK_ENG_NUM) {
-                    nv.step_token(TOK_ENG_NUM, &mut self.active);
+                    out.push(TOK_ENG_NUM as u16);
                     prev_special = Some(TOK_ENG_NUM);
                 }
-            } else if nv.offs.has_eng_num_token && prev_special == Some(TOK_ENG_NUM) && matches!(ch, ' ' | '-' | '_' | '.' | '+' | '/') {
-                // Keep bridging ASCII tokens like "Git PR" or "v2.1" inside a single <ENG_NUM> span
+            } else if nv.offs.has_eng_num_token
+                && prev_special == Some(TOK_ENG_NUM)
+                && matches!(ch, ' ' | '-' | '_' | '.' | '+' | '/')
+            {
+                // Keep bridging ASCII tokens inside a single <ENG_NUM> span
             } else {
-                self.reset_to_bos(Some(nv));
+                out.clear();
+                saw_reset = true;
                 prev_special = None;
             }
         }
+        (out, saw_reset)
+    }
+
+    fn step_token_slice_into(nv: &NeuralView<'_>, toks: &[u16], st: &mut RwkvState) {
+        let n = toks.len();
+        for (i, &t) in toks.iter().enumerate() {
+            let is_last = i + 1 == n;
+            nv.step_token_heads(t as usize, st, is_last, is_last);
+        }
+    }
+
+    fn step_context_str(&mut self, nv: &NeuralView<'_>, text: &str) {
+        let (toks, saw_reset) = Self::encode_context_tokens(nv, text);
+        if saw_reset {
+            if let Some(ref bos) = self.bos_cached {
+                Self::copy_state_from(&mut self.active, bos);
+            }
+            self.active_tokens.clear();
+        } else if let (Some(&last_prev), Some(&first_new)) = (self.active_tokens.last(), toks.first()) {
+            // Coalesce duplicate special tokens across incremental commit boundaries
+            if last_prev == first_new
+                && matches!(
+                    first_new as usize,
+                    TOK_COMMA | TOK_PERIOD | TOK_ENG_NUM
+                )
+            {
+                Self::step_token_slice_into(nv, &toks[1..], &mut self.active);
+                self.active_tokens.extend_from_slice(&toks[1..]);
+                return;
+            }
+        }
+        Self::step_token_slice_into(nv, &toks, &mut self.active);
+        self.active_tokens.extend_from_slice(&toks);
     }
 
     /// Push a committed word/character/punctuation sequence, saving pre-commit state in the 8-step rollback ring.
@@ -792,27 +998,86 @@ impl NeuralContextTracker {
         if self.ring.len() >= HISTORY_RING_CAP {
             self.ring.remove(0);
         }
-        self.ring.push(self.active.clone());
+        self.ring
+            .push((self.active_tokens.clone(), self.active.clone()));
         self.step_context_str(nv, text);
+    }
+
+    /// Adopt a pre-stepped `new_state` for a pure CJK commit without repeating `step_token` calls.
+    pub fn adopt_cjk_commit_state(&mut self, nv: &NeuralView<'_>, cjk_tokens: &[u16], new_state: RwkvState) {
+        if !self.is_ready() {
+            self.init_with_model(nv);
+        }
+        if self.ring.len() >= HISTORY_RING_CAP {
+            self.ring.remove(0);
+        }
+        self.ring
+            .push((self.active_tokens.clone(), self.active.clone()));
+        self.active = new_state;
+        self.active_tokens.extend_from_slice(cjk_tokens);
     }
 
     /// Roll back one committed unit on empty-preedit Backspace (or reset to BOS if history exhausted).
     pub fn pop_commit_or_reset(&mut self, nv: Option<&NeuralView<'_>>) {
-        if let Some(prev) = self.ring.pop() {
-            self.active = prev;
+        if let Some((prev_toks, prev_st)) = self.ring.pop() {
+            self.active = prev_st;
+            self.active_tokens = prev_toks;
         } else {
             self.reset_to_bos(nv);
         }
     }
 
-    /// Rebuild state cleanly from an explicit context string (used in offline evaluation / surrounding text).
+    /// Synchronize state with surrounding host text, reusing `active` or `ring` in `O(1)` / `O(delta)`
+    /// whenever the host context matches what was already incrementally stepped.
     pub fn set_context_str(&mut self, nv: &NeuralView<'_>, text: &str) {
         if !self.is_ready() {
             self.init_with_model(nv);
-        } else {
-            self.reset_to_bos(Some(nv));
         }
-        self.step_context_str(nv, text);
+        let (target_toks, saw_reset) = Self::encode_context_tokens(nv, text);
+
+        // 1. Exact token match (or sliding suffix window match on long unbroken clauses) -> 0 RWKV steps!
+        if target_toks == self.active_tokens {
+            return;
+        }
+        if !saw_reset
+            && target_toks.len() >= 12
+            && self.active_tokens.len() > target_toks.len()
+            && self.active_tokens.ends_with(&target_toks)
+        {
+            return;
+        }
+
+        // 2. Append-only continuation of `active` -> step only newly appended tokens!
+        if !self.active_tokens.is_empty() && target_toks.starts_with(&self.active_tokens) {
+            let delta = &target_toks[self.active_tokens.len()..];
+            Self::step_token_slice_into(nv, delta, &mut self.active);
+            self.active_tokens.extend_from_slice(delta);
+            return;
+        }
+
+        // 3. Match against rollback ring (e.g. partial 1-char backspace into a multi-char commit)
+        if let Some((idx, _)) = self
+            .ring
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, (rtoks, _))| target_toks.starts_with(rtoks))
+        {
+            let base_len = self.ring[idx].0.len();
+            Self::copy_state_from(&mut self.active, &self.ring[idx].1);
+            self.active_tokens.clear();
+            self.active_tokens.extend_from_slice(&target_toks);
+            self.ring.truncate(idx + 1);
+            if target_toks.len() > base_len {
+                Self::step_token_slice_into(nv, &target_toks[base_len..], &mut self.active);
+            }
+            return;
+        }
+
+        // 4. Genuine cursor jump / external edit -> reset cleanly to cached <BOS> and step target tokens
+        self.reset_to_bos(Some(nv));
+        Self::step_token_slice_into(nv, &target_toks, &mut self.active);
+        self.active_tokens = target_toks;
     }
 }
 
@@ -942,6 +1207,22 @@ impl<'a> NeuralView<'a> {
     }
 
     #[inline]
+    fn eval_qmat_batch(
+        &self,
+        qm: &QuantMatOff,
+        x_qs: &[&[i8]],
+        x_scales: &[f32],
+        rows: usize,
+        cols: usize,
+        outs: &mut [&mut [f32]],
+    ) {
+        let w = &self.blob[qm.w_off..qm.w_off + qm.w_len];
+        let sc = &self.blob[qm.sc_off..qm.sc_off + qm.sc_len];
+        let bias = qm.bias_off.map(|(bo, bl)| &self.blob[bo..bo + bl]);
+        int8_matmul_slice(w, sc, bias, x_qs, x_scales, rows, cols, outs);
+    }
+
+    #[inline]
     fn emb_row(&self, tok: usize) -> (&'a [u8], f32, f32) {
         let r = self.offs.summary.rank;
         let w_start = self.offs.emb_w_off + tok * r;
@@ -949,6 +1230,104 @@ impl<'a> NeuralView<'a> {
         let sc = read_f32(self.blob, self.offs.emb_sc_off + tok * 4);
         let ub = read_f32(self.blob, self.offs.uni_bias_off + tok * 4);
         (row, sc, ub)
+    }
+
+    #[inline(always)]
+    fn step_layer_heads(
+        &self,
+        loff: &LayerOffsets,
+        d: usize,
+        h: usize,
+        proj_6d: &[f32],
+        st_l: &mut [f32],
+        y_tm: &mut [f32],
+    ) {
+        for head in 0..h {
+            let base = head * HEAD_DIM;
+            let mut k_norm_sq = 1e-8f32;
+            let mut k_hat = [0.0f32; HEAD_DIM];
+            let mut w_dec = [0.0f32; HEAD_DIM];
+            let mut r_vec = [0.0f32; HEAD_DIM];
+            for j in 0..HEAD_DIM {
+                let kj = proj_6d[d + base + j];
+                k_norm_sq += kj * kj;
+                r_vec[j] = proj_6d[base + j];
+                w_dec[j] = sigmoid(proj_6d[3 * d + base + j]);
+            }
+            let inv_k = 1.0 / k_norm_sq.sqrt();
+            for j in 0..HEAD_DIM {
+                k_hat[j] = proj_6d[d + base + j] * inv_k;
+            }
+
+            let s_mat = &mut st_l[head * HEAD_DIM * HEAD_DIM..(head + 1) * HEAD_DIM * HEAD_DIM];
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                use core::arch::aarch64::*;
+                let wp = w_dec.as_ptr();
+                let kp = k_hat.as_ptr();
+                let rp = r_vec.as_ptr();
+                let sm_ptr = s_mat.as_mut_ptr();
+                for i in 0..HEAD_DIM {
+                    let vi = proj_6d[2 * d + base + i];
+                    let beta_i = sigmoid(proj_6d[4 * d + base + i]);
+                    let gi = proj_6d[5 * d + base + i];
+                    let rho_i = read_f32(self.blob, loff.rho_off + (base + i) * 4);
+
+                    let sp = sm_ptr.add(i * HEAD_DIM);
+                    let mut vp0 = vdupq_n_f32(0.0);
+                    let mut vp1 = vdupq_n_f32(0.0);
+                    let mut j = 0usize;
+                    while j < HEAD_DIM {
+                        let d0 = vmulq_f32(vld1q_f32(sp.add(j)), vld1q_f32(wp.add(j)));
+                        let d1 = vmulq_f32(vld1q_f32(sp.add(j + 4)), vld1q_f32(wp.add(j + 4)));
+                        vst1q_f32(sp.add(j), d0);
+                        vst1q_f32(sp.add(j + 4), d1);
+                        vp0 = vfmaq_f32(vp0, d0, vld1q_f32(kp.add(j)));
+                        vp1 = vfmaq_f32(vp1, d1, vld1q_f32(kp.add(j + 4)));
+                        j += 8;
+                    }
+                    let v_pred = vaddvq_f32(vaddq_f32(vp0, vp1));
+                    let delta_v = vdupq_n_f32(beta_i * (vi - v_pred));
+                    let mut ro0 = vdupq_n_f32(0.0);
+                    let mut ro1 = vdupq_n_f32(0.0);
+                    j = 0;
+                    while j < HEAD_DIM {
+                        let n0 = vfmaq_f32(vld1q_f32(sp.add(j)), delta_v, vld1q_f32(kp.add(j)));
+                        let n1 = vfmaq_f32(vld1q_f32(sp.add(j + 4)), delta_v, vld1q_f32(kp.add(j + 4)));
+                        vst1q_f32(sp.add(j), n0);
+                        vst1q_f32(sp.add(j + 4), n1);
+                        ro0 = vfmaq_f32(ro0, n0, vld1q_f32(rp.add(j)));
+                        ro1 = vfmaq_f32(ro1, n1, vld1q_f32(rp.add(j + 4)));
+                        j += 8;
+                    }
+                    let read_out = rho_i * r_vec[i] * vi + vaddvq_f32(vaddq_f32(ro0, ro1));
+                    y_tm[base + i] = read_out * silu(gi);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            for i in 0..HEAD_DIM {
+                let vi = proj_6d[2 * d + base + i];
+                let beta_i = sigmoid(proj_6d[4 * d + base + i]);
+                let gi = proj_6d[5 * d + base + i];
+                let rho_i = read_f32(self.blob, loff.rho_off + (base + i) * 4);
+
+                let row_s = &mut s_mat[i * HEAD_DIM..(i + 1) * HEAD_DIM];
+                let mut v_pred = 0.0f32;
+                for j in 0..HEAD_DIM {
+                    let decayed = row_s[j] * w_dec[j];
+                    row_s[j] = decayed;
+                    v_pred += decayed * k_hat[j];
+                }
+                let delta_i = beta_i * (vi - v_pred);
+                let mut read_out = rho_i * r_vec[i] * vi;
+                for j in 0..HEAD_DIM {
+                    let ns = row_s[j] + delta_i * k_hat[j];
+                    row_s[j] = ns;
+                    read_out += ns * r_vec[j];
+                }
+                y_tm[base + i] = read_out * silu(gi);
+            }
+        }
     }
 
     /// Advance recurrent state by 1 token and update all cached output heads (`p1`, `mtp_h`, `key1_logp`).
@@ -997,93 +1376,7 @@ impl<'a> NeuralView<'a> {
             self.eval_qmat(&loff.tm_proj, &q_buf[..d], tm_sc, 6 * d, d, &mut proj_6d[..6 * d]);
 
             let st_l = &mut state.mat_state[l * layer_state_stride..(l + 1) * layer_state_stride];
-            for head in 0..h {
-                let base = head * HEAD_DIM;
-                // L2-normalize key k_h[0..32]
-                let mut k_norm_sq = 1e-8f32;
-                let mut k_hat = [0.0f32; HEAD_DIM];
-                let mut w_dec = [0.0f32; HEAD_DIM];
-                let mut r_vec = [0.0f32; HEAD_DIM];
-                for j in 0..HEAD_DIM {
-                    let kj = proj_6d[d + base + j];
-                    k_norm_sq += kj * kj;
-                    r_vec[j] = proj_6d[base + j];
-                    w_dec[j] = sigmoid(proj_6d[3 * d + base + j]);
-                }
-                let inv_k = 1.0 / k_norm_sq.sqrt();
-                for j in 0..HEAD_DIM {
-                    k_hat[j] = proj_6d[d + base + j] * inv_k;
-                }
-
-                let s_mat = &mut st_l[head * HEAD_DIM * HEAD_DIM..(head + 1) * HEAD_DIM * HEAD_DIM];
-                #[cfg(target_arch = "aarch64")]
-                unsafe {
-                    use core::arch::aarch64::*;
-                    let wp = w_dec.as_ptr();
-                    let kp = k_hat.as_ptr();
-                    let rp = r_vec.as_ptr();
-                    let sm_ptr = s_mat.as_mut_ptr();
-                    for i in 0..HEAD_DIM {
-                        let vi = proj_6d[2 * d + base + i];
-                        let beta_i = sigmoid(proj_6d[4 * d + base + i]);
-                        let gi = proj_6d[5 * d + base + i];
-                        let rho_i = read_f32(self.blob, loff.rho_off + (base + i) * 4);
-
-                        let sp = sm_ptr.add(i * HEAD_DIM);
-                        let mut vp0 = vdupq_n_f32(0.0);
-                        let mut vp1 = vdupq_n_f32(0.0);
-                        let mut j = 0usize;
-                        while j < HEAD_DIM {
-                            let d0 = vmulq_f32(vld1q_f32(sp.add(j)), vld1q_f32(wp.add(j)));
-                            let d1 = vmulq_f32(vld1q_f32(sp.add(j + 4)), vld1q_f32(wp.add(j + 4)));
-                            vst1q_f32(sp.add(j), d0);
-                            vst1q_f32(sp.add(j + 4), d1);
-                            vp0 = vfmaq_f32(vp0, d0, vld1q_f32(kp.add(j)));
-                            vp1 = vfmaq_f32(vp1, d1, vld1q_f32(kp.add(j + 4)));
-                            j += 8;
-                        }
-                        let v_pred = vaddvq_f32(vaddq_f32(vp0, vp1));
-                        let delta_v = vdupq_n_f32(beta_i * (vi - v_pred));
-                        let mut ro0 = vdupq_n_f32(0.0);
-                        let mut ro1 = vdupq_n_f32(0.0);
-                        j = 0;
-                        while j < HEAD_DIM {
-                            let n0 = vfmaq_f32(vld1q_f32(sp.add(j)), delta_v, vld1q_f32(kp.add(j)));
-                            let n1 = vfmaq_f32(vld1q_f32(sp.add(j + 4)), delta_v, vld1q_f32(kp.add(j + 4)));
-                            vst1q_f32(sp.add(j), n0);
-                            vst1q_f32(sp.add(j + 4), n1);
-                            ro0 = vfmaq_f32(ro0, n0, vld1q_f32(rp.add(j)));
-                            ro1 = vfmaq_f32(ro1, n1, vld1q_f32(rp.add(j + 4)));
-                            j += 8;
-                        }
-                        let read_out = rho_i * r_vec[i] * vi + vaddvq_f32(vaddq_f32(ro0, ro1));
-                        y_tm[base + i] = read_out * silu(gi);
-                    }
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                for i in 0..HEAD_DIM {
-                    let vi = proj_6d[2 * d + base + i];
-                    let beta_i = sigmoid(proj_6d[4 * d + base + i]);
-                    let gi = proj_6d[5 * d + base + i];
-                    let rho_i = read_f32(self.blob, loff.rho_off + (base + i) * 4);
-
-                    let row_s = &mut s_mat[i * HEAD_DIM..(i + 1) * HEAD_DIM];
-                    let mut v_pred = 0.0f32;
-                    for j in 0..HEAD_DIM {
-                        let decayed = row_s[j] * w_dec[j];
-                        row_s[j] = decayed;
-                        v_pred += decayed * k_hat[j];
-                    }
-                    let delta_i = beta_i * (vi - v_pred);
-                    let mut read_out = rho_i * r_vec[i] * vi;
-                    for j in 0..HEAD_DIM {
-                        let ns = row_s[j] + delta_i * k_hat[j];
-                        row_s[j] = ns;
-                        read_out += ns * r_vec[j];
-                    }
-                    y_tm[base + i] = read_out * silu(gi);
-                }
-            }
+            self.step_layer_heads(loff, d, h, &proj_6d[..6 * d], st_l, &mut y_tm[..d]);
 
             let y_sc = quantize_act_i8(&y_tm[..d], &mut q_buf[..d]);
             self.eval_qmat(&loff.tm_out, &q_buf[..d], y_sc, d, d, &mut tmp_d[..d]);
@@ -1135,6 +1428,183 @@ impl<'a> NeuralView<'a> {
             let log_z = max_k + sum_exp.ln();
             for i in 0..25 {
                 state.key1_logp[i] = k1_raw[i] - log_z;
+            }
+        }
+    }
+
+    /// Batched RWKV-7 single-token transition across multiple independent `(tok, state, compute_mtp, compute_key1)`
+    /// beam hypotheses. Streams the 9.8 MB INT8 weight matrices ONCE per chunk of 8 paths instead of 8 times,
+    /// cutting memory traffic & power while remaining 100% bit-exact with `step_token_heads`.
+    pub fn step_tokens_batch(&self, items: &mut [(usize, &mut RwkvState, bool, bool)]) {
+        if items.is_empty() {
+            return;
+        }
+        let s = &self.offs.summary;
+        let d = s.d_model;
+        let h = s.n_heads;
+        let r = s.rank;
+        let ffn = s.ffn_dim;
+        let layer_state_stride = h * HEAD_DIM * HEAD_DIM;
+
+        for chunk in items.chunks_mut(BATCH_CHUNK) {
+            let cb = chunk.len();
+            if cb == 1 {
+                let (tok, ref mut st, mtp, key1) = chunk[0];
+                self.step_token_heads(tok, st, mtp, key1);
+                continue;
+            }
+
+            let mut x = [[0.0f32; 512]; BATCH_CHUNK];
+            let mut u = [0.0f32; 512];
+            let mut s_shift = [0.0f32; 512];
+            let mut q_batch = [[0i8; 1024]; BATCH_CHUNK];
+            let mut q_scales = [0.0f32; BATCH_CHUNK];
+            let mut work = [[0.0f32; 3072]; BATCH_CHUNK];
+            let mut y_tm = [0.0f32; 512];
+
+            // 1. Batched input embedding -> x[b][..d]
+            for b in 0..cb {
+                let (e_row, e_sc, _) = self.emb_row(chunk[b].0);
+                for k in 0..r {
+                    q_batch[b][k] = e_row[k] as i8;
+                }
+                q_scales[b] = e_sc;
+            }
+            {
+                let q_refs: [&[i8]; BATCH_CHUNK] = std::array::from_fn(|b| &q_batch[b][..r]);
+                let mut outs: Vec<&mut [f32]> =
+                    work[..cb].iter_mut().map(|buf| &mut buf[..d]).collect();
+                self.eval_qmat_batch(&self.offs.w_up, &q_refs[..cb], &q_scales[..cb], d, r, &mut outs);
+            }
+            for b in 0..cb {
+                x[b][..d].copy_from_slice(&work[b][..d]);
+            }
+
+            // 2. Batched layers
+            for (l, loff) in self.offs.layers.iter().enumerate() {
+                let ln1_bytes = &self.blob[loff.ln1_off..loff.ln1_off + d * 4];
+                for b in 0..cb {
+                    rms_norm(&x[b][..d], ln1_bytes, &mut u[..d]);
+                    let prev_tm = &mut chunk[b].1.prev_tm[l * d..(l + 1) * d];
+                    for i in 0..d {
+                        let mu = read_f32(self.blob, loff.mu_tm_off + i * 4);
+                        s_shift[i] = u[i] + mu * (prev_tm[i] - u[i]);
+                        prev_tm[i] = u[i];
+                    }
+                    q_scales[b] = quantize_act_i8(&s_shift[..d], &mut q_batch[b][..d]);
+                }
+
+                {
+                    let q_refs: [&[i8]; BATCH_CHUNK] = std::array::from_fn(|b| &q_batch[b][..d]);
+                    let mut outs: Vec<&mut [f32]> =
+                        work[..cb].iter_mut().map(|buf| &mut buf[..6 * d]).collect();
+                    self.eval_qmat_batch(
+                        &loff.tm_proj,
+                        &q_refs[..cb],
+                        &q_scales[..cb],
+                        6 * d,
+                        d,
+                        &mut outs,
+                    );
+                }
+
+                for b in 0..cb {
+                    let st_l = &mut chunk[b].1.mat_state
+                        [l * layer_state_stride..(l + 1) * layer_state_stride];
+                    self.step_layer_heads(loff, d, h, &work[b][..6 * d], st_l, &mut y_tm[..d]);
+                    q_scales[b] = quantize_act_i8(&y_tm[..d], &mut q_batch[b][..d]);
+                }
+
+                {
+                    let q_refs: [&[i8]; BATCH_CHUNK] = std::array::from_fn(|b| &q_batch[b][..d]);
+                    let mut outs: Vec<&mut [f32]> =
+                        work[..cb].iter_mut().map(|buf| &mut buf[..d]).collect();
+                    self.eval_qmat_batch(&loff.tm_out, &q_refs[..cb], &q_scales[..cb], d, d, &mut outs);
+                }
+                for b in 0..cb {
+                    for i in 0..d {
+                        x[b][i] += work[b][i];
+                    }
+                }
+
+                // ChannelMix
+                let ln2_bytes = &self.blob[loff.ln2_off..loff.ln2_off + d * 4];
+                for b in 0..cb {
+                    rms_norm(&x[b][..d], ln2_bytes, &mut u[..d]);
+                    let prev_cm = &mut chunk[b].1.prev_cm[l * d..(l + 1) * d];
+                    for i in 0..d {
+                        let mu = read_f32(self.blob, loff.mu_cm_off + i * 4);
+                        s_shift[i] = u[i] + mu * (prev_cm[i] - u[i]);
+                        prev_cm[i] = u[i];
+                    }
+                    q_scales[b] = quantize_act_i8(&s_shift[..d], &mut q_batch[b][..d]);
+                }
+
+                {
+                    let q_refs: [&[i8]; BATCH_CHUNK] = std::array::from_fn(|b| &q_batch[b][..d]);
+                    let mut outs: Vec<&mut [f32]> =
+                        work[..cb].iter_mut().map(|buf| &mut buf[..ffn]).collect();
+                    self.eval_qmat_batch(&loff.cm_up, &q_refs[..cb], &q_scales[..cb], ffn, d, &mut outs);
+                }
+
+                for b in 0..cb {
+                    for i in 0..ffn {
+                        let rv = work[b][i].max(0.0);
+                        work[b][i] = rv * rv;
+                    }
+                    q_scales[b] = quantize_act_i8(&work[b][..ffn], &mut q_batch[b][..ffn]);
+                }
+
+                {
+                    let q_refs: [&[i8]; BATCH_CHUNK] = std::array::from_fn(|b| &q_batch[b][..ffn]);
+                    let mut outs: Vec<&mut [f32]> =
+                        work[..cb].iter_mut().map(|buf| &mut buf[..d]).collect();
+                    self.eval_qmat_batch(&loff.cm_dn, &q_refs[..cb], &q_scales[..cb], d, ffn, &mut outs);
+                }
+                for b in 0..cb {
+                    for i in 0..d {
+                        x[b][i] += work[b][i];
+                    }
+                }
+            }
+
+            // 3. Output heads
+            let ln_out_bytes = &self.blob[self.offs.ln_out_off..self.offs.ln_out_off + d * 4];
+            for b in 0..cb {
+                rms_norm(&x[b][..d], ln_out_bytes, &mut u[..d]);
+                q_scales[b] = quantize_act_i8(&u[..d], &mut q_batch[b][..d]);
+            }
+            {
+                let q_refs: [&[i8]; BATCH_CHUNK] = std::array::from_fn(|b| &q_batch[b][..d]);
+                let mut outs: Vec<&mut [f32]> =
+                    work[..cb].iter_mut().map(|buf| &mut buf[..r]).collect();
+                self.eval_qmat_batch(&self.offs.w_dn, &q_refs[..cb], &q_scales[..cb], r, d, &mut outs);
+            }
+            for b in 0..cb {
+                chunk[b].1.p1_scale = quantize_act_i8(&work[b][..r], &mut chunk[b].1.p1_q[..r]);
+                if chunk[b].2 {
+                    self.eval_qmat(
+                        &self.offs.w_mtp_h,
+                        &q_batch[b][..d],
+                        q_scales[b],
+                        r,
+                        d,
+                        &mut chunk[b].1.mtp_h[..r],
+                    );
+                }
+                if chunk[b].3 {
+                    let mut k1_raw = [0.0f32; 25];
+                    self.eval_qmat(&self.offs.w_key1, &q_batch[b][..d], q_scales[b], 25, d, &mut k1_raw);
+                    let max_k = k1_raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum_exp = 0.0f32;
+                    for &v in &k1_raw {
+                        sum_exp += (v - max_k).exp();
+                    }
+                    let log_z = max_k + sum_exp.ln();
+                    for i in 0..25 {
+                        chunk[b].1.key1_logp[i] = k1_raw[i] - log_z;
+                    }
+                }
             }
         }
     }
@@ -1483,5 +1953,166 @@ mod tests {
         let mut tracker = NeuralContextTracker::default();
         tracker.set_context_str(&nv, "用 Rust 写 v2.1，𠮷好。");
         assert!(tracker.is_ready());
+    }
+
+    #[test]
+    fn batch_step_matches_single_step_and_tracker_deduplicates() {
+        let mut blob = build_tiny_wblm0002(&[b"a", b"b", b"Rust"]);
+        // Populate deterministic pseudo-random non-zero weights/scales after LUT so matmuls exercise non-trivial values
+        let lut_end = HEADER_LEN + CJK_LUT_LEN * 2;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        // Re-build with realistic small scales by filling weight bytes and 1.0/16.0 scales cleanly via helper:
+        blob.clear();
+        let vocab_size: usize = 35;
+        let rank: usize = 32;
+        let d_model: usize = 64;
+        let n_heads: usize = 2;
+        let n_layers: usize = 2;
+        let ffn_dim: usize = 96;
+        blob.extend_from_slice(WBLM_MAGIC_V2);
+        for v in [vocab_size, rank, d_model, n_heads, n_layers, ffn_dim] {
+            blob.extend_from_slice(&(v as u32).to_le_bytes());
+        }
+        blob.resize(HEADER_LEN, 0);
+        let mut next_u8 = || -> u8 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed & 0xFF) as u8
+        };
+        let align4 = |b: &mut Vec<u8>| {
+            while b.len() % 4 != 0 {
+                b.push(0);
+            }
+        };
+        let push_i8 = |b: &mut Vec<u8>, n: usize, rng: &mut dyn FnMut() -> u8| {
+            align4(b);
+            for _ in 0..n {
+                let v = ((rng() % 31) as i8) - 15;
+                b.push(v as u8);
+            }
+        };
+        let push_f32 = |b: &mut Vec<u8>, n: usize, scale: f32, rng: &mut dyn FnMut() -> u8| {
+            align4(b);
+            for _ in 0..n {
+                let f = ((rng() as f32 / 255.0) - 0.5) * scale;
+                b.extend_from_slice(&f.to_le_bytes());
+            }
+        };
+        let push_pos_f32 = |b: &mut Vec<u8>, n: usize, scale: f32, rng: &mut dyn FnMut() -> u8| {
+            align4(b);
+            for _ in 0..n {
+                let f = 0.002 + (rng() as f32 / 255.0) * scale;
+                b.extend_from_slice(&f.to_le_bytes());
+            }
+        };
+        let push_qmat = |b: &mut Vec<u8>, rows: usize, cols: usize, has_bias: bool, rng: &mut dyn FnMut() -> u8| {
+            push_i8(b, rows * cols, rng);
+            push_pos_f32(b, rows, 0.01, rng);
+            if has_bias {
+                push_f32(b, rows, 0.05, rng);
+            }
+        };
+        let _ = lut_end;
+        align4(&mut blob);
+        let lut_start = blob.len();
+        blob.resize(lut_start + CJK_LUT_LEN * 2, 0);
+        for (i, ch_u32) in (CJK_LUT_BASE..(CJK_LUT_BASE + 20)).enumerate() {
+            let _ = ch_u32;
+            let off = lut_start + i * 2;
+            blob[off..off + 2].copy_from_slice(&((4 + i) as u16).to_le_bytes());
+        }
+        push_i8(&mut blob, vocab_size * rank, &mut next_u8);
+        push_pos_f32(&mut blob, vocab_size, 0.02, &mut next_u8);
+        push_f32(&mut blob, vocab_size, 0.2, &mut next_u8);
+        push_qmat(&mut blob, d_model, rank, false, &mut next_u8);
+        for _ in 0..n_layers {
+            push_pos_f32(&mut blob, d_model, 0.8, &mut next_u8);
+            push_f32(&mut blob, d_model, 0.3, &mut next_u8);
+            push_qmat(&mut blob, 6 * d_model, d_model, true, &mut next_u8);
+            push_f32(&mut blob, d_model, 0.3, &mut next_u8);
+            push_qmat(&mut blob, d_model, d_model, false, &mut next_u8);
+            push_pos_f32(&mut blob, d_model, 0.8, &mut next_u8);
+            push_f32(&mut blob, d_model, 0.3, &mut next_u8);
+            push_qmat(&mut blob, ffn_dim, d_model, true, &mut next_u8);
+            push_qmat(&mut blob, d_model, ffn_dim, false, &mut next_u8);
+        }
+        push_pos_f32(&mut blob, d_model, 0.8, &mut next_u8);
+        push_qmat(&mut blob, rank, d_model, true, &mut next_u8);
+        push_qmat(&mut blob, rank, d_model, true, &mut next_u8);
+        push_qmat(&mut blob, rank, rank, false, &mut next_u8);
+        push_qmat(&mut blob, 25, d_model, true, &mut next_u8);
+        align4(&mut blob);
+        blob.extend_from_slice(&(32u32).to_le_bytes());
+        blob.extend_from_slice(&(3u32).to_le_bytes());
+        for entry in [&b"a"[..], &b"b"[..], &b"Rust"[..]] {
+            blob.push(entry.len() as u8);
+            blob.extend_from_slice(entry);
+        }
+
+        let offs = NeuralOffsets::parse(&blob).expect("parse synthetic WBLM0002");
+        let nv = NeuralView { blob: &blob, offs: &offs };
+
+        for bsz in [1usize, 2, 5, 8, 11] {
+            let mut base = RwkvState::new_zero(&offs.summary);
+            nv.step_token(0, &mut base);
+            let mut single_states: Vec<RwkvState> = (0..bsz).map(|_| base.clone()).collect();
+            let mut batch_states: Vec<RwkvState> = (0..bsz).map(|_| base.clone()).collect();
+            let toks: Vec<usize> = (0..bsz).map(|i| 4 + (i % 16)).collect();
+            let mtp_flags: Vec<bool> = (0..bsz).map(|i| i < 2 || i % 3 == 0).collect();
+
+            let key1_flags: Vec<bool> = (0..bsz).map(|i| i % 4 == 0).collect();
+
+            for i in 0..bsz {
+                nv.step_token_heads(toks[i], &mut single_states[i], mtp_flags[i], key1_flags[i]);
+            }
+            let mut refs: Vec<(usize, &mut RwkvState, bool, bool)> = toks
+                .iter()
+                .copied()
+                .zip(batch_states.iter_mut())
+                .zip(mtp_flags.iter().copied())
+                .zip(key1_flags.iter().copied())
+                .map(|(((t, s), m), k)| (t, s, m, k))
+                .collect();
+            nv.step_tokens_batch(&mut refs);
+
+            for i in 0..bsz {
+                assert_eq!(single_states[i].p1_q, batch_states[i].p1_q, "p1_q mismatch at bsz={bsz} i={i}");
+                assert!((single_states[i].p1_scale - batch_states[i].p1_scale).abs() < 1e-6);
+                for (a, b) in single_states[i].mat_state.iter().zip(batch_states[i].mat_state.iter()) {
+                    assert!((a - b).abs() < 1e-5, "mat_state diff {a} vs {b}");
+                }
+                if mtp_flags[i] {
+                    for (a, b) in single_states[i].mtp_h.iter().zip(batch_states[i].mtp_h.iter()) {
+                        assert!((a - b).abs() < 1e-5, "mtp_h diff {a} vs {b}");
+                    }
+                }
+            }
+        }
+
+        // Verify `NeuralContextTracker` exact-match, append-delta, and ring-prefix recovery
+        let c0 = char::from_u32(CJK_LUT_BASE).unwrap();
+        let c1 = char::from_u32(CJK_LUT_BASE + 1).unwrap();
+        let c2 = char::from_u32(CJK_LUT_BASE + 2).unwrap();
+        let word1: String = [c0, c1].iter().collect();
+        let full: String = [c0, c1, c2].iter().collect();
+        let after_bs1: String = [c0].iter().collect();
+
+        let mut inc = NeuralContextTracker::default();
+        inc.commit_cjk_str(&nv, &word1);
+        let ring_before = inc.ring.len();
+        inc.set_context_str(&nv, &word1); // exact O(1) hit!
+        assert_eq!(inc.ring.len(), ring_before);
+
+        inc.set_context_str(&nv, &full); // append delta [c2]
+        let mut cold = NeuralContextTracker::default();
+        cold.set_context_str(&nv, &full);
+        assert_eq!(inc.active.p1_q, cold.active.p1_q);
+
+        // Partial 1-char backspace into `word1` recovers from `ring[0]` (<BOS>) + 1 step (`c0`)
+        inc.set_context_str(&nv, &after_bs1);
+        let mut cold_bs = NeuralContextTracker::default();
+        cold_bs.set_context_str(&nv, &after_bs1);
+        assert_eq!(inc.active.p1_q, cold_bs.active.p1_q);
     }
 }

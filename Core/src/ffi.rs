@@ -46,14 +46,16 @@ fn json_escape(s: &str, out: &mut String) {
 }
 
 fn serialize_action_and_state(engine: &JuxuEngine, act: Option<&EngineOutput>) -> String {
-    let mut j = String::with_capacity(512);
+    use std::fmt::Write as _;
+    let mut j = String::with_capacity(1024);
     j.push('{');
     let consumed = act.map(|a| a.consumed).unwrap_or(false);
     let bell = act.map(|a| a.bell).unwrap_or(false);
     let commit = act.map(|a| a.commit_text.as_str()).unwrap_or("");
     let notice = act.map(|a| a.notice.as_str()).unwrap_or("");
 
-    j.push_str(&format!(
+    let _ = write!(
+        j,
         "\"consumed\":{},\"bell\":{},\"asciiMode\":{},\"schemaId\":{},\"page\":{},\"totalPages\":{},\"vertical\":{},",
         consumed,
         bell,
@@ -62,7 +64,7 @@ fn serialize_action_and_state(engine: &JuxuEngine, act: Option<&EngineOutput>) -
         engine.current_page(),
         engine.total_pages(),
         engine.config.orientation == crate::config::CandidateOrientation::Vertical
-    ));
+    );
 
     j.push_str("\"schemaName\":");
     json_escape(engine.config.schema.display_name(), &mut j);
@@ -83,77 +85,84 @@ fn serialize_action_and_state(engine: &JuxuEngine, act: Option<&EngineOutput>) -
         .filter(|k| k.samples > 0)
         .count();
     let (valid_mask, priors) = engine.next_key_mask_and_priors();
-    j.push_str(&format!(
+    let _ = write!(
+        j,
         ",\"userPhraseCount\":{},\"calibratedKeyCount\":{},\"validNextMask\":{},\"nextKeyPriors\":[",
         engine.user.phrases.len(),
         calibrated_keys,
         valid_mask
-    ));
+    );
     for (pi, &pv) in priors.iter().enumerate() {
         if pi > 0 {
             j.push(',');
         }
-        j.push_str(&pv.to_string());
+        let _ = write!(j, "{}", pv);
     }
-    j.push_str("],\"touchOffsets\":[");
-    for (ti, tk) in engine.user.touch_profile.keys.iter().enumerate() {
-        if ti > 0 {
-            j.push(',');
+    j.push(']');
+    if calibrated_keys > 0 {
+        j.push_str(",\"touchOffsets\":[");
+        for (ti, tk) in engine.user.touch_profile.keys.iter().enumerate() {
+            if ti > 0 {
+                j.push(',');
+            }
+            if tk.samples == 0 || (tk.dx.abs() < 1e-4 && tk.dy.abs() < 1e-4) {
+                j.push_str("0,0");
+            } else {
+                let _ = write!(j, "{:.3},{:.3}", tk.dx, tk.dy);
+            }
         }
-        if tk.samples == 0 || (tk.dx.abs() < 1e-4 && tk.dy.abs() < 1e-4) {
-            j.push_str("0,0");
-        } else {
-            j.push_str(&format!("{:.3},{:.3}", tk.dx, tk.dy));
-        }
+        j.push(']');
     }
-    let (t9_mask, t9_priors) = engine.t9_next_key_mask_and_priors();
-    j.push_str(&format!(
-        "],\"t9Mode\":{},\"t9ValidNextMask\":{},\"t9NextKeyPriors\":[",
-        engine.is_t9_pinyin_mode(),
-        t9_mask
-    ));
-    for (pi, &pv) in t9_priors.iter().enumerate() {
-        if pi > 0 {
-            j.push(',');
+    if engine.is_t9_pinyin_mode() {
+        let (t9_mask, t9_priors) = engine.t9_next_key_mask_and_priors();
+        let _ = write!(
+            j,
+            ",\"t9Mode\":true,\"t9ValidNextMask\":{},\"t9NextKeyPriors\":[",
+            t9_mask
+        );
+        for (pi, &pv) in t9_priors.iter().enumerate() {
+            if pi > 0 {
+                j.push(',');
+            }
+            let _ = write!(j, "{}", pv);
         }
-        j.push_str(&pv.to_string());
+        j.push_str("],\"t9TouchOffsets\":[");
+        for (ti, tk) in engine.user.touch_profile.t9_keys.iter().enumerate() {
+            if ti > 0 {
+                j.push(',');
+            }
+            if tk.samples == 0 || (tk.dx.abs() < 1e-4 && tk.dy.abs() < 1e-4) {
+                j.push_str("0,0");
+            } else {
+                let _ = write!(j, "{:.3},{:.3}", tk.dx, tk.dy);
+            }
+        }
+        j.push_str("],\"t9LockedPrefix\":");
+        json_escape(&engine.t9_locked_prefix(), &mut j);
+        j.push_str(",\"t9Syllables\":[");
+        for (si, syl) in engine.t9_syllable_options().iter().enumerate() {
+            if si > 0 {
+                j.push(',');
+            }
+            json_escape(syl, &mut j);
+        }
+        j.push(']');
     }
-    j.push_str("],\"t9TouchOffsets\":[");
-    for (ti, tk) in engine.user.touch_profile.t9_keys.iter().enumerate() {
-        if ti > 0 {
-            j.push(',');
-        }
-        if tk.samples == 0 || (tk.dx.abs() < 1e-4 && tk.dy.abs() < 1e-4) {
-            j.push_str("0,0");
-        } else {
-            j.push_str(&format!("{:.3},{:.3}", tk.dx, tk.dy));
-        }
-    }
-    j.push_str("],\"t9LockedPrefix\":");
-    json_escape(&engine.t9_locked_prefix(), &mut j);
-    j.push_str(",\"t9Syllables\":[");
-    for (si, syl) in engine.t9_syllable_options().iter().enumerate() {
-        if si > 0 {
-            j.push(',');
-        }
-        json_escape(syl, &mut j);
-    }
-    j.push_str("],\"candidates\":[");
+    j.push_str(",\"candidates\":[");
 
     for (idx, c) in engine.page_candidates().iter().enumerate() {
         if idx > 0 {
             j.push(',');
         }
-        j.push_str("{\"index\":");
-        j.push_str(&(idx + 1).to_string());
-        j.push_str(",\"text\":");
+        let _ = write!(j, "{{\"index\":{},\"text\":", idx + 1);
         json_escape(&c.text, &mut j);
         j.push_str(",\"comment\":");
         json_escape(&c.comment, &mut j);
-        j.push_str(&format!(
+        let _ = write!(
+            j,
             ",\"badge\":{},\"confidence\":{:.3},\"isExact\":{}}}",
             c.badge as u8, c.confidence, c.is_exact
-        ));
+        );
     }
     j.push_str("]}");
     j
@@ -405,6 +414,18 @@ pub extern "C" fn juxu_engine_save_user_data(
     } else {
         false
     }
+}
+
+#[no_mangle]
+pub extern "C" fn juxu_engine_export_user_data_tsv(
+    handle: *mut JuxuEngineHandle,
+) -> *mut c_char {
+    let Some(h) = (unsafe { handle.as_mut() }) else {
+        return into_c_string(String::new());
+    };
+    let tsv = h.inner.user.to_tsv_string();
+    h.inner.user.dirty = false;
+    into_c_string(tsv)
 }
 
 #[no_mangle]

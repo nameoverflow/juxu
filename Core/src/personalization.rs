@@ -58,7 +58,7 @@ struct StateSample {
     continuation: Continuation,
 }
 
-fn state_signature(state: &RwkvState) -> u128 {
+pub(crate) fn state_signature(state: &RwkvState) -> u128 {
     // Signs of the next-token projection retain similarities between RWKV states.
     // The projection has already seen the whole available prefix.
     state
@@ -373,6 +373,77 @@ impl PersonalContinuations {
                 }
             } else {
                 neural = None;
+            }
+            context = context.push(ch);
+        }
+        if self.rows.len() > MAX_CONTEXTS {
+            let mut by_weight: Vec<_> = self
+                .rows
+                .iter()
+                .map(|(&key, row)| (key, row.total * row.decay(self.tick)))
+                .collect();
+            let remove = by_weight.len() - CONTEXTS_AFTER_PRUNE;
+            by_weight.select_nth_unstable_by(remove, |a, b| {
+                a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+            });
+            for (key, _) in by_weight.into_iter().take(remove) {
+                self.rows.remove(&key);
+            }
+        }
+    }
+
+    /// Observe a committed pure-CJK sequence using pre-stepped `state_signature`s collected during
+    /// a single shared commit unroll, avoiding redundant `step_token` calls on commit.
+    pub fn observe_prestepped_sigs(
+        &mut self,
+        prefix: &[char],
+        text: &str,
+        confirmed: bool,
+        first_choice: Option<&str>,
+        profile_id: u64,
+        pre_step_sigs: &[u128],
+    ) {
+        if self.state_model != Some(profile_id) {
+            for row in self.rows.values_mut() {
+                row.states = [StateSample::default(); STATE_SAMPLES_PER_CONTEXT];
+            }
+            self.state_model = Some(profile_id);
+        }
+        let base_weight = if confirmed { 1.0 } else { 0.25 };
+        let mut context = Context::with_chars(prefix.iter().copied());
+        let first_chars: Option<Vec<char>> = first_choice
+            .filter(|&fc| fc != text)
+            .map(|fc| fc.chars().collect());
+        let mut diverged = false;
+        for (idx, ch) in text.chars().enumerate() {
+            let different = if let Some(ref fc) = first_chars {
+                let d = fc.get(idx).copied() != Some(ch);
+                if d {
+                    diverged = true;
+                }
+                d || diverged
+            } else {
+                false
+            };
+            if han(ch) {
+                self.tick = self.tick.saturating_add(1);
+                let weight = if different { base_weight + 2.5 } else { base_weight };
+                for (key, _) in context.suffixes() {
+                    self.rows
+                        .entry(key)
+                        .or_default()
+                        .observe(ch as u16, weight, self.tick);
+                }
+                if different {
+                    self.observe_unigram(ch as u16, 3.5);
+                } else if confirmed && idx == 0 {
+                    self.observe_unigram(ch as u16, 0.45);
+                }
+                if let (Some(key), Some(&sig)) = (context.three_chars(), pre_step_sigs.get(idx)) {
+                    if let Some(row) = self.rows.get_mut(&key) {
+                        row.observe_state(ch as u16, sig, weight);
+                    }
+                }
             }
             context = context.push(ch);
         }

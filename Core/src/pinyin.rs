@@ -13,11 +13,12 @@ use crate::neural::{NeuralView, RwkvState, TOK_UNK};
 use crate::personalization::Context as PersonalContext;
 use crate::pinyin_dict::{base_initial_id, PinyinDictView};
 use crate::typo::{
-    key_choices_for_obs, letter_to_t9_digit, softmax_confidences, syllable_to_t9_digits,
-    t9_key_choices_for_obs, t9_letters_for_digit, CorrectionKind, KeyLayout, KeyObs,
+    key_choices_for_obs, letter_to_t9_digit, softmax_confidences, t9_key_choices_for_obs,
+    t9_letters_for_digit, CorrectionKind, KeyLayout, KeyObs,
 };
 use crate::user_data::UserStore;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 const BEAM_WIDTH: usize = 20;
 const MAX_SYL_LEN: usize = 6;
@@ -56,16 +57,47 @@ pub struct PinyinBoundary {
 }
 
 #[derive(Clone)]
+pub enum PathState {
+    Ready(Rc<RwkvState>),
+    PendingChar {
+        parent: Rc<RwkvState>,
+        tok: usize,
+    },
+    Evicted,
+}
+
+#[derive(Clone)]
 pub struct PinyinPath {
     pub text: String,
     pub score: f32,
     pub boundaries: Vec<PinyinBoundary>,
-    pub state: RwkvState,
+    pub path_state: PathState,
     pub(crate) personal_context: PersonalContext,
     pub any_corrected: bool,
 }
 
 impl PinyinPath {
+    #[inline]
+    pub fn ready_state(&self) -> Option<&RwkvState> {
+        match &self.path_state {
+            PathState::Ready(rc) => Some(rc.as_ref()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn ready_rc(&self) -> Option<&Rc<RwkvState>> {
+        match &self.path_state {
+            PathState::Ready(rc) => Some(rc),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_evicted(&self) -> bool {
+        matches!(self.path_state, PathState::Evicted)
+    }
+
     pub fn segmented_code(&self, raw: &str) -> String {
         let mut parts = Vec::with_capacity(self.boundaries.len() + 1);
         for b in &self.boundaries {
@@ -759,18 +791,6 @@ fn build_lattice(
     edges_by_end
 }
 
-fn build_t9_syllable_map<'a>(dict: &'a PinyinDictView) -> HashMap<String, Vec<(u16, &'a str)>> {
-    let mut map: HashMap<String, Vec<(u16, &'a str)>> = HashMap::with_capacity(256);
-    for sid in 0..dict.syllable_count() {
-        let s = dict.syllable_str(sid as u16);
-        let digits = syllable_to_t9_digits(s);
-        if !digits.is_empty() {
-            map.entry(digits).or_default().push((sid as u16, s));
-        }
-    }
-    map
-}
-
 fn build_t9_lattice(
     observations: &[KeyObs],
     t9_locked_syls: &[(usize, String)],
@@ -816,7 +836,7 @@ fn build_t9_lattice(
         unlock_start += 1;
     }
 
-    let t9_map = build_t9_syllable_map(decoder.dict);
+    let t9_map = decoder.dict.t9_map();
     let per_pos_choices: Vec<Vec<(u8, f32, bool, bool)>> = observations
         .iter()
         .map(|obs| {
@@ -858,9 +878,10 @@ fn build_t9_lattice(
             };
 
             let mut had_exact_full = false;
-            if let Some(syls) = t9_map.get(&exact_str) {
+            if let Some(sids) = t9_map.get(&exact_str) {
                 had_exact_full = true;
-                for &(sid, syl_str) in syls {
+                for &sid in sids {
+                    let syl_str = decoder.dict.syllable_str(sid);
                     edges_by_end[actual_end].push(LatticeEdge {
                         start,
                         end: actual_end,
@@ -888,7 +909,7 @@ fn build_t9_lattice(
                         let mut b = exact_bytes.clone();
                         b[pos] = alt_digit;
                         let cand_digits = String::from_utf8_lossy(&b);
-                        let Some(syls) = t9_map.get(cand_digits.as_ref()) else {
+                        let Some(sids) = t9_map.get(cand_digits.as_ref()) else {
                             continue;
                         };
                         let other_lp: f32 = (start..end)
@@ -906,7 +927,8 @@ fn build_t9_lattice(
                         } else {
                             (CorrectionKind::NeighborKey, -5.2)
                         };
-                        for &(sid, syl_str) in syls {
+                        for &sid in sids {
+                            let syl_str = decoder.dict.syllable_str(sid);
                             edges_by_end[actual_end].push(LatticeEdge {
                                 start,
                                 end: actual_end,
@@ -935,7 +957,7 @@ fn build_t9_lattice(
                         let mut b = exact_bytes.clone();
                         b.swap(pos, pos + 1);
                         let cand_digits = String::from_utf8_lossy(&b);
-                        let Some(syls) = t9_map.get(cand_digits.as_ref()) else {
+                        let Some(sids) = t9_map.get(cand_digits.as_ref()) else {
                             continue;
                         };
                         let trans_lp =
@@ -944,7 +966,8 @@ fn build_t9_lattice(
                             } else {
                                 -4.2
                             };
-                        for &(sid, syl_str) in syls {
+                        for &sid in sids {
+                            let syl_str = decoder.dict.syllable_str(sid);
                             edges_by_end[actual_end].push(LatticeEdge {
                                 start,
                                 end: actual_end,
@@ -1004,9 +1027,10 @@ fn build_t9_lattice(
             // Trailing partial-syllable prefix completion at end of input buffer
             if actual_end == n && !had_exact_full && len >= 2 {
                 let mut prefixes: HashSet<String> = HashSet::new();
-                for (digits_key, syls) in &t9_map {
+                for (digits_key, sids) in t9_map {
                     if digits_key.len() > len && digits_key.starts_with(&exact_str) {
-                        for &(_, syl_str) in syls {
+                        for &sid in sids {
+                            let syl_str = decoder.dict.syllable_str(sid);
                             if let Some(pref) = syl_str.get(..len) {
                                 prefixes.insert(pref.to_owned());
                             }
@@ -1321,18 +1345,445 @@ fn add_latin_lattice_edges(
     }
 }
 
-/// Retain full `RwkvState` tensors only for the most recent `STREAM_STATE_WINDOW` keystroke layers
-/// to keep iOS keyboard extension Dirty RAM bounded (< ~12 MB even for 100-key continuous typing).
-const STREAM_STATE_WINDOW: usize = 24;
+/// Retain all `BEAM_WIDTH` states for the most recent `FULL_STATE_WINDOW` keystroke layers
+/// (covering normal Pinyin syllables + 1-backspace lookback with zero recompute), top-2 states for
+/// `TOP2_STATE_WINDOW` (covering long inline English words), and 4-path checkpoints every 12 keys
+/// so even continuous hold-backspace across 60+ keys stays `< 25 MB` Dirty RAM and `< 2 ms` avg!
+const FULL_STATE_WINDOW: usize = 22;
+const TOP2_STATE_WINDOW: usize = 52;
+const CHECKPOINT_STRIDE: usize = 12;
+
+#[inline]
+fn edge_parent_limit(edge: &LatticeEdge) -> usize {
+    match &edge.syl {
+        SylMatch::Full(_) => match edge.correction {
+            CorrectionKind::Exact => {
+                if edge.start <= 3 {
+                    16
+                } else {
+                    8
+                }
+            }
+            CorrectionKind::TouchBoundary => 4,
+            _ => 2,
+        },
+        SylMatch::Initial(_, _) => {
+            if edge.correction == CorrectionKind::Exact && edge.start <= 4 {
+                8
+            } else if edge.correction == CorrectionKind::Exact {
+                4
+            } else {
+                2
+            }
+        }
+        SylMatch::Prefix(_) => 3,
+        SylMatch::Latin {
+            is_explicit_upper, ..
+        } => {
+            if *is_explicit_upper {
+                4
+            } else {
+                2
+            }
+        }
+    }
+}
+
+fn non_prefix_edge_sig(edges: &[LatticeEdge]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    for e in edges {
+        if matches!(e.syl, SylMatch::Prefix(_)) {
+            continue;
+        }
+        // Ignore weak lowercase English background candidates (`kind_cost < -1.0`) in cache invalidation
+        // so completing a subsequent Chinese syllable (`covered_by_exact_full`) never rewinds earlier Chinese layers.
+        if let SylMatch::Latin {
+            is_explicit_upper: false,
+            ..
+        } = e.syl
+        {
+            if e.kind_cost < -1.0 {
+                continue;
+            }
+        }
+        mix(e.start as u64);
+        mix(e.spatial_logp.to_bits() as u64);
+        mix(e.kind_cost.to_bits() as u64);
+        mix(e.correction as u8 as u64);
+        match &e.syl {
+            SylMatch::Full(sid) => {
+                mix(1);
+                mix(*sid as u64);
+            }
+            SylMatch::Initial(id, dg) => {
+                mix(2);
+                mix((*id as u64) | (u64::from(*dg) << 16));
+            }
+            SylMatch::Latin {
+                display,
+                weight,
+                is_oov,
+                is_explicit_upper,
+            } => {
+                mix(3);
+                mix((*weight as u64) | (u64::from(*is_oov) << 16) | (u64::from(*is_explicit_upper) << 17));
+                for &b in display.as_bytes() {
+                    mix(b as u64);
+                }
+            }
+            SylMatch::Prefix(_) => {}
+        }
+    }
+    h
+}
+
+#[inline]
+fn obs_same(a: &KeyObs, b: &KeyObs) -> bool {
+    a.ch == b.ch
+        && a.is_upper == b.is_upper
+        && a.has_touch == b.has_touch
+        && a.norm_x.to_bits() == b.norm_x.to_bits()
+        && a.norm_y.to_bits() == b.norm_y.to_bits()
+}
+
+/// Materialize any `PathState::PendingChar` items in `paths[..limit]` using a single batched
+/// `step_tokens_batch` pass over the 9.8 MB RWKV-7 weights.
+fn materialize_paths_batch(
+    paths: &mut [PinyinPath],
+    nv: Option<&NeuralView<'_>>,
+    limit: usize,
+) {
+    let cap = limit.min(paths.len());
+    let Some(model) = nv else {
+        for p in &mut paths[..cap] {
+            if let PathState::PendingChar { ref parent, .. } = p.path_state {
+                p.path_state = PathState::Ready(Rc::clone(parent));
+            }
+        }
+        return;
+    };
+
+    let mut indices: Vec<usize> = Vec::new();
+    let mut toks: Vec<usize> = Vec::new();
+    let mut states: Vec<RwkvState> = Vec::new();
+    for (idx, p) in paths[..cap].iter().enumerate() {
+        if let PathState::PendingChar { ref parent, tok } = p.path_state {
+            indices.push(idx);
+            toks.push(tok);
+            states.push((**parent).clone());
+        }
+    }
+    if indices.is_empty() {
+        return;
+    }
+
+    {
+        let mut batch: Vec<(usize, &mut RwkvState, bool, bool)> = indices
+            .iter()
+            .zip(toks.iter())
+            .zip(states.iter_mut())
+            .map(|((&path_idx, &tok), st)| (tok, st, path_idx < 2, false))
+            .collect();
+        model.step_tokens_batch(&mut batch);
+    }
+
+    for (path_idx, st) in indices.into_iter().zip(states.into_iter()) {
+        paths[path_idx].path_state = PathState::Ready(Rc::new(st));
+    }
+}
+
+/// Materialize `PendingChar` paths across multiple parent layers in a SINGLE batched `step_tokens_batch` sweep.
+fn materialize_multi_layers_batch(
+    layers: &mut [Vec<PinyinPath>],
+    reqs: &[(usize, usize)],
+    nv: Option<&NeuralView<'_>>,
+) {
+    if reqs.is_empty() {
+        return;
+    }
+    let Some(model) = nv else {
+        for &(pos, limit) in reqs {
+            if let Some(paths) = layers.get_mut(pos) {
+                let cap = limit.min(paths.len());
+                for p in &mut paths[..cap] {
+                    if let PathState::PendingChar { ref parent, .. } = p.path_state {
+                        p.path_state = PathState::Ready(Rc::clone(parent));
+                    }
+                }
+            }
+        }
+        return;
+    };
+
+    let mut coords: Vec<(usize, usize)> = Vec::new();
+    let mut toks: Vec<usize> = Vec::new();
+    let mut states: Vec<RwkvState> = Vec::new();
+    for &(pos, limit) in reqs {
+        let Some(paths) = layers.get(pos) else {
+            continue;
+        };
+        let cap = limit.min(paths.len());
+        for (idx, p) in paths[..cap].iter().enumerate() {
+            if let PathState::PendingChar { ref parent, tok } = p.path_state {
+                coords.push((pos, idx));
+                toks.push(tok);
+                states.push((**parent).clone());
+            }
+        }
+    }
+    if coords.is_empty() {
+        return;
+    }
+    {
+        let mut batch: Vec<(usize, &mut RwkvState, bool, bool)> = coords
+            .iter()
+            .zip(toks.iter())
+            .zip(states.iter_mut())
+            .map(|((&(_, path_idx), &tok), st)| (tok, st, path_idx < 2, false))
+            .collect();
+        model.step_tokens_batch(&mut batch);
+    }
+    for ((pos, idx), st) in coords.into_iter().zip(states.into_iter()) {
+        layers[pos][idx].path_state = PathState::Ready(Rc::new(st));
+    }
+}
 
 #[derive(Default)]
 pub struct PinyinStream {
     layers: Vec<Vec<PinyinPath>>,
+    layer_sigs: Vec<u64>,
+    prev_obs: Vec<KeyObs>,
+    prev_t9_locked: Vec<(usize, String)>,
+    prev_is_t9: bool,
+    prev_ctx: Vec<char>,
+    prev_init_sig: u32,
 }
 
 impl PinyinStream {
     pub fn clear(&mut self) {
         self.layers.clear();
+        self.layer_sigs.clear();
+        self.prev_obs.clear();
+        self.prev_t9_locked.clear();
+    }
+
+    fn run_incremental(
+        &mut self,
+        observations: &[KeyObs],
+        raw_code: &str,
+        t9_locked_syls: &[(usize, String)],
+        is_t9: bool,
+        decoder: &PinyinDecoder<'_>,
+        initial_state: &RwkvState,
+    ) -> (Vec<PinyinCandidate>, Vec<PinyinPath>) {
+        let n = observations.len();
+        if n == 0 {
+            self.clear();
+            return (Vec::new(), Vec::new());
+        }
+
+        let init_sig = initial_state.p1_scale.to_bits()
+            ^ initial_state
+                .p1_q
+                .first()
+                .map_or(0, |&b| (b as u8 as u32) << 16);
+
+        if self.prev_is_t9 != is_t9
+            || self.prev_t9_locked != t9_locked_syls
+            || self.prev_ctx.as_slice() != decoder.context
+            || self.prev_init_sig != init_sig
+        {
+            self.layers.clear();
+            self.layer_sigs.clear();
+            self.prev_obs.clear();
+        }
+
+        let lattice = if is_t9 {
+            build_t9_lattice(observations, t9_locked_syls, decoder)
+        } else {
+            build_lattice(observations, raw_code, decoder)
+        };
+
+        let mut target_sigs = Vec::with_capacity(n + 1);
+        target_sigs.push(0u64);
+        for end in 1..=n {
+            target_sigs.push(non_prefix_edge_sig(&lattice[end]));
+        }
+
+        let common_obs = self
+            .prev_obs
+            .iter()
+            .zip(observations.iter())
+            .take_while(|(a, b)| obs_same(a, b))
+            .count();
+
+        // Keep every cached non-Prefix layer `1..=max_valid` whose lattice edges are 100% identical!
+        // Because `SylMatch::Prefix` is evaluated as an ephemeral terminal overlay (never stored in `self.layers`),
+        // forward typing never invalidates `n - 1` after a partial syllable, and Backspace reuses `layers[0..=n]` directly!
+        let mut keep_layers = if self.layers.is_empty() {
+            0
+        } else {
+            let max_valid = common_obs.min(n).min(self.layers.len() - 1);
+            let mut matched = 0usize;
+            for pos in 1..=max_valid {
+                if self.layer_sigs.get(pos).copied() == Some(target_sigs[pos]) {
+                    matched = pos;
+                } else {
+                    break;
+                }
+            }
+            matched + 1
+        };
+
+        // Check if any newly computed layer `keep_layers..=n` (or terminal `Prefix` overlay at `n`)
+        // references a parent layer whose required states were evicted on ultra-long (>22 key) hold-backspace.
+        if decoder.model.is_some() && keep_layers > 1 {
+            let mut min_evicted_parent: Option<usize> = None;
+            for end in keep_layers..=n {
+                for e in &lattice[end] {
+                    if matches!(e.syl, SylMatch::Prefix(_)) {
+                        continue;
+                    }
+                    let req = edge_parent_limit(e);
+                    if e.start < keep_layers {
+                        let cap = req.min(self.layers[e.start].len());
+                        if self.layers[e.start][..cap].iter().any(PinyinPath::is_evicted) {
+                            min_evicted_parent =
+                                Some(min_evicted_parent.map_or(e.start, |m| m.min(e.start)));
+                        }
+                    }
+                }
+            }
+            for e in &lattice[n] {
+                if matches!(e.syl, SylMatch::Prefix(_)) && e.start < keep_layers {
+                    let cap = 2usize.min(self.layers[e.start].len());
+                    if self.layers[e.start][..cap].iter().any(PinyinPath::is_evicted) {
+                        min_evicted_parent =
+                            Some(min_evicted_parent.map_or(e.start, |m| m.min(e.start)));
+                    }
+                }
+            }
+            if let Some(bad_pos) = min_evicted_parent {
+                let mut cp = bad_pos.saturating_sub(1);
+                while cp > 0 {
+                    if !self.layers[cp].is_empty()
+                        && !self.layers[cp].iter().any(PinyinPath::is_evicted)
+                    {
+                        break;
+                    }
+                    cp -= 1;
+                }
+                if cp == 0 && bad_pos >= CHECKPOINT_STRIDE {
+                    let aligned = ((bad_pos - 1) / CHECKPOINT_STRIDE) * CHECKPOINT_STRIDE;
+                    if aligned > 0
+                        && aligned < self.layers.len()
+                        && !self.layers[aligned].is_empty()
+                        && !self.layers[aligned][0].is_evicted()
+                    {
+                        self.layers[aligned].retain(|p| !p.is_evicted());
+                        cp = aligned;
+                    }
+                }
+                keep_layers = cp + 1;
+            }
+        }
+
+        self.layers.truncate(keep_layers);
+        self.layer_sigs.truncate(keep_layers);
+
+        if self.layers.is_empty() {
+            self.layers.push(vec![PinyinPath {
+                text: String::new(),
+                score: 0.0,
+                boundaries: Vec::new(),
+                path_state: PathState::Ready(Rc::new(initial_state.clone())),
+                personal_context: PersonalContext::with_chars(decoder.context.iter().copied()),
+                any_corrected: false,
+            }]);
+            self.layer_sigs.push(0);
+        }
+
+        let start_end = self.layers.len().max(1);
+        for end in start_end..=n {
+            let next_paths = extend_pinyin_layer(end, &lattice, &mut self.layers, decoder, false);
+            self.layers.push(next_paths);
+            self.layer_sigs.push(target_sigs[end]);
+        }
+
+        // Bound Dirty RAM cleanly while preserving 22-key full window + 52-key top-2 window + checkpoints
+        if decoder.model.is_some() && n > FULL_STATE_WINDOW {
+            let full_cut = n - FULL_STATE_WINDOW;
+            let mut evict_reqs: Vec<(usize, usize)> = Vec::new();
+            for k in 1..full_cut {
+                if self.layers[k].is_empty() {
+                    continue;
+                }
+                let keep_n = if k % CHECKPOINT_STRIDE == 0 {
+                    4usize.min(self.layers[k].len())
+                } else if k + TOP2_STATE_WINDOW >= n {
+                    2usize.min(self.layers[k].len())
+                } else {
+                    0usize
+                };
+                if keep_n > 0 {
+                    evict_reqs.push((k, keep_n));
+                }
+            }
+            materialize_multi_layers_batch(&mut self.layers, &evict_reqs, decoder.model.as_ref());
+            for k in 1..full_cut {
+                if self.layers[k].is_empty() {
+                    continue;
+                }
+                let keep_n = if k % CHECKPOINT_STRIDE == 0 {
+                    4usize.min(self.layers[k].len())
+                } else if k + TOP2_STATE_WINDOW >= n {
+                    2usize.min(self.layers[k].len())
+                } else {
+                    0usize
+                };
+                for p in &mut self.layers[k][keep_n..] {
+                    p.path_state = PathState::Evicted;
+                }
+            }
+        }
+
+        self.prev_obs.clear();
+        self.prev_obs.extend_from_slice(observations);
+        self.prev_t9_locked = t9_locked_syls.to_vec();
+        self.prev_is_t9 = is_t9;
+        self.prev_ctx.clear();
+        self.prev_ctx.extend_from_slice(decoder.context);
+        self.prev_init_sig = init_sig;
+
+        // Ephemeral terminal overlay if `lattice[n]` has trailing `SylMatch::Prefix` edges:
+        // temporarily swap `self.layers[n]` to build candidates & Top-1 prior, then restore clean `self.layers[n]`!
+        let has_terminal_prefix = lattice[n]
+            .iter()
+            .any(|e| matches!(e.syl, SylMatch::Prefix(_)));
+        if has_terminal_prefix {
+            let mut terminal_n =
+                extend_pinyin_layer(n, &lattice, &mut self.layers[..n], decoder, true);
+            materialize_paths_batch(&mut terminal_n, decoder.model.as_ref(), 1);
+            let saved_n = std::mem::replace(&mut self.layers[n], terminal_n);
+            if saved_n.is_empty() {
+                if let Some(best_end) = (1..=n).rev().find(|&pos| !self.layers[pos].is_empty()) {
+                    materialize_paths_batch(&mut self.layers[best_end], decoder.model.as_ref(), 1);
+                }
+            }
+            let res = build_pinyin_candidates(n, raw_code, &lattice, &self.layers, decoder);
+            self.layers[n] = saved_n;
+            return res;
+        }
+
+        if let Some(best_end) = (1..=n).rev().find(|&pos| !self.layers[pos].is_empty()) {
+            materialize_paths_batch(&mut self.layers[best_end], decoder.model.as_ref(), 1);
+        }
+
+        build_pinyin_candidates(n, raw_code, &lattice, &self.layers, decoder)
     }
 
     pub fn update_and_decode(
@@ -1342,61 +1793,10 @@ impl PinyinStream {
         decoder: &PinyinDecoder<'_>,
         initial_state: &RwkvState,
     ) -> (Vec<PinyinCandidate>, Vec<PinyinPath>) {
-        let n = observations.len();
-        if n == 0 {
-            self.layers.clear();
-            return (Vec::new(), Vec::new());
-        }
-        // Keep cached layers up to n - 1 (layer n-1 may have had Prefix edges, so recompute from n-1 or n)
-        while self.layers.len() > n {
-            self.layers.pop();
-        }
-        // If user backspaced past the retained state window, rebuild cleanly from layer 0
-        if decoder.model.is_some() && self.layers.len() > 1 {
-            let check_start = self.layers.len().saturating_sub(STREAM_STATE_WINDOW).max(1);
-            let missing_state = self.layers[check_start..]
-                .iter()
-                .any(|layer| layer.iter().any(|p| p.state.mat_state.is_empty()));
-            if missing_state {
-                self.layers.clear();
-            }
-        }
-        if self.layers.is_empty() {
-            self.layers.push(vec![PinyinPath {
-                text: String::new(),
-                score: 0.0,
-                boundaries: Vec::new(),
-                state: initial_state.clone(),
-                personal_context: PersonalContext::with_chars(decoder.context.iter().copied()),
-                any_corrected: false,
-            }]);
-        }
-        let lattice = build_lattice(observations, raw_code, decoder);
-        // Recompute only the newly added layer(s) (and the last layer if it was previously at the end)
-        let start_end = self.layers.len().max(1);
-        for end in start_end..=n {
-            let next_paths = extend_pinyin_layer(end, &lattice, &self.layers, decoder);
-            if end < self.layers.len() {
-                self.layers[end] = next_paths;
-            } else {
-                self.layers.push(next_paths);
-            }
-            // Evict heavy RWKV recurrent tensors from layers older than the active phrase window
-            if self.layers.len() > STREAM_STATE_WINDOW + 1 {
-                let evict_idx = self.layers.len() - STREAM_STATE_WINDOW - 1;
-                if evict_idx > 0 {
-                    for p in &mut self.layers[evict_idx] {
-                        if !p.state.mat_state.is_empty() {
-                            p.state = RwkvState::default();
-                        }
-                    }
-                }
-            }
-        }
-        build_pinyin_candidates(n, raw_code, &lattice, &self.layers, decoder)
+        self.run_incremental(observations, raw_code, &[], false, decoder, initial_state)
     }
 
-    /// T9 9-key Pinyin decode entry point with optional locked prefix syllables.
+    /// T9 9-key Pinyin decode entry point reusing incremental layer caching & locked prefix syllables.
     pub fn update_and_decode_t9(
         &mut self,
         observations: &[KeyObs],
@@ -1405,35 +1805,14 @@ impl PinyinStream {
         decoder: &PinyinDecoder<'_>,
         initial_state: &RwkvState,
     ) -> (Vec<PinyinCandidate>, Vec<PinyinPath>) {
-        let n = observations.len();
-        self.layers.clear();
-        if n == 0 {
-            return (Vec::new(), Vec::new());
-        }
-        self.layers.push(vec![PinyinPath {
-            text: String::new(),
-            score: 0.0,
-            boundaries: Vec::new(),
-            state: initial_state.clone(),
-            personal_context: PersonalContext::with_chars(decoder.context.iter().copied()),
-            any_corrected: false,
-        }]);
-        let lattice = build_t9_lattice(observations, t9_locked_syls, decoder);
-        for end in 1..=n {
-            let next_paths = extend_pinyin_layer(end, &lattice, &self.layers, decoder);
-            self.layers.push(next_paths);
-            if self.layers.len() > STREAM_STATE_WINDOW + 1 {
-                let evict_idx = self.layers.len() - STREAM_STATE_WINDOW - 1;
-                if evict_idx > 0 {
-                    for p in &mut self.layers[evict_idx] {
-                        if !p.state.mat_state.is_empty() {
-                            p.state = RwkvState::default();
-                        }
-                    }
-                }
-            }
-        }
-        build_pinyin_candidates(n, raw_code, &lattice, &self.layers, decoder)
+        self.run_incremental(
+            observations,
+            raw_code,
+            t9_locked_syls,
+            true,
+            decoder,
+            initial_state,
+        )
     }
 }
 
@@ -1486,12 +1865,68 @@ fn score_char_pure_neural(
 fn extend_pinyin_layer(
     end: usize,
     lattice: &[Vec<LatticeEdge>],
-    layers: &[Vec<PinyinPath>],
+    layers: &mut [Vec<PinyinPath>],
     decoder: &PinyinDecoder<'_>,
+    include_prefix_edges: bool,
 ) -> Vec<PinyinPath> {
     if lattice[end].is_empty() {
         return Vec::new();
     }
+    if !include_prefix_edges
+        && lattice[end]
+            .iter()
+            .all(|e| matches!(e.syl, SylMatch::Prefix(_)))
+    {
+        return Vec::new();
+    }
+
+    // Coalesce all required parent & grandparent state materializations into ONE single `step_tokens_batch` sweep!
+    {
+        let mut req_map: Vec<(usize, usize)> = Vec::with_capacity(10);
+        let mut add_req = |pos: usize, limit: usize| {
+            if pos >= layers.len() {
+                return;
+            }
+            if let Some(existing) = req_map.iter_mut().find(|x| x.0 == pos) {
+                if limit > existing.1 {
+                    existing.1 = limit;
+                }
+            } else {
+                req_map.push((pos, limit));
+            }
+        };
+        for edge in &lattice[end] {
+            if !include_prefix_edges && matches!(edge.syl, SylMatch::Prefix(_)) {
+                continue;
+            }
+            add_req(edge.start, edge_parent_limit(edge));
+        }
+        if decoder.model.is_some() {
+            for e2 in lattice[end]
+                .iter()
+                .filter(|e| {
+                    (include_prefix_edges || !matches!(e.syl, SylMatch::Prefix(_)))
+                        && !matches!(e.syl, SylMatch::Latin { .. })
+                        && e.start > 0
+                })
+                .take(2)
+            {
+                for e1 in lattice[e2.start]
+                    .iter()
+                    .filter(|e| {
+                        e.correction == CorrectionKind::Exact
+                            && !matches!(e.syl, SylMatch::Latin { .. } | SylMatch::Prefix(_))
+                    })
+                    .take(2)
+                {
+                    add_req(e1.start, 2);
+                }
+            }
+        }
+        materialize_multi_layers_batch(layers, &req_map, decoder.model.as_ref());
+    }
+
+    let layers: &[Vec<PinyinPath>] = &*layers;
     let personal = &decoder.user.continuations;
     let personalize = decoder.config.dynamic_word_freq && !personal.is_empty();
     let use_personal_states = personalize
@@ -1502,6 +1937,7 @@ fn extend_pinyin_layer(
 
     struct Step<'a> {
         parent: &'a PinyinPath,
+        parent_rc: &'a Rc<RwkvState>,
         text: String,
         ch: char,
         is_latin: bool,
@@ -1516,10 +1952,15 @@ fn extend_pinyin_layer(
     // Pure character-level single-syllable expansion:
     // ZERO multi-syllable phrase chains, ZERO dictionary phrase lookup, ZERO phrase/user-phrase bonuses.
     for edge in &lattice[end] {
+        if !include_prefix_edges && matches!(edge.syl, SylMatch::Prefix(_)) {
+            continue;
+        }
+        let parent_cap = edge_parent_limit(edge);
         let parents = &layers[edge.start];
         if parents.is_empty() {
             continue;
         }
+        let parents_slice = &parents[..parent_cap.min(parents.len())];
         let syl_score = 1.8 * edge.spatial_logp + edge.kind_cost;
 
         match &edge.syl {
@@ -1543,14 +1984,18 @@ fn extend_pinyin_layer(
                 if decoder.config.dynamic_word_freq {
                     shared_bias += 1.0 * decoder.user.unigram_boost(display);
                 }
-                for parent in parents {
+                for parent in parents_slice {
+                    let Some(parent_rc) = parent.ready_rc() else {
+                        continue;
+                    };
                     let neural_est = if let Some(nv) = &decoder.model {
-                        nv.estimate_latin_logp(&parent.state, display)
+                        nv.estimate_latin_logp(parent_rc.as_ref(), display)
                     } else {
                         0.0
                     };
                     steps.push(Step {
                         parent,
+                        parent_rc,
                         text: display.clone(),
                         ch: first,
                         is_latin: true,
@@ -1571,7 +2016,11 @@ fn extend_pinyin_layer(
                 let scan_limit = chars.len().min(96);
                 let per_parent_keep = if edge.correction == CorrectionKind::Exact { 16 } else { 5 };
 
-                for parent in parents {
+                for parent in parents_slice {
+                    let Some(parent_rc) = parent.ready_rc() else {
+                        continue;
+                    };
+                    let parent_st = parent_rc.as_ref();
                     let mut top: Vec<(char, f32)> = Vec::with_capacity(per_parent_keep + 1);
                     let mut floor = f32::NEG_INFINITY;
                     for e in &chars[..scan_limit] {
@@ -1581,7 +2030,7 @@ fn extend_pinyin_layer(
                         let lp = if let Some(nv) = &decoder.model {
                             score_char_pure_neural(
                                 nv,
-                                &parent.state,
+                                parent_st,
                                 ch,
                                 e.weight,
                                 decoder.dict,
@@ -1615,6 +2064,7 @@ fn extend_pinyin_layer(
                     for (ch, lp) in top {
                         steps.push(Step {
                             parent,
+                            parent_rc,
                             text: ch.to_string(),
                             ch,
                             is_latin: false,
@@ -1649,14 +2099,18 @@ fn extend_pinyin_layer(
                     }
                 }
                 let per_parent_keep = 8usize;
-                for parent in parents {
+                for parent in parents_slice {
+                    let Some(parent_rc) = parent.ready_rc() else {
+                        continue;
+                    };
+                    let parent_st = parent_rc.as_ref();
                     let mut top: Vec<(char, f32)> = Vec::with_capacity(per_parent_keep + 1);
                     let mut floor = f32::NEG_INFINITY;
                     for &(ch, w) in &cand_chars {
                         let lp = if let Some(nv) = &decoder.model {
                             score_char_pure_neural(
                                 nv,
-                                &parent.state,
+                                parent_st,
                                 ch,
                                 w,
                                 decoder.dict,
@@ -1685,6 +2139,7 @@ fn extend_pinyin_layer(
                     for (ch, lp) in top {
                         steps.push(Step {
                             parent,
+                            parent_rc,
                             text: ch.to_string(),
                             ch,
                             is_latin: false,
@@ -1715,14 +2170,18 @@ fn extend_pinyin_layer(
                     }
                 }
                 let per_parent_keep = 6usize;
-                for parent in parents {
+                for parent in parents_slice {
+                    let Some(parent_rc) = parent.ready_rc() else {
+                        continue;
+                    };
+                    let parent_st = parent_rc.as_ref();
                     let mut top: Vec<(char, f32)> = Vec::with_capacity(per_parent_keep + 1);
                     let mut floor = f32::NEG_INFINITY;
                     for &(ch, w) in &cand_chars {
                         let lp = if let Some(nv) = &decoder.model {
                             score_char_pure_neural(
                                 nv,
-                                &parent.state,
+                                parent_st,
                                 ch,
                                 w,
                                 decoder.dict,
@@ -1751,6 +2210,7 @@ fn extend_pinyin_layer(
                     for (ch, lp) in top {
                         steps.push(Step {
                             parent,
+                            parent_rc,
                             text: ch.to_string(),
                             ch,
                             is_latin: false,
@@ -1767,8 +2227,8 @@ fn extend_pinyin_layer(
 
     steps.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
 
-    // Deduplicate by full resulting string BEFORE stepping RWKV so we execute at most `BEAM_WIDTH`
-    // single-token RWKV transitions per layer (skipping unused `mtp_h` and `key1_logp` heads!).
+    // Deduplicate by full resulting string and record lazy `PathState::PendingChar` transitions
+    // (0 RWKV steps and 0 `280 KB` clones until a subsequent syllable actually branches from `end`!).
     let mut next_paths: Vec<PinyinPath> = Vec::with_capacity(BEAM_WIDTH);
     let mut seen_texts: HashSet<String> = HashSet::with_capacity(BEAM_WIDTH * 2);
 
@@ -1785,27 +2245,28 @@ fn extend_pinyin_layer(
 
         let mut score = step.score;
         let mut personal_context = step.parent.personal_context;
-        let state = if let Some(nv) = &decoder.model {
+        let path_state = if let Some(nv) = &decoder.model {
             if step.is_latin {
-                // Re-score Latin accurately while stepping through RWKV
-                let est = nv.estimate_latin_logp(&step.parent.state, &step.text);
-                let (lp, st) = nv.score_and_step_latin(&step.parent.state, &step.text, true, false);
+                let est = nv.estimate_latin_logp(step.parent_rc.as_ref(), &step.text);
+                let (lp, st) =
+                    nv.score_and_step_latin(step.parent_rc.as_ref(), &step.text, true, false);
                 score = score - est + lp;
                 for ch in step.text.chars() {
                     personal_context = personal_context.push(ch);
                 }
-                st
+                PathState::Ready(Rc::new(st))
             } else {
-                let mut st = step.parent.state.clone();
-                nv.step_token_heads(nv.char_to_token(step.ch), &mut st, true, false);
                 personal_context = personal_context.push(step.ch);
-                st
+                PathState::PendingChar {
+                    parent: Rc::clone(step.parent_rc),
+                    tok: nv.char_to_token(step.ch),
+                }
             }
         } else {
             for ch in step.text.chars() {
                 personal_context = personal_context.push(ch);
             }
-            step.parent.state.clone()
+            PathState::Ready(Rc::clone(step.parent_rc))
         };
 
         let mut boundaries = step.parent.boundaries.clone();
@@ -1819,16 +2280,13 @@ fn extend_pinyin_layer(
             text: full_text,
             score,
             boundaries,
-            state,
+            path_state,
             personal_context,
             any_corrected: step.parent.any_corrected || step.correction != CorrectionKind::Exact,
         });
     }
 
     // Pure-Neural MTP-2 2-Syllable Lookahead Rescue (zero phrase dictionary!):
-    // Undoes single-char Garden-Path beam pruning for low-frequency first chars (`蒸馏`, `异步`, `技术`,
-    // `输入(srf)`, `人工(rgzn)`, `数据(sjk)`, `计算(jsj)`) by scoring wider `(c1, c2)` pairs from the
-    // grandparent's cached `mtp_h` vector (~0.05 ms), then exact-unrolling only top-4 rescued pairs.
     if let Some(nv) = &decoder.model {
         let beam_floor = if next_paths.len() >= BEAM_WIDTH {
             next_paths.last().map_or(f32::NEG_INFINITY, |p| p.score)
@@ -1849,8 +2307,6 @@ fn extend_pinyin_layer(
                     let sids = decoder.dict.syllables_with_prefix(&edge.display_syl);
                     let mut out = Vec::with_capacity(160);
                     let mut seen_c = HashSet::with_capacity(160);
-                    // Cover ALL syllables under this initial fairly (never truncate alphabetically,
-                    // which would cut off `shu`, `suan`, `gong`, `zhong`!).
                     for sid in sids {
                         let (sid_init, sid_dg) = decoder.dict.syllable_init(sid);
                         if sid_init == *init_id && (!*is_digraph || sid_dg) {
@@ -1901,6 +2357,7 @@ fn extend_pinyin_layer(
 
         struct RescueCand<'a> {
             gp: &'a PinyinPath,
+            gp_rc: &'a Rc<RwkvState>,
             e1: &'a LatticeEdge,
             e2: &'a LatticeEdge,
             c1: char,
@@ -1914,7 +2371,11 @@ fn extend_pinyin_layer(
 
         for e2 in lattice[end]
             .iter()
-            .filter(|e| !matches!(e.syl, SylMatch::Latin { .. }) && e.start > 0)
+            .filter(|e| {
+                (include_prefix_edges || !matches!(e.syl, SylMatch::Prefix(_)))
+                    && !matches!(e.syl, SylMatch::Latin { .. })
+                    && e.start > 0
+            })
             .take(2)
         {
             let e2_is_init = matches!(e2.syl, SylMatch::Initial(_, _));
@@ -1927,7 +2388,8 @@ fn extend_pinyin_layer(
             for e1 in lattice[e2.start]
                 .iter()
                 .filter(|e| {
-                    e.correction == CorrectionKind::Exact && !matches!(e.syl, SylMatch::Latin { .. })
+                    e.correction == CorrectionKind::Exact
+                        && !matches!(e.syl, SylMatch::Latin { .. } | SylMatch::Prefix(_))
                 })
                 .take(2)
             {
@@ -1944,16 +2406,19 @@ fn extend_pinyin_layer(
                 let c1_keep = if e1_is_init { 40 } else { 28 };
 
                 for gp in gps.iter().take(2) {
-                    if gp.state.mat_state.is_empty() {
+                    let Some(gp_rc) = gp.ready_rc() else {
+                        continue;
+                    };
+                    let gp_st = gp_rc.as_ref();
+                    if gp_st.mat_state.is_empty() {
                         continue;
                     }
-                    // Pick top `c1_keep` chars for `e1` under `gp.state`
                     let mut top_c1: Vec<(char, u32, f32)> = Vec::with_capacity(c1_keep + 1);
                     let mut c1_floor = f32::NEG_INFINITY;
                     for &(ch1, w1) in &c1_raw {
                         let lp1 = score_char_pure_neural(
                             nv,
-                            &gp.state,
+                            gp_st,
                             ch1,
                             w1,
                             decoder.dict,
@@ -1977,9 +2442,8 @@ fn extend_pinyin_layer(
                         }
                     }
 
-                    // Score `(c1, c2)` jointly using cached `gp.state.mtp_h`
                     for &(c1, w1, lp1) in &top_c1 {
-                        let p2_sc = nv.prepare_mtp2_vec(&gp.state, c1, &mut p2_q);
+                        let p2_sc = nv.prepare_mtp2_vec(gp_st, c1, &mut p2_q);
                         let ctx_after_c1 = gp.personal_context.push(c1);
                         for &(c2, w2) in &c2_raw {
                             let raw_lp2 = if nv.char_to_token(c2) == TOK_UNK {
@@ -2011,6 +2475,7 @@ fn extend_pinyin_layer(
                                         pos,
                                         RescueCand {
                                             gp,
+                                            gp_rc,
                                             e1,
                                             e2,
                                             c1,
@@ -2031,70 +2496,87 @@ fn extend_pinyin_layer(
             }
         }
 
-        // Exact 2-step RWKV unroll for up to 4 rescued `(c1, c2)` pairs (zero approximation bias!)
+        // Batch `c1` RWKV transitions across all rescued `(c1, c2)` pairs in a SINGLE weight pass,
+        // and leave `c2` lazy (`PendingChar`) until a future syllable actually branches from `end`!
+        let mut active_rescues: Vec<(RescueCand<'_>, String)> = Vec::with_capacity(4);
         for r in rescues {
             let mut full_text = String::with_capacity(r.gp.text.len() + 8);
             full_text.push_str(&r.gp.text);
             full_text.push(r.c1);
             full_text.push(r.c2);
-            if !seen_texts.insert(full_text.clone()) {
-                continue;
+            if seen_texts.insert(full_text.clone()) {
+                active_rescues.push((r, full_text));
             }
-            let syl_score1 = 1.8 * r.e1.spatial_logp + r.e1.kind_cost;
-            let syl_score2 = 1.8 * r.e2.spatial_logp + r.e2.kind_cost;
-            let lp1 = score_char_pure_neural(
-                nv,
-                &r.gp.state,
-                r.c1,
-                r.w1,
-                decoder.dict,
-                personal,
-                r.gp.personal_context,
-                personalize,
-                use_personal_states,
-            );
-            let mut st = r.gp.state.clone();
-            nv.step_token_heads(nv.char_to_token(r.c1), &mut st, false, false);
-            let pctx1 = r.gp.personal_context.push(r.c1);
-            let lp2 = score_char_pure_neural(
-                nv,
-                &st,
-                r.c2,
-                r.w2,
-                decoder.dict,
-                personal,
-                pctx1,
-                personalize,
-                use_personal_states,
-            );
-            nv.step_token_heads(nv.char_to_token(r.c2), &mut st, true, false);
-            let pctx2 = pctx1.push(r.c2);
-
-            let exact_score = r.gp.score + syl_score1 + syl_score2 + lp1 + lp2;
-            let mut boundaries = r.gp.boundaries.clone();
-            let mid_bytes = r.gp.text.len() + r.c1.len_utf8();
-            boundaries.push(PinyinBoundary {
-                keys: r.e1.end,
-                text_bytes: mid_bytes,
-                syl_display: r.e1.display_syl.clone(),
-                correction: r.e1.correction,
-            });
-            boundaries.push(PinyinBoundary {
-                keys: r.e2.end,
-                text_bytes: full_text.len(),
-                syl_display: r.e2.display_syl.clone(),
-                correction: r.e2.correction,
-            });
-            next_paths.push(PinyinPath {
-                text: full_text,
-                score: exact_score,
-                boundaries,
-                state: st,
-                personal_context: pctx2,
-                any_corrected: r.gp.any_corrected
-                    || r.e1.correction != CorrectionKind::Exact
-                    || r.e2.correction != CorrectionKind::Exact,
-            });
+        }
+        if !active_rescues.is_empty() {
+            let mut c1_states: Vec<RwkvState> = active_rescues
+                .iter()
+                .map(|(r, _)| (**r.gp_rc).clone())
+                .collect();
+            {
+                let mut batch: Vec<(usize, &mut RwkvState, bool, bool)> = active_rescues
+                    .iter()
+                    .zip(c1_states.iter_mut())
+                    .map(|((r, _), st)| (nv.char_to_token(r.c1), st, false, false))
+                    .collect();
+                nv.step_tokens_batch(&mut batch);
+            }
+            for ((r, full_text), st_after_c1) in active_rescues.into_iter().zip(c1_states.into_iter()) {
+                let syl_score1 = 1.8 * r.e1.spatial_logp + r.e1.kind_cost;
+                let syl_score2 = 1.8 * r.e2.spatial_logp + r.e2.kind_cost;
+                let lp1 = score_char_pure_neural(
+                    nv,
+                    r.gp_rc.as_ref(),
+                    r.c1,
+                    r.w1,
+                    decoder.dict,
+                    personal,
+                    r.gp.personal_context,
+                    personalize,
+                    use_personal_states,
+                );
+                let pctx1 = r.gp.personal_context.push(r.c1);
+                let lp2 = score_char_pure_neural(
+                    nv,
+                    &st_after_c1,
+                    r.c2,
+                    r.w2,
+                    decoder.dict,
+                    personal,
+                    pctx1,
+                    personalize,
+                    use_personal_states,
+                );
+                let pctx2 = pctx1.push(r.c2);
+                let exact_score = r.gp.score + syl_score1 + syl_score2 + lp1 + lp2;
+                let mut boundaries = r.gp.boundaries.clone();
+                let mid_bytes = r.gp.text.len() + r.c1.len_utf8();
+                boundaries.push(PinyinBoundary {
+                    keys: r.e1.end,
+                    text_bytes: mid_bytes,
+                    syl_display: r.e1.display_syl.clone(),
+                    correction: r.e1.correction,
+                });
+                boundaries.push(PinyinBoundary {
+                    keys: r.e2.end,
+                    text_bytes: full_text.len(),
+                    syl_display: r.e2.display_syl.clone(),
+                    correction: r.e2.correction,
+                });
+                next_paths.push(PinyinPath {
+                    text: full_text,
+                    score: exact_score,
+                    boundaries,
+                    path_state: PathState::PendingChar {
+                        parent: Rc::new(st_after_c1),
+                        tok: nv.char_to_token(r.c2),
+                    },
+                    personal_context: pctx2,
+                    any_corrected: r.gp.any_corrected
+                        || r.e1.correction != CorrectionKind::Exact
+                        || r.e2.correction != CorrectionKind::Exact,
+                });
+            }
         }
     }
 
@@ -2238,7 +2720,7 @@ fn build_pinyin_candidates(
 
     // Tier 3: Single-char candidates at position 0 ranked purely by RWKV + PersonalContinuations
     let init_path = layers[0].first();
-    let init_state = init_path.map(|p| &p.state);
+    let init_state = init_path.and_then(PinyinPath::ready_state);
     let init_pctx = init_path.map_or_else(PersonalContext::default, |p| p.personal_context);
     let personal = &decoder.user.continuations;
     let personalize = decoder.config.dynamic_word_freq && !personal.is_empty();
@@ -2533,7 +3015,7 @@ pub fn t9_syllable_options(
         return Vec::new();
     }
 
-    let t9_map = build_t9_syllable_map(dict);
+    let t9_map = dict.t9_map();
 
     // Collect top-beam preferred syllable at `start` to surface it first
     let mut beam_preferred: Vec<String> = Vec::new();
@@ -2572,8 +3054,9 @@ pub fn t9_syllable_options(
             .iter()
             .map(|o| o.ch as char)
             .collect();
-        if let Some(syls) = t9_map.get(&digits) {
-            for &(sid, syl_str) in syls {
+        if let Some(sids) = t9_map.get(&digits) {
+            for &sid in sids {
+                let syl_str = dict.syllable_str(sid);
                 if seen.insert(syl_str.to_owned()) {
                     let top_w = dict
                         .lookup_chars(sid, false)
@@ -2609,7 +3092,7 @@ pub fn t9_next_key_priors(
     let unlocked = raw_code.get(locked_keys.min(raw_code.len())..).unwrap_or("");
     let tail = unlocked.rsplit('\'').next().unwrap_or(unlocked);
     let max_tail = tail.len().min(MAX_SYL_LEN);
-    let t9_map = build_t9_syllable_map(dict);
+    let t9_map = dict.t9_map();
 
     let mut can_end_syllable = tail.is_empty();
     for l in 1..=max_tail {

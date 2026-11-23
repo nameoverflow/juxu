@@ -11,6 +11,15 @@ private final class IOSRibbonSlotControl: UIControl {
     private(set) var slotWidth: CGFloat = 0
     private let label = UILabel()
 
+    private struct TitleCacheKey: Equatable {
+        let primary: String
+        let secondary: String
+        let fontSize: CGFloat
+        let isEmphasized: Bool
+        let dark: Bool
+    }
+    private var cachedKey: TitleCacheKey?
+
     private static let idleHitBacking = UIColor(white: 0.5, alpha: 0.01)
 
     override var isHighlighted: Bool {
@@ -40,9 +49,46 @@ private final class IOSRibbonSlotControl: UIControl {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func setRibbonTitle(_ title: NSAttributedString) {
-        label.attributedText = title
-        slotWidth = ceil(title.size().width) + Self.horizontalPadding * 2.0
+    func setSlotContent(
+        primary: String,
+        secondary: String = "",
+        fontSize: CGFloat,
+        isEmphasized: Bool,
+        primaryColor: UIColor,
+        subtleColor: UIColor,
+        dark: Bool
+    ) {
+        let key = TitleCacheKey(
+            primary: primary,
+            secondary: secondary,
+            fontSize: fontSize,
+            isEmphasized: isEmphasized,
+            dark: dark
+        )
+        if cachedKey == key {
+            return
+        }
+        cachedKey = key
+        let attr = NSMutableAttributedString(
+            string: primary,
+            attributes: [
+                .font: UIFont.systemFont(ofSize: fontSize, weight: isEmphasized ? .medium : .regular),
+                .foregroundColor: primaryColor,
+            ]
+        )
+        if !secondary.isEmpty {
+            attr.append(
+                NSAttributedString(
+                    string: " \(secondary)",
+                    attributes: [
+                        .font: UIFont.monospacedSystemFont(ofSize: 11.0, weight: .regular),
+                        .foregroundColor: subtleColor,
+                    ]
+                )
+            )
+        }
+        label.attributedText = attr
+        slotWidth = ceil(attr.size().width) + Self.horizontalPadding * 2.0
     }
 
     override func layoutSubviews() {
@@ -768,14 +814,14 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
                         if i < words.count {
                             ctrl.slotIndex = i
                             ctrl.starterWord = words[i]
-                            let attr = NSAttributedString(
-                                string: words[i],
-                                attributes: [
-                                    .font: UIFont.systemFont(ofSize: idleFontSize, weight: .regular),
-                                    .foregroundColor: secondaryCol,
-                                ]
+                            ctrl.setSlotContent(
+                                primary: words[i],
+                                fontSize: idleFontSize,
+                                isEmphasized: false,
+                                primaryColor: secondaryCol,
+                                subtleColor: subtleCol,
+                                dark: dark
                             )
-                            ctrl.setRibbonTitle(attr)
                             ctrl.isHidden = false
                         } else {
                             ctrl.isHidden = true
@@ -789,28 +835,23 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
                             let item = items[i]
                             ctrl.slotIndex = i
                             ctrl.starterWord = nil
-                            let attr = NSMutableAttributedString(
-                                string: item.text,
-                                attributes: [
-                                    .font: UIFont.systemFont(ofSize: candidateFontSize, weight: i == 0 ? .medium : .regular),
-                                    .foregroundColor: i == 0 ? primaryCol : secondaryCol,
-                                ]
-                            )
+                            let secondary: String
                             if !item.comment.isEmpty && (item.badgeKind == .typoCorrected || item.badgeKind == .pinyinLookup || item.badgeKind == .shortcode) {
-                                let cleanHint = item.badgeKind == .typoCorrected
+                                secondary = item.badgeKind == .typoCorrected
                                     ? item.comment.components(separatedBy: " ").first ?? item.comment
                                     : item.comment
-                                attr.append(
-                                    NSAttributedString(
-                                        string: " \(cleanHint)",
-                                        attributes: [
-                                            .font: UIFont.monospacedSystemFont(ofSize: 11.0, weight: .regular),
-                                            .foregroundColor: subtleCol,
-                                        ]
-                                    )
-                                )
+                            } else {
+                                secondary = ""
                             }
-                            ctrl.setRibbonTitle(attr)
+                            ctrl.setSlotContent(
+                                primary: item.text,
+                                secondary: secondary,
+                                fontSize: candidateFontSize,
+                                isEmphasized: i == 0,
+                                primaryColor: i == 0 ? primaryCol : secondaryCol,
+                                subtleColor: subtleCol,
+                                dark: dark
+                            )
                             ctrl.isHidden = false
                         } else {
                             ctrl.isHidden = true

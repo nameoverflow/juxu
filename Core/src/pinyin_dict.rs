@@ -307,6 +307,8 @@ pub struct PinyinDictView {
     char_syl_index: Vec<(u32, u16)>,
     /// Per-character total reading weight across all syllables for Bayesian emission `P(syl | char)`.
     char_total_weights: HashMap<char, f32>,
+    /// Prebuilt T9 digit sequence -> `syl_id` list (built once on dictionary load, zero per-keystroke alloc).
+    t9_index: HashMap<String, Vec<u16>>,
 }
 
 impl PinyinDictView {
@@ -375,6 +377,22 @@ impl PinyinDictView {
         char_syl_index.sort_unstable();
         char_syl_index.dedup();
 
+        let mut t9_index = HashMap::<String, Vec<u16>>::with_capacity(256);
+        for sid in 0..syl_count {
+            let off = syl_table_off + sid * SYL_STRIDE;
+            if off + 8 > b.len() {
+                break;
+            }
+            let slice = &b[off..off + 8];
+            let len = slice.iter().position(|&c| c == 0).unwrap_or(8);
+            if let Ok(s) = std::str::from_utf8(&slice[..len]) {
+                let digits = crate::typo::syllable_to_t9_digits(s);
+                if !digits.is_empty() {
+                    t9_index.entry(digits).or_default().push(sid as u16);
+                }
+            }
+        }
+
         Ok(Self {
             buf,
             syl_count,
@@ -390,7 +408,13 @@ impl PinyinDictView {
             string_pool_off,
             char_syl_index,
             char_total_weights,
+            t9_index,
         })
+    }
+
+    #[inline]
+    pub fn t9_map(&self) -> &HashMap<String, Vec<u16>> {
+        &self.t9_index
     }
 
     #[inline]

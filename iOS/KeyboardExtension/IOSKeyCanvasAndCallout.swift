@@ -31,10 +31,15 @@ final class IOSKeyboardFeedbackController {
         do {
             let eng = try CHHapticEngine()
             eng.playsHapticsOnly = true
-            eng.isAutoShutdownEnabled = false
-            eng.stoppedHandler = { [weak self] _ in
+            // Allow CoreHaptics to power-gate the Taptic hardware channel after ~2s idle while the keyboard
+            // stays visible on screen (eliminating static idle battery drain), auto-waking on `player.start`.
+            eng.isAutoShutdownEnabled = true
+            eng.stoppedHandler = { [weak self] reason in
                 Task { @MainActor in
-                    self?.engineRunning = false
+                    guard let self else { return }
+                    if reason != .idleTimeout {
+                        self.engineRunning = false
+                    }
                 }
             }
             eng.resetHandler = { [weak self] in
@@ -100,11 +105,21 @@ final class IOSKeyboardFeedbackController {
 
     func fireKeyDown() {
         UIDevice.current.playInputClick()
-        if engineRunning, let player = keyTapPlayer {
+        if let player = keyTapPlayer, let eng = engine {
+            if !engineRunning {
+                try? eng.start()
+                engineRunning = true
+            }
             do {
                 try player.start(atTime: CHHapticTimeImmediate)
                 return
             } catch {
+                if (try? eng.start()) != nil {
+                    engineRunning = true
+                    if (try? player.start(atTime: CHHapticTimeImmediate)) != nil {
+                        return
+                    }
+                }
                 engineRunning = false
             }
         }
@@ -118,11 +133,21 @@ final class IOSKeyboardFeedbackController {
         if playClick {
             UIDevice.current.playInputClick()
         }
-        if engineRunning, let player = softTickPlayer {
+        if let player = softTickPlayer, let eng = engine {
+            if !engineRunning {
+                try? eng.start()
+                engineRunning = true
+            }
             do {
                 try player.start(atTime: CHHapticTimeImmediate)
                 return
             } catch {
+                if (try? eng.start()) != nil {
+                    engineRunning = true
+                    if (try? player.start(atTime: CHHapticTimeImmediate)) != nil {
+                        return
+                    }
+                }
                 engineRunning = false
             }
         }

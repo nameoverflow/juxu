@@ -90,7 +90,9 @@ public final class KeyboardViewController: UIInputViewController {
     public override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         feedback.prepare()
-        bridge.loadConfigAndUser(refreshPublishedLists: false)
+        bridge.reloadConfigAndUserOnAppear { [weak self] in
+            self?.syncEngineToUI()
+        }
         autoPairClosers.removeAll()
         inlineSession.resetForAppearance()
         clipboardGate.resetForKeyboardAppearance()
@@ -133,7 +135,8 @@ public final class KeyboardViewController: UIInputViewController {
         cancelMarkedCode()
         bridge.clearComposition()
         inlineSession.reset()
-        bridge.flushUserDataIfNeeded(refreshPublishedLists: false)
+        bridge.flushUserDataAsync()
+        bridge.flushPendingPersistence()
         feedback.suspend()
     }
 
@@ -748,7 +751,7 @@ public final class KeyboardViewController: UIInputViewController {
                 let ch = String(UnicodeScalar(ascii))
                 let outStr = layoutEngine.shiftState.isUppercase ? ch.uppercased() : ch.lowercased()
                 insertTextWithAutoSpace(outStr, splitInternal: false)
-                bridge.setContext("")
+                syncContextFromProxyIfIdle()
                 layoutEngine.consumeOneShotShiftIfNeeded()
                 syncEngineToUI()
             } else if layoutEngine.shiftState.isUppercase {
@@ -849,7 +852,7 @@ public final class KeyboardViewController: UIInputViewController {
             if bridge.state.preedit.isEmpty {
                 let needsFlush = inlineSession.insertPassthrough(" ", in: proxySink)
                 scheduleTurnBoundaryFlushIfNeeded(needsFlush)
-                bridge.setContext("")
+                syncContextFromProxyIfIdle()
                 syncEngineToUI()
             } else {
                 let out = bridge.handleKey(keyCode: 0x31, scalar: 32, hasCmdOrCtrl: false, timestampMs: Self.nowMs())
@@ -861,7 +864,7 @@ public final class KeyboardViewController: UIInputViewController {
             if bridge.state.preedit.isEmpty {
                 let needsFlush = inlineSession.insertPassthrough("\n", in: proxySink)
                 scheduleTurnBoundaryFlushIfNeeded(needsFlush)
-                bridge.setContext("")
+                syncContextFromProxyIfIdle()
                 syncEngineToUI()
             } else {
                 let out = bridge.handleKey(keyCode: 0x24, scalar: 13, hasCmdOrCtrl: false, timestampMs: Self.nowMs())
@@ -909,8 +912,10 @@ public final class KeyboardViewController: UIInputViewController {
             textDocumentProxy.adjustTextPosition(byCharacterOffset: -1)
             autoPairClosers.append(pairCloser)
             inlineSession.autoSpaceTracker.invalidate()
+            bridge.setContext("")
+        } else {
+            syncContextFromProxyIfIdle()
         }
-        bridge.setContext("")
     }
 
     /// Forgets tracked pairs once the cursor has been moved away from them.
@@ -1087,7 +1092,7 @@ public final class KeyboardViewController: UIInputViewController {
             noteBackspaceDeleted(String(before.suffix(1)))
             textDocumentProxy.deleteBackward()
             let afterDel = before.isEmpty ? "" : String(before.dropLast())
-            bridge.setContext(String(afterDel.suffix(16)))
+            bridge.setContext(String(afterDel.suffix(32)))
             syncEngineToUI()
             return
         }
@@ -1097,7 +1102,7 @@ public final class KeyboardViewController: UIInputViewController {
             noteBackspaceDeleted("\n")
             textDocumentProxy.deleteBackward()
             let afterDel = String(before.dropLast())
-            bridge.setContext(String(afterDel.suffix(16)))
+            bridge.setContext(String(afterDel.suffix(32)))
             syncEngineToUI()
             return
         }
@@ -1115,7 +1120,7 @@ public final class KeyboardViewController: UIInputViewController {
             textDocumentProxy.deleteBackward()
         }
         let afterDel = String(before.dropLast(min(nDel, before.count)))
-        bridge.setContext(String(afterDel.suffix(16)))
+        bridge.setContext(String(afterDel.suffix(32)))
         syncEngineToUI()
     }
 
@@ -1196,7 +1201,7 @@ public final class KeyboardViewController: UIInputViewController {
     private func scheduleUserDataFlush() {
         saveUserDataTimer?.invalidate()
         saveUserDataTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated { self?.bridge.flushUserDataIfNeeded(refreshPublishedLists: false) }
+            MainActor.assumeIsolated { self?.bridge.flushUserDataAsync() }
         }
     }
 

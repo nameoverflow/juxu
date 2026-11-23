@@ -566,6 +566,230 @@ public struct JuxuPreferences: Equatable, Sendable {
     }
 }
 
+/// Serial background persistence worker keeping all file writes, `zlib` compression, and
+/// iOS Keychain (`SecItemCopyMatching` / `SecItemUpdate`) IPC off `@MainActor`.
+private final class JuxuPersistenceWorker: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.hcyue.juxu.persistence", qos: .utility)
+    private let evalLogURL: URL
+    private let userDataURL: URL
+    private let inMemoryOnly: Bool
+
+    #if os(iOS)
+    private var iosEvalRingLoaded = false
+    private var iosEvalRingLines: [String] = []
+    private var iosEvalRingDirty = false
+    private var pendingRingFlush: DispatchWorkItem?
+    #endif
+
+    init(evalLogURL: URL, userDataURL: URL, inMemoryOnly: Bool) {
+        self.evalLogURL = evalLogURL
+        self.userDataURL = userDataURL
+        self.inMemoryOnly = inMemoryOnly
+    }
+
+    func syncBarrier<T>(_ body: () -> T) -> T {
+        queue.sync(execute: body)
+    }
+
+    func enqueueEvalLogBatch(_ batch: String) {
+        guard !inMemoryOnly, !batch.isEmpty else { return }
+        queue.async { [self] in
+            appendEvalLogOnQueue(batch)
+        }
+    }
+
+    func flushPendingSync() {
+        guard !inMemoryOnly else { return }
+        queue.sync {
+            #if os(iOS)
+            pendingRingFlush?.cancel()
+            pendingRingFlush = nil
+            flushIOSEvalRingOnQueue()
+            #endif
+        }
+    }
+
+    func enqueueFlushPending() {
+        #if os(iOS)
+        guard !inMemoryOnly else { return }
+        queue.async { [self] in
+            pendingRingFlush?.cancel()
+            pendingRingFlush = nil
+            flushIOSEvalRingOnQueue()
+        }
+        #endif
+    }
+
+    func enqueueUserDataSave(
+        tsv: String,
+        onSavedMtime: @escaping @Sendable (Date?) -> Void
+    ) {
+        guard !inMemoryOnly else { return }
+        queue.async { [self] in
+            try? Data(tsv.utf8).write(to: userDataURL, options: .atomic)
+            let mtime = (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
+            onSavedMtime(mtime)
+        }
+    }
+
+    #if os(iOS)
+    func enqueueIOSTouchProfilePublish(
+        profile: [TouchKeyCalibrationItem],
+        lastKnown: [TouchKeyCalibrationItem]?,
+        isReset: Bool,
+        onResult: @escaping @Sendable (_ adoptedExternal: [TouchKeyCalibrationItem]?, _ published: [TouchKeyCalibrationItem]?) -> Void
+    ) {
+        guard !inMemoryOnly else { return }
+        queue.async {
+            if !isReset,
+               let data = IOSSharedSettings.read(account: IOSSharedSettings.touchProfileAccount),
+               let current = try? JSONDecoder().decode([TouchKeyCalibrationItem].self, from: data),
+               current.map(\.key) == "abcdefghijklmnopqrstuvwxyz".map(String.init),
+               current != lastKnown {
+                onResult(current, nil)
+                return
+            }
+            if let data = try? JSONEncoder().encode(profile),
+               IOSSharedSettings.write(data, account: IOSSharedSettings.touchProfileAccount) {
+                onResult(nil, profile)
+            }
+        }
+    }
+
+    func checkIOSAppearanceUpdates(
+        onResult: @escaping @Sendable (Data?, [TouchKeyCalibrationItem]?, Date?) -> Void
+    ) {
+        guard !inMemoryOnly else { return }
+        queue.async { [self] in
+            let prefsData = IOSSharedSettings.read(account: IOSSharedSettings.preferencesAccount)
+            var sharedTouch: [TouchKeyCalibrationItem]? = nil
+            if let tData = IOSSharedSettings.read(account: IOSSharedSettings.touchProfileAccount),
+               let items = try? JSONDecoder().decode([TouchKeyCalibrationItem].self, from: tData),
+               items.map(\.key) == "abcdefghijklmnopqrstuvwxyz".map(String.init) {
+                sharedTouch = items
+            }
+            let mtime: Date?
+            if FileManager.default.fileExists(atPath: userDataURL.path) {
+                mtime = (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
+            } else {
+                mtime = nil
+            }
+            onResult(prefsData, sharedTouch, mtime)
+        }
+    }
+    #endif
+
+    func readEvalLogTextSync() -> String {
+        guard !inMemoryOnly else { return "" }
+        return queue.sync {
+            #if os(iOS)
+            pendingRingFlush?.cancel()
+            pendingRingFlush = nil
+            flushIOSEvalRingOnQueue()
+            if iosEvalRingLoaded && !iosEvalRingLines.isEmpty {
+                return iosEvalRingLines.joined(separator: "\n") + "\n"
+            }
+            let ring = Self.decodeSharedEvalRingOnQueue()
+            if !ring.isEmpty {
+                return ring.joined(separator: "\n") + "\n"
+            }
+            #endif
+            return (try? String(contentsOf: evalLogURL, encoding: .utf8)) ?? ""
+        }
+    }
+
+    func clearEvalLogSync() {
+        guard !inMemoryOnly else { return }
+        queue.sync {
+            #if os(iOS)
+            pendingRingFlush?.cancel()
+            pendingRingFlush = nil
+            iosEvalRingLines.removeAll()
+            iosEvalRingLoaded = true
+            iosEvalRingDirty = false
+            if let emptyCompressed = try? (Data() as NSData).compressed(using: .zlib) as Data {
+                _ = IOSSharedSettings.write(emptyCompressed, account: IOSSharedSettings.evalLogAccount)
+            }
+            #endif
+            try? FileManager.default.removeItem(at: evalLogURL)
+            let prevURL = evalLogURL.deletingLastPathComponent().appendingPathComponent("eval_log.prev.jsonl")
+            try? FileManager.default.removeItem(at: prevURL)
+        }
+    }
+
+    private func appendEvalLogOnQueue(_ batch: String) {
+        let payload = Data((batch + "\n").utf8)
+        let fm = FileManager.default
+        if let attrs = try? fm.attributesOfItem(atPath: evalLogURL.path),
+           let size = attrs[.size] as? UInt64,
+           size > 8 * 1024 * 1024 {
+            let prevURL = evalLogURL.deletingLastPathComponent().appendingPathComponent("eval_log.prev.jsonl")
+            try? fm.removeItem(at: prevURL)
+            try? fm.moveItem(at: evalLogURL, to: prevURL)
+        }
+        if !fm.fileExists(atPath: evalLogURL.path) {
+            fm.createFile(
+                atPath: evalLogURL.path,
+                contents: payload,
+                attributes: [.posixPermissions: NSNumber(value: Int16(0o600))]
+            )
+        } else if let fh = try? FileHandle(forWritingTo: evalLogURL) {
+            defer { try? fh.close() }
+            _ = try? fh.seekToEnd()
+            try? fh.write(contentsOf: payload)
+        }
+
+        #if os(iOS)
+        if !iosEvalRingLoaded {
+            iosEvalRingLines = Self.decodeSharedEvalRingOnQueue()
+            iosEvalRingLoaded = true
+        }
+        let added = batch.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        if !added.isEmpty {
+            iosEvalRingLines.append(contentsOf: added)
+            if iosEvalRingLines.count > 400 {
+                iosEvalRingLines.removeFirst(iosEvalRingLines.count - 400)
+            }
+            iosEvalRingDirty = true
+            if pendingRingFlush == nil {
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    self.pendingRingFlush = nil
+                    self.flushIOSEvalRingOnQueue()
+                }
+                pendingRingFlush = work
+                queue.asyncAfter(deadline: .now() + 1.2, execute: work)
+            }
+        }
+        #endif
+    }
+
+    #if os(iOS)
+    private func flushIOSEvalRingOnQueue() {
+        guard iosEvalRingDirty else { return }
+        iosEvalRingDirty = false
+        let joined = iosEvalRingLines.joined(separator: "\n")
+        if let compressed = try? (Data(joined.utf8) as NSData).compressed(using: .zlib) as Data {
+            _ = IOSSharedSettings.write(compressed, account: IOSSharedSettings.evalLogAccount)
+        }
+    }
+
+    private static func decodeSharedEvalRingOnQueue() -> [String] {
+        guard let compressed = IOSSharedSettings.read(account: IOSSharedSettings.evalLogAccount) else {
+            return []
+        }
+        let rawData: Data
+        if let inflated = try? (compressed as NSData).decompressed(using: .zlib) as Data {
+            rawData = inflated
+        } else {
+            rawData = compressed
+        }
+        guard let text = String(data: rawData, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+    }
+    #endif
+}
+
 @MainActor
 public final class JuxuBridge: ObservableObject {
     public static let shared = JuxuBridge()
@@ -578,9 +802,12 @@ public final class JuxuBridge: ObservableObject {
     private var pinyinDictLoaded: Bool = false
     private var auxDictLoaded: Bool = false
     private var lastLoadedUserDataMtime: Date?
+    private var userDataSaveGeneration: UInt64 = 0
     #if os(iOS)
     private let inMemoryOnly: Bool
     private var lastSharedTouchProfile: [TouchKeyCalibrationItem]?
+    private var lastSharedPrefsData: Data?
+    private var lastAppearanceCheckUptime: TimeInterval = 0
     #endif
 
     @Published public private(set) var state: JuxuActionState = .empty
@@ -596,10 +823,7 @@ public final class JuxuBridge: ObservableObject {
     public let evalLogURL: URL
     public let hasSharedContainerAccess: Bool
     private let bridgeInMemoryOnly: Bool
-    #if os(iOS)
-    private var iosEvalRingLoaded: Bool = false
-    private var iosEvalRingLines: [String] = []
-    #endif
+    private let persistence: JuxuPersistenceWorker
 
     public init(customDictsDir: URL? = nil, inMemoryOnly: Bool = false) {
         self.bridgeInMemoryOnly = inMemoryOnly
@@ -657,6 +881,11 @@ public final class JuxuBridge: ObservableObject {
         }
         #endif
 
+        self.persistence = JuxuPersistenceWorker(
+            evalLogURL: self.evalLogURL,
+            userDataURL: self.userDataURL,
+            inMemoryOnly: inMemoryOnly
+        )
         self.handle = juxu_engine_new()
         loadDictionaries(overrideDir: customDictsDir)
         if !inMemoryOnly {
@@ -780,12 +1009,14 @@ public final class JuxuBridge: ObservableObject {
             _ = configURL.path.withCString { juxu_engine_save_config(h, $0) }
         }
         #if os(iOS)
-        if let data = IOSSharedSettings.read(account: IOSSharedSettings.preferencesAccount),
-           let shared = String(data: data, encoding: .utf8) {
+        let data = IOSSharedSettings.read(account: IOSSharedSettings.preferencesAccount)
+        lastSharedPrefsData = data
+        if let data, let shared = String(data: data, encoding: .utf8) {
             shared.withCString { juxu_engine_set_config_toml(h, $0) }
             uiPrefsSourceTOML = shared
         }
         loadSharedTouchProfile()
+        lastAppearanceCheckUptime = ProcessInfo.processInfo.systemUptime
         #endif
         let toml = takeString(juxu_engine_get_config_toml(h))
         var loaded = JuxuPreferences.fromTOML(toml)
@@ -832,7 +1063,9 @@ public final class JuxuBridge: ObservableObject {
         toml.withCString { juxu_engine_set_config_toml(h, $0) }
         if persist {
             #if os(iOS)
-            IOSSharedSettings.write(Data(toml.utf8), account: IOSSharedSettings.preferencesAccount)
+            let raw = Data(toml.utf8)
+            lastSharedPrefsData = raw
+            IOSSharedSettings.write(raw, account: IOSSharedSettings.preferencesAccount)
             #endif
             _ = configURL.path.withCString { juxu_engine_save_config(h, $0) }
             try? toml.write(to: configURL, atomically: true, encoding: .utf8)
@@ -876,17 +1109,114 @@ public final class JuxuBridge: ObservableObject {
     public func flushUserDataIfNeeded(refreshPublishedLists: Bool = true) {
         guard let h = handle else { return }
         if juxu_engine_is_user_dirty(h) {
+            userDataSaveGeneration &+= 1
             #if os(iOS)
             publishTouchProfile()
             #endif
-            _ = userDataURL.path.withCString { juxu_engine_save_user_data(h, $0) }
-            lastLoadedUserDataMtime = (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
+            persistence.syncBarrier {
+                _ = userDataURL.path.withCString { juxu_engine_save_user_data(h, $0) }
+                lastLoadedUserDataMtime = (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
+            }
             if refreshPublishedLists {
                 refreshUserPhrases()
                 refreshTouchProfile()
             }
         }
     }
+
+    /// Non-blocking user data + touch-profile persistence for live typing commits:
+    /// snapshots TSV in memory on `@MainActor` (`~30 µs`) and performs atomic disk + Keychain writes off-thread.
+    public func flushUserDataAsync() {
+        guard let h = handle, !bridgeInMemoryOnly, juxu_engine_is_user_dirty(h) else { return }
+        userDataSaveGeneration &+= 1
+        let gen = userDataSaveGeneration
+        let tsv = takeString(juxu_engine_export_user_data_tsv(h))
+        #if os(iOS)
+        let profile = readTouchProfile()
+        if profile.count == 26,
+           profile != lastSharedTouchProfile,
+           profile.contains(where: { $0.samples > 0 }) {
+            let known = lastSharedTouchProfile
+            persistence.enqueueIOSTouchProfilePublish(
+                profile: profile,
+                lastKnown: known,
+                isReset: false
+            ) { [weak self] adopted, published in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if let adopted {
+                        self.adoptSharedTouchProfile(adopted)
+                    } else if let published {
+                        self.lastSharedTouchProfile = published
+                    }
+                }
+            }
+        }
+        #endif
+        persistence.enqueueUserDataSave(tsv: tsv) { [weak self] mtime in
+            Task { @MainActor [weak self] in
+                guard let self, self.userDataSaveGeneration == gen else { return }
+                self.lastLoadedUserDataMtime = mtime
+            }
+        }
+    }
+
+    /// Enqueue immediate flush of any debounced eval-log ring writes (e.g. on `viewWillDisappear`).
+    public func flushPendingPersistence() {
+        persistence.enqueueFlushPending()
+    }
+
+    #if os(iOS)
+    /// Non-blocking check on keyboard `viewWillAppear`: avoids stalling initial keyboard presentation
+    /// on synchronous Keychain (`securityd`) IPC when nothing changed in the host app.
+    public func reloadConfigAndUserOnAppear(onApplied: (@MainActor @Sendable () -> Void)? = nil) {
+        guard !inMemoryOnly else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastAppearanceCheckUptime >= 0.8 else { return }
+        lastAppearanceCheckUptime = now
+        persistence.checkIOSAppearanceUpdates { [weak self] prefsData, sharedTouch, mtime in
+            Task { @MainActor [weak self] in
+                guard let self, let h = self.handle else { return }
+                var changed = false
+                if prefsData != self.lastSharedPrefsData {
+                    self.lastSharedPrefsData = prefsData
+                    if let prefsData, let shared = String(data: prefsData, encoding: .utf8) {
+                        shared.withCString { juxu_engine_set_config_toml(h, $0) }
+                        let toml = self.takeString(juxu_engine_get_config_toml(h))
+                        var loaded = JuxuPreferences.fromTOML(toml)
+                        let uiPrefs = JuxuPreferences.fromTOML(shared)
+                        loaded.clipboardSuggestion = uiPrefs.clipboardSuggestion
+                        loaded.cangjieKeycapRadicals = uiPrefs.cangjieKeycapRadicals
+                        loaded.wubiKeycapRadicals = uiPrefs.wubiKeycapRadicals
+                        loaded.keySwipeUpInput = uiPrefs.keySwipeUpInput
+                        loaded.keyLongPressAlternates = uiPrefs.keyLongPressAlternates
+                        loaded.backspaceSwipeClear = uiPrefs.backspaceSwipeClear
+                        self.prefs = loaded
+                        self.ensureDictionaryLoaded(for: loaded.schemaId)
+                        self.ensureEmojiTableLoaded()
+                        changed = true
+                    }
+                }
+                if let sharedTouch, sharedTouch != self.lastSharedTouchProfile {
+                    self.adoptSharedTouchProfile(sharedTouch)
+                    changed = true
+                }
+                if let mtime,
+                   !juxu_engine_is_user_dirty(h),
+                   self.lastLoadedUserDataMtime != mtime {
+                    if self.userDataURL.path.withCString({ juxu_engine_load_user_data(h, $0) }) {
+                        self.lastLoadedUserDataMtime = mtime
+                        changed = true
+                    }
+                }
+                if changed {
+                    self.refreshState()
+                    onApplied?()
+                }
+            }
+        }
+    }
+    #endif
 
     public func handleKey(
         keyCode: UInt16,
@@ -1170,77 +1500,11 @@ public final class JuxuBridge: ObservableObject {
         guard let h = handle else { return }
         let batch = takeString(juxu_engine_drain_eval_log_jsonl(h))
         guard !bridgeInMemoryOnly, !suppressEvalLogging, !batch.isEmpty else { return }
-        appendEvalLogLines(batch)
+        persistence.enqueueEvalLogBatch(batch)
     }
-
-    private func appendEvalLogLines(_ batch: String) {
-        let payload = Data((batch + "\n").utf8)
-        let fm = FileManager.default
-        if let attrs = try? fm.attributesOfItem(atPath: evalLogURL.path),
-           let size = attrs[.size] as? UInt64,
-           size > 8 * 1024 * 1024 {
-            let prevURL = evalLogURL.deletingLastPathComponent().appendingPathComponent("eval_log.prev.jsonl")
-            try? fm.removeItem(at: prevURL)
-            try? fm.moveItem(at: evalLogURL, to: prevURL)
-        }
-        if !fm.fileExists(atPath: evalLogURL.path) {
-            fm.createFile(
-                atPath: evalLogURL.path,
-                contents: payload,
-                attributes: [.posixPermissions: NSNumber(value: Int16(0o600))]
-            )
-        } else if let fh = try? FileHandle(forWritingTo: evalLogURL) {
-            defer { try? fh.close() }
-            _ = try? fh.seekToEnd()
-            try? fh.write(contentsOf: payload)
-        }
-
-        #if os(iOS)
-        syncIOSEvalLogRing(newBatch: batch)
-        #endif
-    }
-
-    #if os(iOS)
-    private static func decodeSharedEvalRing() -> [String] {
-        guard let compressed = IOSSharedSettings.read(account: IOSSharedSettings.evalLogAccount) else {
-            return []
-        }
-        let rawData: Data
-        if let inflated = try? (compressed as NSData).decompressed(using: .zlib) as Data {
-            rawData = inflated
-        } else {
-            rawData = compressed
-        }
-        guard let text = String(data: rawData, encoding: .utf8) else { return [] }
-        return text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-    }
-
-    private func syncIOSEvalLogRing(newBatch: String) {
-        if !iosEvalRingLoaded {
-            iosEvalRingLines = Self.decodeSharedEvalRing()
-            iosEvalRingLoaded = true
-        }
-        let added = newBatch.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
-        guard !added.isEmpty else { return }
-        iosEvalRingLines.append(contentsOf: added)
-        if iosEvalRingLines.count > 400 {
-            iosEvalRingLines.removeFirst(iosEvalRingLines.count - 400)
-        }
-        let joined = iosEvalRingLines.joined(separator: "\n")
-        if let compressed = try? (Data(joined.utf8) as NSData).compressed(using: .zlib) as Data {
-            _ = IOSSharedSettings.write(compressed, account: IOSSharedSettings.evalLogAccount)
-        }
-    }
-    #endif
 
     public func readEvalLogText() -> String {
-        #if os(iOS)
-        let ring = Self.decodeSharedEvalRing()
-        if !ring.isEmpty {
-            return ring.joined(separator: "\n") + "\n"
-        }
-        #endif
-        return (try? String(contentsOf: evalLogURL, encoding: .utf8)) ?? ""
+        persistence.readEvalLogTextSync()
     }
 
     public func reloadEvalLogSummary() {
@@ -1291,6 +1555,7 @@ public final class JuxuBridge: ObservableObject {
 
     public func exportEvalLogFileURL() -> URL? {
         #if os(macOS)
+        persistence.flushPendingSync()
         return FileManager.default.fileExists(atPath: evalLogURL.path) ? evalLogURL : nil
         #else
         let text = readEvalLogText()
@@ -1302,16 +1567,7 @@ public final class JuxuBridge: ObservableObject {
     }
 
     public func clearEvalLog() {
-        try? FileManager.default.removeItem(at: evalLogURL)
-        let prevURL = evalLogURL.deletingLastPathComponent().appendingPathComponent("eval_log.prev.jsonl")
-        try? FileManager.default.removeItem(at: prevURL)
-        #if os(iOS)
-        iosEvalRingLines.removeAll()
-        iosEvalRingLoaded = true
-        if let emptyCompressed = try? (Data() as NSData).compressed(using: .zlib) as Data {
-            _ = IOSSharedSettings.write(emptyCompressed, account: IOSSharedSettings.evalLogAccount)
-        }
-        #endif
+        persistence.clearEvalLogSync()
         self.evalLogSummary = .empty
     }
 }

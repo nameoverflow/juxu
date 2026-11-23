@@ -350,6 +350,7 @@ impl JuxuEngine {
 
     /// Explicitly set rolling CJK context (e.g. from surrounding text or offline evaluation).
     pub fn set_recent_context(&mut self, text: &str) {
+        let prev_ctx = self.recent_context.clone();
         self.recent_context.clear();
         for ch in text.chars() {
             if is_cjk_char(ch) {
@@ -359,7 +360,8 @@ impl JuxuEngine {
             }
         }
         if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
-            // Feed up to 64 chars (including cross-clause punctuation for V2 models) into Micro-RWKV-7.
+            // Feed up to 64 chars (including cross-clause punctuation for V2 models) into Micro-RWKV-7;
+            // `NeuralContextTracker::set_context_str` deduplicates matching token suffixes in O(1) (0 RWKV steps).
             let chars: Vec<char> = text.chars().collect();
             let neural_ctx: String = chars
                 .iter()
@@ -371,7 +373,9 @@ impl JuxuEngine {
             let drain_n = self.recent_context.len() - 8;
             self.recent_context.drain(..drain_n);
         }
-        self.last_committed = self.recent_context.iter().collect();
+        if self.recent_context != prev_ctx {
+            self.last_committed = self.recent_context.iter().collect();
+        }
         if self.is_composing() && self.uses_spaceless() {
             self.rebuild_candidates();
         }
@@ -1220,14 +1224,20 @@ impl JuxuEngine {
             let consumed = pc.consumed_keys.min(self.observations.len());
             let pc_boundaries = pc.boundaries.clone();
             let pc_is_exact = pc.candidate.is_exact;
-            let multi_segment = pc_boundaries.len() >= 2;
             let learn = self.config.dynamic_word_freq && (explicit || pc_is_exact);
             let first_choice = (learn && explicit && abs_idx > 0)
                 .then(|| self.candidates.first().map(|c| c.text.clone()))
                 .flatten();
-            // Compute RWKV cohesion surprisal (for auto-phrase) & full mean per-char NLL (for eval log)
-            let surprisal = self.compute_rwkv_surprisal(&commit_text);
-            let eval_lm_chosen = self.compute_rwkv_mean_nll(&commit_text);
+            // Single-pass RWKV unroll across `commit_text`: computes `eval_lm_chosen` (only if logging),
+            // collects `PersonalContinuations` state signatures, and advances `neural_tracker` ONCE instead of 4x!
+            let (_, eval_lm_chosen) = self.step_and_learn_commit_single_pass(
+                &commit_text,
+                learn && self.config.dynamic_word_freq,
+                explicit,
+                first_choice.as_deref(),
+                false,
+                self.config.eval_logging,
+            );
             if self.config.eval_logging {
                 let top1 = self
                     .candidates
@@ -1273,17 +1283,8 @@ impl JuxuEngine {
                 );
             }
             let mut notice = String::new();
-            if learn {
-                // Pure probability-layer user learning: all Pinyin/Shuangpin/T9 adaptation goes
-                // directly into `PersonalContinuations` (0-gram + 1..3-gram + RWKV state kNN),
-                // with zero rule-based phrase dictionary insertion or function-word filtering.
-                self.learn_continuation(&commit_text, explicit, first_choice.as_deref());
-                let _ = multi_segment;
-                let _ = surprisal;
-                // Preserve personal OOV/cased English words for mixed Chinese-English typing.
-                if commit_text.bytes().any(|b| b.is_ascii_alphabetic()) {
-                    self.user.record_english_words_in_text(&commit_text, false);
-                }
+            if learn && commit_text.bytes().any(|b| b.is_ascii_alphabetic()) {
+                self.user.record_english_words_in_text(&commit_text, false);
             }
             self.last_committed = commit_text.clone();
             for ch in commit_text.chars() {
@@ -1291,13 +1292,6 @@ impl JuxuEngine {
                     self.recent_context.push(ch);
                 } else {
                     self.recent_context.clear();
-                }
-            }
-            if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
-                if !commit_text.is_empty() {
-                    self.neural_tracker.commit_cjk_str(&nv, &commit_text);
-                } else {
-                    self.neural_tracker.reset_to_bos(Some(&nv));
                 }
             }
             if self.recent_context.len() > 8 {
@@ -1545,8 +1539,15 @@ impl JuxuEngine {
             }
             self.finalize_stream_segments(segments, true, timestamp_ms, &mut notice)
         } else {
+            let (surp, _) = self.step_and_learn_commit_single_pass(
+                &cand.text,
+                learn,
+                explicit,
+                first_choice.as_deref(),
+                true,
+                false,
+            );
             if self.config.eval_logging {
-                let lm_chosen = self.compute_rwkv_surprisal(&cand.text);
                 self.log_commit_event(
                     timestamp_ms,
                     "commit",
@@ -1557,14 +1558,19 @@ impl JuxuEngine {
                     &cand.text,
                     &eval_top1,
                     eval_typo,
-                    lm_chosen,
+                    surp,
                     eval_cands,
                 );
             }
-            if learn {
-                self.learn_continuation(&cand.text, explicit, first_choice.as_deref());
-            }
-            self.finalize_commit(&cand.text, Some(cand.matched_code), timestamp_ms, &mut notice);
+            self.finalize_commit_with_prestepped(
+                &cand.text,
+                Some(cand.matched_code),
+                timestamp_ms,
+                false,
+                Some(surp),
+                true,
+                &mut notice,
+            );
             cand.text
         };
         self.clear_composition();
@@ -1681,7 +1687,7 @@ impl JuxuEngine {
         let state = self
             .pinyin_paths
             .first()
-            .map(|p| &p.state)
+            .and_then(|p| p.ready_state())
             .unwrap_or(&self.neural_tracker.active);
         let top = nv.top_next_chars(state, 32);
         if top.is_empty() {
@@ -2901,15 +2907,31 @@ impl JuxuEngine {
         let mut start = 0;
         for segment in segments {
             let end = start + segment.code.len();
-            if !confirmed_by_user && segment.correction == CorrectionKind::Exact {
-                self.learn_continuation(&segment.text, false, None);
-            }
+            let learn_seg = !confirmed_by_user
+                && segment.correction == CorrectionKind::Exact
+                && self.config.dynamic_word_freq;
+            let (surp, _) = self.step_and_learn_commit_single_pass(
+                &segment.text,
+                learn_seg,
+                false,
+                None,
+                true,
+                false,
+            );
             if segment.correction == CorrectionKind::Exact
                 || (confirmed_by_user && segment.correction != CorrectionKind::Transposition)
             {
                 self.learn_touch_offsets(segment.code, start..end);
             }
-            self.finalize_commit_with_mode(&segment.text, None, timestamp_ms, passive_clause, notice);
+            self.finalize_commit_with_prestepped(
+                &segment.text,
+                None,
+                timestamp_ms,
+                passive_clause,
+                Some(surp),
+                true,
+                notice,
+            );
             text.push_str(&segment.text);
             start = end;
         }
@@ -2935,17 +2957,125 @@ impl JuxuEngine {
         );
     }
 
+    /// Single-pass RWKV commit unroll: simultaneously computes `surprisal`, `mean_nll`,
+    /// `PersonalContinuations` state signatures, and advances `neural_tracker` without duplicate passes.
+    fn step_and_learn_commit_single_pass(
+        &mut self,
+        text: &str,
+        learn: bool,
+        explicit: bool,
+        first_choice: Option<&str>,
+        need_surprisal: bool,
+        need_mean_nll: bool,
+    ) -> (Option<f32>, Option<f32>) {
+        let do_learn = learn && self.config.dynamic_word_freq;
+        if !text.is_empty() && text.chars().all(|c| ('\u{4E00}'..'\u{A000}').contains(&c)) {
+            if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
+                if !self.neural_tracker.is_ready() {
+                    self.neural_tracker.init_with_model(&nv);
+                }
+                let chars: Vec<char> = text.chars().collect();
+                let n = chars.len();
+                let mut st = self.neural_tracker.active.clone();
+                let mut cjk_toks = Vec::with_capacity(n);
+                let mut sigs = if do_learn {
+                    Vec::with_capacity(n)
+                } else {
+                    Vec::new()
+                };
+                let mut sum_nll = 0.0f32;
+                let mut sum_surp = 0.0f32;
+                for (i, &ch) in chars.iter().enumerate() {
+                    if need_surprisal || need_mean_nll {
+                        let lp = nv.score_next_char(&st, ch).clamp(-13.5, -0.01);
+                        sum_nll += -lp;
+                        if i >= 1 {
+                            sum_surp += -lp;
+                        }
+                    }
+                    if do_learn {
+                        sigs.push(crate::personalization::state_signature(&st));
+                    }
+                    let tok = nv.char_to_token(ch);
+                    cjk_toks.push(tok as u16);
+                    let is_last = i + 1 == n;
+                    nv.step_token_heads(tok, &mut st, is_last, is_last);
+                }
+                let surprisal = if !need_surprisal {
+                    None
+                } else if n == 1 {
+                    Some(sum_nll)
+                } else {
+                    Some(sum_surp / ((n - 1) as f32))
+                };
+                let mean_nll = if need_mean_nll {
+                    Some(sum_nll / (n as f32))
+                } else {
+                    None
+                };
+                let profile_id = nv.offs.profile_id;
+                self.neural_tracker
+                    .adopt_cjk_commit_state(&nv, &cjk_toks, st);
+                if do_learn {
+                    self.user.continuations.observe_prestepped_sigs(
+                        &self.recent_context,
+                        text,
+                        explicit,
+                        first_choice,
+                        profile_id,
+                        &sigs,
+                    );
+                }
+                return (surprisal, mean_nll);
+            }
+        }
+        let surprisal = if need_surprisal {
+            self.compute_rwkv_surprisal(text)
+        } else {
+            None
+        };
+        let mean_nll = if need_mean_nll {
+            self.compute_rwkv_mean_nll(text)
+        } else {
+            None
+        };
+        if do_learn {
+            self.learn_continuation(text, explicit, first_choice);
+        }
+        if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
+            if !text.is_empty() {
+                self.neural_tracker.commit_cjk_str(&nv, text);
+            } else {
+                self.neural_tracker.reset_to_bos(Some(&nv));
+            }
+        }
+        (surprisal, mean_nll)
+    }
+
     fn finalize_automatic_candidate(
         &mut self,
         candidate: &Candidate,
         timestamp_ms: u64,
         notice: &mut String,
     ) {
-        if candidate.is_exact {
-            self.learn_continuation(&candidate.text, false, None);
-        }
+        let (surp, _) = self.step_and_learn_commit_single_pass(
+            &candidate.text,
+            candidate.is_exact && self.config.dynamic_word_freq,
+            false,
+            None,
+            true,
+            false,
+        );
         let code = (!candidate.matched_code.is_empty()).then_some(candidate.matched_code);
-        self.finalize_commit(&candidate.text, code, timestamp_ms, notice);
+        self.finalize_commit_with_prestepped(
+            &candidate.text,
+            code,
+            timestamp_ms,
+            false,
+            Some(surp),
+            true,
+            notice,
+        );
     }
 
     fn learn_touch_offsets(&mut self, code: PackedCode, range: std::ops::Range<usize>) {
@@ -3051,6 +3181,35 @@ impl JuxuEngine {
         passive_stream: bool,
         notice: &mut String,
     ) {
+        let (surp, _) = self.step_and_learn_commit_single_pass(
+            text,
+            false,
+            false,
+            None,
+            true,
+            false,
+        );
+        self.finalize_commit_with_prestepped(
+            text,
+            matched_code,
+            timestamp_ms,
+            passive_stream,
+            Some(surp),
+            true,
+            notice,
+        );
+    }
+
+    fn finalize_commit_with_prestepped(
+        &mut self,
+        text: &str,
+        matched_code: Option<PackedCode>,
+        timestamp_ms: u64,
+        passive_stream: bool,
+        precomputed_surprisal: Option<Option<f32>>,
+        already_stepped_tracker: bool,
+        notice: &mut String,
+    ) {
         // 1. Update personal touch-region adaptive offsets if touch observations match `matched_code`!
         if let Some(code) = matched_code {
             self.learn_touch_offsets(code, 0..self.observations.len());
@@ -3058,7 +3217,7 @@ impl JuxuEngine {
 
         // 2. Compute RWKV surprisal BEFORE advancing neural context, then update personal history
         //    & surprisal-guided auto-phrase (indexed for both active shape schema AND Full Pinyin!)
-        let surprisal = self.compute_rwkv_surprisal(text);
+        let surprisal = precomputed_surprisal.unwrap_or_else(|| self.compute_rwkv_surprisal(text));
         let dict_idx = self.config.schema.slot_index();
         let dict_opt = self.dicts.get(dict_idx).and_then(|d| d.as_ref());
         let prev = self.last_committed.clone();
@@ -3118,11 +3277,13 @@ impl JuxuEngine {
                 self.recent_context.clear();
             }
         }
-        if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
-            if !text.is_empty() {
-                self.neural_tracker.commit_cjk_str(&nv, text);
-            } else {
-                self.neural_tracker.reset_to_bos(Some(&nv));
+        if !already_stepped_tracker {
+            if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
+                if !text.is_empty() {
+                    self.neural_tracker.commit_cjk_str(&nv, text);
+                } else {
+                    self.neural_tracker.reset_to_bos(Some(&nv));
+                }
             }
         }
         if self.recent_context.len() > 8 {
@@ -5101,4 +5262,81 @@ fn compute_context_boost(
 
     boost += w.bigram_scale * bg + w.trigram_scale * tg1 + w.cross_trigram_scale * tg_cross;
     boost
+}
+
+#[cfg(test)]
+mod perf_correctness_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn long_pinyin_backspace_and_t9_incremental_parity() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let py_path = root.join("Resources/Dicts/pinyin.pydict");
+        let aux_path = root.join("Resources/Dicts/wubi_aux.wbaux");
+        if !py_path.exists() || !aux_path.exists() {
+            return;
+        }
+        let mut eng = JuxuEngine::default();
+        eng.load_pinyin_dict(PinyinDictView::from_file(&py_path).expect("load pydict"));
+        eng.set_aux(AuxView::open_mmap(&aux_path).expect("load wbaux"));
+        eng.config.schema = InputSchema::Pinyin;
+
+        let keys = "jintianwomenyiqiquchifanranhouzaikanyixianzhegedaimawenti";
+        let mut forward_top1: Vec<String> = Vec::with_capacity(keys.len());
+        for (i, b) in keys.bytes().enumerate() {
+            let (cx, cy) = eng.key_layout.center_of(b);
+            eng.push_touch_letter(b, cx, cy, true, 1000 + i as u64 * 40);
+            forward_top1.push(
+                eng.page_candidates()
+                    .first()
+                    .map(|c| c.text.clone())
+                    .unwrap_or_default(),
+            );
+        }
+        // Backspace 35 times across the 57-key buffer: top-1 at every step must match forward incremental decode
+        for step in 1..=35usize {
+            eng.handle_key_event(KEY_BACKSPACE, None, false, 4000 + step as u64 * 40);
+            let expected = &forward_top1[keys.len() - 1 - step];
+            let got = eng
+                .page_candidates()
+                .first()
+                .map(|c| c.text.as_str())
+                .unwrap_or("");
+            assert_eq!(got, expected, "backspace parity mismatch at step {step}");
+        }
+        eng.clear_composition();
+
+        // T9 incremental decode vs cold decode parity
+        eng.config.pinyin_t9_layout = true;
+        let t9_digits = "546842696636947478244326";
+        for (i, d) in t9_digits.bytes().enumerate() {
+            let (cx, cy) = eng.key_layout.t9_center_of(d);
+            eng.push_touch_t9(d, cx, cy, true, 6000 + i as u64 * 50);
+        }
+        let inc_top1 = eng
+            .page_candidates()
+            .first()
+            .map(|c| c.text.clone())
+            .unwrap_or_default();
+        assert!(!inc_top1.is_empty());
+
+        let mut cold_eng = JuxuEngine::default();
+        cold_eng.load_pinyin_dict(PinyinDictView::from_file(&py_path).unwrap());
+        cold_eng.set_aux(AuxView::open_mmap(&aux_path).unwrap());
+        cold_eng.config.schema = InputSchema::Pinyin;
+        cold_eng.config.pinyin_t9_layout = true;
+        for (i, d) in t9_digits.bytes().enumerate() {
+            let (cx, cy) = cold_eng.key_layout.t9_center_of(d);
+            cold_eng.observations.push(KeyObs::touch(d, cx, cy, 6000 + i as u64 * 50));
+            cold_eng.raw_code.push(d as char);
+        }
+        cold_eng.rebuild_pinyin_candidates();
+        let cold_top1 = cold_eng
+            .page_candidates()
+            .first()
+            .map(|c| c.text.clone())
+            .unwrap_or_default();
+        assert_eq!(inc_top1, cold_top1);
+    }
 }

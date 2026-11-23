@@ -915,12 +915,10 @@ impl UserStore {
         out
     }
 
-    pub fn save_file<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut out = String::from("# PrisWubi User Data v1\n");
+    /// Serialize personal user store to its canonical TSV representation in memory (zero disk I/O).
+    pub fn to_tsv_string(&self) -> String {
+        let mut out = String::with_capacity(8192);
+        out.push_str("# PrisWubi User Data v1\n");
         out.push_str(&format!("SEQ\t{}\n", self.seq));
         for (i, t) in self.touch_profile.keys.iter().enumerate() {
             if t.samples > 0 {
@@ -978,6 +976,15 @@ impl UserStore {
             ));
         }
         self.continuations.write_to(&mut out);
+        out
+    }
+
+    pub fn save_file<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let out = self.to_tsv_string();
         let write_id = USER_DATA_WRITE_ID.fetch_add(1, Ordering::Relaxed);
         let temporary_path = path.with_extension(format!("tmp.{}.{write_id}", std::process::id()));
         let mut options = fs::OpenOptions::new();
