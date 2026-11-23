@@ -1262,4 +1262,128 @@ fn real_dicts_log_driven_strategy_regressions_pinyin_and_spaceless_wubi98() {
         "expected '或者时期' over '或者其', got {:?}",
         engine.all_candidates().iter().take(4).map(|c| &c.text).collect::<Vec<_>>()
     );
+
+    // P0-2b: Pinyin segmented selection (`分段选字一次成词`) + initial abbr (`zhs -> 最好是`, `zw -> 卓威`)
+    //        AND Wubi 1-key clean ribbon vs 4-key / 2-key lookup!
+    let mut cfg_py = cfg.clone();
+    cfg_py.schema = InputSchema::Pinyin;
+    cfg_py.auto_phrase = true;
+    engine.set_config(cfg_py);
+    engine.clear_composition();
+    engine.clear_context();
+
+    // 1. Assemble "最好是" inside a single Pinyin preedit (`zuihaoshi` -> pick "最好" then "是") -> 1-shot learn!
+    for (i, ch) in "zuihaoshi".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 8000 + i as u64 * 25);
+    }
+    let idx_zh = engine
+        .all_candidates()
+        .iter()
+        .position(|c| c.text == "最好")
+        .expect("expected prefix word '最好' in 'zuihaoshi'");
+    let out_p1 = engine.select_abs_candidate(idx_zh, 8300).unwrap();
+    assert_eq!(out_p1.commit_text, "最好");
+    assert_eq!(engine.raw_code(), "shi");
+    let idx_shi = engine
+        .all_candidates()
+        .iter()
+        .position(|c| c.text == "是")
+        .expect("expected '是' in remaining 'shi'");
+    let out_p2 = engine.select_abs_candidate(idx_shi, 8400).unwrap();
+    assert_eq!(out_p2.commit_text, "是");
+    assert!(
+        engine.user.phrases.contains_key("最好是"),
+        "segmented Pinyin selection '最好'+'是' must immediately learn '最好是'"
+    );
+
+    // Now initial abbreviation `zhs` in Full Pinyin must immediately surface `最好是` in top-2 (alongside `zh's` -> `这是`)!
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "zhs".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 8600 + i as u64 * 25);
+    }
+    let zhs_top2: Vec<String> = engine.all_candidates().iter().take(2).map(|c| c.text.clone()).collect();
+    assert!(
+        zhs_top2.iter().any(|t| t == "最好是"),
+        "expected initial abbr 'zhs' to hit learned '最好是' in top-2, got {:?}",
+        engine.all_candidates().iter().take(5).map(|c| &c.text).collect::<Vec<_>>()
+    );
+
+    // 2. Assemble OOV brand "卓威" (`zhuowei` -> pick "卓" then "威") -> 1-shot learn even with high RWKV surprisal!
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "zhuowei".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 9000 + i as u64 * 25);
+    }
+    let idx_z = engine.all_candidates().iter().position(|c| c.text == "卓").unwrap();
+    let _ = engine.select_abs_candidate(idx_z, 9200).unwrap();
+    let idx_w = engine.all_candidates().iter().position(|c| c.text == "威").unwrap();
+    let _ = engine.select_abs_candidate(idx_w, 9300).unwrap();
+    assert!(engine.user.phrases.contains_key("卓威"));
+    engine.clear_composition();
+    for (i, ch) in "zhuowei".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 9500 + i as u64 * 25);
+    }
+    assert_eq!(engine.all_candidates()[0].text, "卓威");
+
+    // 2b. Modal-particle colloquial phrase "傻逼吗" (`shabima` -> pick "傻逼" + "吗" OR 2x commits) -> `sbm` hits #1!
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "shabima".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 9600 + i as u64 * 25);
+    }
+    if let Some(idx_sb) = engine.all_candidates().iter().position(|c| c.text == "傻逼") {
+        let _ = engine.select_abs_candidate(idx_sb, 9800).unwrap();
+        let idx_ma = engine.all_candidates().iter().position(|c| c.text == "吗").unwrap();
+        let _ = engine.select_abs_candidate(idx_ma, 9850).unwrap();
+    } else {
+        engine.clear_composition();
+        for r in 0..2u64 {
+            engine.user.break_single_burst();
+            let _ = engine.user.record_commit_with_surprisal("", "傻逼", 9700 + r * 200, true, 2, None, engine.pinyin_dict.as_ref(), Some(2.5));
+            let _ = engine.user.record_commit_with_surprisal("傻逼", "吗", 9780 + r * 200, true, 2, None, engine.pinyin_dict.as_ref(), Some(2.5));
+        }
+    }
+    assert!(engine.user.phrases.contains_key("傻逼吗"));
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "sbm".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 9920 + i as u64 * 25);
+    }
+    assert_eq!(
+        engine.all_candidates()[0].text,
+        "傻逼吗",
+        "expected initial abbr 'sbm' to hit learned '傻逼吗' at #1, got {:?}",
+        engine.all_candidates().iter().take(5).map(|c| &c.text).collect::<Vec<_>>()
+    );
+
+    // 3. Switch to Wubi 98: `最好是` (`jgal`) works at 2..4 keys without crowding 1-key `j` (`是`)!
+    let mut cfg_wb98_std = cfg.clone();
+    cfg_wb98_std.schema = InputSchema::Wubi98;
+    cfg_wb98_std.spaceless = false;
+    cfg_wb98_std.fourth_code_auto_commit = false;
+    engine.set_config(cfg_wb98_std);
+    engine.clear_composition();
+    let _ = engine.handle_key_event(0, Some('j'), false, 10_000);
+    assert!(
+        !engine.page_candidates().iter().any(|c| c.text == "最好是"),
+        "1-key Wubi 'j' must not be crowded by count=1 auto_composed '最好是'"
+    );
+    let _ = engine.handle_key_event(0, Some('v'), false, 10_030);
+    let _ = engine.handle_key_event(0, Some('j'), false, 10_060);
+    let _ = engine.handle_key_event(0, Some('g'), false, 10_090);
+    let zhs_code = DictView::open_mmap(base.join("wubi98.wbdict"))
+        .unwrap()
+        .encode_phrase("最好是")
+        .unwrap()
+        .as_string();
+    engine.clear_composition();
+    for (i, ch) in zhs_code.chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 10_200 + i as u64 * 25);
+    }
+    assert!(
+        engine.all_candidates().iter().any(|c| c.text == "最好是"),
+        "4-code Wubi98 '{}' must match cross-mode learned '最好是'",
+        zhs_code
+    );
 }

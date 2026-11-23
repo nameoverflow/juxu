@@ -140,6 +140,9 @@ pub struct JuxuEngine {
     pinyin_paths: Vec<PinyinPath>,
     /// Locked prefix syllables selected from the T9 sidebar: `(consumed_key_count, syllable_str)`.
     t9_locked_syls: Vec<(usize, String)>,
+    /// Accumulates CJK segments manually partial-committed within a single unbroken Pinyin preedit
+    /// (e.g. `zhuowei` -> `卓` + `威`, `zuihaoshi` -> `最好` + `是`) for immediate 1-shot phrase promotion.
+    pinyin_partial_acc: String,
     committed_stream_codes: VecDeque<String>,
     observations: Vec<KeyObs>,
     candidates: Vec<Candidate>,
@@ -188,6 +191,7 @@ impl JuxuEngine {
             pinyin_candidates: Vec::new(),
             pinyin_paths: Vec::new(),
             t9_locked_syls: Vec::new(),
+            pinyin_partial_acc: String::new(),
             committed_stream_codes: VecDeque::new(),
             observations: Vec::new(),
             candidates: Vec::new(),
@@ -1127,6 +1131,7 @@ impl JuxuEngine {
         self.pinyin_candidates.clear();
         self.pinyin_paths.clear();
         self.t9_locked_syls.clear();
+        self.pinyin_partial_acc.clear();
         self.committed_stream_codes.clear();
         self.observations.clear();
         self.candidates.clear();
@@ -1425,6 +1430,14 @@ impl JuxuEngine {
                 }
             }
             if consumed > 0 && consumed < self.observations.len() {
+                if learn && commit_text.chars().all(is_cjk_char) {
+                    self.pinyin_partial_acc.push_str(&commit_text);
+                    if self.pinyin_partial_acc.chars().count() > 4 {
+                        self.pinyin_partial_acc.clear();
+                    }
+                } else {
+                    self.pinyin_partial_acc.clear();
+                }
                 // Trim consumed locked T9 prefix syllables if any
                 if !self.t9_locked_syls.is_empty() {
                     let mut rem = consumed;
@@ -1450,6 +1463,24 @@ impl JuxuEngine {
                     bell: false,
                     notice,
                 });
+            }
+            if learn && !self.pinyin_partial_acc.is_empty() && commit_text.chars().all(is_cjk_char) {
+                let mut full_assembled = std::mem::take(&mut self.pinyin_partial_acc);
+                full_assembled.push_str(&commit_text);
+                let dict_idx = self.config.schema.slot_index();
+                let dict_for_phrase = self
+                    .dicts
+                    .get(dict_idx)
+                    .and_then(|d| d.as_ref())
+                    .or_else(|| self.dicts.iter().find_map(|d| d.as_ref()));
+                if let Some(new_word) = self.user.promote_assembled_immediately(
+                    &full_assembled,
+                    self.config.auto_phrase,
+                    dict_for_phrase,
+                    self.pinyin_dict.as_ref(),
+                ) {
+                    notice = format!("自动成词：{}", new_word);
+                }
             }
             self.clear_composition();
             return Some(EngineOutput {
@@ -2860,6 +2891,7 @@ impl JuxuEngine {
         timestamp_ms: u64,
         notice: &mut String,
     ) -> String {
+        let passive_clause = segments.len() >= 3;
         let mut text = String::new();
         let mut start = 0;
         for segment in segments {
@@ -2872,7 +2904,7 @@ impl JuxuEngine {
             {
                 self.learn_touch_offsets(segment.code, start..end);
             }
-            self.finalize_commit(&segment.text, None, timestamp_ms, notice);
+            self.finalize_commit_with_mode(&segment.text, None, timestamp_ms, passive_clause, notice);
             text.push_str(&segment.text);
             start = end;
         }
@@ -3003,6 +3035,17 @@ impl JuxuEngine {
         timestamp_ms: u64,
         notice: &mut String,
     ) {
+        self.finalize_commit_with_mode(text, matched_code, timestamp_ms, false, notice);
+    }
+
+    fn finalize_commit_with_mode(
+        &mut self,
+        text: &str,
+        matched_code: Option<PackedCode>,
+        timestamp_ms: u64,
+        passive_stream: bool,
+        notice: &mut String,
+    ) {
         // 1. Update personal touch-region adaptive offsets if touch observations match `matched_code`!
         if let Some(code) = matched_code {
             self.learn_touch_offsets(code, 0..self.observations.len());
@@ -3014,7 +3057,7 @@ impl JuxuEngine {
         let dict_idx = self.config.schema.slot_index();
         let dict_opt = self.dicts.get(dict_idx).and_then(|d| d.as_ref());
         let prev = self.last_committed.clone();
-        let learned = self.user.record_commit_with_surprisal(
+        let learned = self.user.record_commit_with_mode(
             &prev,
             text,
             timestamp_ms,
@@ -3023,6 +3066,7 @@ impl JuxuEngine {
             dict_opt,
             self.pinyin_dict.as_ref(),
             surprisal,
+            passive_stream,
         );
         if let Some(new_word) = learned {
             if let Some(d) = dict_opt {

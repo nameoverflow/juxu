@@ -142,10 +142,10 @@ pub struct UserStore {
     pub(crate) continuations: PersonalContinuations,
     pub touch_profile: TouchProfile,
     /// Rolling buffer of recent consecutive CJK characters
-    /// `(ch, timestamp_ms, rwkv_surprisal, commit_id, is_commit_start, is_commit_end)`
+    /// `(ch, timestamp_ms, rwkv_surprisal, commit_id, is_commit_start, is_commit_end, passive_stream)`
     /// across both single-char and multi-char commits so 3-4 char words (e.g. "哈基" + "米" -> "哈基米")
     /// compose cleanly while never slicing mid-word!
-    recent_singles: Vec<(char, u64, Option<f32>, u64, bool, bool)>,
+    recent_singles: Vec<(char, u64, Option<f32>, u64, bool, bool, bool)>,
     /// Candidate consecutive n-grams waiting to reach `auto_phrase_threshold`
     pending_ngrams: HashMap<String, u8>,
     pub dirty: bool,
@@ -227,11 +227,18 @@ impl UserStore {
 
     pub fn lookup_prefix(&self, prefix: PackedCode, limit: usize) -> Vec<(PackedCode, &str, u32)> {
         let (lo, hi) = prefix.prefix_range();
+        let single_key_prefix = prefix.len() == 1;
         let mut out = Vec::new();
         for (&code, texts) in &self.code_index {
             if code > lo && code <= hi {
                 for t in texts {
                     if let Some(p) = self.phrases.get(t) {
+                        // Keep 1-key Wubi candidate ribbons clean: only surface manual phrases or
+                        // well-established high-frequency user phrases at 1 key; at 2..4 keys and
+                        // in Pinyin full/initial-abbr (`zhs`), all user phrases appear immediately.
+                        if single_key_prefix && p.auto_composed && p.count < 4 {
+                            continue;
+                        }
                         out.push((code, p.text.as_str(), p.count));
                     }
                 }
@@ -465,6 +472,36 @@ impl UserStore {
         pdict: Option<&PinyinDictView>,
         surprisal: Option<f32>,
     ) -> Option<String> {
+        self.record_commit_with_mode(
+            prev_committed,
+            committed,
+            timestamp_ms,
+            auto_phrase,
+            auto_threshold,
+            dict,
+            pdict,
+            surprisal,
+            false,
+        )
+    }
+
+    /// Stream-aware commit recorder: `passive_stream = true` marks segments produced by a single
+    /// whole-sentence Space commit (`>= 3` segments in spaceless mode) so casual clause spans require
+    /// higher repetition (`>= 3`), while deliberate character-by-character or word-by-word commits use
+    /// `auto_threshold` (`2`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_commit_with_mode(
+        &mut self,
+        prev_committed: &str,
+        committed: &str,
+        timestamp_ms: u64,
+        auto_phrase: bool,
+        auto_threshold: u8,
+        dict: Option<&DictView>,
+        pdict: Option<&PinyinDictView>,
+        surprisal: Option<f32>,
+        passive_stream: bool,
+    ) -> Option<String> {
         if committed.is_empty() {
             return None;
         }
@@ -499,7 +536,7 @@ impl UserStore {
         }
 
         // Rolling CJK burst tracking for auto-phrase (supports 2..=4 char phrases across
-        // single-char bursts AND mixed word+char bursts like "哈基" + "米" -> "哈基米"!).
+        // single-char bursts AND mixed word+char bursts like "哈基" + "米" -> "哈基米" or "最好" + "是" -> "最好是"!).
         let committed_chars: Vec<char> = committed.chars().collect();
         if committed_chars.is_empty()
             || committed_chars.len() > 3
@@ -509,7 +546,7 @@ impl UserStore {
             return None;
         }
 
-        if let Some(&(_, last_ts, _, _, _, _)) = self.recent_singles.last() {
+        if let Some(&(_, last_ts, _, _, _, _, _)) = self.recent_singles.last() {
             if timestamp_ms > 0 && last_ts > 0 && timestamp_ms.saturating_sub(last_ts) > 5000 {
                 self.recent_singles.clear();
             }
@@ -523,6 +560,7 @@ impl UserStore {
                 seq,
                 idx == 0,
                 idx + 1 == clen,
+                passive_stream,
             ));
         }
         if self.recent_singles.len() > 6 {
@@ -534,9 +572,9 @@ impl UserStore {
             return None;
         }
 
-        // Check longest suffix FIRST (4 -> 3 -> 2 chars) so a 3-char word like "哈基米" is NEVER
-        // short-circuited by its 2-char tail "基米", require spanning >= 2 distinct commits,
-        // and require strict alignment with commit start & commit end boundaries (never tear words in half!).
+        // Check longest suffix FIRST (4 -> 3 -> 2 chars) so a 3-char phrase like "哈基米" or "最好是" is NEVER
+        // short-circuited by its 2-char tail, require spanning >= 2 distinct commits,
+        // and require alignment with commit start & commit end boundaries (never tear a word in half!).
         let n = self.recent_singles.len();
         let mut promoted: Option<String> = None;
         for cand_len in [4usize, 3usize, 2usize] {
@@ -559,6 +597,7 @@ impl UserStore {
                 continue;
             }
             let all_single_commits = slice.iter().all(|x| x.4 && x.5);
+            let any_passive = slice.iter().any(|x| x.6);
             let mut sum_s = 0.0f32;
             let mut cnt_s = 0usize;
             for item in &slice[1..] {
@@ -568,10 +607,19 @@ impl UserStore {
                 }
             }
             let mean_surp = (cnt_s > 0).then(|| sum_s / (cnt_s as f32));
-            let allow_fast_promote = cand_len == 2 && all_single_commits;
+            let last_ch = slice[cand_len - 1].0;
+            let allow_fast_promote = !any_passive
+                && cand_len == 2
+                && all_single_commits
+                && !matches!(last_ch, '的' | '了' | '吗' | '呢' | '吧' | '啊' | '着' | '过');
+            let eff_threshold = if any_passive {
+                auto_threshold.max(3)
+            } else {
+                auto_threshold
+            };
             if let Some(word) = self.bump_pending_ngram(
                 &cand,
-                auto_threshold,
+                eff_threshold,
                 dict,
                 pdict,
                 mean_surp,
@@ -583,6 +631,31 @@ impl UserStore {
             }
         }
         promoted
+    }
+
+    /// Immediately promote a `2..=4` CJK phrase explicitly assembled by the user via manual segmented
+    /// selection within a single unbroken Pinyin preedit (e.g. `zhuowei` -> `卓` + `威`, `biaode` -> `标` + `的`,
+    /// `zuihaoshi` -> `最好` + `是`).
+    pub fn promote_assembled_immediately(
+        &mut self,
+        phrase: &str,
+        auto_phrase: bool,
+        dict: Option<&DictView>,
+        pdict: Option<&PinyinDictView>,
+    ) -> Option<String> {
+        if !auto_phrase || !is_valid_auto_phrase_text(phrase) {
+            return None;
+        }
+        if let Some(up) = self.phrases.get_mut(phrase) {
+            self.seq += 1;
+            up.count = up.count.saturating_add(1);
+            up.last_seq = self.seq;
+            self.dirty = true;
+            return None;
+        }
+        self.pending_ngrams.remove(phrase);
+        self.add_phrase_with_pinyin(phrase, true, dict, pdict);
+        Some(phrase.to_string())
     }
 
     /// Promote a multi-character phrase assembled by the user (e.g. from Pinyin multi-segment selection)
@@ -1009,26 +1082,17 @@ fn is_cjk_ideograph(ch: char) -> bool {
     (0x4E00..=0x9FFF).contains(&u) || (0x3400..=0x4DBF).contains(&u)
 }
 
-/// Reject grammatical clause fragments (modal particles, structural `的/了/着`, pronouns, prepositions,
-/// and accidental single-char stutters like `"是是"`) from automatic dictionary promotion.
-/// Manual `add_phrase` is unrestricted.
+/// Validate candidate automatic phrases purely by length (`2..=4` CJK ideographs) and non-stutter,
+/// without banning ANY function character or modal particle (`的/了/是/吗/呢/吧/啊/嘛…`), so colloquial
+/// expressions like `最好是` (`zhs`), `傻逼吗` (`sbm`), `真的吗` (`zdm`), `标的` (`bd`), `过拟合` (`gnh`)
+/// are all learnable while commit-boundary alignment + repetition thresholds block mid-word & 1-off noise.
 pub fn is_valid_auto_phrase_text(phrase: &str) -> bool {
     let chars: Vec<char> = phrase.chars().collect();
     let n = chars.len();
-    if !(2..=4).contains(&n) {
+    if !(2..=4).contains(&n) || !chars.iter().all(|&c| is_cjk_ideograph(c)) {
         return false;
     }
     if n == 2 && chars[0] == chars[1] {
-        return false;
-    }
-    const BOUNDARY_PARTICLES: &[char] = &[
-        '的', '了', '吗', '呢', '吧', '啊', '呀', '哦', '嘛', '着', '过', '地', '得', '我', '你',
-        '他', '她', '它', '这', '那', '哪', '是', '在', '和', '与', '或', '把', '被', '给', '让',
-        '也', '都', '就', '还', '但', '而', '个',
-    ];
-    let first = chars[0];
-    let last = chars[n - 1];
-    if BOUNDARY_PARTICLES.contains(&first) || BOUNDARY_PARTICLES.contains(&last) || first == '么' {
         return false;
     }
     true

@@ -1284,21 +1284,50 @@ mod tests {
             store.phrases.keys().collect::<Vec<_>>()
         );
 
-        // Grammatical boundary particles ("好" + "的" -> "好的", "是" + "是" -> "是是") must NEVER auto-compose!
-        for round in 0..3u64 {
-            store.break_single_burst();
-            let t = 5000 + round * 1000;
-            let _ = store.record_commit_with_surprisal("", "好", t, true, 2, Some(&dict), None, Some(1.5));
-            let _ = store.record_commit_with_surprisal("好", "的", t + 100, true, 2, Some(&dict), None, Some(1.5));
-            store.break_single_burst();
-            let _ = store.record_commit_with_surprisal("", "是", t + 300, true, 2, Some(&dict), None, Some(1.5));
-            let _ = store.record_commit_with_surprisal("是", "是", t + 400, true, 2, Some(&dict), None, Some(1.5));
-        }
-        assert!(!store.phrases.contains_key("好的"), "trailing particle '的' must not auto-compose");
+        // Zero character blocklist: only 2-char accidental AA stutters ("是是") and mid-word slices ("怎么"+"样" -> "么样")
+        // are rejected, whereas modal/function phrases ("傻逼吗", "最好是", "标的", "过拟合", "落地", "我觉得")
+        // ARE all valid and learnable!
+        store.break_single_burst();
+        let _ = store.record_commit_with_surprisal("", "是", 5300, true, 2, None, None, Some(1.5));
+        let _ = store.record_commit_with_surprisal("是", "是", 5400, true, 2, None, None, Some(1.5));
         assert!(!store.phrases.contains_key("是是"), "AA stutter '是是' must not auto-compose");
-        assert!(!crate::user_data::is_valid_auto_phrase_text("么样"));
-        assert!(!crate::user_data::is_valid_auto_phrase_text("印花税是"));
+        // Mid-word slice check for "怎么" + "样": promotes "怎么样", NEVER slices "么样"!
+        for r in 0..2u64 {
+            store.break_single_burst();
+            let t = 5500 + r * 200;
+            let _ = store.record_commit_with_surprisal("", "怎么", t, true, 2, None, None, Some(1.5));
+            let _ = store.record_commit_with_surprisal("怎么", "样", t + 80, true, 2, None, None, Some(1.5));
+        }
+        assert!(store.phrases.contains_key("怎么样"), "'怎么'+'样' must compose full '怎么样'");
+        assert!(!store.phrases.contains_key("么样"), "mid-word '么样' must NEVER be sliced out of '怎么'+'样'");
+        assert!(crate::user_data::is_valid_auto_phrase_text("傻逼吗"));
+        assert!(crate::user_data::is_valid_auto_phrase_text("真的吗"));
         assert!(crate::user_data::is_valid_auto_phrase_text("技术专家"));
+        assert!(crate::user_data::is_valid_auto_phrase_text("标的"));
+        assert!(crate::user_data::is_valid_auto_phrase_text("过拟合"));
+        assert!(crate::user_data::is_valid_auto_phrase_text("落地"));
+        assert!(crate::user_data::is_valid_auto_phrase_text("最好是"));
+        assert!(crate::user_data::is_valid_auto_phrase_text("我觉得"));
+
+        // Typing "标" + "的" ONCE must NOT 1-shot promote (guards casual '的' suffix),
+        // while typing "最" + "好" + "是" or "标" + "的" TWICE DOES promote cleanly!
+        store.break_single_burst();
+        let _ = store.record_commit_with_surprisal("", "标", 6000, true, 2, None, None, Some(1.2));
+        let _ = store.record_commit_with_surprisal("标", "的", 6100, true, 2, None, None, Some(1.2));
+        assert!(!store.phrases.contains_key("标的"), "1st '标'+'的' should wait for repetition");
+        store.break_single_burst();
+        let _ = store.record_commit_with_surprisal("", "标", 7000, true, 2, None, None, Some(1.2));
+        let _ = store.record_commit_with_surprisal("标", "的", 7100, true, 2, None, None, Some(1.2));
+        assert!(store.phrases.contains_key("标的"), "2nd '标'+'的' must auto-compose '标的'");
+
+        for r in 0..2u64 {
+            store.break_single_burst();
+            let t = 8000 + r * 1000;
+            let _ = store.record_commit_with_surprisal("", "最", t, true, 2, None, None, Some(3.0));
+            let _ = store.record_commit_with_surprisal("最", "好", t + 100, true, 2, None, None, Some(2.0));
+            let _ = store.record_commit_with_surprisal("最好", "是", t + 200, true, 2, None, None, Some(2.5));
+        }
+        assert!(store.phrases.contains_key("最好是"), "expected '最好是' to auto-compose across single-char commits");
 
         // 2. P2-5: Outer-edge keys ('a'/'q' left, 'l'/'p' right) allow up to 0.32 offset while interior clamps at 0.20.
         let mut tp = crate::user_data::TouchProfile::default();
