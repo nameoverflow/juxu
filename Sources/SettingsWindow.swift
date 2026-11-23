@@ -677,6 +677,12 @@ public struct SettingsRootView: View {
                     )
                     Divider()
                     toggleRow(
+                        title: "Emoji 候选",
+                        subtitle: "拼音输入时，在匹配的词语后显示 Emoji 作为次要候选（如 思考 → 🤔）",
+                        isOn: binding(\.emojiCandidates)
+                    )
+                    Divider()
+                    toggleRow(
                         title: "中英文之间自动加空格",
                         subtitle: "中英混输或切换上屏时自动在汉字与英文边界补全空格（保留 URL 及退格删去的空格）",
                         isOn: binding(\.autoSpaceZhEn)

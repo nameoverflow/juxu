@@ -1,5 +1,6 @@
 pub mod code;
 pub mod config;
+pub mod emoji;
 pub mod engine;
 pub mod english;
 pub mod eval_log;

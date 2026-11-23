@@ -31,6 +31,8 @@ pub enum CandidateBadge {
     PinyinLookup = 4,
     /// 用户自造词 / 自动组词词条
     UserPhrase = 5,
+    /// Emoji 次要候选
+    Emoji = 6,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +124,7 @@ pub struct JuxuEngine {
     pub dicts: [Option<DictView>; 9],
     pub pinyin_dict: Option<PinyinDictView>,
     pub english_dict: EnDictView,
+    pub emoji_table: Option<crate::emoji::EmojiTable>,
     pub aux: Option<AuxView>,
     pub config: JuxuConfig,
     pub user: UserStore,
@@ -171,6 +174,7 @@ impl JuxuEngine {
             dicts: [None, None, None, None, None, None, None, None, None],
             pinyin_dict: None,
             english_dict: EnDictView::builtin_default(),
+            emoji_table: None,
             aux: None,
             config,
             user: UserStore::default(),
@@ -870,6 +874,13 @@ impl JuxuEngine {
         }
     }
 
+    pub fn load_emoji_table(&mut self, table: crate::emoji::EmojiTable) {
+        self.emoji_table = Some(table);
+        if !self.raw_code.is_empty() {
+            self.rebuild_candidates();
+        }
+    }
+
     pub fn load_english_dict(&mut self, dict: EnDictView) {
         self.english_dict = dict;
         if !self.raw_code.is_empty() {
@@ -1165,6 +1176,27 @@ impl JuxuEngine {
         self.commit_candidate(abs_idx, timestamp_ms, true)
     }
 
+    /// Emoji are output only: they are not learned or logged, and the word they stand for feeds the context.
+    fn commit_emoji_candidate(&mut self, abs_idx: usize) -> EngineOutput {
+        let text = self.pinyin_candidates[abs_idx].candidate.text.clone();
+        let source = self.pinyin_candidates[..abs_idx]
+            .iter()
+            .rev()
+            .find(|pc| pc.candidate.badge != CandidateBadge::Emoji)
+            .map(|pc| pc.candidate.text.clone());
+        self.clear_composition();
+        self.user.break_single_burst();
+        if let Some(source) = source {
+            self.last_committed = source.clone();
+            self.append_recent_context(&source);
+        }
+        EngineOutput {
+            consumed: true,
+            commit_text: text,
+            ..Default::default()
+        }
+    }
+
     fn commit_candidate(
         &mut self,
         abs_idx: usize,
@@ -1173,6 +1205,9 @@ impl JuxuEngine {
     ) -> Option<EngineOutput> {
         if self.is_pinyin_mode() {
             let pc = self.pinyin_candidates.get(abs_idx)?;
+            if pc.candidate.badge == CandidateBadge::Emoji {
+                return Some(self.commit_emoji_candidate(abs_idx));
+            }
             let commit_text = pc.candidate.text.clone();
             let consumed = pc.consumed_keys.min(self.observations.len());
             let pc_boundaries = pc.boundaries.clone();
@@ -3087,7 +3122,7 @@ impl JuxuEngine {
             context: &self.recent_context,
             layout: &self.key_layout,
         };
-        let (cands, paths) = if self.is_t9_pinyin_mode()
+        let (mut cands, paths) = if self.is_t9_pinyin_mode()
             && self
                 .observations
                 .iter()
@@ -3108,6 +3143,9 @@ impl JuxuEngine {
                 &initial_state,
             )
         };
+        if let Some(table) = self.emoji_table.as_ref().filter(|_| self.config.emoji_candidates) {
+            crate::emoji::inject(table, &mut cands, self.observations.len());
+        }
         self.candidates = cands.iter().map(|pc| pc.candidate.clone()).collect();
         self.pinyin_candidates = cands;
         self.pinyin_paths = paths;

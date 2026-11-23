@@ -54,7 +54,7 @@ app: build/Juxu Resources/Info.plist build/AppIcon.icns build/menu_icon.pdf
 	cp Resources/zh-Hans.lproj/InfoPlist.strings build/Juxu.app/Contents/Resources/zh-Hans.lproj/InfoPlist.strings
 	cp build/AppIcon.icns build/Juxu.app/Contents/Resources/AppIcon.icns
 	cp build/menu_icon.pdf build/Juxu.app/Contents/Resources/menu_icon.pdf
-	cp Resources/Dicts/*.wbdict Resources/Dicts/*.pydict Resources/Dicts/*.wbaux Resources/Dicts/*.endict build/Juxu.app/Contents/Resources/Dicts/
+	cp Resources/Dicts/*.wbdict Resources/Dicts/*.pydict Resources/Dicts/*.wbaux Resources/Dicts/*.endict Resources/Dicts/*.tsv build/Juxu.app/Contents/Resources/Dicts/
 	@id="$$(sh Scripts/resolve-codesign-identity.sh "$(CODESIGN_IDENTITY)" "$(CERT_NAME)")"; \
 	echo "Signing build/Juxu.app with identity: $$id"; \
 	codesign --force --deep --sign "$$id" build/Juxu.app

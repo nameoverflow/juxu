@@ -26,6 +26,10 @@
    - 协议：MIT License (`MIT`)，Copyright (c) 2016 mozillazg，协议原文见 `Resources/RawTables/pinyin/LICENSE`。
    - 原始数据整合自 [Unicode Unihan Database](https://www.unicode.org/reports/tr38/)（`kTGHZ2013` / `kMandarin` 等字段）及《通用规范汉字表》（2013 年版）。
 
+5. **`iDvel/rime-ice`（Emoji 候选词表）**
+   - 协议：GNU General Public License v3.0 (`GPL-3.0`)，协议原文见 `Resources/RawTables/pinyin_ice/LICENSE`。
+   - `Resources/Dicts/emoji.tsv` 取自上游 `opencc/emoji.txt`，仅按词条字节序重新排序。它作为独立资源文件分发，运行时只读映射，不编译进 `Core/` 静态库。
+
 ## 纠错语言模型语料来源（`wubi_aux.wbaux` `WBAUX003`）
 
 `Resources/Dicts/wubi_aux.wbaux`（`WBAUX003`）中的 `Micro-RWKV7-Small` 量化神经语言模型权重（`WBLM0001`，`INT8` 只读 `mmap`，2.52M 参数）与精简高 PMI N-gram 统计表（8,051 字 Unigram、80,000 条 Bigram、35,000 条 Trigram，不含任何原始语料原文）由 `Scripts/train_rwkv7.py` 基于 **2.80 亿字（279.76M 去重简体汉字）** 多域现代中文语料训练，并经 `build-dicts --corpus-lm` 编译生成：
