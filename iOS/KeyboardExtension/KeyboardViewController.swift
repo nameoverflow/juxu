@@ -994,7 +994,9 @@ public final class KeyboardViewController: UIInputViewController {
         waitedTicks: Int,
         expected: IOSLineClear.Expected?,
         collected: String,
-        remaining: String
+        remaining: String,
+        lastSeen: String? = nil,
+        stableTicks: Int = 0
     ) {
         guard generation == clearLineGeneration else { return }
         let before = textDocumentProxy.documentContextBeforeInput ?? ""
@@ -1003,7 +1005,8 @@ public final class KeyboardViewController: UIInputViewController {
             return
         }
         // Never delete from a stale context: an old snapshot could cross the line break or another field.
-        if let expected, !expected.isSatisfied(by: before) {
+        let stable = before == lastSeen ? stableTicks + 1 : 0
+        if let expected, !expected.isSatisfied(by: before, stableTicks: stable) {
             guard waitedTicks < 8 else {
                 finishLineClear(collected: collected, remaining: remaining)
                 return
@@ -1015,7 +1018,9 @@ public final class KeyboardViewController: UIInputViewController {
                     waitedTicks: waitedTicks + 1,
                     expected: expected,
                     collected: collected,
-                    remaining: remaining
+                    remaining: remaining,
+                    lastSeen: before,
+                    stableTicks: stable
                 )
             }
             return

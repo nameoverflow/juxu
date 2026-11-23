@@ -571,6 +571,29 @@ struct IOSKeyboardTests {
         let whole = IOSLineClear.Expected(previous: "abc", removed: 3)
         assert(!whole.isSatisfied(by: "abc") && !whole.isSatisfied(by: "ab"))
         assert(whole.isSatisfied(by: "上一行\n"))
+        assert(!whole.isSatisfied(by: "abc", stableTicks: 8), "Distinct text that never changed is stale")
+        // A line of one repeated character longer than the host window clears fully and stops at the line start.
+        for runLength in [150, 200, 350] {
+            var document = "保留\n" + String(repeating: "a", count: runLength)
+            var expected: IOSLineClear.Expected?
+            var lastSeen: String?
+            var stable = 0
+            var polls = 0
+            while polls < 200 {
+                polls += 1
+                let window = String(document.suffix(100))
+                stable = window == lastSeen ? stable + 1 : 0
+                lastSeen = window
+                if let expected, !expected.isSatisfied(by: window, stableTicks: stable) { continue }
+                let plan = IOSLineClear.plan(before: window, maxBatch: 128)
+                document.removeLast(plan.deleteCount)
+                if plan.reachesLineStart { break }
+                expected = IOSLineClear.Expected(previous: window, removed: plan.deleteCount)
+                lastSeen = nil
+                stable = 0
+            }
+            assert(document == "保留\n", "Run of \(runLength) must clear to the line start, left \(document.count)")
+        }
         // Backspace swipe-down restores line clears in reverse order
         let docA = UUID(), docB = UUID()
         var undo = IOSLineClearUndo()

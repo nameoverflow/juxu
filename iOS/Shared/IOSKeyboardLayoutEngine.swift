@@ -181,11 +181,17 @@ public enum IOSLineClear {
             self.remaining = String(previous.dropLast(removed))
         }
 
-        public func isSatisfied(by before: String) -> Bool {
-            if remaining.isEmpty {
-                return !previous.hasPrefix(before)
-            }
-            return before.hasSuffix(remaining)
+        /// Polls the host needed before an ambiguous window is trusted.
+        public static let settleTicks = 3
+
+        /// A long run of one character can look the same before and after a batch, because the host refills
+        /// its window from the text further left. Such a window only counts once it has stopped changing.
+        public func isSatisfied(by before: String, stableTicks: Int = 0) -> Bool {
+            if !remaining.isEmpty, before == remaining { return true }
+            guard remaining.isEmpty || before.hasSuffix(remaining) else { return false }
+            guard previous.hasPrefix(before) else { return true }
+            if before == previous, Set(previous).count != 1 { return false }
+            return stableTicks >= Self.settleTicks
         }
     }
 }
