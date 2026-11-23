@@ -169,7 +169,20 @@ struct SwiftBridgeTests {
         // Internal mixed boundary (`我们A`) vs clipboard (`splitInternal: false`)
         assert(AutoSpaceFormatter.format(before: "hello", inserting: "我们A", splitInternal: true, options: allOn).text == " 我们 A")
         assert(AutoSpaceFormatter.format(before: "你好", inserting: "我们A", splitInternal: true, options: allOn).text == "我们 A")
+        assert(AutoSpaceFormatter.format(before: "", inserting: "我用rust写了", splitInternal: true, options: allOn).text == "我用 rust 写了")
+        assert(AutoSpaceFormatter.format(before: "", inserting: "我用rust写了", splitInternal: true, options: allOff).text == "我用rust写了")
+        assert(AutoSpaceFormatter.format(before: "", inserting: "使用iOS18系统", splitInternal: true, options: noDigits).text == "使用 iOS18 系统")
+        assert(AutoSpaceFormatter.format(before: "", inserting: "第1名", splitInternal: true, options: noDigits).text == "第1名")
+        assert(AutoSpaceFormatter.format(before: "", inserting: "第1名", splitInternal: true, options: allOn).text == "第 1 名")
         assert(AutoSpaceFormatter.format(before: "使用", inserting: "iOS开发", splitInternal: false, options: allOn).text == " iOS开发")
+
+        // Punctuation pairing (corner brackets, book titles, quotes)
+        assert(PunctuationPairing.action(for: "「", after: nil, openClosers: []) == .insertPair(close: "」"))
+        assert(PunctuationPairing.action(for: "『", after: nil, openClosers: []) == .insertPair(close: "』"))
+        assert(PunctuationPairing.action(for: "《", after: "。", openClosers: []) == .insertPair(close: "》"))
+        assert(PunctuationPairing.action(for: "〈", after: nil, openClosers: []) == .insertPair(close: "〉"))
+        assert(PunctuationPairing.action(for: "」", after: "」", openClosers: ["」"]) == .skipClose)
+        assert(PunctuationPairing.shouldDeletePair(before: "「", after: "」", openClosers: ["」"]))
 
         // CJK Extension B surrogate pair + Latin extended
         assert(AutoSpaceFormatter.format(before: "𠮷", inserting: "a", splitInternal: false, options: allOn).text == " a")

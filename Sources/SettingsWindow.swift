@@ -672,7 +672,7 @@ public struct SettingsRootView: View {
                     Divider()
                     toggleRow(
                         title: "中文标点与引号智能配对",
-                        subtitle: "中文模式下自动转换全角标点，并成对输入 “…” 与 ‘…’",
+                        subtitle: "中文模式下自动转换全角标点，并成对输入引号、括号、直角引号与书名号",
                         isOn: binding(\.smartPunctuation)
                     )
                     Divider()

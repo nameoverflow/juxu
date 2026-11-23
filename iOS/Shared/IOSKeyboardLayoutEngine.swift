@@ -101,58 +101,7 @@ public enum IOSSwipeUp {
 }
 
 /// Chinese punctuation pairing: typing an opener also inserts its closer with the cursor in between.
-public enum IOSPunctuationPairing {
-    public enum Action: Equatable {
-        case plain
-        case insertPair(close: String)
-        case skipClose
-    }
-
-    private static let closers: [String: String] = [
-        "“": "”", "‘": "’", "（": "）", "《": "》", "【": "】", "「": "」",
-    ]
-    private static let closerSet = Set(closers.values)
-    /// Auto-closing is only safe when the cursor is not directly before existing text.
-    private static let safeFollowers = Set("，。！？；：、）》】」”’,.!?;:)]}")
-
-    public static func closer(for open: String) -> String? {
-        closers[open]
-    }
-
-    public static func action(for symbol: String, after: String?, openClosers: [String]) -> Action {
-        if let close = closers[symbol] {
-            guard let next = after?.first else { return .insertPair(close: close) }
-            return (next.isWhitespace || safeFollowers.contains(next)) ? .insertPair(close: close) : .plain
-        }
-        if closerSet.contains(symbol), openClosers.last == symbol, after?.first.map(String.init) == symbol {
-            return .skipClose
-        }
-        return .plain
-    }
-
-    /// Backspace right after an untouched auto-inserted pair removes both halves.
-    public static func shouldDeletePair(before: String?, after: String?, openClosers: [String]) -> Bool {
-        guard let close = openClosers.last,
-              let open = before?.last.map(String.init),
-              closers[open] == close else { return false }
-        return after?.first.map(String.init) == close
-    }
-
-    /// Forget tracked closers once the text right of the cursor no longer starts with them.
-    public static func pruned(_ openClosers: [String], after: String?) -> [String] {
-        guard let last = openClosers.last, after?.first.map(String.init) != last else { return openClosers }
-        return []
-    }
-
-    /// True while the text right of the cursor is still the tracked closers (innermost first) followed by
-    /// what was there when the first pair opened. Compared over the visible window, which the host may trim.
-    public static func cursorStaysInPairs(_ openClosers: [String], tail: String, after: String?) -> Bool {
-        let expected = openClosers.reversed().joined() + tail
-        let visible = after ?? ""
-        let length = min(expected.count, visible.count)
-        return expected.prefix(length) == visible.prefix(length) && visible.count >= openClosers.count
-    }
-}
+public typealias IOSPunctuationPairing = PunctuationPairing
 
 /// Plans the backspace swipe-up: delete leftward from the cursor, stopping at the current line's start.
 public enum IOSLineClear {
