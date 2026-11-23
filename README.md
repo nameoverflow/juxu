@@ -2,6 +2,20 @@
 
 面向 **macOS (`InputMethodKit`)** 与 **iOS (`UIInputViewController` 虚拟键盘扩展 + SwiftUI 宿主 App)** 的原生多方案输入法，统一驱动**全拼（26 键 / 九宫格 T9）、小鹤双拼、小鹤音形、86 / 98 / 新世纪五笔与仓颉三 / 五 / 六代**。
 
+## 快速安装（macOS Apple Silicon）
+
+### 方式一：一行命令安装 / 升级（推荐，免注销、零拦截）
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nameoverflow/juxu/main/Scripts/install-macos.sh | sh
+```
+
+自动校验 SHA-256、安装至 `~/Library/Input Methods/Juxu.app`、自动注册并启用到系统右上角输入法菜单，**无需手动找隐藏目录、无需注销或重启**，装完直接按 `Ctrl + Space`（或地球键 🌐）切换输入。
+
+### 方式二：`.pkg` 安装向导
+
+前往 [GitHub Releases](https://github.com/nameoverflow/juxu/releases/latest) 下载 `Juxu-*-macOS-arm64.pkg` 打开安装（首次若提示无法验证开发者，在「系统设置 → 隐私与安全性」底部点一次「仍要打开」即可），安装器会自动写入 `/Library/Input Methods/Juxu.app` 并立即启用输入法。
+
 ## 核心特性
 
 1. **零外部依赖、零拷贝 `mmap` 通用内核 (`Core/juxu-core`)**：
@@ -28,7 +42,8 @@
 make dicts         # 从 Resources/RawTables/ 重新编译 Resources/Dicts/ 二进制词典（字节级可复现）
 make test          # 运行 Rust 核心测试 + macOS Swift 桥接测试 + iOS 键盘几何与内联上屏测试
 make app           # 编译并签名 macOS 输入法 build/Juxu.app
-make install       # 安装并注册至 ~/Library/Input Methods/Juxu.app
+make pkg           # 构建 macOS 向导安装包 build/Juxu-*-macOS-arm64.pkg
+make install       # 安装并自动注册启用至 ~/Library/Input Methods/Juxu.app
 make ios-core      # 交叉编译 iOS 真机 (aarch64-apple-ios) 与模拟器静态库
 make ios-project   # 使用 XcodeGen 生成 iOS/Juxu.xcodeproj
 make previews      # 渲染 macOS 2x Retina 候选窗与设置页预览图

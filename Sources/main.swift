@@ -1,5 +1,33 @@
 import AppKit
+import Carbon
 import InputMethodKit
+
+if CommandLine.arguments.contains("--register-and-enable") {
+    let bundleURL = Bundle.main.bundleURL
+    let regStatus = TISRegisterInputSource(bundleURL as CFURL)
+    let bundleId = Bundle.main.bundleIdentifier ?? "com.hcyue.juxu.inputmethod"
+    let modeId = "\(bundleId).juxu"
+    let shouldSelect = CommandLine.arguments.contains("--select")
+
+    for (idx, filterDict) in [
+        [kTISPropertyBundleID as String: bundleId],
+        [kTISPropertyInputSourceID as String: bundleId],
+        [kTISPropertyInputSourceID as String: modeId],
+    ].enumerated() {
+        if let list = TISCreateInputSourceList(filterDict as CFDictionary, true)?.takeRetainedValue() as? [TISInputSource] {
+            for src in list {
+                _ = TISEnableInputSource(src)
+                if shouldSelect && idx == 2 {
+                    _ = TISSelectInputSource(src)
+                }
+            }
+        }
+    }
+    if regStatus != noErr {
+        fputs("TISRegisterInputSource returned \(regStatus)\n", stderr)
+    }
+    exit(0)
+}
 
 final class JuxuAppDelegate: NSObject, NSApplicationDelegate {
     private var imkServer: IMKServer?

@@ -1,4 +1,4 @@
-.PHONY: all dicts rust-test swift-test ios-test test app install previews ios-previews ios-project ios-core clean
+.PHONY: all dicts rust-test swift-test ios-test test app pkg install previews ios-previews ios-project ios-core clean
 
 CERT_NAME ?= Talus Local Code Signing
 CODESIGN_IDENTITY ?= auto
@@ -61,6 +61,11 @@ app: build/Juxu Resources/Info.plist build/AppIcon.icns build/menu_icon.pdf
 	echo "Signing build/Juxu.app with identity: $$id"; \
 	codesign --force --deep --sign "$$id" build/Juxu.app
 
+pkg: app
+	chmod +x Scripts/build-macos-pkg.sh
+	@ver="$$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"; \
+	sh Scripts/build-macos-pkg.sh build/Juxu.app "$$ver" "build/Juxu-$$ver-macOS-arm64.pkg"
+
 install: app
 	mkdir -p "$$HOME/Library/Input Methods"
 	pkill -TERM -x Juxu || true
@@ -69,7 +74,7 @@ install: app
 	rm -rf "$$HOME/Library/Input Methods/Juxu.app"
 	cp -R build/Juxu.app "$$HOME/Library/Input Methods/Juxu.app"
 	"$(LSREGISTER)" -f -R -trusted "$$HOME/Library/Input Methods/Juxu.app"
-	swift $(MACOS_TARGET) -e 'import Carbon; let u = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Input Methods/Juxu.app"); TISRegisterInputSource(u as CFURL)'
+	"$$HOME/Library/Input Methods/Juxu.app/Contents/MacOS/Juxu" --register-and-enable
 	killall imklaunchagent 2>/dev/null || true
 	sleep 0.3
 	open -g "$$HOME/Library/Input Methods/Juxu.app"

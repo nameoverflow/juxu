@@ -51,15 +51,21 @@ jobs:
       - name: Run Tests
         run: make test
 
-      - name: Build & Sign macOS App
+      - name: Build, Sign & Package macOS Installer (.pkg / .dmg / .zip)
         env:
           CERT_P12: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12 }}
           CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+          INSTALLER_CERT_P12: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_CERT_P12 }}
+          INSTALLER_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_CERT_PASSWORD }}
           NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
           NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
         run: |
           set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          mkdir -p dist/dmg-root
+          INSTALLER_SIGN_ID=""
+
           if [ -n "$CERT_P12" ] && [ -n "$CERT_PASSWORD" ]; then
             KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
             KEYCHAIN_PASS="$(openssl rand -hex 16)"
@@ -68,12 +74,18 @@ jobs:
             security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
             security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
             security import "$RUNNER_TEMP/cert.p12" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+            if [ -n "$INSTALLER_CERT_P12" ] && [ -n "$INSTALLER_CERT_PASSWORD" ]; then
+              echo "$INSTALLER_CERT_P12" | base64 --decode > "$RUNNER_TEMP/installer-cert.p12"
+              security import "$RUNNER_TEMP/installer-cert.p12" -P "$INSTALLER_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+            fi
+            security set-key-partition-list -S apple-tool:,apple:,codesign:,productsign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
             security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
 
             make app CODESIGN_IDENTITY=dist
             SIGN_ID="$(sh Scripts/resolve-codesign-identity.sh dist)"
             codesign --force --deep --options runtime --timestamp --sign "$SIGN_ID" build/Juxu.app
+
+            INSTALLER_SIGN_ID="$(security find-identity -v -p basic "$KEYCHAIN_PATH" 2>/dev/null | grep -F '"Developer ID Installer:' | head -n 1 | awk -F'"' '{print $2}' || true)"
 
             if [ -n "$NOTARY_KEY_ID" ] && [ -n "$NOTARY_ISSUER_ID" ] && [ -n "$NOTARY_PRIVATE_KEY" ]; then
               echo "$NOTARY_PRIVATE_KEY" > "$RUNNER_TEMP/AuthKey.p8"
@@ -89,24 +101,68 @@ jobs:
             make app CODESIGN_IDENTITY="-"
           fi
 
-      - name: Package ZIP & DMG
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.meta.outputs.version }}"
-          mkdir -p dist/dmg-root
+          # 1. Build native .pkg guided installer (installs to /Library/Input Methods + auto-registers & enables!)
+          chmod +x Scripts/build-macos-pkg.sh
+          sh Scripts/build-macos-pkg.sh build/Juxu.app "${VERSION}" "dist/Juxu-${VERSION}-macOS-arm64.pkg" "$INSTALLER_SIGN_ID"
+          if [ -n "$INSTALLER_SIGN_ID" ] && [ -n "$NOTARY_KEY_ID" ] && [ -n "$NOTARY_ISSUER_ID" ] && [ -n "$NOTARY_PRIVATE_KEY" ]; then
+            xcrun notarytool submit "dist/Juxu-${VERSION}-macOS-arm64.pkg" \
+              --key "$RUNNER_TEMP/AuthKey.p8" \
+              --key-id "$NOTARY_KEY_ID" \
+              --issuer "$NOTARY_ISSUER_ID" \
+              --wait
+            xcrun stapler staple "dist/Juxu-${VERSION}-macOS-arm64.pkg"
+          fi
+
+          # 2. Build portable .zip (also consumed by Scripts/install-macos.sh)
           ditto -c -k --sequesterRsrc --keepParent build/Juxu.app "dist/Juxu-${VERSION}-macOS-arm64.zip"
 
+          # 3. Build .dmg with double-clickable local installer helper
           cp -R build/Juxu.app dist/dmg-root/Juxu.app
-          cat <<'EOF' > "dist/dmg-root/安装说明.txt"
-          句序 Juxu macOS 输入法安装说明：
-          1. 将 Juxu.app 拷贝到 ~/Library/Input Methods/ 目录（在访达中按 Cmd+Shift+G 输入 ~/Library/Input Methods）。
-          2. 若首次运行提示“无法验证开发者”或“已损坏”，请在终端执行：
-             xattr -cr ~/Library/Input\ Methods/Juxu.app
-          3. 注销或重启后，在“系统设置 -> 键盘 -> 输入法”中添加“句序”。
+          cat <<'EOF' > "dist/dmg-root/双击安装句序.command"
+          #!/bin/sh
+          set -eu
+          SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+          USER_DIR="$HOME/Library/Input Methods"
+          DST_APP="$USER_DIR/Juxu.app"
+          LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+          pkill -TERM -x Juxu 2>/dev/null || true
+          pkill -TERM -x PrisWubi 2>/dev/null || true
+          sleep 0.3
+          mkdir -p "$USER_DIR"
+          rm -rf "$DST_APP"
+          cp -R "$SRC_DIR/Juxu.app" "$DST_APP"
+          xattr -cr "$DST_APP" 2>/dev/null || true
+          "$LSREGISTER" -f -R -trusted "$DST_APP" 2>/dev/null || true
+          "$DST_APP/Contents/MacOS/Juxu" --register-and-enable
+          killall imklaunchagent 2>/dev/null || true
+          sleep 0.3
+          open -g "$DST_APP"
+          echo ""
+          echo "✓ 句序 (Juxu) 已安装并自动启用！无需注销，按 Ctrl+Space 或地球键即可开始输入。"
           EOF
+          chmod 0755 "dist/dmg-root/双击安装句序.command"
           hdiutil create -volname "Juxu ${VERSION}" -srcfolder dist/dmg-root -ov -format UDZO "dist/Juxu-${VERSION}-macOS-arm64.dmg"
 
-          (cd dist && shasum -a 256 "Juxu-${VERSION}-macOS-arm64.zip" "Juxu-${VERSION}-macOS-arm64.dmg" > SHA256SUMS.txt)
+          (cd dist && shasum -a 256 \
+            "Juxu-${VERSION}-macOS-arm64.pkg" \
+            "Juxu-${VERSION}-macOS-arm64.dmg" \
+            "Juxu-${VERSION}-macOS-arm64.zip" > SHA256SUMS.txt)
+
+          cat <<EOF > dist/RELEASE_NOTES.md
+          ### macOS 快速安装 / 升级（Apple Silicon）
+
+          #### 方式一：一行命令全自动安装（推荐，免密码、免弹窗、免注销，5 秒即用）
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/nameoverflow/juxu/main/Scripts/install-macos.sh | sh
+          \`\`\`
+          > 自动下载并校验 SHA-256、安装至 \`~/Library/Input Methods/Juxu.app\`、注册并启用到右上角输入法菜单，装完直接按 \`Ctrl + Space\` / 🌐 切换使用。
+
+          #### 方式二：图形向导安装包（\`.pkg\`）
+          1. 下载下方 **\`Juxu-${VERSION}-macOS-arm64.pkg\`**；
+          2. 双击运行（若系统拦截未公证包，在 **系统设置 → 隐私与安全性** 底部点一次「仍要打开」，或右键安装器选「打开」）；
+          3. 安装完成后已自动注册启用输入法，**无需找隐藏目录、无需注销重启**。
+          EOF
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -115,7 +171,9 @@ jobs:
           name: 句序 Juxu ${{ steps.meta.outputs.tag }}
           prerelease: ${{ inputs.prerelease || false }}
           generate_release_notes: true
+          body_path: dist/RELEASE_NOTES.md
           files: |
-            dist/Juxu-${{ steps.meta.outputs.version }}-macOS-arm64.zip
+            dist/Juxu-${{ steps.meta.outputs.version }}-macOS-arm64.pkg
             dist/Juxu-${{ steps.meta.outputs.version }}-macOS-arm64.dmg
+            dist/Juxu-${{ steps.meta.outputs.version }}-macOS-arm64.zip
             dist/SHA256SUMS.txt
