@@ -377,18 +377,23 @@ public struct SettingsRootView: View {
                         .foregroundStyle(.secondary)
 
                     if !bridge.state.preedit.isEmpty {
-                        CandidateBarView(
-                            state: bridge.state,
-                            onSelectCandidate: { idx in
-                                let res = bridge.selectCandidate(pageRelIndex: idx, timestampMs: currentMs())
-                                if !res.commitText.isEmpty {
-                                    labCommittedText += res.commitText
+                        // The bar reports its content width. Scroll it so long candidates cannot widen
+                        // the card and move the keys under the pointer between taps.
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            CandidateBarView(
+                                state: bridge.state,
+                                onSelectCandidate: { idx in
+                                    let res = bridge.selectCandidate(pageRelIndex: idx, timestampMs: currentMs())
+                                    if !res.commitText.isEmpty {
+                                        labCommittedText += res.commitText
+                                    }
+                                },
+                                onTurnPage: { d in
+                                    _ = bridge.turnPage(delta: d)
                                 }
-                            },
-                            onTurnPage: { d in
-                                _ = bridge.turnPage(delta: d)
-                            }
-                        )
+                            )
+                        }
+                        .frame(minHeight: 34, alignment: .leading)
                     } else {
                         HStack {
                             Text("试着点偏 T/Y 交界输入 y-r-w-u（救回「我们」），或在「输入」后点偏 U/I 交界输入 u-f-c-y（救回「法」）")
