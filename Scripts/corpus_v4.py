@@ -609,9 +609,12 @@ def build_sources_list(api=None) -> list[tuple[str, str, str, str | None, bool]]
         ("duplex", "qualialabsAI/DuplexConv", "none_Edu/jsons.tar.gz", "0bb99da7ab7a2f6f86d6b23df92c9383e711d09a", False),
         ("lccc", "silver/lccc", "lccc_large.jsonl.gz", None, False),
         # 2. Chinese technical articles & dev blogs (dense CJK + English code-switching)
-        ("tech_code", "BAAI/IndustryCorpus2_computer_programming_code", "chinese/high/rank_00025.parquet", None, False),
-        ("tech_ai", "BAAI/IndustryCorpus2_artificial_intelligence_machine_learning", "chinese/high/rank_00011.parquet", None, False),
-        ("tech_ai", "BAAI/IndustryCorpus2_artificial_intelligence_machine_learning", "chinese/high/rank_00012.parquet", None, False),
+        ("tech_code", "BAAI/IndustryCorpus2_computer_programming_code", "chinese/high/rank_00025.parquet", None, True),
+        ("tech_code", "BAAI/IndustryCorpus2_computer_programming_code", "chinese/high/rank_00024.parquet", None, True),
+        ("tech_ai", "BAAI/IndustryCorpus2_artificial_intelligence_machine_learning", "chinese/high/rank_00011.parquet", None, True),
+        ("tech_ai", "BAAI/IndustryCorpus2_artificial_intelligence_machine_learning", "chinese/high/rank_00012.parquet", None, True),
+        ("tech_ai", "BAAI/IndustryCorpus2_artificial_intelligence_machine_learning", "chinese/high/rank_00010.parquet", None, True),
+        ("tech_ai", "BAAI/IndustryCorpus2_artificial_intelligence_machine_learning", "chinese/high/rank_00013.parquet", None, True),
         *[
             ("tech_comm", "BAAI/IndustryCorpus2_computer_communication", f"chinese/high/rank_{i:05d}.parquet", None, False)
             for i in (17, 18, 19, 20)
@@ -983,10 +986,14 @@ def prepare(directory: Path, seed: Path):
             if path is None or (cap is not None and writer.group_chars(group) >= cap):
                 continue
             begin = writer.group_chars(group)
-            for text in iter_records(group, path):
-                writer.add(group, text)
-                if cap is not None and writer.group_chars(group) >= cap:
-                    break
+            try:
+                for text in iter_records(group, path):
+                    writer.add(group, text)
+                    if cap is not None and writer.group_chars(group) >= cap:
+                        break
+            except Exception as exc:
+                print(f"[corpus] WARN skipping unreadable shard {group}/{file}: {exc}", flush=True)
+                continue
             end = writer.group_chars(group)
             use.append(
                 {
