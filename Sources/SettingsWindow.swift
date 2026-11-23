@@ -736,7 +736,7 @@ public struct SettingsRootView: View {
             calibratedKeyCount: bridge.state.calibratedKeyCount,
             candidates: [
                 JuxuCandidateItem(index: 1, text: "我们", comment: "⌖trwu 96%", badge: 2, confidence: 0.96, isExact: false),
-                JuxuCandidateItem(index: 2, text: "形序", comment: "", badge: 5, confidence: 0.02, isExact: true),
+                JuxuCandidateItem(index: 2, text: "句序", comment: "", badge: 5, confidence: 0.02, isExact: true),
                 JuxuCandidateItem(index: 3, text: "国", comment: "⚡l", badge: 1, confidence: 0.01, isExact: true),
                 JuxuCandidateItem(index: 4, text: "语言", comment: "", badge: 0, confidence: 0.01, isExact: true),
             ]

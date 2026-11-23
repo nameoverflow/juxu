@@ -23,9 +23,11 @@ all: build/Juxu
 $(CORE_LIB): $(CORE_SOURCES)
 	cargo build --release --manifest-path Core/Cargo.toml
 
+CORPUS_LM ?= $(if $(JUXU_CORPUS_LM),$(JUXU_CORPUS_LM),$(FORMORDO_CORPUS_LM))
+
 dicts: $(CORE_LIB)
-	@if [ -n "$(FORMORDO_CORPUS_LM)" ]; then \
-	  Core/target/release/build-dicts "$(RAW_TABLES_DIR)" Resources/Dicts --corpus-lm "$(FORMORDO_CORPUS_LM)"; \
+	@if [ -n "$(CORPUS_LM)" ]; then \
+	  Core/target/release/build-dicts "$(RAW_TABLES_DIR)" Resources/Dicts --corpus-lm "$(CORPUS_LM)"; \
 	else \
 	  Core/target/release/build-dicts "$(RAW_TABLES_DIR)" Resources/Dicts; \
 	fi

@@ -87,7 +87,7 @@ struct RenderPreviews {
         _ = bridge.pushTouch(reportedAscii: UInt8(ascii: "u"), x: 6.00, y: 0.00, isNormalized: true, timestampMs: 880)
 
         try renderSwiftUIView(
-            WindowChromeMock(title: "棱五笔 (PrisWubi) 偏好设置", isDark: false) {
+            WindowChromeMock(title: "句序 (Juxu) 偏好设置", isDark: false) {
                 SettingsRootView(bridge: bridge, initialSection: .schema)
             },
             width: 740,
@@ -97,7 +97,7 @@ struct RenderPreviews {
         )
 
         try renderSwiftUIView(
-            WindowChromeMock(title: "棱五笔 (PrisWubi) 偏好设置", isDark: true) {
+            WindowChromeMock(title: "句序 (Juxu) 偏好设置", isDark: true) {
                 SettingsRootView(bridge: bridge, initialSection: .typo)
             },
             width: 740,

@@ -1,6 +1,6 @@
 # Third-Party Data & Licenses
 
-形序 (Formordo) 的离线词典（`Resources/Dicts/*.wbdict` 与 `Resources/Dicts/wubi_aux.wbaux`）由 `Core/src/bin/build_dicts.rs` 从 `Resources/RawTables/` 中的以下第三方开源码表与拼音数据直接编译生成（可通过 `make dicts` 完全复现）：
+句序 (Juxu) 的离线词典（`Resources/Dicts/*.wbdict`、`Resources/Dicts/pinyin.pydict` 与 `Resources/Dicts/wubi_aux.wbaux`）由 `Core/src/bin/build_dicts.rs` 从 `Resources/RawTables/` 中的以下第三方开源码表与拼音数据直接编译生成（可通过 `make dicts` 完全复现）：
 
 | 资源目录 | 上游仓库 | 固定提交 (Commit) | 包含文件 | 对应编译产物 | 开源协议 (SPDX) | 协议原文 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -43,9 +43,9 @@
 | 现代正式文本 (Formal) | [opencsg/Fineweb-Edu-Chinese-V2.1 (`4_5`)](https://huggingface.co/datasets/opencsg/Fineweb-Edu-Chinese-V2.1) | 75.00M | `ODC-BY` | 需保留归属说明 |
 | 百科书面语 (Formal) | [wikimedia/wikipedia (`20231101.zh`)](https://huggingface.co/datasets/wikimedia/wikipedia) | 35.00M（繁转简并过滤自动生成小条目） | `CC-BY-SA-4.0` & `GFDL` | 需署名；统计/模型派生权重建议保留来源说明 |
 
-> 若需构建严格纯宽松协议的独立版 `wubi_aux.wbaux`（不引入任何外部社区/社交语料），可直接运行 `make dicts`（不传 `FORMORDO_CORPUS_LM`），退回仅由 `Resources/RawTables/` 生成的基础 Bigram 统计。
+> 若需构建严格纯宽松协议的独立版 `wubi_aux.wbaux`（不引入任何外部社区/社交语料），可直接运行 `make dicts`（不传 `JUXU_CORPUS_LM`），退回仅由 `Resources/RawTables/` 生成的基础 Bigram 统计。
 
 ## 派生二进制产物与协议兼容性提示
 
-- `Resources/Dicts/wubi86.wbdict`、`wubi98.wbdict`、`wubi06.wbdict` 分别是对应原始码表的直接二进制索引编译产物，沿用各自原始码表的开源协议（`LGPL-3.0` / `GPL-3.0` / `Apache-2.0`）。
-- `Resources/Dicts/wubi_aux.wbaux`（`WBAUX003`）汇总了 `mozillazg/pinyin-data` 的拼音反查索引、三套五笔词表的回退统计，以及上述 2.80 亿字多域语料训练的 `Micro-RWKV7-Small`（`WBLM0001` `INT8` 权重，2.56 MB）与高 PMI N-gram 残差表（共 4.16 MB）。分发 `Resources/Dicts/` 时需同时遵守 `GPL-3.0` / `LGPL-3.0` / `Apache-2.0` / `MIT` / `ODC-BY` 条款，并留意上表所列少量社交语料的研究用途限制（公开发布商业 App Store 版本前建议移除 `rednote-xiaohongshu-notes` 后重新执行 `Scripts/train_rwkv7.py` + `FORMORDO_CORPUS_LM=... make dicts`）。
+- `Resources/Dicts/*.wbdict` 分别是对应原始码表的直接二进制索引编译产物，沿用各自原始码表的开源协议（`LGPL-3.0` / `GPL-3.0` / `Apache-2.0`）。
+- `Resources/Dicts/wubi_aux.wbaux`（`WBAUX003`）汇总了 `mozillazg/pinyin-data` 的拼音反查索引、五笔词表的回退统计，以及多域语料训练的 `Micro-RWKV-7`（`WBLM0001` `INT8` 权重）与高 PMI N-gram 残差表。分发 `Resources/Dicts/` 时需同时遵守 `GPL-3.0` / `LGPL-3.0` / `Apache-2.0` / `MIT` / `ODC-BY` 条款，并留意上表所列少量社交语料的研究用途限制（公开发布商业 App Store 版本前建议移除 `rednote-xiaohongshu-notes` 后重新执行 `Scripts/train_rwkv7.py` + `JUXU_CORPUS_LM=... make dicts`）。

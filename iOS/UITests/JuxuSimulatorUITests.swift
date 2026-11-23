@@ -183,7 +183,7 @@ final class JuxuSimulatorUITests: XCTestCase {
             return app
         }
 
-        // 1. Add 形序 in iOS 26.5 Settings -> 通用 -> 键盘 -> 键盘 -> 添加新键盘
+        // 1. Add 句序 in iOS 26.5 Settings -> 通用 -> 键盘 -> 键盘 -> 添加新键盘
         let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
         settings.launch()
 
@@ -249,7 +249,7 @@ final class JuxuSimulatorUITests: XCTestCase {
         } else if pickerInApp.exists && pickerInApp.frame.minY > 500 {
             pickerInApp.tap()
         } else {
-            // Dismiss menu if any and cycle Globe until 形序 is active
+            // Dismiss menu if any and cycle Globe until 句序 is active
             for _ in 0..<6 {
                 globeCoord.tap()
                 Thread.sleep(forTimeInterval: 0.7)
@@ -642,7 +642,7 @@ final class JuxuSimulatorUITests: XCTestCase {
 
     @MainActor
     func testClipboardSuggestionAndOTPExtraction() throws {
-        // 1. Ensure Full Access is enabled for 形序 in iOS Settings -> 通用 -> 键盘 -> 键盘 -> 形序
+        // 1. Ensure Full Access is enabled for 句序 in iOS Settings -> 通用 -> 键盘 -> 键盘 -> 句序
         let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
         settings.terminate()
         settings.launch()
@@ -654,7 +654,7 @@ final class JuxuSimulatorUITests: XCTestCase {
         let kbsCell = settings.tables.cells.containing(.staticText, identifier: "键盘").firstMatch
         if kbsCell.waitForExistence(timeout: 3) { kbsCell.tap() }
 
-        let prisRow = settings.cells.containing(NSPredicate(format: "label CONTAINS '形序'")).firstMatch
+        let prisRow = settings.cells.containing(NSPredicate(format: "label CONTAINS '句序'")).firstMatch
         if prisRow.waitForExistence(timeout: 3) {
             prisRow.tap()
             let fullAccessSwitch = settings.switches.containing(NSPredicate(format: "label CONTAINS '允许完全访问'")).firstMatch
