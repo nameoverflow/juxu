@@ -364,6 +364,7 @@ public struct JuxuPreferences: Equatable, Sendable {
     public var keySwipeUpInput: Bool = false
     public var keyLongPressAlternates: Bool = false
     public var backspaceSwipeClear: Bool = false
+    public var keyboardHoldCursor: Bool = false
     public var evalLogging: Bool = true
     public var emojiCandidates: Bool = false
 
@@ -440,6 +441,7 @@ public struct JuxuPreferences: Equatable, Sendable {
         key_swipe_up_input = \(keySwipeUpInput)
         key_long_press_alternates = \(keyLongPressAlternates)
         backspace_swipe_clear = \(backspaceSwipeClear)
+        keyboard_hold_cursor = \(keyboardHoldCursor)
         emoji_candidates = \(emojiCandidates)
         eval_logging = \(evalLogging)
 
@@ -526,6 +528,8 @@ public struct JuxuPreferences: Equatable, Sendable {
                 p.keyLongPressAlternates = boolVal
             case (_, "backspace_swipe_clear"):
                 p.backspaceSwipeClear = boolVal
+            case (_, "keyboard_hold_cursor"):
+                p.keyboardHoldCursor = boolVal
             case (_, "emoji_candidates"):
                 p.emojiCandidates = boolVal
             case (_, "eval_logging"):
@@ -1123,6 +1127,7 @@ public final class JuxuBridge: ObservableObject {
             loaded.keySwipeUpInput = uiPrefs.keySwipeUpInput
             loaded.keyLongPressAlternates = uiPrefs.keyLongPressAlternates
             loaded.backspaceSwipeClear = uiPrefs.backspaceSwipeClear
+            loaded.keyboardHoldCursor = uiPrefs.keyboardHoldCursor
         }
         self.prefs = loaded
         ensureDictionaryLoaded(for: loaded.schemaId)
@@ -1325,6 +1330,7 @@ public final class JuxuBridge: ObservableObject {
                         loaded.keySwipeUpInput = uiPrefs.keySwipeUpInput
                         loaded.keyLongPressAlternates = uiPrefs.keyLongPressAlternates
                         loaded.backspaceSwipeClear = uiPrefs.backspaceSwipeClear
+                        loaded.keyboardHoldCursor = uiPrefs.keyboardHoldCursor
                         self.prefs = loaded
                         self.ensureDictionaryLoaded(for: loaded.schemaId)
                         self.ensureEmojiTableLoaded()

@@ -1517,6 +1517,7 @@ public final class KeyboardViewController: UIInputViewController {
         keyCanvas.longPressAlternatesEnabled = bridge.prefs.keyLongPressAlternates
         keyCanvas.asciiMode = st.asciiMode
         keyCanvas.backspaceSwipeClearEnabled = bridge.prefs.backspaceSwipeClear
+        keyCanvas.keyboardHoldCursorEnabled = bridge.prefs.keyboardHoldCursor
         layoutEngine.isZLookupActive = bridge.prefs.isCangjieFamily
             && bridge.prefs.zOmnipotent
             && st.preedit.hasPrefix("z")

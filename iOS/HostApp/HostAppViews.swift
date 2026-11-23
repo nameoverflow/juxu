@@ -458,6 +458,8 @@ public struct IOSHostRootView: View {
                         iosToggleRow("长按弹出更多字符", sub: "长按字母键后左右滑动，选择声调字母、大小写、数字或符号", isOn: binding(\.keyLongPressAlternates))
                         Divider()
                         iosToggleRow("退格键上滑清空本行", sub: "上滑删除光标左侧到行首的内容，下滑依次撤回；正在输入拼音时只清空拼音", isOn: binding(\.backspaceSwipeClear))
+                        Divider()
+                        iosToggleRow("全键盘长按移动光标", sub: "在键盘任意键上长按即可滑动光标；继续按住不放则会弹出按键的特殊字符", isOn: binding(\.keyboardHoldCursor))
                     }
                     .padding(14)
                     .background(iosCardBackground)

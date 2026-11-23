@@ -294,6 +294,46 @@ public enum IOSKeyAlternates {
     }
 }
 
+/// Whole-keyboard long-press trackpad policy (opt-in).
+/// When enabled, holding any non-system key enters trackpad cursor mode first; continuing to hold
+/// still on a key with alternates promotes to its alternates popup, whereas moving the finger stays
+/// in cursor mode and cancels the popup.
+public enum IOSKeyboardTrackpadHold {
+    /// Hold duration before trackpad cursor control activates when whole-keyboard hold is on.
+    public static let trackpadDelay: TimeInterval = 0.35
+    /// Spacebar hold duration when whole-keyboard hold is off.
+    public static let defaultSpaceHoldDelay: TimeInterval = 0.42
+    /// Default alternates long-press delay when whole-keyboard hold is off.
+    public static let defaultAlternatesDelay: TimeInterval = 0.40
+    /// Total hold duration before an idle trackpad touch promotes to the key's alternates popup.
+    public static let alternatesPromotionDelay: TimeInterval = 0.78
+    /// Movement threshold (in points) that cancels pending timers or commits to cursor movement.
+    public static let moveCancelDistance: CGFloat = 12.0
+
+    public static func supportsTrackpadHold(for kind: IOSKeyKind, wholeKeyboardEnabled: Bool) -> Bool {
+        if kind == .space { return true }
+        guard wholeKeyboardEnabled else { return false }
+        switch kind {
+        case .backspace, .globe, .planeSwitch:
+            return false
+        default:
+            return true
+        }
+    }
+
+    public static func trackpadHoldDelay(wholeKeyboardEnabled: Bool) -> TimeInterval {
+        wholeKeyboardEnabled ? trackpadDelay : defaultSpaceHoldDelay
+    }
+
+    public static func alternatesDelay(wholeKeyboardEnabled: Bool) -> TimeInterval {
+        wholeKeyboardEnabled ? alternatesPromotionDelay : defaultAlternatesDelay
+    }
+
+    public static func shouldCancelAlternatesOnMove(from start: CGPoint, to current: CGPoint) -> Bool {
+        hypot(current.x - start.x, current.y - start.y) > moveCancelDistance
+    }
+}
+
 public struct IOSKeySpec: Identifiable, Equatable {
     public let id: String
     public let kind: IOSKeyKind

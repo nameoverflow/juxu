@@ -1130,6 +1130,23 @@ struct IOSKeyboardTests {
             assert(f1FinalText == "你好我们" && f1FinalMarked == nil, "Got '\(f1FinalText)'")
         }
 
+        // Whole-keyboard long-press trackpad with delayed alternates promotion
+        assert(IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .space, wholeKeyboardEnabled: false))
+        assert(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .letter(UInt8(ascii: "a")), wholeKeyboardEnabled: false))
+        assert(IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .letter(UInt8(ascii: "a")), wholeKeyboardEnabled: true))
+        assert(IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .symbol("，"), wholeKeyboardEnabled: true))
+        assert(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .backspace, wholeKeyboardEnabled: true), "Backspace keeps repeat delete")
+        assert(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .globe, wholeKeyboardEnabled: true), "Globe keeps system switcher")
+        assert(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .planeSwitch(.numbers, label: "123"), wholeKeyboardEnabled: true), "Plane switch keeps hold-and-slide")
+        assert(IOSKeyboardTrackpadHold.trackpadHoldDelay(wholeKeyboardEnabled: true) < IOSKeyboardTrackpadHold.alternatesDelay(wholeKeyboardEnabled: true), "Trackpad activates before alternates popup")
+        assert(IOSKeyboardTrackpadHold.alternatesDelay(wholeKeyboardEnabled: false) == IOSKeyboardTrackpadHold.defaultAlternatesDelay)
+        let holdStart = CGPoint(x: 200, y: 180)
+        assert(!IOSKeyboardTrackpadHold.shouldCancelAlternatesOnMove(from: holdStart, to: CGPoint(x: 208, y: 184)), "Small jitter keeps alternates timer armed")
+        assert(IOSKeyboardTrackpadHold.shouldCancelAlternatesOnMove(from: holdStart, to: CGPoint(x: 215, y: 180)), "Cursor drag cancels pending alternates popup")
+        var holdCursorPrefs = JuxuPreferences()
+        assert(!holdCursorPrefs.keyboardHoldCursor, "Whole-keyboard hold cursor is opt-in")
+        holdCursorPrefs.keyboardHoldCursor = true
+        assert(JuxuPreferences.fromTOML(holdCursorPrefs.toTOML()).keyboardHoldCursor)
         print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi, T9 Pinyin, YYTextView inline commit & focus-loss recovery tests passed!")
     }
 }

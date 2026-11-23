@@ -490,6 +490,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     var onAlternatesMove: ((CGPoint) -> Void)?
     var onAlternatesEnd: ((Bool) -> Void)?
     var backspaceSwipeClearEnabled: Bool = false
+    var keyboardHoldCursorEnabled: Bool = false
     var longPressAlternatesEnabled: Bool = false
     var asciiMode: Bool = false
 
@@ -512,6 +513,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
         var swipeUpActive: Bool = false
         var swipeDownActive: Bool = false
         var alternatesActive: Bool = false
+        var trackpadActive: Bool = false
     }
 
     private(set) var snapshot: IOSKeyboardLayoutEngine.LayoutSnapshot?
@@ -602,18 +604,14 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
         let pendingIds = trackedTouches
             .filter {
                 let s = $0.value
-                return !s.committedByRollover && !s.isPlaneSlide && !(s.startedOnSpace && trackpad.isActive)
+                return !s.committedByRollover && !s.isPlaneSlide && !s.trackpadActive
             }
             .sorted(by: { $0.value.beganTimestamp < $1.value.beganTimestamp })
             .map(\.key)
 
         for oldId in pendingIds {
             guard var oldState = trackedTouches[oldId] else { continue }
-            if oldState.startedOnSpace && spaceHoldTouchId == oldId {
-                spaceHoldTimer?.invalidate()
-                spaceHoldTimer = nil
-                spaceHoldTouchId = nil
-            }
+            cancelTrackpadHoldTimer(for: oldId)
             oldState.committedByRollover = true
             trackedTouches[oldId] = oldState
             commitRolledOver(oldState)
@@ -643,6 +641,38 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
         }
     }
 
+    private func cancelTrackpadHoldTimer(for id: ObjectIdentifier? = nil) {
+        if let id, spaceHoldTouchId != id { return }
+        spaceHoldTimer?.invalidate()
+        spaceHoldTimer = nil
+        spaceHoldTouchId = nil
+    }
+
+    private func startTrackpadHoldTimer(for id: ObjectIdentifier) {
+        cancelTrackpadHoldTimer()
+        spaceHoldTouchId = id
+        let delay = IOSKeyboardTrackpadHold.trackpadHoldDelay(wholeKeyboardEnabled: keyboardHoldCursorEnabled)
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.spaceHoldTouchId == id else { return }
+                self.spaceHoldTimer = nil
+                self.spaceHoldTouchId = nil
+                guard var st = self.trackedTouches[id],
+                      !st.committedByRollover,
+                      !st.alternatesActive,
+                      !st.swipeUpActive,
+                      st.currentKey.id == st.initialKey.id else { return }
+                st.trackpadActive = true
+                self.trackedTouches[id] = st
+                self.trackpad.begin(at: st.currentPoint, timestamp: ProcessInfo.processInfo.systemUptime)
+                self.onTrackpadStateChanged?(true)
+                self.syncKeycapPressStates()
+            }
+        }
+        spaceHoldTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
     private func cancelLongPressTimer(for id: ObjectIdentifier? = nil) {
         if let id, longPressTouchId != id { return }
         longPressTimer?.invalidate()
@@ -653,7 +683,8 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     private func startLongPressTimer(for id: ObjectIdentifier) {
         cancelLongPressTimer()
         longPressTouchId = id
-        let timer = Timer(timeInterval: 0.40, repeats: false) { [weak self] _ in
+        let delay = IOSKeyboardTrackpadHold.alternatesDelay(wholeKeyboardEnabled: keyboardHoldCursorEnabled)
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.longPressTouchId == id else { return }
                 self.longPressTimer = nil
@@ -662,8 +693,15 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                       !state.committedByRollover,
                       !state.swipeUpActive,
                       state.currentKey.id == state.initialKey.id else { return }
+                self.cancelTrackpadHoldTimer(for: id)
+                if state.trackpadActive {
+                    state.trackpadActive = false
+                    self.trackpad.end()
+                    self.onTrackpadStateChanged?(false)
+                }
                 state.alternatesActive = true
                 self.trackedTouches[id] = state
+                self.syncKeycapPressStates()
                 self.onAlternatesBegin?(state.initialKey)
             }
         }
@@ -769,18 +807,14 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                         return false
                     }
                     return !state.committedByRollover && !state.isPlaneSlide
-                        && !(state.startedOnSpace && trackpad.isActive)
+                        && !state.trackpadActive
                 }
                 .sorted(by: { $0.value.beganTimestamp < $1.value.beganTimestamp })
                 .map(\.key)
 
             for oldId in pendingIds {
                 guard var oldState = trackedTouches[oldId] else { continue }
-                if oldState.startedOnSpace && spaceHoldTouchId == oldId {
-                    spaceHoldTimer?.invalidate()
-                    spaceHoldTimer = nil
-                    spaceHoldTouchId = nil
-                }
+                cancelTrackpadHoldTimer(for: oldId)
                 oldState.committedByRollover = true
                 trackedTouches[oldId] = oldState
                 commitRolledOver(oldState)
@@ -823,22 +857,8 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
             )
             trackedTouches[id] = state
 
-            if isSpace {
-                spaceHoldTimer?.invalidate()
-                spaceHoldTouchId = id
-                let timer = Timer(timeInterval: 0.42, repeats: false) { [weak self] _ in
-                    MainActor.assumeIsolated {
-                        guard let self,
-                              let activeId = self.spaceHoldTouchId,
-                              let st = self.trackedTouches[activeId],
-                              !st.committedByRollover else { return }
-                        self.trackpad.begin(at: st.currentPoint, timestamp: ProcessInfo.processInfo.systemUptime)
-                        self.onTrackpadStateChanged?(true)
-                        self.syncKeycapPressStates()
-                    }
-                }
-                spaceHoldTimer = timer
-                RunLoop.main.add(timer, forMode: .common)
+            if IOSKeyboardTrackpadHold.supportsTrackpadHold(for: hit.kind, wholeKeyboardEnabled: keyboardHoldCursorEnabled) {
+                startTrackpadHoldTimer(for: id)
             }
 
             syncKeycapPressStates()
@@ -879,8 +899,20 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 onAlternatesMove?(pt)
                 continue
             }
-            if state.maxMovedDistance > 12.0 {
+            if state.trackpadActive {
+                trackedTouches[id] = state
+                if IOSKeyboardTrackpadHold.shouldCancelAlternatesOnMove(from: state.initialPoint, to: pt) {
+                    cancelLongPressTimer(for: id)
+                }
+                let (dx, dy) = trackpad.update(point: pt, timestamp: touch.timestamp)
+                if dx != 0 || dy != 0 {
+                    onTrackpadMove?(dx, dy)
+                }
+                continue
+            }
+            if state.maxMovedDistance > IOSKeyboardTrackpadHold.moveCancelDistance {
                 cancelLongPressTimer(for: id)
+                cancelTrackpadHoldTimer(for: id)
             }
 
             if state.initialKey.kind == .backspace {
@@ -933,21 +965,9 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 continue
             }
 
-            // 2. Spacebar 2D trackpad cursor drag
+            // 2. Spacebar waits for trackpad activation (handled above once active)
             if state.startedOnSpace {
                 trackedTouches[id] = state
-                if !trackpad.isActive && hypot(pt.x - state.initialPoint.x, pt.y - state.initialPoint.y) > 14 {
-                    if spaceHoldTouchId == id {
-                        spaceHoldTimer?.invalidate()
-                        spaceHoldTimer = nil
-                    }
-                }
-                if trackpad.isActive {
-                    let (dx, dy) = trackpad.update(point: pt, timestamp: touch.timestamp)
-                    if dx != 0 || dy != 0 {
-                        onTrackpadMove?(dx, dy)
-                    }
-                }
                 continue
             }
 
@@ -1070,7 +1090,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 continue
             }
 
-            if state.startedOnSpace && trackpad.isActive {
+            if state.trackpadActive {
                 trackpad.end()
                 onTrackpadStateChanged?(false)
                 syncKeycapPressStates()
@@ -1178,7 +1198,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                 }
                 continue
             }
-            if state.startedOnSpace && trackpad.isActive {
+            if state.trackpadActive {
                 trackpad.end()
                 onTrackpadStateChanged?(false)
                 continue
