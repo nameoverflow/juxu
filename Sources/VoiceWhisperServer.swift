@@ -616,7 +616,8 @@ public final class VoiceWhisperStreamSession {
     private let transcriber: VoiceWhisperTranscribing
     private let language: String
     private let sampleProvider: SampleProvider
-    private let onPartial: @MainActor (String) -> Void
+    private let onPartial: @MainActor (VoicePartialDisplay) -> Void
+    private var stabilizer = VoicePartialStabilizer()
     private var state: State = .idle
     private var loopTask: Task<Void, Never>?
 
@@ -624,7 +625,7 @@ public final class VoiceWhisperStreamSession {
         transcriber: VoiceWhisperTranscribing,
         language: String,
         sampleProvider: @escaping SampleProvider,
-        onPartial: @escaping @MainActor (String) -> Void
+        onPartial: @escaping @MainActor (VoicePartialDisplay) -> Void
     ) {
         self.transcriber = transcriber
         self.language = language
@@ -700,7 +701,7 @@ public final class VoiceWhisperStreamSession {
                     )
                     guard !Task.isCancelled, state == .streaming else { return }
                     if !text.isEmpty {
-                        onPartial(total > window.count ? "…" + text : text)
+                        onPartial(stabilizer.update(text, windowed: total > window.count))
                     }
                 } catch {
                     return // Partials are best effort; finish() decides about fallback.
