@@ -535,6 +535,20 @@ fn main() {
                 );
                 return;
             }
+            "--pinyin-only" => {
+                fs::create_dir_all(&out_dir).expect("failed to create output dir");
+                let pinyin_dir = raw_dir.join("pinyin");
+                let tghz_set = load_tghz_set(&pinyin_dir);
+                let ice_dir = raw_dir.join("pinyin_ice");
+                let py_blob = build_pinyin_dict(&ice_dir, &tghz_set);
+                let out_path = out_dir.join("pinyin.pydict");
+                fs::write(&out_path, &py_blob).expect("failed to write pinyin.pydict");
+                println!(
+                    "Built char-only pinyin.pydict ({:.2} KB)",
+                    py_blob.len() as f64 / 1024.0
+                );
+                return;
+            }
             other => {
                 eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
@@ -967,8 +981,10 @@ fn build_cangjie_dict(
 }
 
 fn build_pinyin_dict(ice_dir: &Path, tghz_set: &HashSet<u32>) -> Vec<u8> {
+    // Pure char-level neural Pinyin decoding only needs the single-character syllable reading table
+    // (`8105.dict.yaml` + `41448.dict.yaml`) for phonetic candidates and Bayesian `P(syl | char)`.
+    // Multi-character phrase tables (~66 MB) are no longer used or bundled.
     let mut chars: Vec<(String, String, u32, u16)> = Vec::new();
-    let mut primary_syl: HashMap<char, (String, u32)> = HashMap::new();
 
     for (fname, is_rare_file) in [("8105.dict.yaml", false), ("41448.dict.yaml", true)] {
         let path = ice_dir.join(fname);
@@ -1011,106 +1027,13 @@ fn build_pinyin_dict(ice_dir: &Path, tghz_set: &HashSet<u32>) -> Vec<u8> {
                 0
             };
             chars.push((syl.to_string(), text.to_string(), wt, flags));
-            primary_syl
-                .entry(ch)
-                .and_modify(|prev| {
-                    if wt > prev.1 {
-                        *prev = (syl.to_string(), wt);
-                    }
-                })
-                .or_insert_with(|| (syl.to_string(), wt));
         }
     }
 
-    let mut phrases: Vec<(Vec<String>, String, u32, u16)> = Vec::new();
-    for fname in ["base.dict.yaml", "ext.dict.yaml", "others.dict.yaml"] {
-        let path = ice_dir.join(fname);
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let mut in_body = false;
-        for raw_line in content.lines() {
-            let line = raw_line.trim();
-            if !in_body {
-                if line == "..." {
-                    in_body = true;
-                }
-                continue;
-            }
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() < 2 {
-                continue;
-            }
-            let text = parts[0].trim();
-            let syl_str = parts[1].trim();
-            let wt = parts
-                .get(2)
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(10)
-                .min(u32::MAX as u64) as u32;
-            let syls: Vec<String> = syl_str
-                .split_whitespace()
-                .map(|s| s.to_ascii_lowercase())
-                .collect();
-            if syls.len() < 2 || syls.len() > 6 || text.chars().count() != syls.len() {
-                continue;
-            }
-            if !syls
-                .iter()
-                .all(|s| !s.is_empty() && s.len() <= 7 && s.bytes().all(|b| b.is_ascii_lowercase()))
-            {
-                continue;
-            }
-            phrases.push((syls, text.to_string(), wt, 0));
-        }
-    }
-
-    // Auto-annotate `tencent.dict.yaml` using `primary_syl`
-    let tencent_path = ice_dir.join("tencent.dict.yaml");
-    if let Ok(content) = fs::read_to_string(&tencent_path) {
-        let mut in_body = false;
-        for raw_line in content.lines() {
-            let line = raw_line.trim();
-            if !in_body {
-                if line == "..." {
-                    in_body = true;
-                }
-                continue;
-            }
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let parts: Vec<&str> = line.split('\t').collect();
-            let text = parts[0].trim();
-            let char_cnt = text.chars().count();
-            if !(2..=6).contains(&char_cnt) {
-                continue;
-            }
-            let wt = parts
-                .get(1)
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(1)
-                .min(u32::MAX as u64) as u32;
-            let mut syls = Vec::with_capacity(char_cnt);
-            let mut ok = true;
-            for ch in text.chars() {
-                if let Some((s, _)) = primary_syl.get(&ch) {
-                    syls.push(s.clone());
-                } else {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                phrases.push((syls, text.to_string(), wt, 0));
-            }
-        }
-    }
-
-    serialize_pydict(PinyinDictBuildInput { chars, phrases })
+    serialize_pydict(PinyinDictBuildInput {
+        chars,
+        phrases: Vec::new(),
+    })
 }
 
 fn build_english_dict(ice_dir: &Path) -> (Vec<u8>, usize) {
