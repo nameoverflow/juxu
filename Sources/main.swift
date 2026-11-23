@@ -5,8 +5,8 @@ import InputMethodKit
 if CommandLine.arguments.contains("--register-and-enable") {
     let bundleURL = Bundle.main.bundleURL
     let regStatus = TISRegisterInputSource(bundleURL as CFURL)
-    let bundleId = Bundle.main.bundleIdentifier ?? "com.hcyue.juxu.inputmethod"
-    let modeId = "\(bundleId).juxu"
+    let bundleId = Bundle.main.bundleIdentifier ?? "com.hcyue.inputmethod.juxu"
+    let modeId = "\(bundleId).Hans"
     let shouldSelect = CommandLine.arguments.contains("--select")
 
     for (idx, filterDict) in [
@@ -34,7 +34,7 @@ final class JuxuAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let bundle = Bundle.main
-        let bundleId = bundle.bundleIdentifier ?? "com.hcyue.juxu.inputmethod"
+        let bundleId = bundle.bundleIdentifier ?? "com.hcyue.inputmethod.juxu"
 
         // On macOS 27+, `+[IMKServer connectionNameFor:]` enforces `<bundleIdentifier>.Connection`
         // for all third-party input methods (rejecting custom names in IMKInputSession_Modern).
