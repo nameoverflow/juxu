@@ -520,6 +520,7 @@ struct IOSKeyboardTests {
             assert(IOSSwipeUp.symbol(for: b, asciiMode: true) != nil)
         }
         var swipeLayout = IOSKeyboardLayoutEngine()
+        swipeLayout.swipeUpInputEnabled = true
         let swipeSnap = swipeLayout.computeLayout(in: CGSize(width: 440, height: 220))
         assert(swipeSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "w")) })?.swipeUpSymbol == "2")
         assert(swipeSnap.keys.first(where: { $0.kind == .backspace })?.swipeUpSymbol == nil)
@@ -539,10 +540,10 @@ struct IOSKeyboardTests {
         let offSnap = offLayout.computeLayout(in: CGSize(width: 440, height: 220))
         assert(offSnap.keys.allSatisfy { $0.swipeUpSymbol == nil }, "Switching swipe-up off must remove hints and gesture")
         var featurePrefs = JuxuPreferences()
-        assert(featurePrefs.keySwipeUpInput)
-        featurePrefs.keySwipeUpInput = false
+        assert(!featurePrefs.keySwipeUpInput, "Swipe-up input is opt-in")
+        featurePrefs.keySwipeUpInput = true
         let featureRound = JuxuPreferences.fromTOML(featurePrefs.toTOML())
-        assert(!featureRound.keySwipeUpInput)
+        assert(featureRound.keySwipeUpInput)
 
         print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi & T9 Pinyin tests passed!")
     }

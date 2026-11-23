@@ -961,7 +961,16 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
             // Only cancel when deliberately dragged well outside the entire keyboard tray (`y < -72` after >=140ms);
             // rapid thumb flicks into the candidate ribbon (`y = -44..0`) ALWAYS commit cleanly!
             let dt = max(0, touch.timestamp - state.beganTimestamp)
-            if pt.y < -72 && dt >= 0.14 {
+            // An armed swipe-up on a top-row key legitimately travels past the ribbon, so it is not a cancel.
+            let isArmedSwipeUp = state.currentKey.id == state.initialKey.id
+                && state.initialKey.swipeUpSymbol != nil
+                && IOSSwipeUp.isActive(
+                    from: state.initialPoint,
+                    to: pt,
+                    keyHeight: state.initialKey.frame.height,
+                    wasActive: state.swipeUpActive
+                )
+            if pt.y < -72 && dt >= 0.14 && !isArmedSwipeUp {
                 syncKeycapPressStates()
                 onKeyTouchCancel?()
                 continue

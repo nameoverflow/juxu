@@ -345,7 +345,7 @@ public struct JuxuPreferences: Equatable, Sendable {
     public var clipboardSuggestion: Bool = true
     public var cangjieKeycapRadicals: Bool = true
     public var wubiKeycapRadicals: Bool = false
-    public var keySwipeUpInput: Bool = true
+    public var keySwipeUpInput: Bool = false
     public var evalLogging: Bool = true
 
     public var fourthCodeAutoCommit: Bool = true

@@ -379,6 +379,7 @@ public final class KeyboardViewController: UIInputViewController {
             self.stopBackspaceRepeat()
             self.markUserTypedForClipboard()
             self.insertSymbol(symbol)
+            self.layoutEngine.consumeOneShotShiftIfNeeded()
             self.syncEngineToUI()
         }
 

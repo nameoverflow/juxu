@@ -160,7 +160,7 @@ public struct IOSKeyboardLayoutEngine: Equatable {
     public var pinyinT9Layout: Bool = false
     public var cangjieKeycapRadicals: Bool = true
     public var wubiKeycapRadicals: Bool = false
-    public var swipeUpInputEnabled: Bool = true
+    public var swipeUpInputEnabled: Bool = false
     /// Temporarily show Latin `a..z` keycaps during Cangjie `z`+Pinyin reverse lookup.
     public var isZLookupActive: Bool = false
     /// True only on Home-button devices where system does not draw its own bottom Globe bar.
