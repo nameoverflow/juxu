@@ -1,6 +1,22 @@
 #if os(iOS)
 import UIKit
 
+@MainActor
+private final class ProxyDocumentSink: IOSMarkedTextDocumentSink {
+    let proxy: any UITextDocumentProxy
+    init(proxy: any UITextDocumentProxy) { self.proxy = proxy }
+    var documentContextBeforeInput: String? { proxy.documentContextBeforeInput }
+    func setMarkedText(_ markedText: String, selectedRange: NSRange) {
+        proxy.setMarkedText(markedText, selectedRange: selectedRange)
+    }
+    func unmarkText() {
+        proxy.unmarkText()
+    }
+    func insertText(_ text: String) {
+        proxy.insertText(text)
+    }
+}
+
 @objc(KeyboardViewController)
 public final class KeyboardViewController: UIInputViewController {
     private lazy var bridge = JuxuBridge()
@@ -21,9 +37,9 @@ public final class KeyboardViewController: UIInputViewController {
     private var backspaceHoldStart: TimeInterval = 0
     private var lastVisualKeySignature: VisualLayoutSignature?
     private var planeBeforePress: IOSKeyPlane = .letters
-    private var markedCode = ""
-    private var autoSpaceTracker = AutoSpaceContextTracker()
-    private var compositionBaseContext: String?
+    private var inlineSession = IOSInlineMarkedTextSession()
+    private var turnFlushScheduled = false
+    private var proxySink: ProxyDocumentSink { ProxyDocumentSink(proxy: textDocumentProxy) }
     private let clipboardStore = IOSClipboardSuggestionStore()
     private var clipboardGate = IOSClipboardVisibilityGate()
     private let clipboardReadQueue = DispatchQueue(label: "com.hcyue.juxu.clipboard", qos: .userInitiated)
@@ -76,8 +92,7 @@ public final class KeyboardViewController: UIInputViewController {
         feedback.prepare()
         bridge.loadConfigAndUser(refreshPublishedLists: false)
         autoPairClosers.removeAll()
-        autoSpaceTracker.invalidate()
-        compositionBaseContext = nil
+        inlineSession.resetForAppearance()
         clipboardGate.resetForKeyboardAppearance()
         applyDesiredTrayDimensions()
         syncContextFromProxyIfIdle()
@@ -117,8 +132,7 @@ public final class KeyboardViewController: UIInputViewController {
         saveUserDataTimer?.invalidate()
         cancelMarkedCode()
         bridge.clearComposition()
-        autoSpaceTracker.invalidate()
-        compositionBaseContext = nil
+        inlineSession.reset()
         bridge.flushUserDataIfNeeded(refreshPublishedLists: false)
         feedback.suspend()
     }
@@ -154,10 +168,8 @@ public final class KeyboardViewController: UIInputViewController {
     public override func textDidChange(_ textInput: UITextInput?) {
         super.textDidChange(textInput)
         bridge.suppressEvalLogging = isSensitiveEvalProxy()
+        inlineSession.reconcileExternalContext(hostBefore: textDocumentProxy.documentContextBeforeInput)
         syncContextFromProxyIfIdle()
-        if markedCode.isEmpty {
-            autoSpaceTracker.reconcileExternalContext(hostBefore: textDocumentProxy.documentContextBeforeInput)
-        }
         refreshClipboardSuggestion(allowAsyncRead: hasAppeared)
         syncProxyTraits()
     }
@@ -539,8 +551,7 @@ public final class KeyboardViewController: UIInputViewController {
             }
             if moved {
                 self.autoPairClosers.removeAll()
-                self.autoSpaceTracker.invalidate()
-                self.compositionBaseContext = nil
+                self.inlineSession.reset()
                 self.feedback.fireSoftStep(playClick: false)
                 self.syncContextFromProxyIfIdle()
                 self.syncEngineToUI()
@@ -669,7 +680,6 @@ public final class KeyboardViewController: UIInputViewController {
 
         expandedGrid.onClear = { [weak self] in
             self?.feedback.fireSoftStep(playClick: true)
-            self?.compositionBaseContext = nil
             self?.cancelMarkedCode()
             self?.bridge.abandonComposition(timestampMs: Self.nowMs())
             self?.expandedIdleWords = nil
@@ -798,7 +808,6 @@ public final class KeyboardViewController: UIInputViewController {
         case .t9Clear:
             markUserTypedForClipboard()
             if !bridge.state.preedit.isEmpty {
-                compositionBaseContext = nil
                 cancelMarkedCode()
                 bridge.clearComposition()
                 syncEngineToUI()
@@ -838,12 +847,8 @@ public final class KeyboardViewController: UIInputViewController {
         case .space:
             markUserTypedForClipboard()
             if bridge.state.preedit.isEmpty {
-                autoSpaceTracker.recordPassthrough(
-                    " ",
-                    hostBefore: textDocumentProxy.documentContextBeforeInput,
-                    hostBeforeIsAuthoritative: false
-                )
-                textDocumentProxy.insertText(" ")
+                let needsFlush = inlineSession.insertPassthrough(" ", in: proxySink)
+                scheduleTurnBoundaryFlushIfNeeded(needsFlush)
                 bridge.setContext("")
                 syncEngineToUI()
             } else {
@@ -854,12 +859,8 @@ public final class KeyboardViewController: UIInputViewController {
         case .returnKey:
             markUserTypedForClipboard()
             if bridge.state.preedit.isEmpty {
-                autoSpaceTracker.recordPassthrough(
-                    "\n",
-                    hostBefore: textDocumentProxy.documentContextBeforeInput,
-                    hostBeforeIsAuthoritative: false
-                )
-                textDocumentProxy.insertText("\n")
+                let needsFlush = inlineSession.insertPassthrough("\n", in: proxySink)
+                scheduleTurnBoundaryFlushIfNeeded(needsFlush)
                 bridge.setContext("")
                 syncEngineToUI()
             } else {
@@ -883,7 +884,7 @@ public final class KeyboardViewController: UIInputViewController {
             case .skipClose:
                 textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
                 autoPairClosers.removeLast()
-                autoSpaceTracker.invalidate()
+                inlineSession.autoSpaceTracker.invalidate()
                 bridge.setContext("")
                 return
             case .insertPair(let close):
@@ -900,18 +901,14 @@ public final class KeyboardViewController: UIInputViewController {
         if AutoSpaceFormatter.isAutoSpaceRightTrigger(sym, options: AutoSpaceOptions(prefs: bridge.prefs)) {
             insertTextWithAutoSpace(sym, splitInternal: false)
         } else {
-            autoSpaceTracker.recordPassthrough(
-                sym,
-                hostBefore: textDocumentProxy.documentContextBeforeInput,
-                hostBeforeIsAuthoritative: false
-            )
-            textDocumentProxy.insertText(sym)
+            let needsFlush = inlineSession.insertPassthrough(sym, in: proxySink)
+            scheduleTurnBoundaryFlushIfNeeded(needsFlush)
         }
         if let pairCloser {
             textDocumentProxy.insertText(pairCloser)
             textDocumentProxy.adjustTextPosition(byCharacterOffset: -1)
             autoPairClosers.append(pairCloser)
-            autoSpaceTracker.invalidate()
+            inlineSession.autoSpaceTracker.invalidate()
         }
         bridge.setContext("")
     }
@@ -938,7 +935,7 @@ public final class KeyboardViewController: UIInputViewController {
               ) else { return }
         clearLineGeneration &+= 1
         autoPairClosers.removeAll()
-        autoSpaceTracker.invalidate()
+        inlineSession.autoSpaceTracker.invalidate()
         textDocumentProxy.insertText(text)
         bridge.setContext(String(text.suffix(16)))
         syncEngineToUI()
@@ -949,14 +946,13 @@ public final class KeyboardViewController: UIInputViewController {
     private func clearCurrentLineBeforeCursor() {
         markUserTypedForClipboard()
         if !bridge.state.preedit.isEmpty {
-            compositionBaseContext = nil
             cancelMarkedCode()
             bridge.clearComposition()
             syncEngineToUI()
             return
         }
         autoPairClosers.removeAll()
-        autoSpaceTracker.invalidate()
+        inlineSession.autoSpaceTracker.invalidate()
         // Touch-down at a line start removed only the line break: put it back instead of joining lines.
         // After a longer hold-delete, the text already removed stays removed.
         if backspaceSessionDeleted.count == 1, backspaceSessionDeleted.first?.isNewline == true {
@@ -1046,9 +1042,12 @@ public final class KeyboardViewController: UIInputViewController {
     private func commitPendingFirstIfComposing() {
         guard !bridge.state.preedit.isEmpty else { return }
         let rawText = bridge.state.candidates.first?.text ?? bridge.state.preedit
-        insertTextWithAutoSpace(rawText, splitInternal: true, overrideBefore: compositionBaseContext)
-        compositionBaseContext = nil
-        markedCode = ""
+        let needsFlush = inlineSession.commitPendingFirst(
+            rawText,
+            options: currentAutoSpaceOptions(),
+            in: proxySink
+        )
+        scheduleTurnBoundaryFlushIfNeeded(needsFlush)
         bridge.clearComposition()
     }
 
@@ -1070,7 +1069,7 @@ public final class KeyboardViewController: UIInputViewController {
                 textDocumentProxy.deleteBackward()
                 textDocumentProxy.deleteBackward()
                 autoPairClosers.removeLast()
-                autoSpaceTracker.invalidate()
+                inlineSession.autoSpaceTracker.invalidate()
                 bridge.setContext(String((hostBefore ?? "").dropLast().suffix(16)))
                 syncEngineToUI()
                 return
@@ -1081,7 +1080,7 @@ public final class KeyboardViewController: UIInputViewController {
             if !before.isEmpty {
                 bridge.notifyPostCommitBackspace(timestampMs: Self.nowMs())
             }
-            autoSpaceTracker.willDeleteBackward(
+            inlineSession.autoSpaceTracker.willDeleteBackward(
                 hostBefore: before,
                 hostBeforeIsAuthoritative: false
             )
@@ -1092,7 +1091,7 @@ public final class KeyboardViewController: UIInputViewController {
             syncEngineToUI()
             return
         }
-        autoSpaceTracker.invalidate()
+        inlineSession.autoSpaceTracker.invalidate()
         // Native-style accelerated hold-delete: erase up to 3 characters without crossing a newline in one jump
         if before.last == "\n" {
             noteBackspaceDeleted("\n")
@@ -1191,10 +1190,7 @@ public final class KeyboardViewController: UIInputViewController {
     }
 
     private func cancelMarkedCode() {
-        guard !markedCode.isEmpty else { return }
-        textDocumentProxy.setMarkedText("", selectedRange: NSRange(location: 0, length: 0))
-        textDocumentProxy.unmarkText()
-        markedCode = ""
+        inlineSession.cancelMarkedCode(in: proxySink)
     }
 
     private func scheduleUserDataFlush() {
@@ -1206,7 +1202,10 @@ public final class KeyboardViewController: UIInputViewController {
 
     private func syncContextFromProxyIfIdle() {
         guard bridge.state.preedit.isEmpty else { return }
-        let before = textDocumentProxy.documentContextBeforeInput ?? ""
+        let before = inlineSession.autoSpaceTracker.effectiveBefore(
+            hostBefore: textDocumentProxy.documentContextBeforeInput,
+            hostBeforeIsAuthoritative: false
+        )
         bridge.setContext(String(before.suffix(32)))
     }
 
@@ -1247,46 +1246,47 @@ public final class KeyboardViewController: UIInputViewController {
         }
     }
 
+    private func currentAutoSpaceOptions() -> AutoSpaceOptions {
+        isAutoSpacingAllowedForProxy()
+            ? AutoSpaceOptions(prefs: bridge.prefs)
+            : AutoSpaceOptions(enabled: false, spaceDigits: false)
+    }
+
+    private func scheduleTurnBoundaryFlushIfNeeded(_ needed: Bool) {
+        guard needed, !turnFlushScheduled else { return }
+        turnFlushScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.turnFlushScheduled = false
+            self.inlineSession.flushTurnBoundary(in: self.proxySink)
+        }
+    }
+
     private func insertTextWithAutoSpace(
         _ text: String,
         splitInternal: Bool,
         overrideBefore: String? = nil
     ) {
-        guard !text.isEmpty else { return }
-        let options = isAutoSpacingAllowedForProxy()
-            ? AutoSpaceOptions(prefs: bridge.prefs)
-            : AutoSpaceOptions(enabled: false, spaceDigits: false)
-        let formatted = autoSpaceTracker.prepareCommit(
+        let needsFlush = inlineSession.insertTextWithAutoSpace(
             text,
-            hostBefore: textDocumentProxy.documentContextBeforeInput,
-            hostBeforeIsAuthoritative: false,
-            overrideBefore: overrideBefore,
             splitInternal: splitInternal,
-            options: options
+            overrideBefore: overrideBefore,
+            options: currentAutoSpaceOptions(),
+            in: proxySink
         )
-        textDocumentProxy.insertText(formatted)
+        scheduleTurnBoundaryFlushIfNeeded(needsFlush)
     }
 
     private func applyEngineState(_ out: JuxuActionState) {
-        if !out.commitText.isEmpty {
-            let base = markedCode.isEmpty ? nil : compositionBaseContext
-            insertTextWithAutoSpace(out.commitText, splitInternal: true, overrideBefore: base)
-            markedCode = ""
+        let res = inlineSession.applyEngineState(
+            commitText: out.commitText,
+            inlinePreedit: out.activeInlinePreedit,
+            options: currentAutoSpaceOptions(),
+            in: proxySink
+        )
+        scheduleTurnBoundaryFlushIfNeeded(res.needsAsyncFlush)
+        if res.didCommit {
             scheduleUserDataFlush()
-        }
-        let inlinePreedit = out.activeInlinePreedit
-        if inlinePreedit.isEmpty {
-            compositionBaseContext = nil
-            cancelMarkedCode()
-        } else if inlinePreedit != markedCode {
-            if markedCode.isEmpty {
-                compositionBaseContext = autoSpaceTracker.effectiveBefore(
-                    hostBefore: textDocumentProxy.documentContextBeforeInput,
-                    hostBeforeIsAuthoritative: false
-                )
-            }
-            textDocumentProxy.setMarkedText(inlinePreedit, selectedRange: NSRange(location: inlinePreedit.utf16.count, length: 0))
-            markedCode = inlinePreedit
         }
         if out.preedit.isEmpty && !expandedGrid.isHidden {
             expandedGrid.isHidden = true

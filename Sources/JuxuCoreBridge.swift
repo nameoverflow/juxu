@@ -1636,6 +1636,8 @@ public struct AutoSpaceContextTracker: Sendable {
         return currentHost
     }
 
+    public var currentShadowBefore: String { shadowBefore }
+
     public mutating func prepareCommit(
         _ text: String,
         hostBefore: String?,
@@ -1645,11 +1647,15 @@ public struct AutoSpaceContextTracker: Sendable {
         options: AutoSpaceOptions
     ) -> String {
         guard !text.isEmpty else { return text }
-        let syncedBefore = effectiveBefore(
-            hostBefore: hostBefore,
-            hostBeforeIsAuthoritative: hostBeforeIsAuthoritative
-        )
-        let before = overrideBefore ?? syncedBefore
+        let before: String
+        if let overrideBefore {
+            before = overrideBefore
+        } else {
+            before = effectiveBefore(
+                hostBefore: hostBefore,
+                hostBeforeIsAuthoritative: hostBeforeIsAuthoritative
+            )
+        }
         let suppressLeading: Bool
         if let sup = suppressedAnchorTail, !sup.isEmpty, before.hasSuffix(sup) {
             suppressLeading = true
@@ -1776,6 +1782,9 @@ public struct AutoSpaceContextTracker: Sendable {
             shadowBefore = AutoSpaceFormatter.tailScalars(of: current, maxScalars: 64)
             return
         }
+        if (!optimisticInserted.isEmpty || optimisticDeleteCount > 0) && current == prevHost {
+            return
+        }
         let expected = applyOptimisticDelta(to: prevHost)
         if current == expected {
             lastObservedHostBefore = current
@@ -1817,5 +1826,263 @@ public struct AutoSpaceContextTracker: Sendable {
             result.append(optimisticInserted)
         }
         return result
+    }
+}
+
+@MainActor
+public protocol IOSMarkedTextDocumentSink: AnyObject {
+    var documentContextBeforeInput: String? { get }
+    func setMarkedText(_ markedText: String, selectedRange: NSRange)
+    func unmarkText()
+    func insertText(_ text: String)
+}
+
+/// Coordinates inline `markedText` composition and committed text insertion on iOS `UITextDocumentProxy`.
+///
+/// Why we cannot use `insertText(_:)` or same-turn `unmarkText() + setMarkedText(_:)`:
+/// 1. Custom `UITextInput` views such as `YYTextView` (Bilibili, Weibo, etc.) implement `insertText(_:)`
+///    as `replaceRange(_selectedTextRange, withText:)` without replacing or clearing `_markedTextRange`.
+///    The ONLY `UITextInput` operation that replaces `_markedTextRange` in `YYTextView` is
+///    `setMarkedText(committed, selectedRange: (committed.utf16.count, 0))` followed by `unmarkText()`.
+/// 2. In UIKit's `UIInputViewController`, `textDocumentProxy` coalesces calls within a single runloop turn
+///    into `TIKeyboardOutput` (`insertionText` -> last `setMarkedText` -> `unmarkIfNecessary`). Calling
+///    `unmarkText()` and a new `setMarkedText(nextPreedit)` in the SAME turn causes `unmarkIfNecessary`
+///    to unmark `nextPreedit` in place! Therefore, streaming/partial commits flush
+///    `setMarkedText(committed) + unmarkText()` in Turn 1, and apply `setMarkedText(nextPreedit)` on the
+///    next main-runloop turn via `flushTurnBoundary(in:)`.
+@MainActor
+public struct IOSInlineMarkedTextSession {
+    public var markedCode: String {
+        deferredInlinePreedit ?? hostMarkedCode
+    }
+    private var hostMarkedCode: String = ""
+    private var turnUnmarkedCommit: String?
+    public private(set) var deferredInlinePreedit: String?
+
+    public var autoSpaceTracker = AutoSpaceContextTracker()
+    public private(set) var compositionBaseContext: String?
+
+    public init() {}
+
+    public mutating func reset() {
+        turnUnmarkedCommit = nil
+        deferredInlinePreedit = nil
+        autoSpaceTracker.invalidate()
+        compositionBaseContext = nil
+    }
+
+    public mutating func resetForAppearance() {
+        hostMarkedCode = ""
+        turnUnmarkedCommit = nil
+        deferredInlinePreedit = nil
+        autoSpaceTracker.invalidate()
+        compositionBaseContext = nil
+    }
+
+    public mutating func reconcileExternalContext(hostBefore: String?) {
+        guard hostMarkedCode.isEmpty && deferredInlinePreedit == nil && turnUnmarkedCommit == nil else { return }
+        autoSpaceTracker.reconcileExternalContext(hostBefore: hostBefore)
+    }
+
+    public mutating func flushTurnBoundary(in sink: any IOSMarkedTextDocumentSink) {
+        turnUnmarkedCommit = nil
+        guard let pending = deferredInlinePreedit else { return }
+        deferredInlinePreedit = nil
+        guard !pending.isEmpty else { return }
+        sink.setMarkedText(
+            pending,
+            selectedRange: NSRange(location: pending.utf16.count, length: 0)
+        )
+        hostMarkedCode = pending
+    }
+
+    public mutating func cancelMarkedCode(in sink: any IOSMarkedTextDocumentSink) {
+        deferredInlinePreedit = nil
+        if turnUnmarkedCommit == nil && !hostMarkedCode.isEmpty {
+            sink.setMarkedText("", selectedRange: NSRange(location: 0, length: 0))
+            sink.unmarkText()
+            hostMarkedCode = ""
+        }
+        compositionBaseContext = nil
+    }
+
+    private mutating func prepareFormattedCommit(
+        _ text: String,
+        splitInternal: Bool,
+        overrideBefore: String?,
+        options: AutoSpaceOptions,
+        in sink: any IOSMarkedTextDocumentSink
+    ) -> String {
+        autoSpaceTracker.prepareCommit(
+            text,
+            hostBefore: sink.documentContextBeforeInput,
+            hostBeforeIsAuthoritative: false,
+            overrideBefore: overrideBefore,
+            splitInternal: splitInternal,
+            options: options
+        )
+    }
+
+    private mutating func commitReplacingMarkedIfNeeded(
+        _ formatted: String,
+        in sink: any IOSMarkedTextDocumentSink
+    ) -> Bool {
+        if let prev = turnUnmarkedCommit {
+            let combined = prev + formatted
+            turnUnmarkedCommit = combined
+            deferredInlinePreedit = nil
+            sink.setMarkedText(
+                combined,
+                selectedRange: NSRange(location: combined.utf16.count, length: 0)
+            )
+            sink.unmarkText()
+            hostMarkedCode = ""
+            return true
+        } else if !hostMarkedCode.isEmpty {
+            turnUnmarkedCommit = formatted
+            deferredInlinePreedit = nil
+            sink.setMarkedText(
+                formatted,
+                selectedRange: NSRange(location: formatted.utf16.count, length: 0)
+            )
+            sink.unmarkText()
+            hostMarkedCode = ""
+            return true
+        } else {
+            sink.insertText(formatted)
+            return false
+        }
+    }
+
+    @discardableResult
+    public mutating func insertTextWithAutoSpace(
+        _ text: String,
+        splitInternal: Bool,
+        overrideBefore: String? = nil,
+        options: AutoSpaceOptions,
+        in sink: any IOSMarkedTextDocumentSink
+    ) -> Bool {
+        guard !text.isEmpty else { return false }
+        let formatted = prepareFormattedCommit(
+            text,
+            splitInternal: splitInternal,
+            overrideBefore: overrideBefore,
+            options: options,
+            in: sink
+        )
+        if let prev = turnUnmarkedCommit {
+            let combined = prev + formatted
+            turnUnmarkedCommit = combined
+            sink.setMarkedText(
+                combined,
+                selectedRange: NSRange(location: combined.utf16.count, length: 0)
+            )
+            sink.unmarkText()
+            return true
+        } else {
+            sink.insertText(formatted)
+            return false
+        }
+    }
+
+    @discardableResult
+    public mutating func insertPassthrough(
+        _ text: String,
+        in sink: any IOSMarkedTextDocumentSink
+    ) -> Bool {
+        guard !text.isEmpty else { return false }
+        autoSpaceTracker.recordPassthrough(
+            text,
+            hostBefore: sink.documentContextBeforeInput,
+            hostBeforeIsAuthoritative: false
+        )
+        if let prev = turnUnmarkedCommit {
+            let combined = prev + text
+            turnUnmarkedCommit = combined
+            sink.setMarkedText(
+                combined,
+                selectedRange: NSRange(location: combined.utf16.count, length: 0)
+            )
+            sink.unmarkText()
+            return true
+        } else {
+            sink.insertText(text)
+            return false
+        }
+    }
+
+    @discardableResult
+    public mutating func commitPendingFirst(
+        _ rawText: String,
+        options: AutoSpaceOptions,
+        in sink: any IOSMarkedTextDocumentSink
+    ) -> Bool {
+        guard !rawText.isEmpty else {
+            cancelMarkedCode(in: sink)
+            return false
+        }
+        let hadMarked = !markedCode.isEmpty
+        let base = hadMarked ? compositionBaseContext : nil
+        let formatted = prepareFormattedCommit(
+            rawText,
+            splitInternal: true,
+            overrideBefore: base,
+            options: options,
+            in: sink
+        )
+        let usedTurnUnmark = commitReplacingMarkedIfNeeded(formatted, in: sink)
+        compositionBaseContext = nil
+        return usedTurnUnmark
+    }
+
+    @discardableResult
+    public mutating func applyEngineState(
+        commitText: String,
+        inlinePreedit: String,
+        options: AutoSpaceOptions,
+        in sink: any IOSMarkedTextDocumentSink
+    ) -> (didCommit: Bool, needsAsyncFlush: Bool) {
+        var didCommit = false
+        var needsAsyncFlush = false
+        var committedShadow: String?
+
+        if !commitText.isEmpty {
+            let hadMarked = !markedCode.isEmpty
+            let base = hadMarked ? compositionBaseContext : nil
+            let formatted = prepareFormattedCommit(
+                commitText,
+                splitInternal: true,
+                overrideBefore: base,
+                options: options,
+                in: sink
+            )
+            if commitReplacingMarkedIfNeeded(formatted, in: sink) {
+                needsAsyncFlush = true
+            }
+            committedShadow = autoSpaceTracker.currentShadowBefore
+            didCommit = true
+        }
+
+        if inlinePreedit.isEmpty {
+            cancelMarkedCode(in: sink)
+        } else if turnUnmarkedCommit != nil {
+            compositionBaseContext = committedShadow ?? compositionBaseContext ?? autoSpaceTracker.currentShadowBefore
+            deferredInlinePreedit = inlinePreedit
+            needsAsyncFlush = true
+        } else if inlinePreedit != hostMarkedCode {
+            if hostMarkedCode.isEmpty {
+                compositionBaseContext = committedShadow ?? autoSpaceTracker.effectiveBefore(
+                    hostBefore: sink.documentContextBeforeInput,
+                    hostBeforeIsAuthoritative: false
+                )
+            }
+            sink.setMarkedText(
+                inlinePreedit,
+                selectedRange: NSRange(location: inlinePreedit.utf16.count, length: 0)
+            )
+            hostMarkedCode = inlinePreedit
+        }
+
+        return (didCommit, needsAsyncFlush)
     }
 }

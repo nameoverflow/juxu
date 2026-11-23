@@ -42,7 +42,7 @@ targets:
         PrisWubiSettingsGroup: $(AppIdentifierPrefix)com.hcyue.priswubi.settings
         CFBundleDisplayName: 句序
         CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "8"
+        CFBundleVersion: "9"
         CFBundleURLTypes:
           - CFBundleURLName: com.hcyue.juxu
             CFBundleURLSchemes:
@@ -94,7 +94,7 @@ targets:
         PrisWubiSettingsGroup: $(AppIdentifierPrefix)com.hcyue.priswubi.settings
         CFBundleDisplayName: 句序
         CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "8"
+        CFBundleVersion: "9"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.keyboard-service
           NSExtensionPrincipalClass: KeyboardViewController

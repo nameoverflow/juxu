@@ -371,7 +371,10 @@ final class JuxuSimulatorUITests: XCTestCase {
             try tap(.letter(letter))
         }
         let fieldVal = (field.value as? String) ?? ""
-        XCTAssertTrue(fieldVal.hasSuffix("fcu·ktqn·kc"), "Expected active code in text field, got: \(fieldVal)")
+        XCTAssertTrue(
+            fieldVal == "今天天气真好我们一起fcu·ktqn·kc" || fieldVal == "今天天气真好我们一起fcu·kt·qnkc",
+            "Expected committed prefix + active code tail in text field, got: \(fieldVal)"
+        )
         attachShot(name: "spaceless-98-composing")
         typingApp.staticTexts["去吃饭吧"].tap()
         XCTAssertEqual(field.value as? String, target)

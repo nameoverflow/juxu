@@ -623,6 +623,313 @@ struct IOSKeyboardTests {
         let featureRound = JuxuPreferences.fromTOML(featurePrefs.toTOML())
         assert(featureRound.keySwipeUpInput && featureRound.keyLongPressAlternates && featureRound.backspaceSwipeClear)
 
-        print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi & T9 Pinyin tests passed!")
+        // 20. Verify `IOSInlineMarkedTextSession` against BOTH custom `YYTextView` (Bilibili/Weibo)
+        //     and standard Apple `UITextView` `UITextInput` semantics!
+        //
+        //     `YYTextView.m` implements `insertText:` as `[self replaceRange:_selectedTextRange withText:text]`,
+        //     completely ignoring `_markedTextRange`, and `unmarkText` sets `_markedTextRange = nil` WITHOUT
+        //     firing `textViewDidChange:`.
+        @MainActor
+        final class YYTextViewDocumentMock: IOSMarkedTextDocumentSink {
+            var storage = NSMutableString()
+            var selectedRange = NSRange(location: 0, length: 0)
+            var markedRange: NSRange?
+            var didChangeUnmarkedCount = 0
+
+            init(initialText: String = "", cursor: Int? = nil) {
+                storage.setString(initialText)
+                let pos = cursor ?? storage.length
+                selectedRange = NSRange(location: pos, length: 0)
+            }
+
+            var text: String { storage as String }
+
+            var documentContextBeforeInput: String? {
+                guard selectedRange.location > 0 else { return nil }
+                return storage.substring(with: NSRange(location: 0, length: selectedRange.location))
+            }
+
+            func insertText(_ text: String) {
+                guard !text.isEmpty else { return }
+                let len = (text as NSString).length
+                // Exact `YYTextView.m` behavior: replaces `_selectedTextRange` ONLY; does NOT touch `_markedTextRange`!
+                storage.replaceCharacters(in: selectedRange, with: text)
+                if let mr = markedRange, selectedRange.location <= mr.location {
+                    markedRange = NSRange(location: mr.location + len - selectedRange.length, length: mr.length)
+                }
+                selectedRange = NSRange(location: selectedRange.location + len, length: 0)
+                if markedRange == nil {
+                    didChangeUnmarkedCount += 1
+                }
+            }
+
+            func setMarkedText(_ markedText: String, selectedRange relSel: NSRange) {
+                if selectedRange.length > 0 {
+                    storage.replaceCharacters(in: selectedRange, with: "")
+                    selectedRange = NSRange(location: selectedRange.location, length: 0)
+                }
+                let nsMarked = markedText as NSString
+                if let mr = markedRange {
+                    storage.replaceCharacters(in: mr, with: markedText)
+                    markedRange = NSRange(location: mr.location, length: nsMarked.length)
+                    selectedRange = NSRange(location: mr.location + relSel.location, length: relSel.length)
+                } else {
+                    let start = selectedRange.location + selectedRange.length
+                    markedRange = NSRange(location: start, length: nsMarked.length)
+                    storage.replaceCharacters(in: NSRange(location: start, length: 0), with: markedText)
+                    selectedRange = NSRange(location: start + relSel.location, length: relSel.length)
+                }
+                if markedRange?.length == 0 {
+                    markedRange = nil
+                }
+                if markedRange == nil {
+                    didChangeUnmarkedCount += 1
+                }
+            }
+
+            func unmarkText() {
+                // Exact `YYTextView.m` behavior: clears `_markedTextRange` without firing `textViewDidChange:`!
+                markedRange = nil
+            }
+        }
+
+        @MainActor
+        final class StandardUITextViewMock: IOSMarkedTextDocumentSink {
+            var storage = NSMutableString()
+            var selectedRange = NSRange(location: 0, length: 0)
+            var markedRange: NSRange?
+
+            init(initialText: String = "", cursor: Int? = nil) {
+                storage.setString(initialText)
+                let pos = cursor ?? storage.length
+                selectedRange = NSRange(location: pos, length: 0)
+            }
+
+            var text: String { storage as String }
+
+            var documentContextBeforeInput: String? {
+                guard selectedRange.location > 0 else { return nil }
+                return storage.substring(with: NSRange(location: 0, length: selectedRange.location))
+            }
+
+            func insertText(_ text: String) {
+                let len = (text as NSString).length
+                let target = markedRange ?? selectedRange
+                storage.replaceCharacters(in: target, with: text)
+                markedRange = nil
+                selectedRange = NSRange(location: target.location + len, length: 0)
+            }
+
+            func setMarkedText(_ markedText: String, selectedRange relSel: NSRange) {
+                let nsMarked = markedText as NSString
+                let target = markedRange ?? selectedRange
+                storage.replaceCharacters(in: target, with: markedText)
+                markedRange = NSRange(location: target.location, length: nsMarked.length)
+                selectedRange = NSRange(location: target.location + relSel.location, length: relSel.length)
+            }
+
+            func unmarkText() {
+                // Standard UIKit commits whatever is currently in `markedRange` in place!
+                markedRange = nil
+            }
+        }
+
+        /// Simulates iOS 26.5 `UIInputViewController` -> `TIKeyboardOutput` XPC coalescing!
+        /// Within a single runloop turn, UIKit applies:
+        ///   1) `insertionText` (`insertText`)
+        ///   2) ONLY the last `setMarkedText` call of the turn
+        ///   3) `unmarkIfNecessary` (`unmarkText`) AFTER `setMarkedText`!
+        @MainActor
+        final class TIKeyboardOutputProxyMock: IOSMarkedTextDocumentSink {
+            let host: any IOSMarkedTextDocumentSink
+            private var turnInsertion = ""
+            private var turnMarked: (String, NSRange)?
+            private var turnUnmark = false
+
+            init(host: any IOSMarkedTextDocumentSink) {
+                self.host = host
+            }
+
+            var documentContextBeforeInput: String? { host.documentContextBeforeInput }
+
+            func insertText(_ text: String) {
+                turnInsertion += text
+            }
+
+            func setMarkedText(_ markedText: String, selectedRange: NSRange) {
+                turnMarked = (markedText, selectedRange)
+            }
+
+            func unmarkText() {
+                turnUnmark = true
+            }
+
+            func flushXPCBatch() {
+                let ins = turnInsertion
+                let mk = turnMarked
+                let unm = turnUnmark
+                turnInsertion = ""
+                turnMarked = nil
+                turnUnmark = false
+                if !ins.isEmpty {
+                    host.insertText(ins)
+                }
+                if let (text, range) = mk {
+                    host.setMarkedText(text, selectedRange: range)
+                }
+                if unm {
+                    host.unmarkText()
+                }
+            }
+
+            func drainTurn(session: inout IOSInlineMarkedTextSession) {
+                flushXPCBatch()
+                session.flushTurnBoundary(in: self)
+                flushXPCBatch()
+            }
+        }
+
+        // 20a. Bilibili comment box exact repro #1: `dbfd` -> "破坏", then prediction "计算", then `sm` -> "机"
+        bridge.switchSchema(86, persist: false)
+        var wb86NormalPrefs = bridge.prefs
+        wb86NormalPrefs.spaceless = false
+        bridge.applyAndSavePreferences(wb86NormalPrefs, persist: false)
+        bridge.clearComposition()
+
+        for rawHost in [YYTextViewDocumentMock() as any IOSMarkedTextDocumentSink, StandardUITextViewMock()] {
+            let proxy = TIKeyboardOutputProxyMock(host: rawHost)
+            var session = IOSInlineMarkedTextSession()
+            bridge.clearComposition()
+            for ch in "dbfd".unicodeScalars {
+                let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 8000)
+                session.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy)
+                proxy.drainTurn(session: &session)
+            }
+            let commitPohuai = bridge.handleKey(keyCode: 0x31, scalar: 32, hasCmdOrCtrl: false, timestampMs: 8050)
+            assert(commitPohuai.commitText == "破坏")
+            session.applyEngineState(commitText: commitPohuai.commitText, inlinePreedit: commitPohuai.activeInlinePreedit, options: onOpts, in: proxy)
+            proxy.drainTurn(session: &session)
+            // Idle prediction tap ("计算")
+            session.insertTextWithAutoSpace("计算", splitInternal: true, options: onOpts, in: proxy)
+            proxy.drainTurn(session: &session)
+            // Follow-up word `sm` -> Space -> "机"
+            for ch in "sm".unicodeScalars {
+                let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 8100)
+                session.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy)
+                proxy.drainTurn(session: &session)
+            }
+            let commitJi = bridge.handleKey(keyCode: 0x31, scalar: 32, hasCmdOrCtrl: false, timestampMs: 8150)
+            assert(commitJi.commitText == "机")
+            session.applyEngineState(commitText: commitJi.commitText, inlinePreedit: commitJi.activeInlinePreedit, options: onOpts, in: proxy)
+            proxy.drainTurn(session: &session)
+
+            if let yy = rawHost as? YYTextViewDocumentMock {
+                assert(yy.text == "破坏计算机", "Expected '破坏计算机' in YYTextView, got '\(yy.text)'")
+                assert(yy.markedRange == nil, "Expected nil markedRange after commit in YYTextView")
+                assert(yy.selectedRange == NSRange(location: 5, length: 0))
+            } else if let std = rawHost as? StandardUITextViewMock {
+                assert(std.text == "破坏计算机", "Expected '破坏计算机' in UITextView, got '\(std.text)'")
+                assert(std.markedRange == nil)
+                assert(std.selectedRange == NSRange(location: 5, length: 0))
+            }
+        }
+
+        // 20b. Bilibili exact repro #2 + Simulator `TIKeyboardOutput` streaming test:
+        //      Spaceless Wubi streaming ("破坏计算机系统罪警告...") must commit strictly left-to-right BEFORE
+        //      the active inline preedit tail in BOTH `YYTextView` AND `StandardUITextView` under `TIKeyboardOutput`!
+        var wb86StreamPrefs = bridge.prefs
+        wb86StreamPrefs.spaceless = true
+        bridge.applyAndSavePreferences(wb86StreamPrefs, persist: false)
+
+        for rawHost in [YYTextViewDocumentMock() as any IOSMarkedTextDocumentSink, StandardUITextViewMock()] {
+            bridge.clearComposition()
+            bridge.setContext("")
+            let proxy = TIKeyboardOutputProxyMock(host: rawHost)
+            var streamSession = IOSInlineMarkedTextSession()
+            let streamCodes = "dbfdytbhsmtxxylhdaqtf" + "txxylhdaqtf"
+            for ch in streamCodes.unicodeScalars {
+                let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 9000)
+                streamSession.applyEngineState(
+                    commitText: st.commitText,
+                    inlinePreedit: st.activeInlinePreedit,
+                    options: onOpts,
+                    in: proxy
+                )
+                proxy.drainTurn(session: &streamSession)
+            }
+            assert(!streamSession.markedCode.isEmpty, "Expected active inline tail in spaceless stream")
+            let currentText = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
+            assert(currentText.hasPrefix("破坏"), "Committed prefix must stay at start, got '\(currentText)'")
+            assert(currentText.hasSuffix(streamSession.markedCode), "Active marked tail must stay at end, got '\(currentText)'")
+            // Ensure NO raw ASCII codes leaked between committed Chinese words!
+            let prefixBeforeMarked = String(currentText.dropLast(streamSession.markedCode.count))
+            assert(!prefixBeforeMarked.contains(where: { $0.isASCII && $0.isLetter }), "Leaked raw code in committed prefix: '\(currentText)'")
+
+            let finishStream = bridge.handleKey(keyCode: 0x31, scalar: 32, hasCmdOrCtrl: false, timestampMs: 9100)
+            streamSession.applyEngineState(
+                commitText: finishStream.commitText,
+                inlinePreedit: finishStream.activeInlinePreedit,
+                options: onOpts,
+                in: proxy
+            )
+            proxy.drainTurn(session: &streamSession)
+            let finalText = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
+            let finalMarked = (rawHost as? YYTextViewDocumentMock)?.markedRange ?? (rawHost as! StandardUITextViewMock).markedRange
+            assert(finalMarked == nil && streamSession.markedCode.isEmpty)
+            assert(!finalText.contains(where: { $0.isASCII && $0.isLetter }) && finalText.hasPrefix("破坏计算机"), "Got '\(finalText)'")
+        }
+
+        // 20c. Mid-text insertion ("前缀|后缀"), 5th-code push + CJK/EN auto-spacing, AND same-turn
+        //      `commitPendingFirst` + `insertPassthrough("，")` (e.g. T9 sidebar punctuation while composing)!
+        wb86StreamPrefs.spaceless = false
+        bridge.applyAndSavePreferences(wb86StreamPrefs, persist: false)
+        bridge.clearComposition()
+
+        for rawHost in [YYTextViewDocumentMock(initialText: "hello后缀", cursor: 5) as any IOSMarkedTextDocumentSink,
+                        StandardUITextViewMock(initialText: "hello后缀", cursor: 5)] {
+            bridge.clearComposition()
+            let proxy = TIKeyboardOutputProxyMock(host: rawHost)
+            var midSession = IOSInlineMarkedTextSession()
+            midSession.reconcileExternalContext(hostBefore: proxy.documentContextBeforeInput)
+            // Type 5 codes `lgdba` ("国" pushed on 5th key 'a' -> "工") after "hello" before "后缀"!
+            for ch in "lgdba".unicodeScalars {
+                let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 9200)
+                midSession.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy)
+                proxy.drainTurn(session: &midSession)
+            }
+            let midText = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
+            assert(midText == "hello 国a后缀", "Expected 5th-code push with auto-space in middle of text, got '\(midText)'")
+            // Same-turn `commitPendingFirst("工")` + `insertPassthrough("，")` WITHOUT intermediate runloop tick!
+            midSession.commitPendingFirst(bridge.state.candidates.first!.text, options: onOpts, in: proxy)
+            midSession.insertPassthrough("，", in: proxy)
+            bridge.clearComposition()
+            proxy.drainTurn(session: &midSession)
+
+            // Simulate intermediate stale XPC `textDidChange` where host still reports `"hello"` before catching up!
+            midSession.reconcileExternalContext(hostBefore: "hello")
+            assert(midSession.autoSpaceTracker.effectiveBefore(hostBefore: "hello", hostBeforeIsAuthoritative: false) == "hello 国工，")
+            let afterPunct = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
+            let afterMarked = (rawHost as? YYTextViewDocumentMock)?.markedRange ?? (rawHost as! StandardUITextViewMock).markedRange
+            let afterSel = (rawHost as? YYTextViewDocumentMock)?.selectedRange ?? (rawHost as! StandardUITextViewMock).selectedRange
+            assert(afterPunct == "hello 国工，后缀" && afterMarked == nil, "Got '\(afterPunct)'")
+            assert(afterSel == NSRange(location: 9, length: 0))
+        }
+
+        // Single-letter preedit Backspace must NEVER commit raw ASCII in either StandardUITextView or YYTextView!
+        for rawHost in [YYTextViewDocumentMock() as any IOSMarkedTextDocumentSink, StandardUITextViewMock()] {
+            let proxy = TIKeyboardOutputProxyMock(host: rawHost)
+            var bsSession = IOSInlineMarkedTextSession()
+            let st1 = bridge.handleKey(keyCode: 0, scalar: UnicodeScalar("d").value, hasCmdOrCtrl: false, timestampMs: 9300)
+            bsSession.applyEngineState(commitText: st1.commitText, inlinePreedit: st1.activeInlinePreedit, options: onOpts, in: proxy)
+            proxy.drainTurn(session: &bsSession)
+            let stBs = bridge.handleKey(keyCode: 0x33, scalar: 0, hasCmdOrCtrl: false, timestampMs: 9350)
+            bsSession.applyEngineState(commitText: stBs.commitText, inlinePreedit: stBs.activeInlinePreedit, options: onOpts, in: proxy)
+            proxy.drainTurn(session: &bsSession)
+            let txt = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
+            let mr = (rawHost as? YYTextViewDocumentMock)?.markedRange ?? (rawHost as! StandardUITextViewMock).markedRange
+            assert(txt.isEmpty && mr == nil, "Expected empty text after backspace, got '\(txt)'")
+        }
+
+        print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi, T9 Pinyin & YYTextView inline commit tests passed!")
     }
 }
