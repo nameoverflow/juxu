@@ -80,6 +80,7 @@ public final class VoiceSessionController {
     private var sessionGeneration: UInt64 = 0
     private var pipelineClient: VoicePipelineClient?
     private var activeTask: Task<Void, Never>?
+    private var activeContextCaptureTask: Task<Void, Never>?
     private var activeCaretRect: NSRect = .zero
     private var activeWindowLevel: CGWindowLevel?
     private var activeCommitHandler: ((String, Bool) -> Void)?
@@ -507,6 +508,21 @@ public final class VoiceSessionController {
         latestPartial = ""
         latestTentativeCount = 0
         cueSounded = false
+
+        // Capture full AXUIElement context asynchronously so key-down / HUD display stays instant (0 ms added).
+        activeContextCaptureTask?.cancel()
+        let captureGeneration = sessionGeneration &+ 1
+        let respectBlacklist = VoiceContextInspectorStore.shared.respectBlacklist
+        activeContextCaptureTask = Task { @MainActor [weak self] in
+            let captured = await VoiceContextCapture.captureAsync(
+                options: VoiceContextCaptureOptions(respectBlacklist: respectBlacklist)
+            )
+            guard !Task.isCancelled, let self else { return }
+            VoiceContextInspectorStore.shared.record(captured)
+            if self.phase == .recording || self.isStarting || self.sessionGeneration == captureGeneration {
+                self.activeContext = self.activeContext.merged(with: captured)
+            }
+        }
 
         isStarting = true
         startAborted = false
@@ -952,6 +968,8 @@ public final class VoiceSessionController {
         activeStream = nil
         activeTask?.cancel()
         activeTask = nil
+        activeContextCaptureTask?.cancel()
+        activeContextCaptureTask = nil
         activeRecorder?.cancel()
         activeRecorder = nil
         activeCommitHandler = nil
@@ -977,6 +995,8 @@ public final class VoiceSessionController {
         activeStream = nil
         activeTask?.cancel()
         activeTask = nil
+        activeContextCaptureTask?.cancel()
+        activeContextCaptureTask = nil
         activeRecorder?.cancel()
         activeRecorder = nil
         activeCommitHandler = nil
