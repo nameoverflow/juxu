@@ -12,6 +12,7 @@ public final class KeyboardViewController: UIInputViewController {
     private let t9SidebarView = IOST9SidebarView()
     private let expandedGrid = IOSExpandedCandidateView()
     private let calloutView = IOSKeyCalloutView()
+    private let alternatesView = IOSKeyAlternatesView()
 
     private var heightConstraint: NSLayoutConstraint?
     private var ribbonHeightConstraint: NSLayoutConstraint?
@@ -251,6 +252,7 @@ public final class KeyboardViewController: UIInputViewController {
         inputView.addSubview(ribbonView)
         inputView.addSubview(expandedGrid)
         inputView.addSubview(calloutView)
+        inputView.addSubview(alternatesView)
 
         let hc = inputView.heightAnchor.constraint(equalToConstant: 273)
         hc.priority = UILayoutPriority(999)
@@ -379,6 +381,41 @@ public final class KeyboardViewController: UIInputViewController {
             self.stopBackspaceRepeat()
             self.markUserTypedForClipboard()
             self.insertSymbol(symbol)
+            self.layoutEngine.consumeOneShotShiftIfNeeded()
+            self.syncEngineToUI()
+        }
+
+        keyCanvas.onAlternatesBegin = { [weak self] spec in
+            guard let self, case .letter(let ascii) = spec.kind else { return }
+            self.calloutView.hideImmediately()
+            self.keyCanvas.coveredCalloutKeyId = nil
+            self.feedback.fireSoftStep(playClick: false)
+            let options = IOSKeyAlternates.options(for: ascii, asciiMode: self.layoutEngine.asciiMode)
+            self.alternatesView.present(
+                items: options.items,
+                defaultIndex: options.defaultIndex,
+                over: self.keyCanvas.convert(spec.frame, to: self.inputView),
+                containerWidth: self.inputView?.bounds.width ?? self.keyCanvas.bounds.width,
+                dark: self.isDarkAppearance
+            )
+        }
+
+        keyCanvas.onAlternatesMove = { [weak self] point in
+            guard let self else { return }
+            let x = self.keyCanvas.convert(point, to: self.inputView).x
+            if self.alternatesView.update(xInSuperview: x) {
+                self.feedback.fireSoftStep(playClick: false)
+            }
+        }
+
+        keyCanvas.onAlternatesEnd = { [weak self] commit in
+            guard let self else { return }
+            let text = self.alternatesView.selectedText
+            self.alternatesView.hide()
+            self.stopBackspaceRepeat()
+            guard commit, let text else { return }
+            self.markUserTypedForClipboard()
+            self.insertSymbol(text)
             self.layoutEngine.consumeOneShotShiftIfNeeded()
             self.syncEngineToUI()
         }
@@ -1003,6 +1040,7 @@ public final class KeyboardViewController: UIInputViewController {
         layoutEngine.cangjieKeycapRadicals = bridge.prefs.cangjieKeycapRadicals
         layoutEngine.wubiKeycapRadicals = bridge.prefs.wubiKeycapRadicals
         layoutEngine.swipeUpInputEnabled = bridge.prefs.keySwipeUpInput
+        keyCanvas.longPressAlternatesEnabled = bridge.prefs.keyLongPressAlternates
         layoutEngine.isZLookupActive = bridge.prefs.isCangjieFamily
             && bridge.prefs.zOmnipotent
             && st.preedit.hasPrefix("z")
