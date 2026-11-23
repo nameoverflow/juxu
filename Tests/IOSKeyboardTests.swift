@@ -593,6 +593,28 @@ struct IOSKeyboardTests {
         assert(startUndo.records.count == IOSLineClearUndo.maxRecords)
         assert(startUndo.take(before: "x", documentID: docA) == "\(IOSLineClearUndo.maxRecords + 2)")
 
+        // Chinese punctuation pairing
+        for (open, close) in [("“", "”"), ("‘", "’"), ("（", "）"), ("《", "》"), ("【", "】"), ("「", "」")] {
+            assert(IOSPunctuationPairing.closer(for: open) == close)
+            assert(IOSPunctuationPairing.action(for: open, after: nil, openClosers: []) == .insertPair(close: close))
+        }
+        assert(IOSPunctuationPairing.action(for: "（", after: "，后文", openClosers: []) == .insertPair(close: "）"))
+        assert(IOSPunctuationPairing.action(for: "（", after: "\n下一行", openClosers: []) == .insertPair(close: "）"))
+        assert(IOSPunctuationPairing.action(for: "“", after: "已有文字", openClosers: []) == .plain, "No auto-close directly before text")
+        assert(IOSPunctuationPairing.action(for: "”", after: "”", openClosers: ["”"]) == .skipClose)
+        assert(IOSPunctuationPairing.action(for: "”", after: "”", openClosers: []) == .plain, "Only auto-inserted closers are skipped")
+        assert(IOSPunctuationPairing.action(for: "）", after: "”", openClosers: ["”"]) == .plain)
+        assert(IOSPunctuationPairing.action(for: "，", after: nil, openClosers: []) == .plain)
+        assert(IOSPunctuationPairing.shouldDeletePair(before: "你好“", after: "”", openClosers: ["”"]))
+        assert(!IOSPunctuationPairing.shouldDeletePair(before: "你好“字", after: "”", openClosers: ["”"]), "Pair with content inside stays")
+        assert(!IOSPunctuationPairing.shouldDeletePair(before: "“", after: "”", openClosers: []))
+        assert(!IOSPunctuationPairing.shouldDeletePair(before: "（", after: "”", openClosers: ["”"]))
+        assert(IOSPunctuationPairing.pruned(["）", "”"], after: "”）") == ["）", "”"])
+        assert(IOSPunctuationPairing.pruned(["”"], after: "别的") == [])
+        assert(IOSPunctuationPairing.pruned(["”"], after: nil) == [])
+        assert(IOSPunctuationPairing.cursorStaysInPairs(["）", "”"], tail: "，后文", after: "”），后文"))
+        assert(IOSPunctuationPairing.cursorStaysInPairs(["”"], tail: "很长的后文", after: "”很长"), "A trimmed window still matches")
+        assert(!IOSPunctuationPairing.cursorStaysInPairs(["”"], tail: "，后文", after: "”别处的文字"), "Tapping before another closer must forget the pair")
         var featurePrefs = JuxuPreferences()
         assert(!featurePrefs.keySwipeUpInput && !featurePrefs.keyLongPressAlternates && !featurePrefs.backspaceSwipeClear, "Gesture features are opt-in")
         featurePrefs.keySwipeUpInput = true

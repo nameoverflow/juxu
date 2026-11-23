@@ -75,6 +75,7 @@ public final class KeyboardViewController: UIInputViewController {
         super.viewWillAppear(animated)
         feedback.prepare()
         bridge.loadConfigAndUser(refreshPublishedLists: false)
+        autoPairClosers.removeAll()
         autoSpaceTracker.invalidate()
         compositionBaseContext = nil
         clipboardGate.resetForKeyboardAppearance()
@@ -295,6 +296,10 @@ public final class KeyboardViewController: UIInputViewController {
     private var backspaceSessionDeleted = ""
     /// A tap's deletion waits for release while a swipe-down undo is possible.
     private var backspaceTapDeferred = false
+    /// Closers auto-inserted by punctuation pairing that still sit right of the cursor, innermost last.
+    private var autoPairClosers: [String] = []
+    /// Text right of the cursor when the outermost tracked pair was inserted.
+    private var autoPairTail = ""
 
     /// Bumped to abandon an in-flight line clear as soon as anything else happens.
     private var clearLineGeneration: UInt64 = 0
@@ -533,6 +538,7 @@ public final class KeyboardViewController: UIInputViewController {
                 }
             }
             if moved {
+                self.autoPairClosers.removeAll()
                 self.autoSpaceTracker.invalidate()
                 self.compositionBaseContext = nil
                 self.feedback.fireSoftStep(playClick: false)
@@ -601,14 +607,7 @@ public final class KeyboardViewController: UIInputViewController {
             self.keyCanvas.flushPendingTouches()
             self.feedback.fireSoftStep(playClick: true)
             self.markUserTypedForClipboard()
-            self.commitPendingFirstIfComposing()
-            self.autoSpaceTracker.recordPassthrough(
-                sym,
-                hostBefore: self.textDocumentProxy.documentContextBeforeInput,
-                hostBeforeIsAuthoritative: false
-            )
-            self.textDocumentProxy.insertText(sym)
-            self.bridge.setContext("")
+            self.insertSymbol(sym)
             self.syncEngineToUI()
         }
 
@@ -870,8 +869,34 @@ public final class KeyboardViewController: UIInputViewController {
         }
     }
 
+    private var isPunctuationPairingActive: Bool {
+        bridge.prefs.smartPunctuation && !layoutEngine.asciiMode
+    }
+
     private func insertSymbol(_ sym: String) {
         commitPendingFirstIfComposing()
+        var pairCloser: String?
+        if isPunctuationPairingActive {
+            let after = textDocumentProxy.documentContextAfterInput
+            refreshAutoPairs(after: after)
+            switch IOSPunctuationPairing.action(for: sym, after: after, openClosers: autoPairClosers) {
+            case .skipClose:
+                textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
+                autoPairClosers.removeLast()
+                autoSpaceTracker.invalidate()
+                bridge.setContext("")
+                return
+            case .insertPair(let close):
+                pairCloser = close
+                if autoPairClosers.isEmpty {
+                    autoPairTail = after ?? ""
+                }
+            case .plain:
+                break
+            }
+        } else {
+            autoPairClosers.removeAll()
+        }
         if AutoSpaceFormatter.isAutoSpaceRightTrigger(sym, options: AutoSpaceOptions(prefs: bridge.prefs)) {
             insertTextWithAutoSpace(sym, splitInternal: false)
         } else {
@@ -882,7 +907,21 @@ public final class KeyboardViewController: UIInputViewController {
             )
             textDocumentProxy.insertText(sym)
         }
+        if let pairCloser {
+            textDocumentProxy.insertText(pairCloser)
+            textDocumentProxy.adjustTextPosition(byCharacterOffset: -1)
+            autoPairClosers.append(pairCloser)
+            autoSpaceTracker.invalidate()
+        }
         bridge.setContext("")
+    }
+
+    /// Forgets tracked pairs once the cursor has been moved away from them.
+    private func refreshAutoPairs(after: String?) {
+        autoPairClosers = IOSPunctuationPairing.pruned(autoPairClosers, after: after)
+        if !IOSPunctuationPairing.cursorStaysInPairs(autoPairClosers, tail: autoPairTail, after: after) {
+            autoPairClosers.removeAll()
+        }
     }
 
     /// Remembers what the current backspace press already removed, so a swipe can account for it.
@@ -898,6 +937,7 @@ public final class KeyboardViewController: UIInputViewController {
                   documentID: textDocumentProxy.documentIdentifier
               ) else { return }
         clearLineGeneration &+= 1
+        autoPairClosers.removeAll()
         autoSpaceTracker.invalidate()
         textDocumentProxy.insertText(text)
         bridge.setContext(String(text.suffix(16)))
@@ -915,6 +955,7 @@ public final class KeyboardViewController: UIInputViewController {
             syncEngineToUI()
             return
         }
+        autoPairClosers.removeAll()
         autoSpaceTracker.invalidate()
         // Touch-down at a line start removed only the line break: put it back instead of joining lines.
         // After a longer hold-delete, the text already removed stays removed.
@@ -1018,6 +1059,22 @@ public final class KeyboardViewController: UIInputViewController {
             let out = bridge.handleKey(keyCode: 0x33, scalar: 0, hasCmdOrCtrl: false, timestampMs: Self.nowMs())
             applyEngineState(out)
             return
+        }
+        if isPunctuationPairingActive, !autoPairClosers.isEmpty {
+            let hostBefore = textDocumentProxy.documentContextBeforeInput
+            let hostAfter = textDocumentProxy.documentContextAfterInput
+            refreshAutoPairs(after: hostAfter)
+            if IOSPunctuationPairing.shouldDeletePair(before: hostBefore, after: hostAfter, openClosers: autoPairClosers) {
+                noteBackspaceDeleted(String((hostBefore ?? "").suffix(1)) + (autoPairClosers.last ?? ""))
+                textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
+                textDocumentProxy.deleteBackward()
+                textDocumentProxy.deleteBackward()
+                autoPairClosers.removeLast()
+                autoSpaceTracker.invalidate()
+                bridge.setContext(String((hostBefore ?? "").dropLast().suffix(16)))
+                syncEngineToUI()
+                return
+            }
         }
         guard acceleratedChunk, let before = textDocumentProxy.documentContextBeforeInput, !before.isEmpty else {
             let before = textDocumentProxy.documentContextBeforeInput ?? ""
