@@ -28,6 +28,7 @@ public final class VoiceSessionController {
         _shared?.teardown()
         _shared = nil
         VoiceHUDPanelController.unload()
+        VoiceGlobalHotkeyController.unload()
     }
 
     private enum Phase {
@@ -55,6 +56,20 @@ public final class VoiceSessionController {
 
     public var isActive: Bool {
         phase != .idle
+    }
+
+    public var isRecording: Bool { phase == .recording }
+
+    /// Test seam: replaces starting the microphone.
+    var startRecordingOverride: (() -> Void)?
+
+    public func cancelForChord() {
+        cancelPendingHold()
+        if phase == .recording { cancelCurrentSession(showNotice: false) }
+    }
+
+    public func showExternalNotice(_ message: String) {
+        showNotice(message, isError: false, duration: 3.2)
     }
 
     /// Handles modifier/key events from `JuxuInputController` ONLY when voice is enabled.
@@ -156,6 +171,8 @@ public final class VoiceSessionController {
     }
 
     public func handleDeactivate() {
+        // With the global key, switching app or input method does not end a dictation.
+        if VoiceGlobalHotkeyController.isListening { return }
         cancelPendingHold()
         if phase == .recording {
             cancelCurrentSession(showNotice: false)
@@ -271,6 +288,10 @@ public final class VoiceSessionController {
         context: VoiceContext,
         onCommit: @escaping (_ text: String, _ replaceSelection: Bool) -> Void
     ) {
+        if let startRecordingOverride {
+            startRecordingOverride()
+            return
+        }
         let prefs = VoicePreferencesStore.shared.prefs
         let useAppleSpeech = (prefs.providerMode == .local && prefs.localASRPreset == .appleSpeech)
 
