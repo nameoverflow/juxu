@@ -1281,6 +1281,34 @@ impl<'a> NeuralView<'a> {
         best
     }
 
+    /// Precompute quantized `MTP-2` conditional projection `p2_q` for `c1` given `state.mtp_h` (`~0.4 µs`).
+    /// Reuse `p2_q` across many `c2` candidates via `score_mtp2_char` (`~0.02 µs` each).
+    #[inline]
+    pub fn prepare_mtp2_vec(&self, state: &RwkvState, c1: char, p2_q: &mut [i8; 512]) -> f32 {
+        let r = self.offs.summary.rank;
+        let tok1 = self.char_to_token(c1);
+        let (e1_row, e1_sc, _) = self.emb_row(tok1);
+        let mut e1_q = [0i8; 512];
+        for k in 0..r {
+            e1_q[k] = e1_row[k] as i8;
+        }
+        let mut c1_contrib = [0.0f32; 512];
+        self.eval_qmat(&self.offs.w_mtp_c1, &e1_q[..r], e1_sc, r, r, &mut c1_contrib[..r]);
+        for k in 0..r {
+            c1_contrib[k] += state.mtp_h[k];
+        }
+        quantize_act_i8(&c1_contrib[..r], &mut p2_q[..r])
+    }
+
+    /// Score `log P(c2 | state, c1)` using a precomputed `MTP-2` vector from `prepare_mtp2_vec` (`~0.02 µs`).
+    #[inline]
+    pub fn score_mtp2_char(&self, p2_q: &[i8; 512], p2_scale: f32, c2: char) -> f32 {
+        let r = self.offs.summary.rank;
+        let tok2 = self.char_to_token(c2);
+        let (e2_row, e2_sc, ub2) = self.emb_row(tok2);
+        int8_dot_row(e2_row, e2_sc, &p2_q[..r], p2_scale) + ub2
+    }
+
     /// Fast zero-unroll phrase log-probability `log P(c1, c2.. | state)` using cached `p1` + `MTP-2` (`~0.4 µs`).
     #[inline]
     pub fn score_phrase_fast(&self, state: &RwkvState, text: &str) -> f32 {

@@ -213,6 +213,20 @@ impl UserStore {
         mask
     }
 
+    /// Record a committed CJK sequence into pure probability-layer `PersonalContinuations`.
+    pub fn observe_continuation(
+        &mut self,
+        prefix: &[char],
+        text: &str,
+        confirmed: bool,
+        first_choice: Option<&str>,
+        neural: Option<(crate::neural::NeuralView<'_>, crate::neural::RwkvState)>,
+    ) {
+        self.continuations
+            .observe(prefix, text, confirmed, first_choice, neural);
+        self.dirty = true;
+    }
+
     pub fn lookup_exact(&self, code: PackedCode) -> Vec<(&str, u32, u64)> {
         let Some(list) = self.code_index.get(&code) else {
             return Vec::new();
@@ -401,6 +415,10 @@ impl UserStore {
             });
         let _ = entry;
         self.dirty = true;
+        if !auto_composed {
+            // Reflect explicit manual phrases directly into RWKV probability space as well.
+            self.continuations.observe(&[], text, true, Some(""), None);
+        }
         if let Some(pd) = pdict {
             self.index_phrase_pinyin(text, pd);
         }
@@ -1063,6 +1081,7 @@ impl UserStore {
                 }
                 "CONT_SEQ" if parts.len() == 2 => store.continuations.load_clock(parts[1]),
                 "CONT_MODEL" if parts.len() == 2 => store.continuations.load_model(parts[1]),
+                "CONT_UNI" => store.continuations.load_unigrams(&parts[1..]),
                 "CONT" => store.continuations.load_row(&parts[1..]),
                 _ => {}
             }

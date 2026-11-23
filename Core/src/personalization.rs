@@ -191,14 +191,14 @@ impl Counts {
         if total < 0.25 {
             return (0.0, 0.0);
         }
-        let support = total / (total + 3.0);
+        let support = total / (total + 1.5);
         let lambda = max_lambda * support;
         let w = self
             .options
             .iter()
             .find(|o| o.ch == ch)
             .map_or(0.0, |o| o.weight * decay);
-        let p_cache = (w / (total + 1.0)).clamp(0.0, 0.99);
+        let p_cache = (w / (total + 0.5)).clamp(0.0, 0.99);
         (p_cache, lambda)
     }
 
@@ -245,29 +245,77 @@ impl Counts {
             return (0.0, 0.0);
         }
         let similarity = (1.0 - nearest as f32 / 32.0).clamp(0.0, 1.0);
-        let lambda = 0.55 * similarity * (support / (support + 3.0));
-        let p_cache = (matches / (support + 1.0)).clamp(0.0, 0.99);
+        let lambda = 0.68 * similarity * (support / (support + 1.5));
+        let p_cache = (matches / (support + 0.5)).clamp(0.0, 0.99);
         (p_cache, lambda)
     }
 }
+
+const MAX_UNIGRAMS: usize = 1_024;
+const UNIGRAMS_AFTER_PRUNE: usize = 768;
 
 #[derive(Default)]
 pub(crate) struct PersonalContinuations {
     tick: u64,
     rows: HashMap<u64, Counts>,
+    /// 0-gram personal unigram prior `(last_tick, weight)` so rare sentence-initial characters
+    /// (e.g. `卓` in `卓威`, `哈` in `哈基米`, `傻` in `傻逼吗`) survive pure-char beam search
+    /// after a single explicit selection without any phrase dictionary rules.
+    unigrams: HashMap<u16, (u64, f32)>,
+    uni_tick: u64,
+    uni_total: f32,
     state_model: Option<u64>,
 }
 
 impl PersonalContinuations {
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.rows.is_empty() && self.unigrams.is_empty()
     }
 
     pub fn matches_model(&self, view: &NeuralView<'_>) -> bool {
         self.state_model == Some(view.offs.profile_id)
     }
 
-    /// A rejected first choice increases evidence at the first differing character.
+    fn observe_unigram(&mut self, ch: u16, weight: f32) {
+        let decay = (-(self.tick.saturating_sub(self.uni_tick) as f32) / HALF_LIFE).exp2();
+        self.uni_tick = self.tick;
+        self.uni_total = (self.uni_total * decay).min(256.0) + weight;
+        let entry = self.unigrams.entry(ch).or_insert((self.tick, 0.0));
+        let edecay = (-(self.tick.saturating_sub(entry.0) as f32) / HALF_LIFE).exp2();
+        entry.0 = self.tick;
+        entry.1 = (entry.1 * edecay).min(32.0) + weight;
+        if self.unigrams.len() > MAX_UNIGRAMS {
+            let now = self.tick;
+            let mut by_w: Vec<(u16, f32)> = self
+                .unigrams
+                .iter()
+                .map(|(&k, &(t, w))| (k, w * (-(now.saturating_sub(t) as f32) / HALF_LIFE).exp2()))
+                .collect();
+            let remove = by_w.len() - UNIGRAMS_AFTER_PRUNE;
+            by_w.select_nth_unstable_by(remove, |a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            for (k, _) in by_w.into_iter().take(remove) {
+                self.unigrams.remove(&k);
+            }
+        }
+    }
+
+    fn cache_unigram_prob(&self, ch: u16) -> (f32, f32) {
+        let Some(&(etick, ew)) = self.unigrams.get(&ch) else {
+            return (0.0, 0.0);
+        };
+        let edecay = (-(self.tick.saturating_sub(etick) as f32) / HALF_LIFE).exp2();
+        let w = ew * edecay;
+        if w < 0.25 {
+            return (0.0, 0.0);
+        }
+        let tdecay = (-(self.tick.saturating_sub(self.uni_tick) as f32) / HALF_LIFE).exp2();
+        let total = self.uni_total * tdecay;
+        let p_uni = (w / (total.max(w) + 8.0)).clamp(0.0, 0.25);
+        let lambda = 0.14 * (w / (w + 2.0));
+        (p_uni, lambda)
+    }
+
+    /// A rejected first choice increases evidence at every differing character.
     pub fn observe(
         &mut self,
         prefix: &[char],
@@ -284,25 +332,36 @@ impl PersonalContinuations {
                 self.state_model = Some(view.offs.profile_id);
             }
         }
-        let weight = if confirmed { 1.0 } else { 0.25 };
+        let base_weight = if confirmed { 1.0 } else { 0.25 };
         let mut context = Context::with_chars(prefix.iter().copied());
-        let mut other = first_choice.map(str::chars);
-        for ch in text.chars() {
-            let different = other
-                .as_mut()
-                .and_then(Iterator::next)
-                .is_some_and(|a| a != ch);
-            if different {
-                other = None;
-            }
+        let first_chars: Option<Vec<char>> = first_choice
+            .filter(|&fc| fc != text)
+            .map(|fc| fc.chars().collect());
+        let mut diverged = false;
+        for (idx, ch) in text.chars().enumerate() {
+            let different = if let Some(ref fc) = first_chars {
+                let d = fc.get(idx).copied() != Some(ch);
+                if d {
+                    diverged = true;
+                }
+                d || diverged
+            } else {
+                false
+            };
             if han(ch) {
                 self.tick = self.tick.saturating_add(1);
-                let weight = if different { weight + 2.0 } else { weight };
+                let weight = if different { base_weight + 2.5 } else { base_weight };
                 for (key, _) in context.suffixes() {
                     self.rows
                         .entry(key)
                         .or_default()
                         .observe(ch as u16, weight, self.tick);
+                }
+                // Record 0-gram unigram prior for sentence-initial / explicitly corrected characters
+                if different {
+                    self.observe_unigram(ch as u16, 3.5);
+                } else if confirmed && idx == 0 {
+                    self.observe_unigram(ch as u16, 0.45);
                 }
                 if let Some((model, state)) = neural.as_mut() {
                     if let Some(key) = context.three_chars() {
@@ -361,7 +420,7 @@ impl PersonalContinuations {
     }
 
     /// Unified Neural Cache LM probability-space interpolation:
-    /// `P_final(ch | h) = (1 - lambda) * exp(rwkv_logp) + lambda * P_cache(ch | h_sig, suffix)`
+    /// `P_final(ch | h) = (1 - lambda) * exp(rwkv_logp) + lambda * P_cache(ch | h_sig, suffix, uni)`
     /// Returns the calibrated log-probability in nats.
     pub fn interpolate_logp(
         &self,
@@ -370,7 +429,7 @@ impl PersonalContinuations {
         ch: char,
         state: Option<&RwkvState>,
     ) -> f32 {
-        if self.rows.is_empty() || !han(ch) {
+        if self.is_empty() || !han(ch) {
             return rwkv_logp;
         }
         let ch_u16 = ch as u16;
@@ -388,18 +447,29 @@ impl PersonalContinuations {
             }
         }
 
-        // 2. Fall back to or blend with longest matching character suffix (1..=3 chars)
+        // 2. Fall back to 1..=3 char suffix continuations when RWKV state kNN did not match
         if best_lambda < 0.04 {
-            let max_lambdas = [0.18f32, 0.30, 0.42];
+            let max_lambdas = [0.38f32, 0.58, 0.75];
             for (idx, (key, _)) in context.suffixes().enumerate() {
                 if let Some(row) = self.rows.get(&key) {
                     let (p_suf, l_suf) =
                         row.cache_suffix_prob(ch_u16, max_lambdas[idx.min(2)], self.tick);
-                    if l_suf > best_lambda || (l_suf > 0.04 && p_suf > best_p) {
+                    if l_suf * p_suf > best_lambda * best_p || (best_lambda < 0.04 && l_suf > best_lambda) {
                         best_p = p_suf;
                         best_lambda = l_suf;
                     }
                 }
+            }
+        }
+
+        // 3. Fall back to 0-gram personal unigram prior ONLY for rare/surprising characters
+        //    (`rwkv_logp < -5.5`), rescuing sentence-initial personal words (`卓威`, `哈基米`, `句序`)
+        //    without ever distorting common high-probability characters (`是`, `上`, `这`, `的`).
+        if best_lambda * best_p < 1e-3 && rwkv_logp < -5.5 && !self.unigrams.is_empty() {
+            let (p_uni, l_uni) = self.cache_unigram_prob(ch_u16);
+            if l_uni * p_uni > best_lambda * best_p {
+                best_p = p_uni;
+                best_lambda = l_uni;
             }
         }
 
@@ -412,12 +482,19 @@ impl PersonalContinuations {
     }
 
     pub fn write_to(&self, out: &mut String) {
-        if self.rows.is_empty() {
+        if self.is_empty() {
             return;
         }
         let _ = writeln!(out, "CONT_SEQ\t{}", self.tick);
         if let Some(model) = self.state_model {
             let _ = writeln!(out, "CONT_MODEL\t{model:x}");
+        }
+        if !self.unigrams.is_empty() {
+            let _ = write!(out, "CONT_UNI\t{}\t{:.4}", self.uni_tick, self.uni_total);
+            for (&ch, &(t, w)) in &self.unigrams {
+                let _ = write!(out, "\t{:x}:{}:{:.4}", ch, t, w);
+            }
+            out.push('\n');
         }
         for (&key, row) in &self.rows {
             let _ = write!(out, "CONT\t{key:x}\t{}\t{:.4}", row.tick, row.total);
@@ -447,6 +524,37 @@ impl PersonalContinuations {
 
     pub fn load_model(&mut self, value: &str) {
         self.state_model = u64::from_str_radix(value, 16).ok();
+    }
+
+    pub fn load_unigrams(&mut self, fields: &[&str]) {
+        let [tick_s, total_s, items @ ..] = fields else {
+            return;
+        };
+        let (Ok(tick), Ok(total)) = (tick_s.parse::<u64>(), total_s.parse::<f32>()) else {
+            return;
+        };
+        if !total.is_finite() || total < 0.0 {
+            return;
+        }
+        self.uni_tick = self.uni_tick.max(tick);
+        self.uni_total = total;
+        self.tick = self.tick.max(tick);
+        for item in items {
+            let mut it = item.split(':');
+            let (Some(ch_s), Some(t_s), Some(w_s)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            let (Ok(ch), Ok(t), Ok(w)) = (
+                u16::from_str_radix(ch_s, 16),
+                t_s.parse::<u64>(),
+                w_s.parse::<f32>(),
+            ) else {
+                continue;
+            };
+            if char::from_u32(ch as u32).is_some_and(han) && w.is_finite() && w > 0.0 {
+                self.unigrams.insert(ch, (t, w));
+            }
+        }
     }
 
     pub fn load_row(&mut self, fields: &[&str]) {

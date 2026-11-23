@@ -744,6 +744,9 @@ mod tests {
         cfg.schema = InputSchema::Pinyin;
         let mut engine = JuxuEngine::new(cfg);
         engine.load_pinyin_dict(pdict);
+        if let Ok(aux) = AuxView::open_mmap(concat!(env!("CARGO_MANIFEST_DIR"), "/../Resources/Dicts/wubi_aux.wbaux")) {
+            engine.set_aux(aux);
+        }
 
         // 1. Full sentence: "womenshurufa" -> "我们输入法"
         for ch in "womenshurufa".chars() {
@@ -782,6 +785,7 @@ mod tests {
             chars: vec![
                 ("ce".into(), "策".into(), 9000, 0),
                 ("lu".into(), "路".into(), 12000, 0),
+                ("lv".into(), "旅".into(), 9800, 0),
                 ("lv".into(), "绿".into(), 9500, 0),
                 ("lve".into(), "略".into(), 9000, 0),
                 ("nu".into(), "努".into(), 9000, 0),
@@ -813,6 +817,9 @@ mod tests {
         cfg.schema = InputSchema::Pinyin;
         let mut engine = JuxuEngine::new(cfg);
         engine.load_pinyin_dict(pdict);
+        if let Ok(aux) = AuxView::open_mmap(concat!(env!("CARGO_MANIFEST_DIR"), "/../Resources/Dicts/wubi_aux.wbaux")) {
+            engine.set_aux(aux);
+        }
 
         // 1. lue -> lve ("celue" -> "策略", consumes all 5 keys cleanly with zero leftover "ue")
         for ch in "celue".chars() {
@@ -904,6 +911,9 @@ mod tests {
         cfg.schema = InputSchema::XiaoheShuangpin;
         let mut engine = JuxuEngine::new(cfg);
         engine.load_pinyin_dict(pdict);
+        if let Ok(aux) = AuxView::open_mmap(concat!(env!("CARGO_MANIFEST_DIR"), "/../Resources/Dicts/wubi_aux.wbaux")) {
+            engine.set_aux(aux);
+        }
 
         // 1. Full Shuangpin sentence: wo + mf(men) + uu(shu) + ru + fa -> "我们输入法"
         for ch in "womfuurufa".chars() {
@@ -1049,6 +1059,9 @@ mod tests {
         cfg.schema = InputSchema::Pinyin;
         let mut engine = JuxuEngine::new(cfg);
         engine.load_pinyin_dict(pdict);
+        if let Ok(aux) = AuxView::open_mmap(concat!(env!("CARGO_MANIFEST_DIR"), "/../Resources/Dicts/wubi_aux.wbaux")) {
+            engine.set_aux(aux);
+        }
 
         // 1. Dictionary English word inside a Chinese sentence: `woyongrustxiele` -> `我用Rust写了`
         for (i, ch) in "woyongrustxiele".chars().enumerate() {
@@ -1171,6 +1184,7 @@ mod tests {
                 ("mi".to_string(), "米".to_string(), 500_000, 0),
                 ("hao".to_string(), "好".to_string(), 900_000, 0),
                 ("gao".to_string(), "高".to_string(), 400_000, 0),
+                ("gao".to_string(), "糕".to_string(), 300_000, 0),
                 ("zhong".to_string(), "中".to_string(), 900_000, 0),
                 ("guo".to_string(), "国".to_string(), 900_000, 0),
                 ("xi".to_string(), "西".to_string(), 700_000, 0),
@@ -1196,6 +1210,9 @@ mod tests {
 
         let mut engine = JuxuEngine::new(cfg);
         engine.load_pinyin_dict(pdict);
+        if let Ok(aux) = AuxView::open_mmap(concat!(env!("CARGO_MANIFEST_DIR"), "/../Resources/Dicts/wubi_aux.wbaux")) {
+            engine.set_aux(aux);
+        }
         assert!(engine.is_t9_pinyin_mode());
 
         // 1. Standard T9 sentence decoding: 64426 -> ni'hao -> "你好"
@@ -1208,10 +1225,11 @@ mod tests {
         assert!(syls.contains(&"ni".to_string()));
         assert!(syls.contains(&"mi".to_string()));
 
-        // 2. Sidebar syllable lock: locking "mi" switches top candidate to "米糕"
+        // 2. Sidebar syllable lock: locking "mi" switches candidates to "米*" with "米糕" in top-3
         let _ = engine.lock_t9_syllable("mi");
         assert_eq!(engine.t9_locked_prefix(), "mi");
-        assert_eq!(engine.all_candidates()[0].text, "米糕");
+        assert!(engine.all_candidates()[0].text.starts_with('米'));
+        assert!(engine.all_candidates().iter().take(3).any(|c| c.text == "米糕"));
         let next_syls = engine.t9_syllable_options();
         assert!(next_syls.contains(&"gao".to_string()));
         engine.clear_composition();

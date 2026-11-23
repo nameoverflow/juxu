@@ -1274,44 +1274,15 @@ impl JuxuEngine {
             }
             let mut notice = String::new();
             if learn {
+                // Pure probability-layer user learning: all Pinyin/Shuangpin/T9 adaptation goes
+                // directly into `PersonalContinuations` (0-gram + 1..3-gram + RWKV state kNN),
+                // with zero rule-based phrase dictionary insertion or function-word filtering.
                 self.learn_continuation(&commit_text, explicit, first_choice.as_deref());
-                let prev = self.last_committed.clone();
-                let dict_idx = self.config.schema.slot_index();
-                let dict_opt = self.dicts.get(dict_idx).and_then(|d| d.as_ref());
-                let learned = self.user.record_commit_with_surprisal(
-                    &prev,
-                    &commit_text,
-                    timestamp_ms,
-                    self.config.auto_phrase,
-                    self.config.auto_phrase_threshold,
-                    dict_opt,
-                    self.pinyin_dict.as_ref(),
-                    surprisal,
-                );
-                if let Some(new_word) = learned {
-                    notice = format!("自动成词：{}", new_word);
-                } else if multi_segment {
-                    // User assembled a multi-segment phrase in Pinyin; promote if surprising to RWKV
-                    if let Some(new_word) = self.user.record_assembled_phrase(
-                        &commit_text,
-                        surprisal,
-                        self.config.auto_phrase,
-                        self.config.auto_phrase_threshold,
-                        dict_opt,
-                        self.pinyin_dict.as_ref(),
-                    ) {
-                        notice = format!("自动成词：{}", new_word);
-                    }
-                }
-                // Lightly seed constituent characters (capped at 3) so single-syllable homophone lookup
-                // (e.g. `ju` -> `橘` after `橘子`) surfaces recently used characters without inflating common chars.
-                if commit_text.chars().count() >= 2 {
-                    for ch in commit_text.chars() {
-                        let s = ch.to_string();
-                        if self.user.unigram_counts.get(&s).copied().unwrap_or(0) < 3 {
-                            let _ = self.user.record_commit("", &s, timestamp_ms, false, 2, None);
-                        }
-                    }
+                let _ = multi_segment;
+                let _ = surprisal;
+                // Preserve personal OOV/cased English words for mixed Chinese-English typing.
+                if commit_text.bytes().any(|b| b.is_ascii_alphabetic()) {
+                    self.user.record_english_words_in_text(&commit_text, false);
                 }
             }
             self.last_committed = commit_text.clone();
