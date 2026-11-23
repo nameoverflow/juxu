@@ -354,6 +354,27 @@ struct SwiftBridgeTests {
         assert(!VoiceHUDPanelController.isLoaded, "Disabling voice must unload VoiceHUDPanelController")
         assert(!VoiceLocalInstaller.isLoaded, "Disabling voice must unload VoiceLocalInstaller")
         precondition(!VoiceWhisperServerManager.isLoaded, "Disabling voice must unload the whisper-server manager")
+        // The HUD meter separates loudness on a dB scale across both laptop and close-up mics.
+        let rmsFromDB = { (db: Float) -> Float in pow(10, db / 20) }
+        var laptopMeter = VoiceLevelMeter()
+        for _ in 0..<10 { _ = laptopMeter.process(rms: rmsFromDB(-41.5), seconds: 0.1) }
+        let laptopSteps: [Float] = ([-41.5, -36, -32, -29, -25] as [Float]).map { db in
+            var out: Float = 0
+            for _ in 0..<4 { out = laptopMeter.process(rms: rmsFromDB(db), seconds: 0.1) }
+            return out
+        }
+        precondition(laptopSteps[0] == 0, "laptop room noise stays at rest")
+        precondition(zip(laptopSteps, laptopSteps.dropFirst()).allSatisfy { $0 < $1 }, "louder speech always draws higher on laptop mic")
+        precondition(laptopSteps[2] >= 0.35 && laptopSteps[4] >= 0.85, "laptop speech spans a clear visual range")
+
+        var closeMicMeter = VoiceLevelMeter()
+        for _ in 0..<10 { _ = closeMicMeter.process(rms: rmsFromDB(-56), seconds: 0.1) }
+        precondition(closeMicMeter.process(rms: rmsFromDB(-56), seconds: 0.1) == 0, "quiet room stays at rest")
+        for _ in 0..<6 { _ = closeMicMeter.process(rms: rmsFromDB(-12), seconds: 0.1) }
+        let closeLoud = closeMicMeter.process(rms: rmsFromDB(-12), seconds: 0.1)
+        let closeNormal = closeMicMeter.process(rms: rmsFromDB(-26), seconds: 0.1)
+        let closeWhisper = closeMicMeter.process(rms: rmsFromDB(-42), seconds: 0.1)
+        precondition(closeWhisper > 0.05 && closeWhisper < closeNormal && closeNormal < closeLoud, "adaptive ceiling separates whisper, normal and loud speech on hot mics")
 
         // Verify legacy "rule_based" config migrates cleanly to local LLM (.qwen15B)
         let defaultVoiceLLM = VoicePreferences()

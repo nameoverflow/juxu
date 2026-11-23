@@ -301,6 +301,7 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     private var latestAppleTranscript: String = ""
     private var appleFinalContinuation: CheckedContinuation<String, Error>?
     private var appleFinished = false
+    private var levelMeter = VoiceLevelMeter()
 
     public var onAudioLevel: (@Sendable (Float) -> Void)?
     public var onPartialTranscript: (@Sendable (String) -> Void)?
@@ -407,18 +408,31 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     }
 
     private func processBuffer(_ buffer: AVAudioPCMBuffer) {
-        // Compute normalized RMS audio level for HUD bars
+        // HUD meter only: the audio sent to the recogniser is converted below, untouched by this.
         if let channelData = buffer.floatChannelData?[0] {
             let count = Int(buffer.frameLength)
             if count > 0 {
-                var sum: Float = 0
-                for i in 0..<count {
-                    let s = channelData[i]
-                    sum += s * s
+                // CoreAudio tap buffers are often ~100 ms; slicing into ~25 ms windows keeps
+                // brief pauses tracking the noise floor while preserving syllable loudness peaks.
+                let sampleRate = buffer.format.sampleRate
+                let step = max(1, Int((sampleRate * 0.025).rounded()))
+                var peakLevel: Float = 0
+                var offset = 0
+                while offset < count {
+                    let end = min(count, offset + step)
+                    let chunk = end - offset
+                    var sum: Float = 0
+                    for i in offset..<end {
+                        let s = channelData[i]
+                        sum += s * s
+                    }
+                    let rms = sqrt(sum / Float(chunk))
+                    let seconds = Float(Double(chunk) / sampleRate)
+                    let level = levelMeter.process(rms: rms, seconds: seconds)
+                    if level > peakLevel { peakLevel = level }
+                    offset = end
                 }
-                let rms = sqrt(sum / Float(count))
-                let level = min(1.0, max(0.0, rms * 8.5))
-                onAudioLevel?(level)
+                onAudioLevel?(peakLevel)
             }
         }
 

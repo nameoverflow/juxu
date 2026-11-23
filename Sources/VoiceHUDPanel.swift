@@ -448,9 +448,9 @@ final class VoiceHUDContentView: NSView {
         let levelTau: CGFloat = targetLevel > smoothedLevel ? 0.03 : 0.13
         smoothedLevel += (targetLevel - smoothedLevel) * (1 - exp(-CGFloat(dt) / levelTau))
 
+        // The level is already perceptual (see VoiceLevelMeter), so it maps straight to height.
         // Below the gate the bars collapse to a straight line of dots.
-        let gated = max(0, (smoothedLevel - 0.04) / 0.96)
-        let energy = pow(gated, 0.65)
+        let energy = max(0, (smoothedLevel - 0.02) / 0.98)
         let dot = VoiceHUDMetrics.barWidth
         let span = VoiceHUDMetrics.barMaxHeight - dot
 
@@ -489,6 +489,49 @@ final class VoiceHUDContentView: NSView {
             }
         }
         CATransaction.commit()
+    }
+}
+
+/// Maps microphone loudness to a 0...1 display level on a decibel scale, so whisper, normal and
+/// loud speech look different across both quiet far-field laptop mics and loud close-up mics.
+/// A slow noise-floor estimate keeps room noise at rest, and an adaptive peak ceiling tracks
+/// louder microphones upward without pinning normal speech.
+/// Display only: it never touches the audio given to the recogniser or the speech gate.
+struct VoiceLevelMeter {
+    static let quietestDB: Float = -58
+    static let lowestFloorDB: Float = -65
+    static let highestFloorDB: Float = -41
+    static let floorMarginDB: Float = 3.5
+    static let minSpanDB: Float = 12
+    static let initialCeilingDB: Float = -25
+    static let maxCeilingDB: Float = -4
+
+    private(set) var noiseFloorDB: Float?
+    private(set) var peakCeilingDB: Float?
+
+    mutating func process(rms: Float, seconds: Float) -> Float {
+        let db = 20 * log10(max(rms, 1e-6))
+        let clamped = min(Self.highestFloorDB, max(Self.lowestFloorDB, db))
+        if let floor = noiseFloorDB {
+            // Falls quickly into pauses, rises slowly so sustained speech is not taken for noise.
+            let tau: Float = clamped < floor ? 0.15 : 6
+            noiseFloorDB = floor + (clamped - floor) * (1 - exp(-seconds / tau))
+        } else {
+            noiseFloorDB = clamped
+        }
+        let bottom = max(Self.quietestDB, (noiseFloorDB ?? Self.lowestFloorDB) + Self.floorMarginDB)
+        let minTop = min(Self.maxCeilingDB, max(bottom + Self.minSpanDB, Self.initialCeilingDB))
+        let targetPeak = min(Self.maxCeilingDB, max(minTop, db))
+        if let peak = peakCeilingDB {
+            // Expands quickly for loud close-up mics and relaxes slowly so transient peaks
+            // keep loud-vs-soft contrast visible.
+            let tau: Float = targetPeak > peak ? 0.25 : 5
+            peakCeilingDB = peak + (targetPeak - peak) * (1 - exp(-seconds / tau))
+        } else {
+            peakCeilingDB = minTop
+        }
+        let top = max(minTop, peakCeilingDB ?? minTop)
+        return max(0, min(1, (db - bottom) / (top - bottom)))
     }
 }
 
