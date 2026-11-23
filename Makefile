@@ -74,26 +74,26 @@ install: app
 	  "$(LSREGISTER)" -u "$$HOME/Library/Input Methods/Juxu.app" 2>/dev/null || true; \
 	  rm -rf "$$HOME/Library/Input Methods/Juxu.app"; \
 	fi
-	@if [ -d "/Library/Input Methods/Juxu.app" ] && [ -w "/Library/Input Methods/Juxu.app" ]; then \
+	@if LC_ALL=C grep -q -a "im.juxu.inputmethod.Juxu" /System/Library/Caches/com.apple.IntlDataCache.le.kbdx 2>/dev/null && [ -d "/Library/Input Methods/Juxu.app" ] && [ -w "/Library/Input Methods/Juxu.app" ]; then \
 	  rm -rf "/Library/Input Methods/Juxu.app/Contents"; \
 	  cp -R build/Juxu.app/Contents "/Library/Input Methods/Juxu.app/Contents"; \
 	  chmod -R ug+rwX,o+rX "/Library/Input Methods/Juxu.app" 2>/dev/null || true; \
-	elif [ -w "/Library/Input Methods" ]; then \
-	  rm -rf "/Library/Input Methods/Juxu.app"; \
-	  cp -R build/Juxu.app "/Library/Input Methods/Juxu.app"; \
-	  chmod -R ug+rwX,o+rX "/Library/Input Methods/Juxu.app" 2>/dev/null || true; \
+	  "$(LSREGISTER)" -f -R -trusted "/Library/Input Methods/Juxu.app"; \
 	elif [ -t 0 ] && sudo -v 2>/dev/null; then \
 	  sudo rm -rf "/Library/Input Methods/Juxu.app"; \
 	  sudo cp -R build/Juxu.app "/Library/Input Methods/Juxu.app"; \
 	  sudo chown -R root:staff "/Library/Input Methods/Juxu.app"; \
 	  sudo chmod -R ug+rwX,o+rX "/Library/Input Methods/Juxu.app"; \
+	  sudo "$(LSREGISTER)" -f -R -trusted "/Library/Input Methods/Juxu.app"; \
+	  sudo "/Library/Input Methods/Juxu.app/Contents/MacOS/Juxu" --register-system-cache; \
 	else \
-	  osascript -e 'do shell script "rm -rf \"/Library/Input Methods/Juxu.app\" && cp -R \"" & (POSIX path of (POSIX file "build/Juxu.app")) & "\" \"/Library/Input Methods/Juxu.app\" && chown -R root:staff \"/Library/Input Methods/Juxu.app\" && chmod -R ug+rwX,o+rX \"/Library/Input Methods/Juxu.app\"" with administrator privileges'; \
+	  osascript -e 'do shell script "rm -rf \"/Library/Input Methods/Juxu.app\" && cp -R \"" & (POSIX path of (POSIX file "build/Juxu.app")) & "\" \"/Library/Input Methods/Juxu.app\" && chown -R root:staff \"/Library/Input Methods/Juxu.app\" && chmod -R ug+rwX,o+rX \"/Library/Input Methods/Juxu.app\" && \"$(LSREGISTER)\" -f -R -trusted \"/Library/Input Methods/Juxu.app\" && \"/Library/Input Methods/Juxu.app/Contents/MacOS/Juxu\" --register-system-cache" with administrator privileges'; \
 	fi
-	"$(LSREGISTER)" -f -R -trusted "/Library/Input Methods/Juxu.app"
-	"/Library/Input Methods/Juxu.app/Contents/MacOS/Juxu" --register-and-enable
-	killall imklaunchagent 2>/dev/null || true
+	@uc="$$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null || true)"; \
+	if [ -n "$$uc" ] && [ -d "$$uc" ]; then rm -f "$${uc}"com.apple.IntlDataCache* "$${uc}"*/com.apple.IntlDataCache* 2>/dev/null || true; fi
+	killall KeyboardSettings TextInputMenuAgent TextInputSwitcher imklaunchagent 2>/dev/null || true
 	sleep 0.3
+	"/Library/Input Methods/Juxu.app/Contents/MacOS/Juxu" --register-and-enable
 	open -g "/Library/Input Methods/Juxu.app"
 	@echo "Installed and launched /Library/Input Methods/Juxu.app"
 

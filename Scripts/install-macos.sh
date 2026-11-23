@@ -88,33 +88,40 @@ if [ -d "$USER_APP" ]; then
     rm -rf "$USER_APP" 2>/dev/null || true
 fi
 
-if [ -d "$SYS_APP" ] && [ -w "$SYS_APP" ]; then
+NEEDS_ROOT_CACHE=0
+if ! LC_ALL=C grep -q -a "im.juxu.inputmethod.Juxu" /System/Library/Caches/com.apple.IntlDataCache.le.kbdx 2>/dev/null; then
+    NEEDS_ROOT_CACHE=1
+fi
+
+if [ "$NEEDS_ROOT_CACHE" = "0" ] && [ -d "$SYS_APP" ] && [ -w "$SYS_APP" ]; then
     rm -rf "$SYS_APP/Contents"
     cp -R "$SRC_APP/Contents" "$SYS_APP/Contents"
     chmod -R ug+rwX,o+rX "$SYS_APP" 2>/dev/null || true
-elif [ -w "$SYS_DIR" ]; then
-    rm -rf "$SYS_APP"
-    cp -R "$SRC_APP" "$SYS_APP"
-    chmod -R ug+rwX,o+rX "$SYS_APP" 2>/dev/null || true
+    "$LSREGISTER" -f -R -trusted "$SYS_APP" 2>/dev/null || true
 else
-    echo "==> 首次写入系统输入法目录 ${SYS_DIR} 需要管理员权限（后续升级无需重复授权）..."
+    echo "==> 首次安装正在写入 ${SYS_APP} 并刷新系统输入法全局缓存（需验证管理员权限，后续升级免密）..."
     if [ -r /dev/tty ] && [ -w /dev/tty ] && sudo -v </dev/tty 2>/dev/null; then
-        sudo sh -c 'rm -rf "$2" && cp -R "$1" "$2" && chown -R root:staff "$2" && chmod -R ug+rwX,o+rX "$2"' _ "$SRC_APP" "$SYS_APP" </dev/tty
+        sudo sh -c 'rm -rf "$2" && cp -R "$1" "$2" && chown -R root:staff "$2" && chmod -R ug+rwX,o+rX "$2" && "$3" -f -R -trusted "$2" && "$2/Contents/MacOS/Juxu" --register-system-cache' _ "$SRC_APP" "$SYS_APP" "$LSREGISTER" </dev/tty
     else
-        osascript - "$SRC_APP" "$SYS_APP" <<'APPLESCRIPT'
+        osascript - "$SRC_APP" "$SYS_APP" "$LSREGISTER" <<'APPLESCRIPT'
 on run argv
     set srcApp to item 1 of argv
     set dstApp to item 2 of argv
-    do shell script "rm -rf " & quoted form of dstApp & " && cp -R " & quoted form of srcApp & " " & quoted form of dstApp & " && chown -R root:staff " & quoted form of dstApp & " && chmod -R ug+rwX,o+rX " & quoted form of dstApp with administrator privileges
+    set lsReg to item 3 of argv
+    set juxuBin to dstApp & "/Contents/MacOS/Juxu"
+    do shell script "rm -rf " & quoted form of dstApp & " && cp -R " & quoted form of srcApp & " " & quoted form of dstApp & " && chown -R root:staff " & quoted form of dstApp & " && chmod -R ug+rwX,o+rX " & quoted form of dstApp & " && " & quoted form of lsReg & " -f -R -trusted " & quoted form of dstApp & " && " & quoted form of juxuBin & " --register-system-cache" with administrator privileges
 end run
 APPLESCRIPT
     fi
 fi
 
-"$LSREGISTER" -f -R -trusted "$SYS_APP" 2>/dev/null || true
-"$SYS_APP/Contents/MacOS/Juxu" --register-and-enable
-killall imklaunchagent 2>/dev/null || true
+USER_CACHE_DIR="$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null || true)"
+if [ -n "$USER_CACHE_DIR" ] && [ -d "$USER_CACHE_DIR" ]; then
+    rm -f "${USER_CACHE_DIR}"com.apple.IntlDataCache* "${USER_CACHE_DIR}"*/com.apple.IntlDataCache* 2>/dev/null || true
+fi
+killall KeyboardSettings TextInputMenuAgent TextInputSwitcher imklaunchagent 2>/dev/null || true
 sleep 0.3
+"$SYS_APP/Contents/MacOS/Juxu" --register-and-enable
 open -g "$SYS_APP"
 
 echo ""

@@ -20,6 +20,19 @@ private func isInputModeEnabledInActiveList(_ modeId: String) -> Bool {
     return false
 }
 
+if CommandLine.arguments.contains("--register-system-cache") {
+    // Must be invoked as root (euid == 0): CarbonCore's `OpenCCFFile` only writes the global
+    // `/System/Library/Caches/com.apple.IntlDataCache.le.kbdx` (read by sandboxed `KeyboardSettings.appex`
+    // before reboot) when `geteuid() == 0`.
+    let bundleURL = Bundle.main.bundleURL
+    let regStatus = TISRegisterInputSource(bundleURL as CFURL)
+    if regStatus != noErr {
+        fputs("TISRegisterInputSource (system) returned \(regStatus)\n", stderr)
+    }
+    _ = TISCreateInputSourceList(nil, true)
+    exit(0)
+}
+
 if CommandLine.arguments.contains("--register-and-enable") {
     _ = NSApplication.shared
     let bundle = Bundle.main
@@ -83,7 +96,7 @@ if CommandLine.arguments.contains("--register-and-enable") {
     // If not yet enabled silently, open Keyboard Settings and re-send `TISEnableInputSource` so macOS
     // presents the one-click enable sheet directly.
     if !isInputModeEnabledInActiveList(modeId), let src = foundSource {
-        if let settingsURL = URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension") {
+        if let settingsURL = URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension?InputSources") {
             NSWorkspace.shared.open(settingsURL)
             RunLoop.current.run(until: Date().addingTimeInterval(1.0))
             _ = TISEnableInputSource(src)

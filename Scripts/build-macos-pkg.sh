@@ -43,6 +43,10 @@ chown -R root:staff "$APP_DST" 2>/dev/null || true
 chmod -R ug+rwX,o+rX "$APP_DST" 2>/dev/null || true
 "$LSREGISTER" -f -R -trusted "$APP_DST" 2>/dev/null || true
 
+# Rebuild `/System/Library/Caches/com.apple.IntlDataCache.le.kbdx` as root (euid == 0) so
+# sandboxed `KeyboardSettings.appex` immediately sees Juxu without logging out or rebooting!
+"$APP_DST/Contents/MacOS/Juxu" --register-system-cache 2>/dev/null || true
+
 CONSOLE_USER="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
 if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" != "loginwindow" ]; then
     CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || true)"
@@ -55,10 +59,16 @@ if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ "$CONSOLE_USER" 
         rm -rf "$USER_HOME/Library/Input Methods/Juxu.app" 2>/dev/null || true
     fi
 
+    USER_CACHE_DIR="$(sudo -u "$CONSOLE_USER" getconf DARWIN_USER_CACHE_DIR 2>/dev/null || true)"
+    if [ -n "$USER_CACHE_DIR" ] && [ -d "$USER_CACHE_DIR" ]; then
+        rm -f "${USER_CACHE_DIR}"com.apple.IntlDataCache* "${USER_CACHE_DIR}"*/com.apple.IntlDataCache* 2>/dev/null || true
+    fi
+    killall -u "$CONSOLE_USER" KeyboardSettings TextInputMenuAgent TextInputSwitcher imklaunchagent 2>/dev/null || true
+    sleep 0.3
+
     if [ -n "$CONSOLE_UID" ]; then
         /bin/launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
             "$APP_DST/Contents/MacOS/Juxu" --register-and-enable 2>/dev/null || true
-        killall -u "$CONSOLE_USER" imklaunchagent 2>/dev/null || true
         sleep 0.3
         /bin/launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
             open -g "$APP_DST" 2>/dev/null || true
