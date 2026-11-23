@@ -447,8 +447,8 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     var onAlternatesBegin: ((IOSKeySpec) -> Void)?
     var onAlternatesMove: ((CGPoint) -> Void)?
     var onAlternatesEnd: ((Bool) -> Void)?
-    var backspaceSwipeClearEnabled: Bool = true
-    var longPressAlternatesEnabled: Bool = true
+    var backspaceSwipeClearEnabled: Bool = false
+    var longPressAlternatesEnabled: Bool = false
 
     private struct TrackedTouch {
         weak var touch: UITouch?

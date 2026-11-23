@@ -916,8 +916,9 @@ public final class KeyboardViewController: UIInputViewController {
             return
         }
         autoSpaceTracker.invalidate()
-        // Touch-down at a line start already removed the line break: put it back instead of joining lines.
-        if backspaceSessionDeleted.contains(where: \.isNewline) {
+        // Touch-down at a line start removed only the line break: put it back instead of joining lines.
+        // After a longer hold-delete, the text already removed stays removed.
+        if backspaceSessionDeleted.count == 1, backspaceSessionDeleted.first?.isNewline == true {
             textDocumentProxy.insertText(backspaceSessionDeleted)
             backspaceSessionDeleted = ""
             bridge.setContext("")
