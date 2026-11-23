@@ -491,6 +491,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     var onAlternatesEnd: ((Bool) -> Void)?
     var backspaceSwipeClearEnabled: Bool = false
     var longPressAlternatesEnabled: Bool = false
+    var asciiMode: Bool = false
 
     private struct TrackedTouch {
         weak var touch: UITouch?
@@ -842,8 +843,13 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
 
             syncKeycapPressStates()
             onKeyTouchDown?(hit)
-            if longPressAlternatesEnabled, case .letter = hit.kind {
+            switch hit.kind {
+            case .letter where longPressAlternatesEnabled:
                 startLongPressTimer(for: id)
+            case .symbol(let sym) where IOSKeyAlternates.symbolOptions(for: sym, asciiMode: asciiMode) != nil:
+                startLongPressTimer(for: id)
+            default:
+                break
             }
         }
     }

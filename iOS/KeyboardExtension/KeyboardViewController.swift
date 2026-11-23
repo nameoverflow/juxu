@@ -493,11 +493,20 @@ public final class KeyboardViewController: UIInputViewController {
         }
 
         keyCanvas.onAlternatesBegin = { [weak self] spec in
-            guard let self, case .letter(let ascii) = spec.kind else { return }
+            guard let self else { return }
+            let options: (items: [String], defaultIndex: Int)
+            switch spec.kind {
+            case .letter(let ascii):
+                options = IOSKeyAlternates.options(for: ascii, asciiMode: self.layoutEngine.asciiMode)
+            case .symbol(let sym):
+                guard let symOptions = IOSKeyAlternates.symbolOptions(for: sym, asciiMode: self.layoutEngine.asciiMode) else { return }
+                options = symOptions
+            default:
+                return
+            }
             self.calloutView.hideImmediately()
             self.keyCanvas.coveredCalloutKeyId = nil
             self.feedback.fireSoftStep(playClick: false)
-            let options = IOSKeyAlternates.options(for: ascii, asciiMode: self.layoutEngine.asciiMode)
             self.alternatesView.present(
                 items: options.items,
                 defaultIndex: options.defaultIndex,
@@ -523,6 +532,9 @@ public final class KeyboardViewController: UIInputViewController {
             guard commit, let text else { return }
             self.markUserTypedForClipboard()
             self.insertSymbol(text)
+            if IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol(text, on: self.layoutEngine.plane) {
+                self.layoutEngine.switchPlane(.letters)
+            }
             self.layoutEngine.consumeOneShotShiftIfNeeded()
             self.syncEngineToUI()
         }
@@ -1314,6 +1326,7 @@ public final class KeyboardViewController: UIInputViewController {
         layoutEngine.wubiKeycapRadicals = bridge.prefs.wubiKeycapRadicals
         layoutEngine.swipeUpInputEnabled = bridge.prefs.keySwipeUpInput
         keyCanvas.longPressAlternatesEnabled = bridge.prefs.keyLongPressAlternates
+        keyCanvas.asciiMode = st.asciiMode
         keyCanvas.backspaceSwipeClearEnabled = bridge.prefs.backspaceSwipeClear
         layoutEngine.isZLookupActive = bridge.prefs.isCangjieFamily
             && bridge.prefs.zOmnipotent

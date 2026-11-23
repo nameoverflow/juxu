@@ -553,6 +553,22 @@ struct IOSKeyboardTests {
         }
         let narrow = IOSKeyAlternates.stripFrame(keyFrame: CGRect(x: 300, y: 60, width: 30, height: 42), count: 8, defaultIndex: 6, containerWidth: 320)
         assert(narrow.minX >= 4.0 && narrow.maxX <= 316.0)
+        // Symbol key long-press alternates
+        let zeroAlt = IOSKeyAlternates.symbolOptions(for: "0", asciiMode: false)
+        assert(zeroAlt?.items == ["0", "°"] && zeroAlt?.defaultIndex == 0)
+        let rmbAlt = IOSKeyAlternates.symbolOptions(for: "￥", asciiMode: false)
+        assert(rmbAlt?.items.first == "￥" && (rmbAlt?.items.contains("$") == true) && rmbAlt?.defaultIndex == 0)
+        let cnParenAlt = IOSKeyAlternates.symbolOptions(for: "（", asciiMode: false)
+        assert(cnParenAlt?.items.first == "（" && (cnParenAlt?.items.contains("「") == true) && cnParenAlt?.defaultIndex == 0)
+        assert(IOSKeyAlternates.symbolOptions(for: "1", asciiMode: false) == nil)
+        var symPlaneLayout = IOSKeyboardLayoutEngine()
+        symPlaneLayout.switchPlane(.numbers)
+        for key in symPlaneLayout.computeLayout(in: CGSize(width: 440, height: 220)).keys {
+            guard case .symbol(let sym) = key.kind,
+                  let o = IOSKeyAlternates.symbolOptions(for: sym, asciiMode: false) else { continue }
+            let strip = IOSKeyAlternates.stripFrame(keyFrame: key.frame, count: o.items.count, defaultIndex: o.defaultIndex, containerWidth: 440)
+            assert(strip.minX >= 4.0 && strip.maxX <= 436.0, "Symbol alternates strip must stay inside the keyboard")
+        }
         var offLayout = IOSKeyboardLayoutEngine()
         offLayout.swipeUpInputEnabled = false
         let offSnap = offLayout.computeLayout(in: CGSize(width: 440, height: 220))

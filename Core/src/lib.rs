@@ -1383,4 +1383,24 @@ mod tests {
         assert!(lines[1].contains("\"event\":\"backspace_after_commit\""));
         assert!(lines[2].contains("\"event\":\"abandon\""));
     }
+
+    #[test]
+    fn chinese_smart_punctuation_maps_braces_to_corner_brackets() {
+        let mut eng = JuxuEngine::new(JuxuConfig::default());
+        let open = eng.handle_key_event(0, Some('{'), false, 1_000);
+        assert!(open.consumed);
+        assert_eq!(open.commit_text, "「");
+
+        let close = eng.handle_key_event(0, Some('}'), false, 1_050);
+        assert!(close.consumed);
+        assert_eq!(close.commit_text, "」");
+
+        let sq_open = eng.handle_key_event(0, Some('['), false, 1_100);
+        assert!(sq_open.consumed);
+        assert_eq!(sq_open.commit_text, "【");
+
+        let sq_close = eng.handle_key_event(0, Some(']'), false, 1_150);
+        assert!(sq_close.consumed);
+        assert_eq!(sq_close.commit_text, "】");
+    }
 }
