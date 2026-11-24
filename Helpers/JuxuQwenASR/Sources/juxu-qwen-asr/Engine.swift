@@ -83,9 +83,14 @@ final class QwenEngine {
         context: String?,
         isCancelled: () -> Bool
     ) -> EngineResult {
+        // Need at least 10 ms (160 samples at 16 kHz) for a single STFT frame in AudioPreprocessing/AudioEncoder.
+        guard pcm.count >= 160 else {
+            return EngineResult(text: "", truncated: false, cancelled: false)
+        }
         var parts: [String] = []
         var truncated = false
         for chunk in Self.chunks(pcm) {
+            if chunk.count < 160 { continue }
             if isCancelled() { return EngineResult(text: "", truncated: false, cancelled: true) }
             guard let (text, hitLimit) = decode(chunk, language: language, context: context, isCancelled: isCancelled) else {
                 return EngineResult(text: "", truncated: false, cancelled: true)

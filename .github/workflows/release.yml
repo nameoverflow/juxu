@@ -83,6 +83,7 @@ jobs:
 
             make app CODESIGN_IDENTITY=dist
             SIGN_ID="$(sh Scripts/resolve-codesign-identity.sh dist)"
+            codesign --force --options runtime --timestamp --sign "$SIGN_ID" build/Juxu.app/Contents/MacOS/juxu-qwen-asr
             codesign --force --deep --options runtime --timestamp --sign "$SIGN_ID" build/Juxu.app
 
             INSTALLER_SIGN_ID="$(security find-identity -v -p basic "$KEYCHAIN_PATH" 2>/dev/null | grep -F '"Developer ID Installer:' | head -n 1 | awk -F'"' '{print $2}' || true)"

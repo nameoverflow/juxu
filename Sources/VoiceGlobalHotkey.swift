@@ -160,10 +160,10 @@ public enum VoiceGlobalCommitPolicy {
 @MainActor
 final class VoiceGlobalCommitter {
     /// Set by the input controller while 句序 is the active input method.
-    private(set) static var inputMethodSink: ((String) -> Bool)?
+    private(set) static var inputMethodSink: ((String, Bool) -> Bool)?
     private static weak var inputMethodOwner: AnyObject?
 
-    static func setInputMethodSink(owner: AnyObject, _ sink: @escaping (String) -> Bool) {
+    static func setInputMethodSink(owner: AnyObject, _ sink: @escaping (String, Bool) -> Bool) {
         inputMethodOwner = owner
         inputMethodSink = sink
     }
@@ -232,8 +232,18 @@ final class VoiceGlobalCommitter {
         return true
     }
 
+    /// Returns currently selected text in the focused element when safe (non-secure) and within size limit.
+    func selectedText(maxLength: Int = 4000) -> String? {
+        guard !IsSecureEventInputEnabled(), let element = target.element ?? Self.focusedElement() else { return nil }
+        if Self.string(element, kAXSubroleAttribute) == kAXSecureTextFieldSubrole { return nil }
+        guard let selected = Self.string(element, kAXSelectedTextAttribute),
+              !selected.isEmpty,
+              selected.count <= maxLength else { return nil }
+        return selected
+    }
+
     /// Inserts `text` into the original field, or leaves it on the clipboard. Returns a notice, if any.
-    func commit(_ text: String, completion: @escaping @MainActor (String?) -> Void) {
+    func commit(_ text: String, replaceSelection: Bool = false, completion: @escaping @MainActor (String?) -> Void) {
         let current = Self.focusedElement()
         let isSecure = IsSecureEventInputEnabled()
             || current.flatMap { Self.string($0, kAXSubroleAttribute) } == kAXSecureTextFieldSubrole
@@ -252,7 +262,7 @@ final class VoiceGlobalCommitter {
         )
         switch route {
         case .inputMethod:
-            if Self.inputMethodSink?(text) == true {
+            if Self.inputMethodSink?(text, replaceSelection) == true {
                 completion(nil)
             } else {
                 Self.leaveOnClipboard(text)
@@ -286,9 +296,13 @@ final class VoiceGlobalCommitter {
     /// Many apps report success without inserting, so the field's value is read back.
     private static func insertWithAccessibility(_ text: String, into element: AXUIElement) -> Bool {
         guard let before = string(element, kAXValueAttribute) else { return false }
+        let selectedBefore = string(element, kAXSelectedTextAttribute)
         guard AXUIElementSetAttributeValue(element, kAXSelectedTextAttribute as CFString, text as CFString) == .success,
               let after = string(element, kAXValueAttribute) else { return false }
-        return after != before && after.contains(text)
+        if after == before {
+            return selectedBefore == text
+        }
+        return after.contains(text)
     }
 
     /// Pastes, then restores the user's clipboard only if the text is confirmed in the field.
@@ -345,7 +359,7 @@ public final class VoiceGlobalHotkeyController {
     public static var isListening: Bool { testingForceListening || _shared?.tap != nil }
 
     public static func sync(with prefs: VoicePreferences) {
-        guard prefs.enabled, prefs.isGlobalHotkeyEnabled else {
+        guard prefs.enabled, prefs.isGlobalHotkeyEnabled, prefs.triggerKey.isHoldToTalk else {
             unload()
             return
         }
@@ -429,7 +443,7 @@ public final class VoiceGlobalHotkeyController {
         }
         guard type == .flagsChanged || type == .keyDown, let nsEvent = NSEvent(cgEvent: event) else { return }
         let prefs = VoicePreferencesStore.shared.prefs
-        guard prefs.enabled, prefs.isGlobalHotkeyEnabled else { return }
+        guard prefs.enabled, prefs.isGlobalHotkeyEnabled, prefs.triggerKey.isHoldToTalk else { return }
         let session = VoiceSessionController.shared
         let decision = VoiceGlobalKeyRouter.decide(
             isKeyDown: type == .keyDown,
@@ -456,11 +470,12 @@ public final class VoiceGlobalHotkeyController {
                 contextProvider: {
                     VoiceContext(
                         bundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+                        selectedText: prefs.speakToEditSelection ? committer.selectedText() : nil,
                         personalVocabulary: prefs.parsedCustomVocabulary
                     )
                 },
-                onCommit: { text, _ in
-                    committer.commit(text) { notice in
+                onCommit: { text, replaceSelection in
+                    committer.commit(text, replaceSelection: replaceSelection) { notice in
                         if let notice { VoiceSessionController.sharedIfLoaded?.showExternalNotice(notice) }
                     }
                 }

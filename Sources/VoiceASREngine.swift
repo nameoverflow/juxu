@@ -82,23 +82,7 @@ public struct VoicePinnedModel: Sendable {
     }
 
     public func matches(_ file: File, at url: URL) async -> Bool {
-        await Task.detached(priority: .utility) { () -> Bool in
-            guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value,
-                  size == file.size,
-                  let handle = try? FileHandle(forReadingFrom: url) else { return false }
-            defer { try? handle.close() }
-            var hasher = SHA256()
-            while true {
-                if Task.isCancelled { return false }
-                let done: Bool = autoreleasepool {
-                    guard let chunk = try? handle.read(upToCount: 8 << 20), !chunk.isEmpty else { return true }
-                    hasher.update(data: chunk)
-                    return false
-                }
-                if done { break }
-            }
-            return hasher.finalize().map { String(format: "%02x", $0) }.joined() == file.sha256
-        }.value
+        await VoiceFileChecksum.matches(sha256: file.sha256, expectedSize: file.size, at: url)
     }
 
     /// Verifies every file in full and records the result.
@@ -110,6 +94,30 @@ public struct VoicePinnedModel: Sendable {
     }
 }
 
+public enum VoiceFileChecksum {
+    public static func matches(sha256 expected: String, expectedSize: Int64? = nil, at url: URL) async -> Bool {
+        await Task.detached(priority: .utility) { () -> Bool in
+            if let expectedSize {
+                guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value,
+                      size == expectedSize else { return false }
+            }
+            guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+            defer { try? handle.close() }
+            var hasher = SHA256()
+            while true {
+                if Task.isCancelled { return false }
+                let done: Bool = autoreleasepool {
+                    guard let chunk = try? handle.read(upToCount: 8 << 20), !chunk.isEmpty else { return true }
+                    hasher.update(data: chunk)
+                    return false
+                }
+                if done { break }
+            }
+            return hasher.finalize().map { String(format: "%02x", $0) }.joined() == expected.lowercased()
+        }.value
+    }
+}
+
 public struct VoiceASRModelDescriptor: Sendable {
     public let displayName: String
     public let sizeLabel: String
@@ -117,6 +125,7 @@ public struct VoiceASRModelDescriptor: Sendable {
     /// File or directory name under VoiceModels; nil for options that download nothing.
     public let modelFilename: String?
     public let downloadURLs: [URL]
+    public let expectedSHA256: String?
     public let pinned: VoicePinnedModel?
     /// Nil for options the session handles itself (Apple Speech, custom HTTP).
     public let executor: VoiceASRExecutorID?
@@ -125,7 +134,7 @@ public struct VoiceASRModelDescriptor: Sendable {
     public let fallbackRank: Int?
 }
 
-private func whisperDescriptor(name: String, size: String, file: String, rank: Int) -> VoiceASRModelDescriptor {
+private func whisperDescriptor(name: String, size: String, file: String, sha256: String, rank: Int) -> VoiceASRModelDescriptor {
     VoiceASRModelDescriptor(
         displayName: name,
         sizeLabel: size,
@@ -135,6 +144,7 @@ private func whisperDescriptor(name: String, size: String, file: String, rank: I
             URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(file)")!,
             URL(string: "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/\(file)")!,
         ],
+        expectedSHA256: sha256,
         pinned: nil,
         executor: .whisperServer,
         engineLabel: "whisper.cpp",
@@ -172,15 +182,28 @@ extension VoiceLocalASRModelPreset {
                 licenseNote: "Apache-2.0",
                 modelFilename: qwen3ASRPinned.directoryName,
                 downloadURLs: [],
+                expectedSHA256: nil,
                 pinned: qwen3ASRPinned,
                 executor: .qwenHelper,
                 engineLabel: "Qwen 引擎",
                 fallbackRank: nil
             )
         case .whisperTurbo:
-            return whisperDescriptor(name: "Whisper v3 Turbo", size: "547 MB", file: "ggml-large-v3-turbo-q5_0.bin", rank: 0)
+            return whisperDescriptor(
+                name: "Whisper v3 Turbo",
+                size: "547 MB",
+                file: "ggml-large-v3-turbo-q5_0.bin",
+                sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+                rank: 0
+            )
         case .whisperBase:
-            return whisperDescriptor(name: "Whisper Base（轻量极速）", size: "142 MB", file: "ggml-base.bin", rank: 1)
+            return whisperDescriptor(
+                name: "Whisper Base（轻量极速）",
+                size: "142 MB",
+                file: "ggml-base.bin",
+                sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+                rank: 1
+            )
         case .appleSpeech:
             return Self.builtIn("Apple 端侧语音（免下载）")
         case .customHTTP:
@@ -191,7 +214,7 @@ extension VoiceLocalASRModelPreset {
     private static func builtIn(_ name: String) -> VoiceASRModelDescriptor {
         VoiceASRModelDescriptor(
             displayName: name, sizeLabel: "0 MB", licenseNote: "", modelFilename: nil, downloadURLs: [],
-            pinned: nil, executor: nil, engineLabel: "", fallbackRank: nil
+            expectedSHA256: nil, pinned: nil, executor: nil, engineLabel: "", fallbackRank: nil
         )
     }
 

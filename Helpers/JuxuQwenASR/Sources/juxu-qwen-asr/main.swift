@@ -75,10 +75,14 @@ final class Queue {
     }
 }
 
+let replyLock = NSLock()
+
 func reply(_ object: [String: Any]) {
     guard var data = try? JSONSerialization.data(withJSONObject: object) else { return }
     data.append(0x0A)
+    replyLock.lock()
     FileHandle.standardOutput.write(data)
+    replyLock.unlock()
 }
 
 /// Current and peak physical footprint, the figure Activity Monitor reports as Memory.
@@ -120,11 +124,11 @@ let reader = Thread {
         guard let samples = request.samples, samples >= 0, samples <= 16_000 * 1_200,
               let pcm = readExact(samples) else {
             reply(["id": request.id, "error": "bad audio"])
-            exit(3)
+            _exit(3)
         }
         queue.push(Job(request: request, pcm: pcm.map { Float($0) / 32768 }))
     }
-    exit(0) // stdin closed: the owner is gone.
+    _exit(0) // stdin closed: the owner is gone; avoid C++ destructors racing with Metal on main thread.
 }
 reader.stackSize = 1 << 20
 reader.start()

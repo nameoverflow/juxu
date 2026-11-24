@@ -50,9 +50,9 @@ public final class JuxuInputController: IMKInputController {
         sawClientSupportForRanges = false
         autoPairClosers.removeAll()
         configurePanelCallbacks()
-        VoiceGlobalCommitter.setInputMethodSink(owner: self) { [weak self] text in
+        VoiceGlobalCommitter.setInputMethodSink(owner: self) { [weak self] text, replaceSelection in
             guard let self, self.activeClient != nil else { return false }
-            self.commitVoiceText(text, replaceSelection: false, client: self.activeClient)
+            self.commitVoiceText(text, replaceSelection: replaceSelection, client: self.activeClient)
             return true
         }
     }
@@ -102,10 +102,11 @@ public final class JuxuInputController: IMKInputController {
 
         // Strictly on-demand voice entry: when disabled, zero voice controllers or panels are loaded.
         if VoiceGlobalHotkeyController.isListening {
-            // The global listener already saw this key. Esc must not also reach the app;
-            // any other key is a shortcut and has to pass through.
+            // The global listener already saw this key. Esc must not also reach the app, even if
+            // the listen-only tap cancelled the session just before IMK received the same event.
             if event.type == .keyDown, event.keyCode == 0x35,
-               VoiceSessionController.sharedIfLoaded?.isCapturing == true {
+               let session = VoiceSessionController.sharedIfLoaded,
+               session.isCapturing || session.consumeRecentEscapeCancel() {
                 return true
             }
         } else if VoicePreferencesStore.shared.prefs.enabled {

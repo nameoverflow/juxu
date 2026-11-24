@@ -67,6 +67,7 @@ public final class VoiceLocalInstaller: ObservableObject {
     private var activeTask: Task<Void, Never>?
     private var activeProcess: Process?
     private var activeDownloadDelegate: ModelDownloadDelegate?
+    private var downloadToken: UInt64 = 0
 
     private init() {}
 
@@ -181,11 +182,12 @@ public final class VoiceLocalInstaller: ObservableObject {
     public func installASR(preset: VoiceLocalASRModelPreset) {
         guard !phase.isBusy, let filename = preset.modelFilename else { return }
         if let pinned = preset.descriptor.pinned {
-            installPinnedModel(pinned, displayName: preset.displayName)
+            installPinnedModel(pinned, preset: preset)
             return
         }
         let urls = preset.downloadURLs
         let displayName = preset.displayName
+        let expectedSHA256 = preset.descriptor.expectedSHA256
 
         activeTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -203,7 +205,8 @@ public final class VoiceLocalInstaller: ObservableObject {
                     try await self.downloadModelWithFallback(
                         urls: urls,
                         destination: destURL,
-                        displayName: displayName
+                        displayName: displayName,
+                        expectedSHA256: expectedSHA256
                     )
                 }
 
@@ -219,10 +222,14 @@ public final class VoiceLocalInstaller: ObservableObject {
     }
 
     /// Downloads a pinned revision file by file and verifies every SHA-256 before use.
-    private func installPinnedModel(_ pinned: VoicePinnedModel, displayName: String) {
+    private func installPinnedModel(_ pinned: VoicePinnedModel, preset: VoiceLocalASRModelPreset) {
+        let displayName = preset.displayName
         activeTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
+                guard VoiceASRRegistry.dependencyPath(for: preset) != nil else {
+                    throw VoiceEngineError.cliFailed("未找到内置的 \(preset.descriptor.engineLabel) 组件，请重新安装最新版句序")
+                }
                 let directory = pinned.directory
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 try? FileManager.default.removeItem(at: pinned.markerURL(in: directory))
@@ -233,7 +240,8 @@ public final class VoiceLocalInstaller: ObservableObject {
                     try await self.downloadModelWithFallback(
                         urls: pinned.downloadURLs(for: file),
                         destination: destination,
-                        displayName: "\(displayName) · \(file.name)"
+                        displayName: "\(displayName) · \(file.name)",
+                        expectedSHA256: nil
                     )
                     self.phase = .downloadingModel(name: displayName, progress: 1, detail: "校验 \(file.name)…")
                     guard await pinned.matches(file, at: destination) else {
@@ -242,6 +250,9 @@ public final class VoiceLocalInstaller: ObservableObject {
                     }
                 }
                 try pinned.writeMarker(in: directory)
+                guard VoiceASRRegistry.dependencyPath(for: preset) != nil else {
+                    throw VoiceEngineError.cliFailed("未找到内置的 \(preset.descriptor.engineLabel) 组件，请重新安装最新版句序")
+                }
                 self.refreshToken += 1
                 self.phase = .completed("✓ \(displayName) 已就绪，现在即可语音输入")
             } catch is CancellationError {
@@ -257,6 +268,7 @@ public final class VoiceLocalInstaller: ObservableObject {
         guard !phase.isBusy, let filename = preset.modelFilename else { return }
         let urls = preset.downloadURLs
         let displayName = preset.displayName
+        let expectedSHA256 = preset.expectedSHA256
 
         activeTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -274,7 +286,8 @@ public final class VoiceLocalInstaller: ObservableObject {
                     try await self.downloadModelWithFallback(
                         urls: urls,
                         destination: destURL,
-                        displayName: displayName
+                        displayName: displayName,
+                        expectedSHA256: expectedSHA256
                     )
                 }
 
@@ -298,6 +311,7 @@ public final class VoiceLocalInstaller: ObservableObject {
     }
 
     public func cancel() {
+        downloadToken &+= 1
         activeTask?.cancel()
         activeTask = nil
         if let proc = activeProcess, proc.isRunning {
@@ -328,13 +342,25 @@ public final class VoiceLocalInstaller: ObservableObject {
             proc.environment = env
 
             let errPipe = Pipe()
-            proc.standardOutput = Pipe()
+            proc.standardOutput = FileHandle.nullDevice
             proc.standardError = errPipe
+
+            let errBuffer = LockedTailBuffer(maxBytes: 32_768)
+            errPipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                } else {
+                    errBuffer.append(data)
+                }
+            }
 
             self.activeProcess = proc
 
             proc.terminationHandler = { [weak self] finishedProc in
-                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                errPipe.fileHandleForReading.readabilityHandler = nil
+                errBuffer.append(errPipe.fileHandleForReading.readDataToEndOfFile())
+                let errData = errBuffer.snapshot()
                 Task { @MainActor [weak self] in
                     self?.activeProcess = nil
                     if Task.isCancelled || finishedProc.terminationReason == .uncaughtSignal {
@@ -354,6 +380,7 @@ public final class VoiceLocalInstaller: ObservableObject {
             do {
                 try proc.run()
             } catch {
+                errPipe.fileHandleForReading.readabilityHandler = nil
                 self.activeProcess = nil
                 cont.resume(throwing: VoiceEngineError.cliFailed(error.localizedDescription))
             }
@@ -363,7 +390,8 @@ public final class VoiceLocalInstaller: ObservableObject {
     private func downloadModelWithFallback(
         urls: [URL],
         destination: URL,
-        displayName: String
+        displayName: String,
+        expectedSHA256: String?
     ) async throws {
         try FileManager.default.createDirectory(
             at: Self.modelsDirectory,
@@ -386,6 +414,14 @@ public final class VoiceLocalInstaller: ObservableObject {
                     displayName: displayName,
                     sourceTag: sourceTag
                 )
+                if let expectedSHA256 {
+                    try Task.checkCancellation()
+                    self.phase = .downloadingModel(name: displayName, progress: 1, detail: "校验 SHA-256…")
+                    guard await VoiceFileChecksum.matches(sha256: expectedSHA256, at: destination) else {
+                        try? FileManager.default.removeItem(at: destination)
+                        throw VoiceEngineError.cliFailed("\(displayName) 校验失败，已删除，请重试")
+                    }
+                }
                 return
             } catch is CancellationError {
                 throw CancellationError()
@@ -404,6 +440,8 @@ public final class VoiceLocalInstaller: ObservableObject {
     ) async throws {
         let partURL = destination.appendingPathExtension("part")
         try? FileManager.default.removeItem(at: partURL)
+        downloadToken &+= 1
+        let token = downloadToken
 
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let delegate = ModelDownloadDelegate(
@@ -411,6 +449,7 @@ public final class VoiceLocalInstaller: ObservableObject {
                 partURL: partURL,
                 onProgress: { [weak self] fraction, written, expected in
                     Task { @MainActor [weak self] in
+                        guard let self, self.downloadToken == token, self.phase.isBusy else { return }
                         let writtenStr = ByteCountFormatter.string(fromByteCount: written, countStyle: .file)
                         let detail: String
                         if expected > 0 {
@@ -419,7 +458,7 @@ public final class VoiceLocalInstaller: ObservableObject {
                         } else {
                             detail = "\(sourceTag) · 已下载 \(writtenStr)"
                         }
-                        self?.phase = .downloadingModel(
+                        self.phase = .downloadingModel(
                             name: displayName,
                             progress: fraction,
                             detail: detail
@@ -428,7 +467,10 @@ public final class VoiceLocalInstaller: ObservableObject {
                 },
                 onComplete: { [weak self] result in
                     Task { @MainActor [weak self] in
-                        self?.activeDownloadDelegate = nil
+                        if let self, self.downloadToken == token {
+                            self.downloadToken &+= 1
+                            self.activeDownloadDelegate = nil
+                        }
                         switch result {
                         case .success:
                             cont.resume(returning: ())
@@ -441,6 +483,32 @@ public final class VoiceLocalInstaller: ObservableObject {
             self.activeDownloadDelegate = delegate
             delegate.start(url: url)
         }
+    }
+}
+
+private final class LockedTailBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private let maxBytes: Int
+    private var data = Data()
+
+    init(maxBytes: Int) {
+        self.maxBytes = maxBytes
+    }
+
+    func append(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+        lock.lock()
+        data.append(chunk)
+        if data.count > maxBytes {
+            data.removeFirst(data.count - maxBytes)
+        }
+        lock.unlock()
+    }
+
+    func snapshot() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
     }
 }
 

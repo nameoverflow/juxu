@@ -3,6 +3,7 @@ import SwiftUI
 
 public struct VoiceSettingsView: View {
     @State private var globalPermissions = VoiceGlobalPermissions(inputMonitoring: false, accessibility: false)
+    @State private var isWindowVisible = true
     @ObservedObject public var bridge: JuxuBridge
     @ObservedObject public var voiceStore: VoicePreferencesStore
 
@@ -181,11 +182,8 @@ public struct VoiceSettingsView: View {
 
                 fieldRow(title: "API Key") {
                     HStack(spacing: 8) {
-                        SecureField(preset.keyPlaceholder, text: $primaryKeyDraft)
+                        SecureField(preset.keyPlaceholder, text: primaryKeyBinding)
                             .textFieldStyle(.roundedBorder)
-                            .onChange(of: primaryKeyDraft) { _, newVal in
-                                VoiceKeychainStore.write(newVal, for: preset.keychainAccount)
-                            }
                         Text(hasSavedKey ? "✓ 钥匙串" : "必填")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(hasSavedKey ? Color.green : Color.orange)
@@ -223,11 +221,8 @@ public struct VoiceSettingsView: View {
                                     .textFieldStyle(.roundedBorder)
                             }
                             fieldRow(title: "整理 API Key") {
-                                SecureField("sk-...", text: $splitLLMKeyDraft)
+                                SecureField("sk-...", text: splitLLMKeyBinding)
                                     .textFieldStyle(.roundedBorder)
-                                    .onChange(of: splitLLMKeyDraft) { _, newVal in
-                                        VoiceKeychainStore.write(newVal, for: .cloudCustomLLMAPIKey)
-                                    }
                             }
                         }
                     }
@@ -297,10 +292,28 @@ public struct VoiceSettingsView: View {
                 }
             }
         }
-        .onAppear { globalPermissions = VoiceGlobalPermissions.current() }
-        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
-            guard voiceStore.prefs.isGlobalHotkeyEnabled else { return }
+        .onAppear {
+            isWindowVisible = true
             globalPermissions = VoiceGlobalPermissions.current()
+        }
+        .onDisappear {
+            isWindowVisible = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { _ in
+            isWindowVisible = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            isWindowVisible = true
+            if voiceStore.prefs.isGlobalHotkeyEnabled {
+                globalPermissions = VoiceGlobalPermissions.current()
+            }
+        }
+        .task(id: voiceStore.prefs.isGlobalHotkeyEnabled && isWindowVisible) {
+            guard voiceStore.prefs.isGlobalHotkeyEnabled, isWindowVisible else { return }
+            while !Task.isCancelled {
+                globalPermissions = VoiceGlobalPermissions.current()
+                try? await Task.sleep(for: .seconds(2))
+            }
         }
     }
 
@@ -485,6 +498,26 @@ public struct VoiceSettingsView: View {
     }
 
     // MARK: - Helpers
+
+    private var primaryKeyBinding: Binding<String> {
+        Binding(
+            get: { primaryKeyDraft },
+            set: { newVal in
+                primaryKeyDraft = newVal
+                VoiceKeychainStore.write(newVal, for: voiceStore.prefs.cloudPreset.keychainAccount)
+            }
+        )
+    }
+
+    private var splitLLMKeyBinding: Binding<String> {
+        Binding(
+            get: { splitLLMKeyDraft },
+            set: { newVal in
+                splitLLMKeyDraft = newVal
+                VoiceKeychainStore.write(newVal, for: .cloudCustomLLMAPIKey)
+            }
+        )
+    }
 
     private func reloadKeysForCurrentPreset() {
         let account = voiceStore.prefs.cloudPreset.keychainAccount

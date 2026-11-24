@@ -4,6 +4,7 @@ import AppKit
 struct SwiftBridgeTests {
     @MainActor
     static func main() {
+        VoicePreferencesStore.defaultInMemoryForTesting = true
         let dictsURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("Resources/Dicts", isDirectory: true)
         let bridge = JuxuBridge(customDictsDir: dictsURL, inMemoryOnly: true)
@@ -267,10 +268,10 @@ struct SwiftBridgeTests {
         assert(narrowState.macOSPreedit == "g")
 
         // 6. Verify macOS Voice MVP: strict lazy-loading, preset resolution, preferences persistence, WAV/multipart, prompts & local polisher
-        assert(VoicePreferences().enabled == false, "Voice entry must be disabled by default")
-        assert(!VoiceSessionController.isLoaded, "VoiceSessionController must NOT be loaded before voice is enabled")
-        assert(!VoiceHUDPanelController.isLoaded, "VoiceHUDPanelController must NOT be loaded before voice is enabled")
-        assert(!VoiceLocalInstaller.isLoaded, "VoiceLocalInstaller must NOT be loaded before voice is enabled")
+        precondition(VoicePreferences().enabled == false, "Voice entry must be disabled by default")
+        precondition(!VoiceSessionController.isLoaded, "VoiceSessionController must NOT be loaded before voice is enabled")
+        precondition(!VoiceHUDPanelController.isLoaded, "VoiceHUDPanelController must NOT be loaded before voice is enabled")
+        precondition(!VoiceLocalInstaller.isLoaded, "VoiceLocalInstaller must NOT be loaded before voice is enabled")
         precondition(!VoiceWhisperServerManager.isLoaded, "whisper-server manager must NOT be loaded before voice is enabled")
         precondition(VoiceWhisperStreamPolicy.normalizedTranscript("今天开会\n 明天发布\n") == "今天开会明天发布")
         precondition(VoiceWhisperStreamPolicy.normalizedTranscript("hello\nworld") == "hello world")
@@ -389,17 +390,21 @@ struct SwiftBridgeTests {
         precondition(latin.update("open therapy", windowed: false).tentativeCount == "open therapy".count, "half a Latin word is not locked")
 
         let defaultVoice = VoicePreferences()
-        assert(defaultVoice.cloudPreset == .groq)
-        assert(defaultVoice.effectiveCloudASRBaseURL == "https://api.groq.com/openai/v1")
-        assert(defaultVoice.effectiveCloudASRModel == "whisper-large-v3-turbo")
-        assert(defaultVoice.effectiveCloudLLMModel == "llama-3.3-70b-versatile")
-        assert(defaultVoice.effectiveCloudASRKeyAccount == defaultVoice.effectiveCloudLLMKeyAccount)
+        precondition(defaultVoice.cloudPreset == .groq)
+        precondition(defaultVoice.effectiveCloudASRBaseURL == "https://api.groq.com/openai/v1")
+        precondition(defaultVoice.effectiveCloudASRModel == "whisper-large-v3-turbo")
+        precondition(defaultVoice.effectiveCloudLLMModel == "llama-3.3-70b-versatile")
+        precondition(defaultVoice.effectiveCloudASRKeyAccount == defaultVoice.effectiveCloudLLMKeyAccount)
+        precondition(VoiceLocalASRModelPreset.whisperTurbo.descriptor.expectedSHA256?.count == 64)
+        precondition(VoiceLocalASRModelPreset.whisperBase.descriptor.expectedSHA256?.count == 64)
+        precondition(VoiceLocalLLMPreset.qwen15B.expectedSHA256?.count == 64)
+        precondition(VoiceAudioRecorder.maxRecordingSamples > 0 && VoiceAudioRecorder.maxRecordingSamples <= 16_000 * 300)
 
         let tempVoiceURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("juxu-voice-test-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: tempVoiceURL) }
         let voiceStore = VoicePreferencesStore(fileURL: tempVoiceURL, inMemoryOnly: false)
-        assert(!voiceStore.prefs.enabled)
+        precondition(!voiceStore.prefs.enabled)
         voiceStore.update {
             $0.enabled = true
             $0.providerMode = .local
@@ -408,25 +413,33 @@ struct SwiftBridgeTests {
             $0.customVocabulary = "句序, Juxu，RWKV-7\nTypeless"
         }
         let reloadedStore = VoicePreferencesStore(fileURL: tempVoiceURL, inMemoryOnly: false)
-        assert(reloadedStore.prefs.enabled == true)
-        assert(reloadedStore.prefs.providerMode == .local)
-        assert(reloadedStore.prefs.localASRPreset == .whisperTurbo)
-        assert(reloadedStore.prefs.localLLMPreset == .qwen15B)
-        assert(reloadedStore.prefs.parsedCustomVocabulary == ["句序", "Juxu", "RWKV-7", "Typeless"])
+        precondition(reloadedStore.prefs.enabled == true)
+        precondition(reloadedStore.prefs.providerMode == .local)
+        precondition(reloadedStore.prefs.localASRPreset == .whisperTurbo)
+        precondition(reloadedStore.prefs.localLLMPreset == .qwen15B)
+        precondition(reloadedStore.prefs.parsedCustomVocabulary == ["句序", "Juxu", "RWKV-7", "Typeless"])
 
         // Trigger lazy load and verify disabling voice unloads session, HUD, and local installer
         _ = VoiceSessionController.shared
         _ = VoiceLocalInstaller.shared
         _ = VoiceWhisperServerManager.shared
         _ = VoiceQwenHelperManager.shared
-        assert(VoiceSessionController.isLoaded)
-        assert(VoiceLocalInstaller.isLoaded)
+        precondition(VoiceSessionController.isLoaded)
+        precondition(VoiceLocalInstaller.isLoaded)
         reloadedStore.update { $0.enabled = false }
-        assert(!VoiceSessionController.isLoaded, "Disabling voice must unload VoiceSessionController")
-        assert(!VoiceHUDPanelController.isLoaded, "Disabling voice must unload VoiceHUDPanelController")
-        assert(!VoiceLocalInstaller.isLoaded, "Disabling voice must unload VoiceLocalInstaller")
+        precondition(!VoiceSessionController.isLoaded, "Disabling voice must unload VoiceSessionController")
+        precondition(!VoiceHUDPanelController.isLoaded, "Disabling voice must unload VoiceHUDPanelController")
+        precondition(!VoiceLocalInstaller.isLoaded, "Disabling voice must unload VoiceLocalInstaller")
         precondition(!VoiceWhisperServerManager.isLoaded, "Disabling voice must unload the whisper-server manager")
         precondition(!VoiceQwenHelperManager.isLoaded, "Disabling voice must unload the Qwen helper manager")
+
+        // Global hotkey sync must stay unloaded when triggerKey is .optionSpace so local Option+Space still works.
+        var optSpaceGlobal = VoicePreferences()
+        optSpaceGlobal.enabled = true
+        optSpaceGlobal.globalVoiceHotkey = true
+        optSpaceGlobal.triggerKey = .optionSpace
+        VoiceGlobalHotkeyController.sync(with: optSpaceGlobal)
+        precondition(!VoiceGlobalHotkeyController.isLoaded && !VoiceGlobalHotkeyController.isListening, "Option+Space must not activate the global tap")
 
         // Global voice key: off by default, and existing settings files are unaffected.
         let legacyVoice = try! JSONEncoder().encode(VoicePreferences())
@@ -608,6 +621,8 @@ struct SwiftBridgeTests {
         precondition(holdSession.isHandsFree)
         _ = holdSession.handleEvent(escapeKey, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
         precondition(!holdSession.isCapturing && !holdSession.isHandsFree && holdFinishes == finishesBefore + 1, "Esc cancels without transcribing")
+        precondition(holdSession.consumeRecentEscapeCancel(), "Esc cancel is recorded once so IMK can swallow the same Esc keyDown")
+        precondition(!holdSession.consumeRecentEscapeCancel(), "Subsequent Esc is not swallowed")
         precondition(cues == [.start], "cancelling plays no end cue")
         cues = []
         feed(command(true)); feed(command(false)); feed(command(true))
@@ -636,32 +651,32 @@ struct SwiftBridgeTests {
 
         // Verify legacy "rule_based" config migrates cleanly to local LLM (.qwen15B)
         let defaultVoiceLLM = VoicePreferences()
-        assert(defaultVoiceLLM.localLLMPreset == .qwen15B)
+        precondition(defaultVoiceLLM.localLLMPreset == .qwen15B)
         let migrated = try! JSONDecoder().decode(VoiceLocalLLMPreset.self, from: Data("\"rule_based\"".utf8))
-        assert(migrated == .qwen15B, "Legacy rule_based must migrate to .qwen15B")
+        precondition(migrated == .qwen15B, "Legacy rule_based must migrate to .qwen15B")
 
         // Verify app-aware tone & Speak-to-Edit prompt builder
-        assert(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.tencent.xinWeChat").contains("即时聊天"))
-        assert(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.apple.dt.Xcode").contains("技术术语"))
+        precondition(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.tencent.xinWeChat").contains("即时聊天"))
+        precondition(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.apple.dt.Xcode").contains("技术术语"))
         let normalMsgs = VoicePromptBuilder.polishMessages(
             rawTranscript: "测试一下",
             toneMode: .autoByApp,
             context: VoiceContext(bundleIdentifier: "com.apple.mail", personalVocabulary: ["句序", "句序", "Juxu"])
         )
-        assert(normalMsgs.count == 2)
-        assert(normalMsgs[0]["content"]?.contains("句序、Juxu") == true)
+        precondition(normalMsgs.count == 2)
+        precondition(normalMsgs[0]["content"]?.contains("句序、Juxu") == true)
         let editMsgs = VoicePromptBuilder.polishMessages(
             rawTranscript: "翻成英文",
             toneMode: .professional,
             context: VoiceContext(selectedText: "你好世界")
         )
-        assert(editMsgs[1]["content"]?.contains("你好世界") == true && editMsgs[1]["content"]?.contains("翻成英文") == true)
+        precondition(editMsgs[1]["content"]?.contains("你好世界") == true && editMsgs[1]["content"]?.contains("翻成英文") == true)
 
         // Verify WAV header & multipart form builder
         let wav = VoiceWAVEncoder.encodePCM16Mono(samples: [0, 1000, -1000, 32767], sampleRate: 16_000)
-        assert(wav.count == 44 + 8)
-        assert(String(data: wav.prefix(4), encoding: .ascii) == "RIFF")
-        assert(String(data: wav.subdata(in: 8..<12), encoding: .ascii) == "WAVE")
+        precondition(wav.count == 44 + 8)
+        precondition(String(data: wav.prefix(4), encoding: .ascii) == "RIFF")
+        precondition(String(data: wav.subdata(in: 8..<12), encoding: .ascii) == "WAVE")
         let multipart = VoiceMultipartBuilder.buildAudioTranscriptionBody(
             boundary: "TESTBOUNDARY",
             wavData: wav,
@@ -669,10 +684,10 @@ struct SwiftBridgeTests {
             language: "zh",
             prompt: "句序"
         )
-        let multipartPrefix = String(decoding: multipart.prefix(320), as: UTF8.self)
-        assert(multipartPrefix.contains("--TESTBOUNDARY"))
-        assert(multipartPrefix.contains("whisper-large-v3-turbo"))
-        assert(multipartPrefix.contains("speech.wav"))
+        let multipartPrefix = String(decoding: multipart.prefix(512), as: UTF8.self)
+        precondition(multipartPrefix.contains("--TESTBOUNDARY"))
+        precondition(multipartPrefix.contains("whisper-large-v3-turbo"))
+        precondition(multipartPrefix.contains("speech.wav"))
 
         // 7. Verify Cangjie 3 / 5 / 6 schema switching, categories, TOML round-trip, and 5-code input
         for (sid, expectedName, expectedTag) in [(UInt32(33), "仓颉三代", "cangjie3"), (UInt32(35), "仓颉五代", "cangjie5"), (UInt32(36), "仓颉六代", "cangjie6")] {

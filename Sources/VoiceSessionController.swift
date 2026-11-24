@@ -84,6 +84,7 @@ public final class VoiceSessionController {
     private var activeWindowLevel: CGWindowLevel?
     private var activeCommitHandler: ((String, Bool) -> Void)?
     private var activeContext: VoiceContext = VoiceContext()
+    private var lastEscapeCancelUptime: TimeInterval = 0
 
     private init() {}
 
@@ -95,6 +96,18 @@ public final class VoiceSessionController {
 
     /// The voice key is down and audio is being captured, or the microphone is coming up for it.
     public var isCapturing: Bool { phase == .recording || (isStarting && !startAborted) }
+
+    /// Returns true once if Esc just cancelled a voice session (e.g. via the listen-only global tap
+    /// right before IMK receives the same Esc keyDown).
+    public func consumeRecentEscapeCancel(window: TimeInterval = 0.25) -> Bool {
+        guard lastEscapeCancelUptime > 0 else { return false }
+        let elapsed = ProcessInfo.processInfo.systemUptime - lastEscapeCancelUptime
+        if elapsed >= 0 && elapsed <= window {
+            lastEscapeCancelUptime = 0
+            return true
+        }
+        return false
+    }
 
     /// Test seam: replaces starting the microphone.
     var startRecordingOverride: (() -> Void)?
@@ -142,6 +155,7 @@ public final class VoiceSessionController {
         }
 
         if event.type == .keyDown && event.keyCode == 0x35 && (phase != .idle || isCapturing) {
+            lastEscapeCancelUptime = ProcessInfo.processInfo.systemUptime
             cancelCurrentSession(showNotice: true)
             return true
         }
@@ -151,13 +165,17 @@ public final class VoiceSessionController {
                 let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
                 if event.keyCode == 0x31 && mods == .option {
                     if phase == .idle {
-                        startRecording(
-                            caretRect: caretRectProvider(),
-                            windowLevel: windowLevel,
-                            context: contextProvider(),
-                            warmDelay: 0,
-                            onCommit: onCommit
-                        )
+                        if !isStarting {
+                            startRecording(
+                                caretRect: caretRectProvider(),
+                                windowLevel: windowLevel,
+                                context: contextProvider(),
+                                warmDelay: 0,
+                                onCommit: onCommit
+                            )
+                        } else if !startAborted {
+                            cancelCurrentSession(showNotice: false)
+                        }
                     } else if phase == .recording {
                         finishRecordingAndProcess()
                     }
@@ -556,6 +574,19 @@ public final class VoiceSessionController {
             recorder.onPartialTranscript = { [weak self] partial in
                 Task { @MainActor [weak self] in
                     self?.latestPartial = partial
+                }
+            }
+            recorder.onMaxDurationReached = { [weak self, weak recorder] in
+                Task { @MainActor [weak self, weak recorder] in
+                    guard let self, let recorder, self.activeRecorder === recorder, self.phase == .recording else { return }
+                    self.finishRecordingAndProcess()
+                }
+            }
+            recorder.onAudioInterrupted = { [weak self, weak recorder] message in
+                Task { @MainActor [weak self, weak recorder] in
+                    guard let self, let recorder, self.activeRecorder === recorder, self.phase == .recording else { return }
+                    self.cancelCurrentSession(showNotice: false)
+                    self.showNotice(message, isError: true)
                 }
             }
 

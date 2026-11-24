@@ -144,6 +144,15 @@ public enum VoiceLocalLLMPreset: String, Codable, CaseIterable, Identifiable, Se
         ]
     }
 
+    public var expectedSHA256: String? {
+        switch self {
+        case .qwen15B:
+            return "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e"
+        case .ollamaHTTP, .none:
+            return nil
+        }
+    }
+
     public init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
         self = VoiceLocalLLMPreset(rawValue: raw) ?? .qwen15B
@@ -355,18 +364,25 @@ public enum VoiceKeychainStore {
 
     @discardableResult
     public static func delete(_ account: VoiceKeychainAccount) -> Bool {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account.rawValue,
-        ]
-        let status = SecItemDelete(query as CFDictionary)
-        return status == errSecSuccess || status == errSecItemNotFound
+        var ok = true
+        for svc in [service, legacyService] {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: svc,
+                kSecAttrAccount as String: account.rawValue,
+            ]
+            let status = SecItemDelete(query as CFDictionary)
+            if status != errSecSuccess && status != errSecItemNotFound {
+                ok = false
+            }
+        }
+        return ok
     }
 }
 
 @MainActor
 public final class VoicePreferencesStore: ObservableObject {
+    public static var defaultInMemoryForTesting = false
     public static let shared = VoicePreferencesStore()
 
     @Published public private(set) var prefs: VoicePreferences
@@ -374,7 +390,8 @@ public final class VoicePreferencesStore: ObservableObject {
     private let inMemoryOnly: Bool
 
     public init(fileURL: URL? = nil, inMemoryOnly: Bool = false) {
-        self.inMemoryOnly = inMemoryOnly
+        let effectiveInMemory = inMemoryOnly || (fileURL == nil && Self.defaultInMemoryForTesting)
+        self.inMemoryOnly = effectiveInMemory
         if let fileURL {
             self.fileURL = fileURL
         } else {
@@ -383,7 +400,7 @@ public final class VoicePreferencesStore: ObservableObject {
                 .appendingPathComponent("Library/Application Support/Juxu", isDirectory: true)
                 .appendingPathComponent("voice.json")
         }
-        if !inMemoryOnly,
+        if !effectiveInMemory,
            FileManager.default.fileExists(atPath: self.fileURL.path),
            let data = try? Data(contentsOf: self.fileURL),
            let decoded = try? JSONDecoder().decode(VoicePreferences.self, from: data) {

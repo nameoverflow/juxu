@@ -305,9 +305,16 @@ public enum VoiceLocalCLIDiscovery {
 // MARK: - On-Demand Audio Recorder & Apple Speech Live Streamer
 
 public final class VoiceAudioRecorder: @unchecked Sendable {
+    /// Caps buffered PCM16 audio at 5 minutes (16 kHz mono ≈ 9.6 MB WAV), preventing
+    /// unbounded memory growth in hands-free mode and staying well within cloud upload limits.
+    public static let maxRecordingSamples = 16_000 * 300
+
     private let lock = NSLock()
+    private let configQueue = DispatchQueue(label: "im.juxu.voice.audio.config")
     private var engine: AVAudioEngine?
+    private var configChangeObserver: NSObjectProtocol?
     private var pcm16Samples: [Int16] = []
+    private var didReachMaxDuration = false
     private var targetFormat: AVAudioFormat?
     private var converter: AVAudioConverter?
     private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
@@ -326,6 +333,8 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     public var onAudioLevel: (@Sendable (Float) -> Void)?
     public var onAudioSpectrum: (@Sendable ([[Float]]) -> Void)?
     public var onPartialTranscript: (@Sendable (String) -> Void)?
+    public var onMaxDurationReached: (@Sendable () -> Void)?
+    public var onAudioInterrupted: (@Sendable (String) -> Void)?
 
     public init() {}
 
@@ -350,10 +359,12 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
             throw VoiceEngineError.networkError("无法初始化 16kHz PCM 音频格式")
         }
 
-        self.targetFormat = outFormat
-        self.converter = AVAudioConverter(from: inputFormat, to: outFormat)
+        let conv = AVAudioConverter(from: inputFormat, to: outFormat)
         lock.lock()
+        self.targetFormat = outFormat
+        self.converter = conv
         pcm16Samples.removeAll(keepingCapacity: true)
+        didReachMaxDuration = false
         latestAppleTranscript = ""
         appleFinished = false
         lock.unlock()
@@ -380,9 +391,11 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
                     )
                 }
             }
+            lock.lock()
             self.speechRecognizer = recognizer
             self.speechRequest = req
-            self.speechTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
+            lock.unlock()
+            let task = recognizer.recognitionTask(with: req) { [weak self] result, error in
                 guard let self else { return }
                 if let result {
                     let text = result.bestTranscription.formattedString
@@ -415,17 +428,78 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
                     }
                 }
             }
+            lock.lock()
+            self.speechTask = task
+            lock.unlock()
         }
 
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, when in
-            guard let self else { return }
-            self.speechRequest?.append(buffer)
-            self.processBuffer(buffer, when: when)
+        installInputTap(on: eng, inputFormat: inputFormat)
+
+        let observer = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: eng,
+            queue: nil
+        ) { [weak self, weak eng] _ in
+            guard let self, let eng else { return }
+            self.handleConfigurationChange(for: eng)
         }
+        lock.lock()
+        self.engine = eng
+        self.configChangeObserver = observer
+        lock.unlock()
 
         eng.prepare()
         try eng.start()
-        self.engine = eng
+    }
+
+    private func installInputTap(on eng: AVAudioEngine, inputFormat: AVAudioFormat) {
+        eng.inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, when in
+            guard let self else { return }
+            let (req, conv, fmt): (SFSpeechAudioBufferRecognitionRequest?, AVAudioConverter?, AVAudioFormat?) = {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                return (self.speechRequest, self.converter, self.targetFormat)
+            }()
+            req?.append(buffer)
+            self.processBuffer(buffer, when: when, converter: conv, targetFormat: fmt)
+        }
+    }
+
+    private func handleConfigurationChange(for eng: AVAudioEngine) {
+        configQueue.async { [weak self, weak eng] in
+            guard let self, let eng else { return }
+            let outFormat: AVAudioFormat? = {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                guard self.engine === eng else { return nil }
+                return self.targetFormat
+            }()
+            guard let outFormat else { return }
+
+            eng.inputNode.removeTap(onBus: 0)
+            eng.stop()
+            let newInputFormat = eng.inputNode.outputFormat(forBus: 0)
+            guard newInputFormat.sampleRate > 0, newInputFormat.channelCount > 0,
+                  let newConv = AVAudioConverter(from: newInputFormat, to: outFormat) else {
+                self.onAudioInterrupted?("音频输入设备变化，录音已中断")
+                return
+            }
+            self.lock.lock()
+            guard self.engine === eng else {
+                self.lock.unlock()
+                return
+            }
+            self.converter = newConv
+            self.lock.unlock()
+
+            self.installInputTap(on: eng, inputFormat: newInputFormat)
+            eng.prepare()
+            do {
+                try eng.start()
+            } catch {
+                self.onAudioInterrupted?("音频设备切换后无法继续录音")
+            }
+        }
     }
 
     /// Blanks what the microphone captures while a cue is audible, so it never reaches the recogniser.
@@ -437,7 +511,12 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func processBuffer(_ buffer: AVAudioPCMBuffer, when: AVAudioTime) {
+    private func processBuffer(
+        _ buffer: AVAudioPCMBuffer,
+        when: AVAudioTime,
+        converter: AVAudioConverter?,
+        targetFormat: AVAudioFormat?
+    ) {
         // HUD meter only: the audio sent to the recogniser is converted below, untouched by this.
         if let channelData = buffer.floatChannelData?[0] {
             let count = Int(buffer.frameLength)
@@ -501,33 +580,60 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
 
         if error == nil, outBuffer.frameLength > 0, let int16Ptr = outBuffer.int16ChannelData?[0] {
             let count = Int(outBuffer.frameLength)
-            let chunk = UnsafeBufferPointer(start: int16Ptr, count: count)
+            var hitLimitNow = false
             lock.lock()
-            let firstNew = pcm16Samples.count
-            pcm16Samples.append(contentsOf: chunk)
-            if when.isHostTimeValid, cueMuteEnd > cueMuteStart {
-                let muted = VoiceCueMute.sampleRange(
-                    bufferStart: AVAudioTime.seconds(forHostTime: when.hostTime),
-                    count: count,
-                    sampleRate: targetFormat.sampleRate,
-                    muteStart: cueMuteStart,
-                    muteEnd: cueMuteEnd
-                )
-                for i in muted { pcm16Samples[firstNew + i] = 0 }
+            let remaining = Self.maxRecordingSamples - pcm16Samples.count
+            if remaining > 0 {
+                let appendCount = min(count, remaining)
+                let chunk = UnsafeBufferPointer(start: int16Ptr, count: appendCount)
+                let firstNew = pcm16Samples.count
+                pcm16Samples.append(contentsOf: chunk)
+                if when.isHostTimeValid, cueMuteEnd > cueMuteStart {
+                    let muted = VoiceCueMute.sampleRange(
+                        bufferStart: AVAudioTime.seconds(forHostTime: when.hostTime),
+                        count: appendCount,
+                        sampleRate: targetFormat.sampleRate,
+                        muteStart: cueMuteStart,
+                        muteEnd: cueMuteEnd
+                    )
+                    for i in muted { pcm16Samples[firstNew + i] = 0 }
+                }
+                if pcm16Samples.count >= Self.maxRecordingSamples && !didReachMaxDuration {
+                    didReachMaxDuration = true
+                    hitLimitNow = true
+                }
+            } else if !didReachMaxDuration {
+                didReachMaxDuration = true
+                hitLimitNow = true
             }
             lock.unlock()
+            if hitLimitNow {
+                onMaxDurationReached?()
+            }
         }
     }
 
     public func stopAndCollectSamples() -> [Int16] {
-        engine?.inputNode.removeTap(onBus: 0)
-        engine?.stop()
-        engine = nil
-        converter = nil
-        targetFormat = nil
-        speechRequest?.endAudio()
+        let (eng, observer, req): (AVAudioEngine?, NSObjectProtocol?, SFSpeechAudioBufferRecognitionRequest?) = {
+            lock.lock()
+            defer { lock.unlock() }
+            let e = engine
+            let o = configChangeObserver
+            let r = speechRequest
+            engine = nil
+            configChangeObserver = nil
+            return (e, o, r)
+        }()
+        if let observer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        eng?.inputNode.removeTap(onBus: 0)
+        eng?.stop()
+        req?.endAudio()
 
         lock.lock()
+        converter = nil
+        targetFormat = nil
         let out = pcm16Samples
         pcm16Samples.removeAll(keepingCapacity: false)
         lock.unlock()
@@ -599,13 +705,24 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     }
 
     public func cancel() {
-        engine?.inputNode.removeTap(onBus: 0)
-        engine?.stop()
-        engine = nil
-        converter = nil
-        targetFormat = nil
+        let (eng, observer): (AVAudioEngine?, NSObjectProtocol?) = {
+            lock.lock()
+            defer { lock.unlock() }
+            let e = engine
+            let o = configChangeObserver
+            engine = nil
+            configChangeObserver = nil
+            return (e, o)
+        }()
+        if let observer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        eng?.inputNode.removeTap(onBus: 0)
+        eng?.stop()
         teardownAppleSpeech()
         lock.lock()
+        converter = nil
+        targetFormat = nil
         pcm16Samples.removeAll(keepingCapacity: false)
         latestAppleTranscript = ""
         let pending = appleFinalContinuation
@@ -616,11 +733,18 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     }
 
     private func teardownAppleSpeech() {
-        speechRequest?.endAudio()
-        speechTask?.cancel()
-        speechTask = nil
-        speechRequest = nil
-        speechRecognizer = nil
+        let (req, task): (SFSpeechAudioBufferRecognitionRequest?, SFSpeechRecognitionTask?) = {
+            lock.lock()
+            defer { lock.unlock() }
+            let r = speechRequest
+            let t = speechTask
+            speechRequest = nil
+            speechTask = nil
+            speechRecognizer = nil
+            return (r, t)
+        }()
+        req?.endAudio()
+        task?.cancel()
     }
 }
 

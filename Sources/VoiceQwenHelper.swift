@@ -118,10 +118,13 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
         try Task.checkCancellation()
         guard let current = connection else { throw VoiceEngineError.cliFailed("Qwen 引擎未运行") }
 
-        let pcm = wavData.dropFirst(44)
+        let rawPCM = wavData.dropFirst(44)
+        let sampleCount = rawPCM.count / 2
+        guard sampleCount >= 160 else { return "" }
+        let pcm = rawPCM.prefix(sampleCount * 2)
         let id = nextID
         nextID += 1
-        var request: [String: Any] = ["id": id, "kind": isFinal ? "final" : "partial", "samples": pcm.count / 2]
+        var request: [String: Any] = ["id": id, "kind": isFinal ? "final" : "partial", "samples": sampleCount]
         if let name = Self.modelLanguage(language) { request["language"] = name }
         if let context { request["context"] = context }
         var payload = try JSONSerialization.data(withJSONObject: request)
@@ -172,10 +175,14 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
         if isFinal, reply["truncated"] as? Bool == true {
             throw VoiceEngineError.cliFailed("Qwen 结果不完整")
         }
+        let voiced = await Task.detached(priority: .userInitiated) {
+            VoiceSpeechGate.voicedSeconds(VoiceWhisperStreamPolicy.pcmSamples(fromWAV: wavData))
+        }.value
+        try Task.checkCancellation()
         return VoiceWhisperStreamPolicy.cleanedTranscript(
             text,
             language: language,
-            voicedSeconds: VoiceSpeechGate.voicedSeconds(VoiceWhisperStreamPolicy.pcmSamples(fromWAV: wavData))
+            voicedSeconds: voiced
         )
     }
 
@@ -209,7 +216,7 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
     private func ensureReady() async throws {
         if let connection, connection.isReady, connection.process.isRunning { return }
         if let startTask {
-            try await startTask.value
+            try await awaitCancellable(startTask)
             return
         }
         let task = Task<Void, Error> { @MainActor [weak self] in
@@ -217,8 +224,37 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
             try await self.launch()
         }
         startTask = task
-        defer { if startTask == task { startTask = nil } }
-        try await task.value
+        Task { @MainActor [weak self] in
+            _ = try? await task.value
+            if self?.startTask == task { self?.startTask = nil }
+        }
+        try await awaitCancellable(task)
+    }
+
+    private func awaitCancellable<T: Sendable>(_ task: Task<T, Error>) async throws -> T {
+        try Task.checkCancellation()
+        let waiter = CancellableTaskWaiter<T>()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                if Task.isCancelled {
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                waiter.continuation = cont
+                Task { @MainActor in
+                    do {
+                        let value = try await task.value
+                        waiter.resume(with: .success(value))
+                    } catch {
+                        waiter.resume(with: .failure(error))
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in
+                waiter.resume(with: .failure(CancellationError()))
+            }
+        }
     }
 
     private func launch() async throws {
@@ -346,4 +382,15 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
 private final class ReplyBox: @unchecked Sendable {
     let value: [String: Any]
     init(_ value: [String: Any]) { self.value = value }
+}
+
+@MainActor
+final class CancellableTaskWaiter<T: Sendable> {
+    var continuation: CheckedContinuation<T, Error>?
+
+    func resume(with result: Result<T, Error>) {
+        guard let cont = continuation else { return }
+        continuation = nil
+        cont.resume(with: result)
+    }
 }

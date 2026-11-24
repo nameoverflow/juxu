@@ -404,6 +404,7 @@ public final class VoiceWhisperServerManager: VoiceASREngine {
     private var startTask: Task<Int, Error>?
     private var idleItem: DispatchWorkItem?
     private var activeSessions = 0
+    private var inFlightRequests = 0
 
     public var isServerRunning: Bool { process?.isRunning == true && port != nil }
     public var supervisorPID: Int32? { process?.processIdentifier }
@@ -452,6 +453,14 @@ public final class VoiceWhisperServerManager: VoiceASREngine {
     }
 
     public func transcribe(wavData: Data, language: String, timeout: TimeInterval, isFinal: Bool) async throws -> String {
+        inFlightRequests += 1
+        idleItem?.cancel()
+        idleItem = nil
+        defer {
+            inFlightRequests = max(0, inFlightRequests - 1)
+            scheduleIdleStopIfNeeded()
+        }
+
         let port = try await ensureRunning()
         try Task.checkCancellation()
         guard let url = URL(string: "http://127.0.0.1:\(port)/inference") else {
@@ -486,10 +495,14 @@ public final class VoiceWhisperServerManager: VoiceASREngine {
             throw VoiceEngineError.cliFailed("本地常驻识别返回异常")
         }
         // Plain `json` on purpose: `verbose_json` measured 0.78 s against 0.42 s per pass on this model.
+        let voiced = await Task.detached(priority: .userInitiated) {
+            VoiceSpeechGate.voicedSeconds(VoiceWhisperStreamPolicy.pcmSamples(fromWAV: wavData))
+        }.value
+        try Task.checkCancellation()
         return VoiceWhisperStreamPolicy.cleanedTranscript(
             text,
             language: language,
-            voicedSeconds: VoiceSpeechGate.voicedSeconds(VoiceWhisperStreamPolicy.pcmSamples(fromWAV: wavData))
+            voicedSeconds: voiced
         )
     }
 
@@ -498,10 +511,10 @@ public final class VoiceWhisperServerManager: VoiceASREngine {
     private func scheduleIdleStopIfNeeded() {
         idleItem?.cancel()
         idleItem = nil
-        guard activeSessions == 0, process != nil || startTask != nil else { return }
+        guard activeSessions == 0, inFlightRequests == 0, process != nil || startTask != nil else { return }
         let item = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
-                guard let self, self.activeSessions == 0 else { return }
+                guard let self, self.activeSessions == 0, self.inFlightRequests == 0 else { return }
                 self.stop()
             }
         }
@@ -514,20 +527,46 @@ public final class VoiceWhisperServerManager: VoiceASREngine {
             return port
         }
         if let startTask {
-            return try await startTask.value
+            return try await awaitCancellable(startTask)
         }
         let task = Task<Int, Error> { @MainActor [weak self] in
             guard let self else { throw CancellationError() }
+            defer {
+                if self.startTask == nil { /* already cleared */ }
+            }
             return try await self.launchWithRetries()
         }
         startTask = task
-        do {
-            let value = try await task.value
-            if startTask == task { startTask = nil }
-            return value
-        } catch {
-            if startTask == task { startTask = nil }
-            throw error
+        Task { @MainActor [weak self] in
+            _ = try? await task.value
+            if self?.startTask == task { self?.startTask = nil }
+        }
+        return try await awaitCancellable(task)
+    }
+
+    private func awaitCancellable<T: Sendable>(_ task: Task<T, Error>) async throws -> T {
+        try Task.checkCancellation()
+        let waiter = CancellableTaskWaiter<T>()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                if Task.isCancelled {
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                waiter.continuation = cont
+                Task { @MainActor in
+                    do {
+                        let value = try await task.value
+                        waiter.resume(with: .success(value))
+                    } catch {
+                        waiter.resume(with: .failure(error))
+                    }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in
+                waiter.resume(with: .failure(CancellationError()))
+            }
         }
     }
 

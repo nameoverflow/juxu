@@ -66,6 +66,7 @@ app: build/Juxu Resources/Info.plist build/AppIcon.icns build/menu_icon.pdf $(QW
 	cp Resources/Dicts/*.wbdict Resources/Dicts/*.pydict Resources/Dicts/*.wbaux Resources/Dicts/*.endict Resources/Dicts/*.tsv build/Juxu.app/Contents/Resources/Dicts/
 	@id="$$(sh Scripts/resolve-codesign-identity.sh "$(CODESIGN_IDENTITY)" "$(CERT_NAME)")"; \
 	echo "Signing build/Juxu.app with identity: $$id"; \
+	codesign --force --sign "$$id" build/Juxu.app/Contents/MacOS/juxu-qwen-asr; \
 	codesign --force --deep --sign "$$id" build/Juxu.app
 
 pkg: app
