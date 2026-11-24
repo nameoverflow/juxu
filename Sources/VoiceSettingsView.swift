@@ -2,6 +2,8 @@ import AppKit
 import SwiftUI
 
 public struct VoiceSettingsView: View {
+    @State private var globalPermissions = VoiceGlobalPermissions(inputMonitoring: false, accessibility: false)
+    @State private var isWindowVisible = true
     @ObservedObject public var bridge: JuxuBridge
     @ObservedObject public var voiceStore: VoicePreferencesStore
 
@@ -180,11 +182,8 @@ public struct VoiceSettingsView: View {
 
                 fieldRow(title: "API Key") {
                     HStack(spacing: 8) {
-                        SecureField(preset.keyPlaceholder, text: $primaryKeyDraft)
+                        SecureField(preset.keyPlaceholder, text: primaryKeyBinding)
                             .textFieldStyle(.roundedBorder)
-                            .onChange(of: primaryKeyDraft) { _, newVal in
-                                VoiceKeychainStore.write(newVal, for: preset.keychainAccount)
-                            }
                         Text(hasSavedKey ? "✓ 钥匙串" : "必填")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(hasSavedKey ? Color.green : Color.orange)
@@ -222,11 +221,8 @@ public struct VoiceSettingsView: View {
                                     .textFieldStyle(.roundedBorder)
                             }
                             fieldRow(title: "整理 API Key") {
-                                SecureField("sk-...", text: $splitLLMKeyDraft)
+                                SecureField("sk-...", text: splitLLMKeyBinding)
                                     .textFieldStyle(.roundedBorder)
-                                    .onChange(of: splitLLMKeyDraft) { _, newVal in
-                                        VoiceKeychainStore.write(newVal, for: .cloudCustomLLMAPIKey)
-                                    }
                             }
                         }
                     }
@@ -254,6 +250,89 @@ public struct VoiceSettingsView: View {
 
     // MARK: - Trigger & Behavior
 
+    private var globalHotkeyBinding: Binding<Bool> {
+        Binding(
+            get: { voiceStore.prefs.isGlobalHotkeyEnabled },
+            set: { isOn in
+                voiceStore.update { $0.globalVoiceHotkey = isOn ? true : nil }
+                if isOn { VoiceGlobalPermissions.request() }
+                globalPermissions = VoiceGlobalPermissions.current()
+            }
+        )
+    }
+
+    private var globalHotkeyRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("全局语音快捷键")
+                        .font(.system(size: 13, weight: .medium))
+                    Text("在任何应用里按住语音键，即使当前输入法不是句序")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Toggle("", isOn: globalHotkeyBinding)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
+            if voiceStore.prefs.isGlobalHotkeyEnabled {
+                if !voiceStore.prefs.triggerKey.isHoldToTalk {
+                    Text("全局模式需要长按类触发键，请改选右 Option、右 Command 或 Fn")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.orange)
+                }
+                globalPermissionRow("输入监控（监听语音键）", granted: globalPermissions.inputMonitoring, pane: VoiceGlobalPermissions.inputMonitoringPane)
+                globalPermissionRow("辅助功能（写入其他应用）", granted: globalPermissions.accessibility, pane: VoiceGlobalPermissions.accessibilityPane)
+                if !globalPermissions.inputMonitoring || !globalPermissions.accessibility {
+                    Text("如果列表里已勾选句序仍显示未授权，通常是应用更新后签名变化：请移除句序后重新添加。")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .onAppear {
+            isWindowVisible = true
+            globalPermissions = VoiceGlobalPermissions.current()
+        }
+        .onDisappear {
+            isWindowVisible = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { _ in
+            isWindowVisible = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            isWindowVisible = true
+            if voiceStore.prefs.isGlobalHotkeyEnabled {
+                globalPermissions = VoiceGlobalPermissions.current()
+            }
+        }
+        .task(id: voiceStore.prefs.isGlobalHotkeyEnabled && isWindowVisible) {
+            guard voiceStore.prefs.isGlobalHotkeyEnabled, isWindowVisible else { return }
+            while !Task.isCancelled {
+                globalPermissions = VoiceGlobalPermissions.current()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+
+    private func globalPermissionRow(_ title: String, granted: Bool, pane: URL) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.circle")
+                .foregroundStyle(granted ? Color.green : Color.orange)
+                .font(.system(size: 12))
+            Text(title + (granted ? "：已授权" : "：未授权"))
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+            Spacer()
+            if !granted {
+                Button("打开系统设置") { NSWorkspace.shared.open(pane) }
+                    .controlSize(.small)
+            }
+        }
+    }
+
     private var triggerAndBehaviorCard: some View {
         card {
             VStack(spacing: 11) {
@@ -273,6 +352,30 @@ public struct VoiceSettingsView: View {
                     }
                     .labelsHidden()
                     .frame(width: 205)
+                }
+
+                Divider()
+
+                globalHotkeyRow
+
+                Divider()
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("开始和结束提示音")
+                            .font(.system(size: 13, weight: .medium))
+                        Text("双击语音键可免按住长录，再按一下结束，Esc 取消")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { voiceStore.prefs.areVoiceCuesEnabled },
+                        set: { isOn in voiceStore.update { $0.voiceCues = isOn ? nil : false } }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
                 }
 
                 Divider()
@@ -396,6 +499,26 @@ public struct VoiceSettingsView: View {
 
     // MARK: - Helpers
 
+    private var primaryKeyBinding: Binding<String> {
+        Binding(
+            get: { primaryKeyDraft },
+            set: { newVal in
+                primaryKeyDraft = newVal
+                VoiceKeychainStore.write(newVal, for: voiceStore.prefs.cloudPreset.keychainAccount)
+            }
+        )
+    }
+
+    private var splitLLMKeyBinding: Binding<String> {
+        Binding(
+            get: { splitLLMKeyDraft },
+            set: { newVal in
+                splitLLMKeyDraft = newVal
+                VoiceKeychainStore.write(newVal, for: .cloudCustomLLMAPIKey)
+            }
+        )
+    }
+
     private func reloadKeysForCurrentPreset() {
         let account = voiceStore.prefs.cloudPreset.keychainAccount
         if loadedKeyAccount != account {
@@ -459,7 +582,7 @@ private struct LocalVoiceConfigCard: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("本地语音识别模型")
                         .font(.system(size: 13, weight: .semibold))
-                    Text("自动安装 whisper.cpp（Metal 加速）并下载模型，按需运行不常驻")
+                    Text("选择模型并一键下载；按需运行，闲置自动释放")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                 }
@@ -473,12 +596,12 @@ private struct LocalVoiceConfigCard: View {
                 .frame(width: 245)
             }
 
-            switch asrPreset {
-            case .whisperTurbo, .whisperBase:
+            switch asrPreset.backend {
+            case .engine:
                 installActionRow(
                     status: asrStatus,
                     sizeLabel: asrPreset.approximateSizeLabel,
-                    depName: "whisper.cpp",
+                    depName: asrPreset.descriptor.engineLabel,
                     onInstall: { installer.installASR(preset: asrPreset) },
                     onDelete: {
                         if let file = asrPreset.modelFilename {

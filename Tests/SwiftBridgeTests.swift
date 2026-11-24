@@ -4,6 +4,7 @@ import AppKit
 struct SwiftBridgeTests {
     @MainActor
     static func main() {
+        VoicePreferencesStore.defaultInMemoryForTesting = true
         let dictsURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("Resources/Dicts", isDirectory: true)
         let bridge = JuxuBridge(customDictsDir: dictsURL, inMemoryOnly: true)
@@ -267,23 +268,143 @@ struct SwiftBridgeTests {
         assert(narrowState.macOSPreedit == "g")
 
         // 6. Verify macOS Voice MVP: strict lazy-loading, preset resolution, preferences persistence, WAV/multipart, prompts & local polisher
-        assert(VoicePreferences().enabled == false, "Voice entry must be disabled by default")
-        assert(!VoiceSessionController.isLoaded, "VoiceSessionController must NOT be loaded before voice is enabled")
-        assert(!VoiceHUDPanelController.isLoaded, "VoiceHUDPanelController must NOT be loaded before voice is enabled")
-        assert(!VoiceLocalInstaller.isLoaded, "VoiceLocalInstaller must NOT be loaded before voice is enabled")
+        precondition(VoicePreferences().enabled == false, "Voice entry must be disabled by default")
+        precondition(!VoiceSessionController.isLoaded, "VoiceSessionController must NOT be loaded before voice is enabled")
+        precondition(!VoiceHUDPanelController.isLoaded, "VoiceHUDPanelController must NOT be loaded before voice is enabled")
+        precondition(!VoiceLocalInstaller.isLoaded, "VoiceLocalInstaller must NOT be loaded before voice is enabled")
+        precondition(!VoiceWhisperServerManager.isLoaded, "whisper-server manager must NOT be loaded before voice is enabled")
+        precondition(VoiceWhisperStreamPolicy.normalizedTranscript("今天开会\n 明天发布\n") == "今天开会明天发布")
+        precondition(VoiceWhisperStreamPolicy.normalizedTranscript("hello\nworld") == "hello world")
+        precondition(VoiceSpeechGate.finalAudio([Int16](repeating: 0, count: 48_000)) == nil, "digital silence is not speech")
+        precondition(VoiceSpeechGate.finalAudio([Int16](repeating: 1_000, count: 48_000)) == nil, "a steady level is not speech")
+        var clicks = [Int16](repeating: 5, count: 48_000)
+        for c in 0..<9 { for j in 0..<160 { clicks[3_000 + c * 5_000 + j] = 9_000 } }
+        precondition(VoiceSpeechGate.finalAudio(clicks) == nil, "isolated key clicks are not speech")
+        // A periodic 150 Hz signal with a syllable envelope is the shape the gate looks for.
+        var voiced = [Int16](repeating: 0, count: 48_000)
+        for i in 16_000..<32_000 {
+            let envelope = 0.6 + 0.4 * sin(2 * Double.pi * 4 * Double(i) / 16_000)
+            voiced[i] = Int16(3_000 * envelope * sin(2 * Double.pi * 150 * Double(i) / 16_000))
+        }
+        precondition(VoiceSpeechGate.finalAudio(voiced) != nil, "periodic speech-like audio is kept")
+        // Continuous speech filling the entire clip (no 10% silence) must still pass the gate.
+        var continuous = [Int16](repeating: 0, count: 32_000)
+        for i in 0..<continuous.count {
+            let envelope = 0.7 + 0.3 * sin(2 * Double.pi * 3.5 * Double(i) / 16_000)
+            continuous[i] = Int16(500 * envelope * sin(2 * Double.pi * 160 * Double(i) / 16_000))
+        }
+        precondition(VoiceSpeechGate.finalAudio(continuous) != nil, "continuous speech without silence passes the gate")
+        // Quiet speech (~ -39 dBFS) over steady room noise (~ -44 dBFS) must pass, while noise alone is rejected.
+        var rngState: UInt64 = 0x1234_5678_9abc_def0
+        let nextNoise = { () -> Double in
+            rngState = rngState &* 6364136223846793005 &+ 1442695040888963407
+            let u = Double((rngState >> 33) & 0x7fff_ffff) / Double(0x7fff_ffff)
+            return u * 2.0 - 1.0
+        }
+        let noiseOnly = (0..<48_000).map { _ in Int16(360 * nextNoise()) }
+        precondition(VoiceSpeechGate.finalAudio(noiseOnly) == nil, "steady broadband room noise is rejected")
+        var quietSpeechOverNoise = (0..<48_000).map { _ in Int16(360 * nextNoise()) }
+        for i in 16_000..<32_000 {
+            let sig = 480 * sin(2 * Double.pi * 155 * Double(i) / 16_000)
+            quietSpeechOverNoise[i] = Int16(max(-32767, min(32767, Double(quietSpeechOverNoise[i]) + sig)))
+        }
+        precondition(VoiceSpeechGate.finalAudio(quietSpeechOverNoise) != nil, "quiet speech over room noise passes the gate")
+        // A brief single-syllable word (~140 ms) must not be rejected as silence.
+        var briefWord = [Int16](repeating: 0, count: 24_000)
+        for i in 8_000..<10_240 {
+            briefWord[i] = Int16(300 * sin(2 * Double.pi * 150 * Double(i) / 16_000))
+        }
+        precondition(VoiceSpeechGate.finalAudio(briefWord) != nil, "brief single-syllable speech passes the gate")
+        // partialAudio must keep trailing audio to the end of the window so quiet final words are not clipped.
+        var trailingQuiet = [Int16](repeating: 0, count: 48_000)
+        for i in 8_000..<24_000 {
+            trailingQuiet[i] = Int16(2_500 * sin(2 * Double.pi * 150 * Double(i) / 16_000))
+        }
+        for i in 32_000..<44_000 {
+            trailingQuiet[i] = Int16(45 * sin(2 * Double.pi * 150 * Double(i) / 16_000))
+        }
+        let partialKept = VoiceSpeechGate.partialAudio(trailingQuiet)
+        precondition(partialKept != nil && partialKept!.count >= 40_000, "partialAudio preserves quiet trailing words")
+        precondition(VoiceLocalASRModelPreset(rawValue: "whisper_turbo") == .whisperTurbo, "existing presets still decode")
+        precondition(VoiceLocalASRModelPreset(rawValue: "qwen3_asr") == .qwen3ASR)
+        precondition(VoiceQwenHelperManager.modelLanguage("zh") == "Chinese")
+        precondition(VoiceQwenHelperManager.modelLanguage("auto") == nil)
+        precondition(!VoiceQwenHelperManager.isLoaded, "Qwen helper must NOT be loaded before voice is enabled")
+        precondition(VoiceLocalASRModelPreset.qwen3ASR.descriptor.pinned?.isInstalled(at: FileManager.default.temporaryDirectory) == false, "no marker means not installed")
+        for preset in VoiceLocalASRModelPreset.allCases {
+            precondition(!preset.displayName.isEmpty, "every preset has a descriptor")
+            precondition((preset.descriptor.executor != nil) == (preset.backend == .engine))
+        }
+        precondition(VoiceLocalASRModelPreset.whisperTurbo.modelFilename == "ggml-large-v3-turbo-q5_0.bin", "existing model files keep their names")
+        precondition(VoiceLocalASRModelPreset.whisperBase.modelFilename == "ggml-base.bin")
+        precondition(VoiceHallucinationFilter.shouldDrop("请不吝点赞 订阅 转发 打赏支持明镜与点点栏目", voicedSeconds: 0.3))
+        precondition(VoiceHallucinationFilter.shouldDrop("字幕志愿者 杨栋梁", voicedSeconds: 0))
+        precondition(!VoiceHallucinationFilter.shouldDrop("请大家点赞订阅转发", voicedSeconds: 1.6), "a person really saying it keeps it")
+        precondition(!VoiceHallucinationFilter.shouldDrop("这个视频的点赞和转发数据不错", voicedSeconds: 0), "ordinary sentences are never credits")
+        precondition(VoiceHallucinationFilter.filtered("今天下午三点我们开会讨论一下新版本的发布计划\n请不吝点赞 订阅 转发 打赏支持明镜与点点栏目", voicedSeconds: 4.2) == "今天下午三点我们开会讨论一下新版本的发布计划", "a credit line cannot borrow real speech as evidence")
+        precondition(VoiceHallucinationFilter.filtered("请大家点赞订阅转发", voicedSeconds: 1.6) == "请大家点赞订阅转发")
+        precondition(VoiceWhisperStreamPolicy.simplified("今天下午三點我們開", language: "zh") == "今天下午三点我们开")
+        precondition(VoiceWhisperStreamPolicy.simplified("之後對於這個問題是什麼", language: "zh") == "之后对于这个问题是什么")
+        let latinAndPunctuation = "Hello World 123, GPT-4 v2.1 (test) 100%! ,.?;:，。！？、《》"
+        precondition(VoiceWhisperStreamPolicy.simplified(latinAndPunctuation, language: "zh") == latinAndPunctuation)
+        let validSimplified = "俱乐部 摔跤 狼藉 姊妹 乾隆 乾坤 著名 瞭望 大阪 苎麻 叱吒 钳子 酒麴 折叠 于是 头发 里面 皇后 云彩 一只 几个 准备"
+        precondition(VoiceWhisperStreamPolicy.simplified(validSimplified, language: "zh") == validSimplified)
+        precondition(VoiceWhisperStreamPolicy.simplified("三點", language: "en") == "三點", "only zh is converted")
+        precondition(VoiceHallucinationFilter.shouldDrop(VoiceWhisperStreamPolicy.simplified("請不吝點贊 訂閱 轉發 打賞支持明鏡與點點欄目", language: "zh"), voicedSeconds: 0.3))
+
+        let cadence = VoicePartialCadence.standard
+        precondition(cadence.interval(lastPass: 0.1, thermal: .nominal, lowPower: false, memoryPressure: false) == cadence.minInterval, "fast passes run at the target cadence")
+        precondition(abs(cadence.interval(lastPass: 0.7, thermal: .nominal, lowPower: false, memoryPressure: false) - 1.0) < 0.001, "slow passes back off so the model is not pinned")
+        precondition(cadence.interval(lastPass: 0.1, thermal: .serious, lowPower: false, memoryPressure: false) >= 1.0, "a hot Mac slows captions")
+        precondition(cadence.interval(lastPass: 0.1, thermal: .critical, lowPower: false, memoryPressure: false) >= 2.0)
+        precondition(cadence.interval(lastPass: 0.1, thermal: .nominal, lowPower: true, memoryPressure: false) >= 0.7, "Low Power Mode slows captions")
+        precondition(cadence.interval(lastPass: 0.1, thermal: .nominal, lowPower: false, memoryPressure: true) >= 1.0, "memory pressure slows captions")
+        var timing = VoiceSessionTimeline()
+        timing.begin(); timing.mark(.release, at: CFAbsoluteTimeGetCurrent() + 1); timing.mark(.release, at: CFAbsoluteTimeGetCurrent() + 9)
+        precondition(timing.summary.contains("release=") && !timing.summary.contains("release=9"), "a timing mark keeps its first value")
+
+        var stable = VoicePartialStabilizer()
+        precondition(stable.update("语音书", windowed: false) == VoicePartialDisplay(text: "语音书", tentativeCount: 3), "the first pass is tentative")
+        precondition(stable.update("语音书的", windowed: false) == VoicePartialDisplay(text: "语音书的", tentativeCount: 4), "active clause stays mutable before a clause boundary")
+        precondition(stable.update("语音输入的时候", windowed: false) == VoicePartialDisplay(text: "语音输入的时候", tentativeCount: 7), "earlier misrecognition in the active clause is revised in place")
+        precondition(stable.update("语音输入的时候，有一些", windowed: false) == VoicePartialDisplay(text: "语音输入的时候，有一些", tentativeCount: 11), "clause locks only after words following punctuation agree")
+        precondition(stable.update("语音输入的时候，有一些字。", windowed: false) == VoicePartialDisplay(text: "语音输入的时候，有一些字", tentativeCount: 4), "completed clause locks white while trailing full stop is hidden")
+        let oneBadPass = stable.update("完全不同的内容在这里", windowed: false)
+        precondition(oneBadPass.text == "语音输入的时候，有一些字", "one pass that cannot be aligned does not move the caption")
+        var sliding = VoicePartialStabilizer()
+        _ = sliding.update("甲乙丙丁戊己庚辛壬癸，子丑", windowed: false)
+        _ = sliding.update("甲乙丙丁戊己庚辛壬癸，子丑寅", windowed: false)
+        let slid = sliding.update("丁戊己庚辛壬癸，子丑寅卯", windowed: true)
+        precondition(slid.text == "甲乙丙丁戊己庚辛壬癸，子丑寅卯", "a sliding window aligns on overlap, not position")
+        var longNoPunct = VoicePartialStabilizer()
+        let longFirst = "今天下午我们一起开会讨论一下新版本的语音输入优化方案和发布节奏安排"
+        let longSecond = longFirst + "没问题"
+        _ = longNoPunct.update(longFirst, windowed: false)
+        let longResult = longNoPunct.update(longSecond, windowed: false)
+        precondition(longResult.text == longSecond && longResult.tentativeCount > 0 && longResult.tentativeCount < longSecond.count, "long unpunctuated speech locks earlier prefix while keeping trailing words mutable")
+        var punctuation = VoicePartialStabilizer()
+        _ = punctuation.update("我们开会。", windowed: false)
+        precondition(punctuation.update("我们开会，讨论", windowed: false).text == "我们开会，讨论", "changed punctuation is not a disagreement")
+        var latin = VoicePartialStabilizer()
+        _ = latin.update("open the", windowed: false)
+        precondition(latin.update("open therapy", windowed: false).tentativeCount == "open therapy".count, "half a Latin word is not locked")
 
         let defaultVoice = VoicePreferences()
-        assert(defaultVoice.cloudPreset == .groq)
-        assert(defaultVoice.effectiveCloudASRBaseURL == "https://api.groq.com/openai/v1")
-        assert(defaultVoice.effectiveCloudASRModel == "whisper-large-v3-turbo")
-        assert(defaultVoice.effectiveCloudLLMModel == "llama-3.3-70b-versatile")
-        assert(defaultVoice.effectiveCloudASRKeyAccount == defaultVoice.effectiveCloudLLMKeyAccount)
+        precondition(defaultVoice.cloudPreset == .groq)
+        precondition(defaultVoice.effectiveCloudASRBaseURL == "https://api.groq.com/openai/v1")
+        precondition(defaultVoice.effectiveCloudASRModel == "whisper-large-v3-turbo")
+        precondition(defaultVoice.effectiveCloudLLMModel == "llama-3.3-70b-versatile")
+        precondition(defaultVoice.effectiveCloudASRKeyAccount == defaultVoice.effectiveCloudLLMKeyAccount)
+        precondition(VoiceLocalASRModelPreset.whisperTurbo.descriptor.expectedSHA256?.count == 64)
+        precondition(VoiceLocalASRModelPreset.whisperBase.descriptor.expectedSHA256?.count == 64)
+        precondition(VoiceLocalLLMPreset.qwen15B.expectedSHA256?.count == 64)
+        precondition(VoiceAudioRecorder.maxRecordingSamples > 0 && VoiceAudioRecorder.maxRecordingSamples <= 16_000 * 300)
 
         let tempVoiceURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("juxu-voice-test-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: tempVoiceURL) }
         let voiceStore = VoicePreferencesStore(fileURL: tempVoiceURL, inMemoryOnly: false)
-        assert(!voiceStore.prefs.enabled)
+        precondition(!voiceStore.prefs.enabled)
         voiceStore.update {
             $0.enabled = true
             $0.providerMode = .local
@@ -292,50 +413,270 @@ struct SwiftBridgeTests {
             $0.customVocabulary = "句序, Juxu，RWKV-7\nTypeless"
         }
         let reloadedStore = VoicePreferencesStore(fileURL: tempVoiceURL, inMemoryOnly: false)
-        assert(reloadedStore.prefs.enabled == true)
-        assert(reloadedStore.prefs.providerMode == .local)
-        assert(reloadedStore.prefs.localASRPreset == .whisperTurbo)
-        assert(reloadedStore.prefs.localLLMPreset == .qwen15B)
-        assert(reloadedStore.prefs.parsedCustomVocabulary == ["句序", "Juxu", "RWKV-7", "Typeless"])
+        precondition(reloadedStore.prefs.enabled == true)
+        precondition(reloadedStore.prefs.providerMode == .local)
+        precondition(reloadedStore.prefs.localASRPreset == .whisperTurbo)
+        precondition(reloadedStore.prefs.localLLMPreset == .qwen15B)
+        precondition(reloadedStore.prefs.parsedCustomVocabulary == ["句序", "Juxu", "RWKV-7", "Typeless"])
 
         // Trigger lazy load and verify disabling voice unloads session, HUD, and local installer
         _ = VoiceSessionController.shared
         _ = VoiceLocalInstaller.shared
-        assert(VoiceSessionController.isLoaded)
-        assert(VoiceLocalInstaller.isLoaded)
+        _ = VoiceWhisperServerManager.shared
+        _ = VoiceQwenHelperManager.shared
+        precondition(VoiceSessionController.isLoaded)
+        precondition(VoiceLocalInstaller.isLoaded)
         reloadedStore.update { $0.enabled = false }
-        assert(!VoiceSessionController.isLoaded, "Disabling voice must unload VoiceSessionController")
-        assert(!VoiceHUDPanelController.isLoaded, "Disabling voice must unload VoiceHUDPanelController")
-        assert(!VoiceLocalInstaller.isLoaded, "Disabling voice must unload VoiceLocalInstaller")
+        precondition(!VoiceSessionController.isLoaded, "Disabling voice must unload VoiceSessionController")
+        precondition(!VoiceHUDPanelController.isLoaded, "Disabling voice must unload VoiceHUDPanelController")
+        precondition(!VoiceLocalInstaller.isLoaded, "Disabling voice must unload VoiceLocalInstaller")
+        precondition(!VoiceWhisperServerManager.isLoaded, "Disabling voice must unload the whisper-server manager")
+        precondition(!VoiceQwenHelperManager.isLoaded, "Disabling voice must unload the Qwen helper manager")
+
+        // Global hotkey sync must stay unloaded when triggerKey is .optionSpace so local Option+Space still works.
+        var optSpaceGlobal = VoicePreferences()
+        optSpaceGlobal.enabled = true
+        optSpaceGlobal.globalVoiceHotkey = true
+        optSpaceGlobal.triggerKey = .optionSpace
+        VoiceGlobalHotkeyController.sync(with: optSpaceGlobal)
+        precondition(!VoiceGlobalHotkeyController.isLoaded && !VoiceGlobalHotkeyController.isListening, "Option+Space must not activate the global tap")
+
+        // Global voice key: off by default, and existing settings files are unaffected.
+        let legacyVoice = try! JSONEncoder().encode(VoicePreferences())
+        precondition(!String(decoding: legacyVoice, as: UTF8.self).contains("globalVoiceHotkey"), "off leaves voice.json unchanged")
+        precondition(try! JSONDecoder().decode(VoicePreferences.self, from: legacyVoice).isGlobalHotkeyEnabled == false)
+        precondition(!VoiceGlobalHotkeyController.isLoaded && !VoiceGlobalHotkeyController.isListening, "nothing listens while off")
+        var globalOn = VoicePreferences(); globalOn.globalVoiceHotkey = true
+        precondition(try! JSONDecoder().decode(VoicePreferences.self, from: JSONEncoder().encode(globalOn)).isGlobalHotkeyEnabled)
+
+        let route = { (down: Bool, key: UInt16, flags: NSEvent.ModifierFlags, secure: Bool, recording: Bool) in
+            VoiceGlobalKeyRouter.decide(isKeyDown: down, keyCode: key, flags: flags, trigger: .rightCommand, isSecureInput: secure, isRecording: recording)
+        }
+        precondition(route(false, 0x36, .command, false, false) == .forward, "the trigger reaches the hold logic")
+        precondition(route(true, 8, .command, false, false) == .forward, "a chord reaches the pending hold and cancels it")
+        precondition(route(true, 8, .command, false, true) == .cancelChord, "a shortcut during recording cancels dictation")
+        precondition(route(true, 0x35, [], false, true) == .forward, "Esc cancels")
+        precondition(route(false, 0x36, .command, true, false) == .ignore, "secure input never starts a recording")
+        precondition(route(true, 8, [], true, false) == .ignore, "keys in secure input are not read")
+        precondition(route(false, 0x36, [], true, true) == .forward, "a recording in progress can still end")
+        precondition(VoiceGlobalKeyRouter.decide(isKeyDown: true, keyCode: 0x31, flags: .option, trigger: .optionSpace, isSecureInput: false, isRecording: false) == .ignore, "Option+Space is not global")
+
+        let commitRoute = { (secure: Bool, same: Bool, imk: Bool, ax: Bool, field: Bool) in
+            VoiceGlobalCommitPolicy.route(isSecure: secure, focusUnchanged: same, hasInputMethodClient: imk, hasAccessibility: ax, hasTextField: field)
+        }
+        precondition(commitRoute(false, true, true, false, false) == .inputMethod)
+        precondition(commitRoute(false, true, false, true, true) == .accessibility)
+        for blocked in [commitRoute(true, true, true, true, true), commitRoute(false, false, true, true, true), commitRoute(false, true, false, false, true), commitRoute(false, true, false, true, false)] {
+            if case .clipboardOnly = blocked { continue }
+            preconditionFailure("password fields, changed focus and missing targets must keep the text on the clipboard")
+        }
+        precondition(
+            VoiceGlobalCommitPolicy.route(isSecure: false, focusUnchanged: true, hasInputMethodClient: false, hasAccessibility: true, hasTextField: false, allowsPasteFallback: true) == .pasteFallback,
+            "custom-rendered apps without native AXTextField fall back to paste"
+        )
+        precondition(VoiceGlobalCommitPolicy.allowsPasteFallback(bundleIdentifier: "com.tencent.xinWeChat", elementRole: nil), "WeChat 4.x allows paste fallback")
+        precondition(!VoiceGlobalCommitPolicy.allowsPasteFallback(bundleIdentifier: "com.apple.finder", elementRole: "AXGroup"), "Finder must not blindly paste")
+
+        let testBoard = NSPasteboard(name: NSPasteboard.Name("juxu.tests.\(UUID().uuidString)"))
+        testBoard.clearContents()
+        let richItem = NSPasteboardItem()
+        richItem.setString("原来的内容", forType: .string)
+        richItem.setData(Data([1, 2, 3]), forType: NSPasteboard.PasteboardType("com.juxu.test"))
+        testBoard.writeObjects([richItem])
+        let boardSnapshot = VoiceClipboardSnapshot(testBoard)
+        testBoard.clearContents(); testBoard.setString("听写文字", forType: .string)
+        boardSnapshot.restore(to: testBoard)
+        precondition(testBoard.string(forType: .string) == "原来的内容", "the clipboard text is restored")
+        precondition(testBoard.data(forType: NSPasteboard.PasteboardType("com.juxu.test")) == Data([1, 2, 3]), "every clipboard type is restored")
+        testBoard.releaseGlobally()
+
+        // The HUD meter separates loudness on a dB scale across both laptop and close-up mics.
+        let rmsFromDB = { (db: Float) -> Float in pow(10, db / 20) }
+        var laptopMeter = VoiceLevelMeter()
+        for _ in 0..<10 { _ = laptopMeter.process(rms: rmsFromDB(-41.5), seconds: 0.1) }
+        let laptopSteps: [Float] = ([-41.5, -36, -32, -29, -25] as [Float]).map { db in
+            var out: Float = 0
+            for _ in 0..<4 { out = laptopMeter.process(rms: rmsFromDB(db), seconds: 0.1) }
+            return out
+        }
+        precondition(laptopSteps[0] == 0, "laptop room noise stays at rest")
+        precondition(zip(laptopSteps, laptopSteps.dropFirst()).allSatisfy { $0 < $1 }, "louder speech always draws higher on laptop mic")
+        precondition(laptopSteps[2] >= 0.35 && laptopSteps[4] >= 0.85, "laptop speech spans a clear visual range")
+
+        var closeMicMeter = VoiceLevelMeter()
+        for _ in 0..<10 { _ = closeMicMeter.process(rms: rmsFromDB(-56), seconds: 0.1) }
+        precondition(closeMicMeter.process(rms: rmsFromDB(-56), seconds: 0.1) == 0, "quiet room stays at rest")
+        for _ in 0..<6 { _ = closeMicMeter.process(rms: rmsFromDB(-12), seconds: 0.1) }
+        let closeLoud = closeMicMeter.process(rms: rmsFromDB(-12), seconds: 0.1)
+        let closeNormal = closeMicMeter.process(rms: rmsFromDB(-26), seconds: 0.1)
+        let closeWhisper = closeMicMeter.process(rms: rmsFromDB(-42), seconds: 0.1)
+        precondition(closeWhisper > 0.05 && closeWhisper < closeNormal && closeNormal < closeLoud, "adaptive ceiling separates whisper, normal and loud speech on hot mics")
+
+        // The 11-band speech spectrum analyzer separates frequency bands independently across bars
+        // while keeping steady room noise at zero.
+        let sampleRate = 16_000.0
+        let frameLen = 512
+        let makeTone = { (hz: Double, amp: Float) -> [Float] in
+            (0..<frameLen).map { i in amp * sin(Float(2 * Double.pi * hz * Double(i) / sampleRate)) }
+        }
+        let quietFloor = (0..<frameLen).map { i in
+            Float(0.008) * sin(Float(Double(i) * 0.13)) // ~-45 dBFS steady rumble
+        }
+        let spectrum = VoiceSpectrumAnalyzer()
+        for _ in 0..<12 { _ = spectrum.processFrame(quietFloor, sampleRate: sampleRate) }
+        let quietBars = spectrum.processFrame(quietFloor, sampleRate: sampleRate)
+        precondition(quietBars.allSatisfy { $0 < 0.05 }, "steady room noise stays at rest across all 11 bars, got \(quietBars)")
+
+        let lowVowel = makeTone(520, 0.05) // Band 3 -> center bar 5
+        let lowBars = spectrum.processFrame(lowVowel, sampleRate: sampleRate)
+        precondition(lowBars[5] > 0.5 && lowBars[5] > lowBars[0] * 3 && lowBars[5] > lowBars[10] * 3,
+                     "520 Hz vowel peaks on center bar 5, got \(lowBars)")
+
+        let highSibilant = makeTone(3450, 0.04) // Band 9 -> outer bar 0
+        let highBars = spectrum.processFrame(highSibilant, sampleRate: sampleRate)
+        precondition(highBars[0] > 0.4 && highBars[0] > highBars[5] * 2,
+                     "3450 Hz fricative peaks on high-frequency bar 0 rather than center bar 5, got \(highBars)")
+
+        // Hold logic, fed the same synthetic events a listener would deliver. The microphone is never started.
+        VoicePreferencesStore.shared.update({ $0.enabled = true; $0.triggerKey = .rightCommand }, persist: false)
+        let holdSession = VoiceSessionController.shared
+        var holdStarts = 0
+        var holdFinishes = 0
+        holdSession.startRecordingOverride = { holdStarts += 1 }
+        holdSession.finishRecordingOverride = { holdFinishes += 1 }
+        holdSession.doubleTapWindow = 0
+        let command = { (down: Bool) -> NSEvent in
+            let e = CGEvent(keyboardEventSource: nil, virtualKey: 0x36, keyDown: down)!
+            e.type = .flagsChanged
+            e.flags = down ? .maskCommand : []
+            return NSEvent(cgEvent: e)!
+        }
+        let keyC: NSEvent = {
+            let e = CGEvent(keyboardEventSource: nil, virtualKey: 8, keyDown: true)!
+            e.flags = .maskCommand
+            return NSEvent(cgEvent: e)!
+        }()
+        let feed = { (event: NSEvent) in
+            _ = holdSession.handleEvent(event, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
+        }
+        // Capture starts on key-down with no delay.
+        feed(command(true))
+        precondition(holdStarts == 1 && holdSession.isCapturing, "pressing the voice key starts at once")
+        feed(command(true))
+        precondition(holdStarts == 1, "a repeated key-down does not start twice")
+        feed(command(false))
+        precondition(holdFinishes == 1 && !holdSession.isCapturing, "release finishes the dictation")
+        // A shortcut is dropped immediately and still reaches the app.
+        feed(command(true))
+        let chordConsumed = holdSession.handleEvent(keyC, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
+        precondition(!chordConsumed, "right-Command-C still reaches the app")
+        precondition(!holdSession.isCapturing, "a shortcut cancels at once")
+        feed(command(false))
+        precondition(holdStarts == 2 && holdFinishes == 1, "a cancelled shortcut never finishes into a transcription")
+        // Adding another modifier is a shortcut too.
+        let leftShift: NSEvent = {
+            let e = CGEvent(keyboardEventSource: nil, virtualKey: 0x38, keyDown: true)!
+            e.type = .flagsChanged
+            e.flags = [.maskCommand, .maskShift]
+            return NSEvent(cgEvent: e)!
+        }()
+        feed(command(true)); feed(leftShift)
+        precondition(!holdSession.isCapturing, "another modifier cancels at once")
+        feed(command(false))
+        precondition(holdStarts == 3 && holdFinishes == 1, "the release after a cancel does nothing")
+        // Without the global key, leaving the app cancels; with it, the dictation continues.
+        feed(command(true)); holdSession.handleDeactivate()
+        precondition(!holdSession.isCapturing, "without the global key, deactivation cancels as before"); feed(command(false))
+        VoiceGlobalHotkeyController.testingForceListening = true
+        precondition(VoiceGlobalHotkeyController.isListening)
+        feed(command(true)); holdSession.handleDeactivate()
+        precondition(holdSession.isCapturing, "with the global key, switching app does not cancel"); feed(command(false))
+        precondition(holdStarts == 5 && holdFinishes == 2, "one press is exactly one dictation")
+        VoiceGlobalHotkeyController.testingForceListening = false
+
+        // Double-tap hands-free: a tap waits briefly, a second tap latches, the next press ends.
+        var cues: [VoiceCueKind] = []
+        holdSession.cueOverride = { cues.append($0) }
+        holdSession.doubleTapWindow = 0.3
+        let escapeKey: NSEvent = NSEvent(cgEvent: CGEvent(keyboardEventSource: nil, virtualKey: 0x35, keyDown: true)!)!
+        var finishesBefore = holdFinishes
+        feed(command(true)); feed(command(false))
+        precondition(holdSession.isCapturing && holdFinishes == finishesBefore, "a tap waits for a possible second tap")
+        holdSession.fireTapTimeoutForTesting()
+        precondition(!holdSession.isCapturing && holdFinishes == finishesBefore + 1, "a lone tap ends after the window")
+        precondition(cues.isEmpty, "a lone tap is silent")
+        finishesBefore = holdFinishes
+        feed(command(true)); feed(command(false)); feed(command(true)); feed(command(false))
+        precondition(holdSession.isHandsFree && holdSession.isCapturing, "a double tap latches")
+        precondition(cues == [.start], "latching plays the start cue once")
+        holdSession.cancelForChord()
+        precondition(holdSession.isCapturing, "typing does not end a hands-free dictation")
+        feed(command(true))
+        precondition(!holdSession.isCapturing && !holdSession.isHandsFree && holdFinishes == finishesBefore + 1, "the next press ends it")
+        precondition(cues == [.start, .end], "ending plays the end cue")
+        feed(command(false))
+        precondition(holdFinishes == finishesBefore + 1, "the release after ending does nothing")
+        cues = []
+        feed(command(true)); feed(command(false)); feed(command(true)); feed(command(false))
+        precondition(holdSession.isHandsFree)
+        _ = holdSession.handleEvent(escapeKey, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
+        precondition(!holdSession.isCapturing && !holdSession.isHandsFree && holdFinishes == finishesBefore + 1, "Esc cancels without transcribing")
+        precondition(holdSession.consumeRecentEscapeCancel(), "Esc cancel is recorded once so IMK can swallow the same Esc keyDown")
+        precondition(!holdSession.consumeRecentEscapeCancel(), "Subsequent Esc is not swallowed")
+        precondition(cues == [.start], "cancelling plays no end cue")
+        cues = []
+        feed(command(true)); feed(command(false)); feed(command(true))
+        _ = holdSession.handleEvent(keyC, caretRectProvider: { .zero }, windowLevel: nil, contextProvider: { VoiceContext() }, onCommit: { _, _ in })
+        precondition(!holdSession.isCapturing && !holdSession.isHandsFree, "a shortcut on the second press cancels")
+        feed(command(false))
+        precondition(holdFinishes == finishesBefore + 1 && cues.isEmpty, "a cancelled double tap stays silent")
+        VoicePreferencesStore.shared.update({ $0.voiceCues = false }, persist: false)
+        feed(command(true)); feed(command(false)); feed(command(true)); feed(command(false)); feed(command(true)); feed(command(false))
+        precondition(cues.isEmpty, "the setting turns cues off")
+        VoicePreferencesStore.shared.update({ $0.voiceCues = nil }, persist: false)
+        holdSession.cueOverride = nil
+        holdSession.doubleTapWindow = 0
+
+        // Cues: the blanked range covers only the audible time, and tones stay short and in range.
+        precondition(VoiceCueMute.sampleRange(bufferStart: 10, count: 1600, sampleRate: 16_000, muteStart: 10.05, muteEnd: 10.06) == 800..<960, "only the cue is blanked")
+        precondition(VoiceCueMute.sampleRange(bufferStart: 10, count: 1600, sampleRate: 16_000, muteStart: 9, muteEnd: 9.5).isEmpty, "audio after the cue is kept")
+        precondition(VoiceCueMute.sampleRange(bufferStart: 10, count: 1600, sampleRate: 16_000, muteStart: 9.9, muteEnd: 11) == 0..<1600, "a buffer inside the cue is blanked whole")
+        let tone = VoiceCuePlayer.toneSamples(fromHz: 660, toHz: 880)
+        precondition(tone.count == 3087 && abs(Int(tone.last!)) < 200, "the tone is short and fades out")
+
+        holdSession.startRecordingOverride = nil
+        holdSession.finishRecordingOverride = nil
+        VoicePreferencesStore.shared.update({ $0.enabled = false }, persist: false)
+        precondition(!VoiceSessionController.isLoaded && !VoiceGlobalHotkeyController.isLoaded, "turning voice off releases the listener")
 
         // Verify legacy "rule_based" config migrates cleanly to local LLM (.qwen15B)
         let defaultVoiceLLM = VoicePreferences()
-        assert(defaultVoiceLLM.localLLMPreset == .qwen15B)
+        precondition(defaultVoiceLLM.localLLMPreset == .qwen15B)
         let migrated = try! JSONDecoder().decode(VoiceLocalLLMPreset.self, from: Data("\"rule_based\"".utf8))
-        assert(migrated == .qwen15B, "Legacy rule_based must migrate to .qwen15B")
+        precondition(migrated == .qwen15B, "Legacy rule_based must migrate to .qwen15B")
 
         // Verify app-aware tone & Speak-to-Edit prompt builder
-        assert(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.tencent.xinWeChat").contains("即时聊天"))
-        assert(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.apple.dt.Xcode").contains("技术术语"))
+        precondition(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.tencent.xinWeChat").contains("即时聊天"))
+        precondition(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.apple.dt.Xcode").contains("技术术语"))
         let normalMsgs = VoicePromptBuilder.polishMessages(
             rawTranscript: "测试一下",
             toneMode: .autoByApp,
             context: VoiceContext(bundleIdentifier: "com.apple.mail", personalVocabulary: ["句序", "句序", "Juxu"])
         )
-        assert(normalMsgs.count == 2)
-        assert(normalMsgs[0]["content"]?.contains("句序、Juxu") == true)
+        precondition(normalMsgs.count == 2)
+        precondition(normalMsgs[0]["content"]?.contains("句序、Juxu") == true)
         let editMsgs = VoicePromptBuilder.polishMessages(
             rawTranscript: "翻成英文",
             toneMode: .professional,
             context: VoiceContext(selectedText: "你好世界")
         )
-        assert(editMsgs[1]["content"]?.contains("你好世界") == true && editMsgs[1]["content"]?.contains("翻成英文") == true)
+        precondition(editMsgs[1]["content"]?.contains("你好世界") == true && editMsgs[1]["content"]?.contains("翻成英文") == true)
 
         // Verify WAV header & multipart form builder
         let wav = VoiceWAVEncoder.encodePCM16Mono(samples: [0, 1000, -1000, 32767], sampleRate: 16_000)
-        assert(wav.count == 44 + 8)
-        assert(String(data: wav.prefix(4), encoding: .ascii) == "RIFF")
-        assert(String(data: wav.subdata(in: 8..<12), encoding: .ascii) == "WAVE")
+        precondition(wav.count == 44 + 8)
+        precondition(String(data: wav.prefix(4), encoding: .ascii) == "RIFF")
+        precondition(String(data: wav.subdata(in: 8..<12), encoding: .ascii) == "WAVE")
         let multipart = VoiceMultipartBuilder.buildAudioTranscriptionBody(
             boundary: "TESTBOUNDARY",
             wavData: wav,
@@ -343,10 +684,10 @@ struct SwiftBridgeTests {
             language: "zh",
             prompt: "句序"
         )
-        let multipartPrefix = String(decoding: multipart.prefix(320), as: UTF8.self)
-        assert(multipartPrefix.contains("--TESTBOUNDARY"))
-        assert(multipartPrefix.contains("whisper-large-v3-turbo"))
-        assert(multipartPrefix.contains("speech.wav"))
+        let multipartPrefix = String(decoding: multipart.prefix(512), as: UTF8.self)
+        precondition(multipartPrefix.contains("--TESTBOUNDARY"))
+        precondition(multipartPrefix.contains("whisper-large-v3-turbo"))
+        precondition(multipartPrefix.contains("speech.wav"))
 
         // 7. Verify Cangjie 3 / 5 / 6 schema switching, categories, TOML round-trip, and 5-code input
         for (sid, expectedName, expectedTag) in [(UInt32(33), "仓颉三代", "cangjie3"), (UInt32(35), "仓颉五代", "cangjie5"), (UInt32(36), "仓颉六代", "cangjie6")] {
