@@ -1,6 +1,9 @@
 use crate::mmap_buf::ByteSource;
+use crate::typo::letter_to_t9_digit;
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::sync::OnceLock;
 
 pub const ENDICT_MAGIC: &[u8; 8] = b"ENDICT01";
 const HEADER_LEN: usize = 32;
@@ -9,6 +12,37 @@ const ENTRY_LEN: usize = 16;
 pub const EN_FLAG_TECH: u16 = 1 << 0;
 pub const EN_FLAG_HIGH_FREQ: u16 = 1 << 1;
 pub const EN_FLAG_ABBR: u16 = 1 << 2;
+
+/// Pack a 2..=12 T9 digit sequence (`'2'..='9'`) into a compact `u64` key (`0` allocations).
+#[inline]
+pub fn pack_t9_digits_slice(digits: &[u8]) -> Option<u64> {
+    if !(2..=12).contains(&digits.len()) {
+        return None;
+    }
+    let mut acc: u64 = 1;
+    for &b in digits {
+        if !(b'2'..=b'9').contains(&b) {
+            return None;
+        }
+        acc = (acc << 4) | u64::from(b - b'0');
+    }
+    Some(acc)
+}
+
+/// Pack an ASCII alphabetic word (`2..=12` letters) into its corresponding T9 `u64` key.
+#[inline]
+pub fn pack_word_to_t9_key(word: &str) -> Option<u64> {
+    let bytes = word.as_bytes();
+    if !(2..=12).contains(&bytes.len()) {
+        return None;
+    }
+    let mut acc: u64 = 1;
+    for &b in bytes {
+        let d = letter_to_t9_digit(b.to_ascii_lowercase())?;
+        acc = (acc << 4) | u64::from(d - b'0');
+    }
+    Some(acc)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct EnEntry<'a> {
@@ -23,6 +57,7 @@ pub struct EnDictView {
     entry_count: usize,
     entries_off: usize,
     str_off: usize,
+    t9_index: OnceLock<HashMap<u64, Vec<u32>>>,
 }
 
 #[inline]
@@ -90,6 +125,7 @@ impl EnDictView {
             entry_count,
             entries_off,
             str_off,
+            t9_index: OnceLock::new(),
         })
     }
 
@@ -280,6 +316,52 @@ impl EnDictView {
         pool.truncate(limit);
         pool
     }
+
+    /// Look up top-weighted English entries matching a T9 digit sequence (`'2'..='9'`, `len 2..=12`).
+    /// Index is built lazily on first T9 query using purely corpus frequency (`0` hardcoded word list).
+    pub fn lookup_t9(&self, digits: &[u8], limit: usize) -> Vec<EnEntry<'_>> {
+        if limit == 0 || self.entry_count == 0 {
+            return Vec::new();
+        }
+        let Some(t9_key) = pack_t9_digits_slice(digits) else {
+            return Vec::new();
+        };
+        let index = self.t9_index.get_or_init(|| {
+            let mut map: HashMap<u64, Vec<u32>> = HashMap::with_capacity(4_096);
+            for i in 0..self.entry_count {
+                let e = self.entry_at(i);
+                let min_w = if e.key.len() == 2 {
+                    50_000
+                } else if e.key.len() == 3 {
+                    42_000
+                } else {
+                    32_000
+                };
+                if e.weight >= min_w {
+                    if let Some(k) = pack_word_to_t9_key(e.key) {
+                        map.entry(k).or_default().push(i as u32);
+                    }
+                }
+            }
+            for bucket in map.values_mut() {
+                bucket.sort_unstable_by(|&a, &b| {
+                    self.entry_at(b as usize)
+                        .weight
+                        .cmp(&self.entry_at(a as usize).weight)
+                });
+                bucket.truncate(4);
+            }
+            map
+        });
+        let Some(indices) = index.get(&t9_key) else {
+            return Vec::new();
+        };
+        indices
+            .iter()
+            .take(limit)
+            .map(|&i| self.entry_at(i as usize))
+            .collect()
+    }
 }
 
 /// Serialize `(lower_key, canonical_display, weight, flags)` into `ENDICT01` binary bytes.
@@ -338,6 +420,36 @@ pub fn format_english_display(raw_slice: &str, canonical: &str) -> String {
     } else {
         canonical.to_owned()
     }
+}
+
+/// Resolve English display casing without any hardcoded word list (pure information-asymmetry rule):
+/// 1. Any explicit uppercase in `raw_slice` comes directly from the user's current keystrokes -> keep `raw_slice`.
+/// 2. If personal `user_disp` contains uppercase (`Arbitero`, `Flarepath`, `Juxu`), use `user_disp`.
+/// 3. If dictionary `dict_disp` contains uppercase (`iPhone`, `macOS`, `iOS`, `GitHub`, `RWKV`), use `dict_disp`
+///    even when an older unmarked all-lowercase `user_disp` (`iphone`, `macos`) exists.
+/// 4. Otherwise fall back to `user_disp`, `dict_disp`, or `raw_slice`.
+pub fn resolve_english_display(
+    raw_slice: &str,
+    user_disp: Option<&str>,
+    dict_disp: Option<&str>,
+) -> String {
+    if raw_slice.bytes().any(|b| b.is_ascii_uppercase()) {
+        return raw_slice.to_owned();
+    }
+    if let Some(ud) = user_disp {
+        if ud.bytes().any(|b| b.is_ascii_uppercase()) {
+            return ud.to_owned();
+        }
+    }
+    if let Some(dd) = dict_disp {
+        if dd.bytes().any(|b| b.is_ascii_uppercase()) {
+            return dd.to_owned();
+        }
+    }
+    user_disp
+        .or(dict_disp)
+        .unwrap_or(raw_slice)
+        .to_owned()
 }
 
 /// Curated fallback list of ultra-common English & developer words (used when `english.endict` is not loaded).

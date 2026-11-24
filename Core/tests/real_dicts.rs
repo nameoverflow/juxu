@@ -1551,3 +1551,230 @@ fn real_dicts_balanced_autophrase_backspace_rollback_and_wubi98_fixes() {
         "high-cohesion function-word phrase '来个' must compose cleanly without function-word blocklist"
     );
 }
+
+#[test]
+fn real_dicts_zero_hardcode_mixed_cn_en_and_unified_pinyin() {
+    use juxu_core::english::EnDictView;
+    use juxu_core::pinyin_dict::PinyinDictView;
+
+    let base = dicts_dir();
+    let pdict = PinyinDictView::from_file(base.join("pinyin.pydict")).expect("open pinyin.pydict");
+    let wb98 = DictView::open_mmap(base.join("wubi98.wbdict")).expect("open wubi98.wbdict");
+    let endict = EnDictView::open_mmap(base.join("english.endict")).expect("open english.endict");
+    let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
+
+    let mut cfg = JuxuConfig::default();
+    cfg.schema = InputSchema::Pinyin;
+    let mut engine = JuxuEngine::new(cfg.clone());
+    engine.load_pinyin_dict(pdict);
+    engine.load_dict(InputSchema::Wubi98, wb98);
+    engine.load_english_dict(endict);
+    engine.set_aux(aux);
+
+    // 1. Pinyin phonological & probabilistic CN-EN boundary:
+    //    - `tadaxuexuedesjsj` and `desjsj` must NEVER be hijacked into raw OOV English (`tadaxuexuedesjsj` / `desjsj`),
+    //      and `worktree` / `sglang` (true phonologically impossible OOV words) MUST decode as raw English!
+    for (ctx, keys) in [("", "tadaxuexuedesjsj"), ("他大学学", "desjsj")] {
+        engine.clear_composition();
+        engine.clear_context();
+        if !ctx.is_empty() {
+            engine.set_recent_context(ctx);
+        }
+        for (i, ch) in keys.chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 900 + i as u64 * 25);
+        }
+        let top3: Vec<String> = engine
+            .all_candidates()
+            .iter()
+            .take(3)
+            .map(|c| c.text.clone())
+            .collect();
+        assert!(
+            !top3[0].bytes().any(|b| b.is_ascii_alphabetic()),
+            "ctx={ctx:?} keys={keys:?} must NEVER hijack #1 into English, got top3={:?}",
+            top3
+        );
+    }
+
+    //    - `des`, `wobud`, `tas`, `dans` must rank Chinese #1, while `合到`+`main` and brand-new OOV `sglang`
+    //      rank English #1, and `句序日志`+`reviewyixia` segments `review` + Chinese (`review一下` in Top-2)!
+    for (ctx, keys, expected) in [
+        ("他大学学", "des", "的是"),
+        ("", "wobud", "我不懂"),
+        ("", "tas", "他是"),
+        ("", "dans", "但是"),
+        ("把这个分支合到", "main", "main"),
+        ("", "sglang", "sglang"),
+        ("", "woyongworktreexie", "我用worktree写"),
+    ] {
+        engine.clear_composition();
+        engine.clear_context();
+        if !ctx.is_empty() {
+            engine.set_recent_context(ctx);
+        }
+        for (i, ch) in keys.chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 1_000 + i as u64 * 95);
+        }
+        let top = engine.all_candidates().first().cloned().expect("expected candidate");
+        assert_eq!(
+            top.text, expected,
+            "ctx={ctx:?} keys={keys:?} expected #1 {expected:?}, got {:?} (top5={:?})",
+            top.text,
+            engine.all_candidates().iter().take(5).map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    engine.clear_composition();
+    engine.set_recent_context("根据我的句序日志");
+    for (i, ch) in "reviewyixia".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 1_500 + i as u64 * 95);
+    }
+    let rev_top2: Vec<String> = engine
+        .all_candidates()
+        .iter()
+        .take(2)
+        .map(|c| c.text.clone())
+        .collect();
+    assert!(
+        rev_top2[0].starts_with("review") && rev_top2.iter().any(|t| t == "review一下"),
+        "expected 'reviewyixia' to segment 'review' + Chinese with 'review一下' in Top-2, got {:?}",
+        rev_top2
+    );
+
+    // 2. Canonical casing preservation (zero hardcoded list):
+    //    Even if unmarked lowercase `iphone`/`macos` were previously recorded in `ENWORD`,
+    //    dictionary casing (`iPhone`, `macOS`) and user explicit casing (`Arbitero`) win!
+    engine.user.record_english_word("iphone");
+    engine.user.record_english_word("macos");
+    engine.user.record_english_word("Arbitero");
+
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "xianzuomacos".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 2_000 + i as u64 * 25);
+    }
+    assert_eq!(engine.all_candidates()[0].text, "先做macOS");
+
+    // 3. Page-1 first-syllable single-char interleaving (`duanyan` after `耗时` keeps `断` on Page 1-2, not #27!)
+    engine.clear_composition();
+    engine.set_recent_context("耗时");
+    for (i, ch) in "duanyan".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 2_500 + i as u64 * 25);
+    }
+    let idx_duan = engine
+        .all_candidates()
+        .iter()
+        .position(|c| c.text == "断")
+        .expect("expected single-char '断'");
+    assert!(
+        idx_duan < 8,
+        "expected '断' surfaced near front for 'duanyan' (was #27), got #{}",
+        idx_duan + 1
+    );
+
+    // 4. Unified personal Chinese lexicon across Wubi -> Full Pinyin, Abbr (`jx`), Xiaohe Shuangpin, and T9!
+    let _ = engine.add_user_phrase("句序");
+    for (schema, is_t9, keys) in [
+        (InputSchema::Pinyin, false, "juxu"),
+        (InputSchema::Pinyin, false, "jx"),
+        (InputSchema::XiaoheShuangpin, false, "juxu"),
+        (InputSchema::Pinyin, true, "5898"),
+    ] {
+        let mut scfg = cfg.clone();
+        scfg.schema = schema;
+        scfg.pinyin_t9_layout = is_t9;
+        engine.set_config(scfg);
+        engine.clear_composition();
+        engine.clear_context();
+        for (i, ch) in keys.chars().enumerate() {
+            let out = if is_t9 {
+                let (tx, ty) = juxu_core::typo::KeyLayout::default().t9_center_of(ch as u8);
+                engine.push_touch_t9(ch as u8, tx, ty, true, 3_000 + i as u64 * 25)
+            } else {
+                engine.handle_key_event(0, Some(ch), false, 3_000 + i as u64 * 25)
+            };
+            let _ = out;
+        }
+        let top3: Vec<String> = engine
+            .all_candidates()
+            .iter()
+            .take(3)
+            .map(|c| c.text.clone())
+            .collect();
+        assert!(
+            top3.iter().any(|t| t == "句序"),
+            "schema={:?} t9={} keys={keys:?} expected '句序' in top-3, got {:?}",
+            schema,
+            is_t9,
+            top3
+        );
+    }
+
+    // 5. 98 Wubi `spaceless` cold-start Wubi `#1` guard + `#2/#3` English surfacing + 1-shot cross-schema learning:
+    let mut wcfg = cfg.clone();
+    wcfg.schema = InputSchema::Wubi98;
+    wcfg.spaceless = true;
+    engine.set_config(wcfg);
+    engine.clear_composition();
+    engine.set_recent_context("在感觉怎么样装到");
+    for (i, ch) in "iphonehrhrh".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 4_000 + i as u64 * 25);
+    }
+    assert_eq!(engine.all_candidates()[0].text, "iPhone上看看");
+
+    // Empty 3-code `bug` in 98 Wubi `spaceless` outputs `"bug"` at #1 automatically;
+    // colliding code `api` (`荥` in 98 Wubi) keeps deterministic Wubi Chinese at `#1` on cold start
+    // while surfacing canonical `"API"` in `#2/#3`, and selecting it once records it in `ENWORD`!
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "bug".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 4_800 + i as u64 * 25);
+    }
+    assert_eq!(engine.all_candidates()[0].text, "bug");
+
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "api".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 5_000 + i as u64 * 25);
+    }
+    let api_cands: Vec<String> = engine
+        .all_candidates()
+        .iter()
+        .take(4)
+        .map(|c| c.text.clone())
+        .collect();
+    assert!(
+        !api_cands[0].is_ascii(),
+        "cold-start colliding 'api' in Wubi98 spaceless must keep Chinese at #1, got {:?}",
+        api_cands
+    );
+    let api_idx = api_cands
+        .iter()
+        .position(|t| t.eq_ignore_ascii_case("api"))
+        .expect("expected 'API' surfaced in #2/#3 of Wubi98 spaceless candidates");
+    let out_api = engine.select_abs_candidate(api_idx, 5_200).unwrap();
+    assert!(out_api.commit_text.eq_ignore_ascii_case("api"));
+    assert!(
+        engine.user.lookup_english_exact("api").is_some(),
+        "selecting #2/#3 English candidate in Wubi spaceless must 1-shot learn into ENWORD"
+    );
+
+    // Brand-new coined 3-letter term `Agy` learned once works in T9 (`249` -> `Agy`) immediately!
+    engine.user.record_english_word("Agy");
+    let mut t9cfg = cfg.clone();
+    t9cfg.schema = InputSchema::Pinyin;
+    t9cfg.pinyin_t9_layout = true;
+    engine.set_config(t9cfg);
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "249".chars().enumerate() {
+        let (tx, ty) = juxu_core::typo::KeyLayout::default().t9_center_of(ch as u8);
+        let _ = engine.push_touch_t9(ch as u8, tx, ty, true, 6_000 + i as u64 * 25);
+    }
+    let t9_cands: Vec<String> = engine.all_candidates().iter().take(6).map(|c| c.text.clone()).collect();
+    assert!(
+        t9_cands.iter().any(|t| t == "Agy"),
+        "1-shot learned new word 'Agy' must immediately appear in T9 ('249'), got {:?}",
+        t9_cands
+    );
+}

@@ -1521,6 +1521,7 @@ public final class KeyboardViewController: UIInputViewController {
             && bridge.prefs.zOmnipotent
             && st.preedit.hasPrefix("z")
         layoutEngine.isComposing = !st.preedit.isEmpty
+        keyCanvas.isComposing = !st.preedit.isEmpty
         layoutEngine.validNextMask = st.validNextMask
         layoutEngine.nextKeyPriors = st.nextKeyPriors
         layoutEngine.touchOffsets = st.touchOffsets

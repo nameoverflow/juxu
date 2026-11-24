@@ -83,8 +83,13 @@ public enum IOSSwipeUp {
     }
 
     /// Upward travel needed to arm the gesture; light thumb roll during normal typing stays below it.
-    public static func armDistance(keyHeight: CGFloat) -> CGFloat {
-        max(26.0, keyHeight * 0.60)
+    /// During active composition (`isComposing == true`), require a longer, steeper deliberate drag
+    /// so rapid ballistic thumb lift-rolls toward upper rows never break an ongoing Pinyin/Wubi stream.
+    public static func armDistance(keyHeight: CGFloat, isComposing: Bool = false) -> CGFloat {
+        if isComposing {
+            return max(35.0, keyHeight * 0.80)
+        }
+        return max(26.0, keyHeight * 0.60)
     }
 
     /// Mostly-vertical upward drag past the arm distance, with hysteresis so sliding back down cancels it.
@@ -92,11 +97,13 @@ public enum IOSSwipeUp {
         from start: CGPoint,
         to current: CGPoint,
         keyHeight: CGFloat,
-        wasActive: Bool
+        wasActive: Bool,
+        isComposing: Bool = false
     ) -> Bool {
         let up = start.y - current.y
-        let threshold = armDistance(keyHeight: keyHeight) * (wasActive ? 0.6 : 1.0)
-        return up >= threshold && abs(current.x - start.x) <= up * 0.55
+        let threshold = armDistance(keyHeight: keyHeight, isComposing: isComposing) * (wasActive ? 0.6 : 1.0)
+        let maxLateralRatio: CGFloat = isComposing ? 0.42 : 0.55
+        return up >= threshold && abs(current.x - start.x) <= up * maxLateralRatio
     }
 }
 

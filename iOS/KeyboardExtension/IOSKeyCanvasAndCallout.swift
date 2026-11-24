@@ -515,6 +515,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     }
 
     private(set) var snapshot: IOSKeyboardLayoutEngine.LayoutSnapshot?
+    var isComposing: Bool = false
     var validNextMask: UInt32 = 0x03FF_FFFF
     var nextKeyPriors: [UInt8] = Array(repeating: 100, count: 26)
     var touchOffsets: [Float] = Array(repeating: 0, count: 52)
@@ -633,7 +634,10 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
             } else {
                 onKeyTouchUp?(state.initialKey, state.initialPoint)
             }
-        } else if state.swipeUpActive, let symbol = state.initialKey.swipeUpSymbol {
+        } else if state.swipeUpActive,
+                  let symbol = state.initialKey.swipeUpSymbol,
+                  !(isComposing && state.prevTimestamp - state.beganTimestamp < 0.085)
+        {
             onKeySwipeUp?(symbol)
         } else {
             let cleanPt = (state.currentKey.id == state.initialKey.id)
@@ -967,7 +971,8 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                     from: state.initialPoint,
                     to: pt,
                     keyHeight: state.initialKey.frame.height,
-                    wasActive: state.swipeUpActive
+                    wasActive: state.swipeUpActive,
+                    isComposing: isComposing
                 )
                 if active != state.swipeUpActive {
                     state.swipeUpActive = active

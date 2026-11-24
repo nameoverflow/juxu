@@ -534,6 +534,10 @@ struct IOSKeyboardTests {
         assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 130), keyHeight: 45, wasActive: false))
         assert(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 82), keyHeight: 45, wasActive: true), "Hysteresis keeps an armed swipe")
         assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 86), keyHeight: 45, wasActive: true), "Sliding back cancels")
+        // During active Pinyin/Wubi composition (`isComposing: true`), a 28pt thumb flick must NOT break composition,
+        // while a deliberate 38pt vertical swipe still arms cleanly.
+        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 103, y: 72), keyHeight: 45, wasActive: false, isComposing: true))
+        assert(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 102, y: 62), keyHeight: 45, wasActive: false, isComposing: true))
 
         // Long-press alternates
         let uAlt = IOSKeyAlternates.options(for: UInt8(ascii: "u"), asciiMode: false)
