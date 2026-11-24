@@ -1335,6 +1335,29 @@ struct IOSKeyboardTests {
             .filter { !$0.contains("space_comma_key") }.joined(separator: "\n")
         assert(oldTOML != commaPrefs.toTOML() && !JuxuPreferences.fromTOML(oldTOML).spaceCommaKey)
 
+        // Interactive typo-correction benchmark evaluation from real eval_log.jsonl lines
+        let benchLog = """
+        {"ts":1000,"schema":"xiaohe_sp","event":"commit","ctx":"","keys":"jntm","rank":0,"explicit":false,"chosen":"今天","top1":"今天","typo":"none","cands":[{"t":"今天","b":0,"x":1,"c":1.00}]}
+        {"ts":2000,"schema":"xiaohe_sp","event":"commit","ctx":"今天","keys":"yrwu","rank":0,"explicit":false,"chosen":"我们","top1":"我们","typo":"touch","cands":[{"t":"我们","b":2,"x":0,"c":0.91}]}
+        {"ts":3500,"schema":"xiaohe_sp","event":"commit","ctx":"今天我们","keys":"kshv","rank":0,"explicit":false,"chosen":"开会","top1":"开会","typo":"neighbor","cands":[{"t":"开会","b":2,"x":0,"c":0.87},{"t":"快回","b":0,"x":1,"c":0.13}]}
+        {"ts":5000,"schema":"xiaohe_sp","event":"commit","ctx":"今天我们开会","keys":"tlly","rank":1,"explicit":true,"chosen":"讨论","top1":"套路","typo":"none","cands":[{"t":"套路","b":0,"x":1,"c":0.60},{"t":"讨论","b":0,"x":1,"c":0.40}]}
+        """
+        let benchReport = IOSTypoBenchmark.evaluate(
+            jsonl: benchLog,
+            sinceMs: 1000,
+            typedText: "今天我们开会讨论",
+            promptText: "今天我们开会讨论"
+        )
+        assert(benchReport != nil)
+        assert(benchReport!.totalCommits == 4)
+        assert(benchReport!.rescuedCount == 2, "Expected 2 rescued commits")
+        assert(benchReport!.top1Hits == 3)
+        assert(benchReport!.actualAccuracyPercent > benchReport!.baselineAccuracyPercent, "Rescued output must beat unassisted baseline")
+        assert(benchReport!.rescues[0].wasEmptyCode && benchReport!.rescues[0].rescuedText == "我们")
+        assert(!benchReport!.rescues[1].wasEmptyCode && benchReport!.rescues[1].baselineDisplay == "快回" && benchReport!.rescues[1].rescuedText == "开会")
+        assert(benchReport!.shareSummaryText.contains("救回误触：2 次"))
+        assert(IOSTypoBenchmark.evaluate(jsonl: benchLog, sinceMs: 9999, typedText: "", promptText: nil) == nil, "Events before session start are ignored")
+
         print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi, T9 Pinyin, YYTextView inline commit & focus-loss recovery tests passed!")
     }
 }

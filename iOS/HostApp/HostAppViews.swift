@@ -477,6 +477,8 @@ public struct IOSHostRootView: View {
         iosScreenContainer(title: "误触与热区") {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    IOSTypoBenchmarkCard(bridge: bridge)
+
                     IOSTouchHitboxMapCard(
                         calibrations: bridge.touchCalibrations,
                         onReset: { bridge.resetTouchCalibration() }
@@ -840,6 +842,327 @@ public struct IOSHostRootView: View {
             UIApplication.shared.open(url)
         }
         #endif
+    }
+}
+
+/// Interactive typing benchmark card that replays real `eval_log.jsonl` commits to contrast
+/// raw unassisted typing against Juxu's 2D touch-hitbox & Bayesian typo correction.
+public struct IOSTypoBenchmarkCard: View {
+    @ObservedObject public var bridge: JuxuBridge
+    @State private var promptIndex: Int = 0
+    @State private var freeMode: Bool = false
+    @State private var typedText: String = ""
+    @State private var sessionStartMs: UInt64 = UInt64(Date().timeIntervalSince1970 * 1000)
+    @State private var report: IOSTypoBenchmarkReport? = nil
+    @State private var copiedFeedback: Bool = false
+    @FocusState private var inputFocused: Bool
+
+    public init(bridge: JuxuBridge) {
+        self.bridge = bridge
+    }
+
+    private var currentPrompt: String? {
+        freeMode ? nil : IOSTypoBenchmark.prompts[promptIndex % IOSTypoBenchmark.prompts.count]
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("误触纠错实测对比")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("用句序键盘正常快打一段，实时对比「无纠错裸打」与「句序纠错后」")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(freeMode ? "用参考句" : "自由输入") {
+                    freeMode.toggle()
+                    resetSession()
+                }
+                .font(.system(size: 11.5, weight: .medium))
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            if !bridge.prefs.evalLogging {
+                HStack(spacing: 8) {
+                    Image(systemName: "info.circle.fill")
+                        .foregroundStyle(.orange)
+                    Text("开启下方「记录输入与选词诊断日志」即可实时生成纠错对比。")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("开启") {
+                        var copy = bridge.prefs
+                        copy.evalLogging = true
+                        bridge.applyAndSavePreferences(copy)
+                        resetSession()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.mini)
+                }
+                .padding(9)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(Color.orange.opacity(0.10))
+                )
+            }
+
+            if let prompt = currentPrompt {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("参考短句（照着快打即可）")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            promptIndex = (promptIndex + 1) % IOSTypoBenchmark.prompts.count
+                            resetSession()
+                        } label: {
+                            Label("换一句", systemImage: "arrow.triangle.2.circlepath")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.accentColor)
+                    }
+                    Text(prompt)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(Color.primary.opacity(0.045))
+                )
+            }
+
+            TextField(
+                freeMode ? "切换句序键盘，随便快打几句话…" : "点这里，用句序键盘正常快打上方句子…",
+                text: $typedText,
+                axis: .vertical
+            )
+            .lineLimit(2...4)
+            .font(.system(size: 14.5))
+            .focused($inputFocused)
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Color.primary.opacity(0.035))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(inputFocused ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.10), lineWidth: 1)
+            )
+            .onChange(of: typedText) { newValue in
+                if newValue.isEmpty {
+                    sessionStartMs = nowMs()
+                    report = nil
+                } else {
+                    refreshReport()
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button("生成 / 刷新对比") {
+                    inputFocused = false
+                    refreshReport()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+
+                Button("重测") {
+                    resetSession()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Spacer()
+
+                if let report {
+                    #if os(iOS)
+                    ShareLink(item: report.shareSummaryText) {
+                        Label("分享战报", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    #else
+                    Button(copiedFeedback ? "已复制" : "复制战报") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(report.shareSummaryText, forType: .string)
+                        copiedFeedback = true
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    #endif
+                }
+            }
+
+            if let report {
+                Divider()
+                benchmarkResultsView(report)
+            }
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .fill(Color.primary.opacity(0.055))
+        )
+    }
+
+    @ViewBuilder
+    private func benchmarkResultsView(_ report: IOSTypoBenchmarkReport) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                metricBox(
+                    title: "救回误触",
+                    value: "\(report.rescuedCount) 次",
+                    accent: report.rescuedCount > 0 ? .orange : .primary
+                )
+                metricBox(
+                    title: "准确率提升",
+                    value: String(format: "+%.1f%%", report.accuracyGainPercent),
+                    accent: report.accuracyGainPercent > 0 ? .green : .primary
+                )
+                metricBox(
+                    title: "首选直出",
+                    value: String(format: "%.0f%%", report.top1RatePercent),
+                    accent: .accentColor
+                )
+                metricBox(
+                    title: "速度",
+                    value: report.charsPerMinute > 0 ? "\(report.charsPerMinute) 字/分" : "—",
+                    accent: .primary
+                )
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("若无纠错（裸打基线）")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(String(format: "%.1f%%", report.baselineAccuracyPercent))
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                highlightedLine(report.baselineSegments, highlightColor: .red)
+            }
+            .padding(9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.red.opacity(0.055))
+            )
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("句序 2D 热区 + 贝叶斯纠错后")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.green)
+                    Spacer()
+                    Text(String(format: "%.1f%%", report.actualAccuracyPercent))
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.green)
+                }
+                highlightedLine(report.actualSegments, highlightColor: .green)
+            }
+            .padding(9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.green.opacity(0.07))
+            )
+
+            if !report.rescues.isEmpty {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("本次救回明细")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(report.rescues.prefix(6)) { item in
+                        HStack(spacing: 6) {
+                            Text(item.wasEmptyCode ? "\(item.keys)（空码）" : "\(item.keys) → \(item.baselineDisplay)")
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Image(systemName: "arrow.right")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .foregroundStyle(.orange)
+                            Text(item.rescuedText)
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            Text(item.kindLabel)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(
+                                    Capsule().fill(Color.orange.opacity(0.14))
+                                )
+                        }
+                    }
+                }
+            } else {
+                Text("这轮按键非常精准，没有触发误触纠错；可以试着加快盲打速度再测一次。")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func metricBox(title: String, value: String, accent: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(size: 13.5, weight: .bold, design: .monospaced))
+                .foregroundStyle(accent)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(0.045))
+        )
+    }
+
+    private func highlightedLine(_ segments: [IOSTypoDiffSegment], highlightColor: Color) -> Text {
+        segments.reduce(Text("")) { partial, seg in
+            let piece = seg.isRescued
+                ? Text(seg.text).foregroundColor(highlightColor).bold()
+                : Text(seg.text).foregroundColor(.primary)
+            return partial + piece
+        }
+        .font(.system(size: 13.5))
+    }
+
+    private func nowMs() -> UInt64 {
+        UInt64(Date().timeIntervalSince1970 * 1000)
+    }
+
+    private func resetSession() {
+        typedText = ""
+        sessionStartMs = nowMs()
+        report = nil
+        copiedFeedback = false
+    }
+
+    private func refreshReport() {
+        bridge.reloadEvalLogSummary()
+        bridge.reloadTouchCalibration()
+        let jsonl = bridge.readEvalLogText()
+        report = IOSTypoBenchmark.evaluate(
+            jsonl: jsonl,
+            sinceMs: sessionStartMs,
+            typedText: typedText,
+            promptText: currentPrompt
+        )
     }
 }
 

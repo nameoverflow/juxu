@@ -476,3 +476,267 @@ public struct IOSClipboardVisibilityGate: Equatable, Sendable {
         return !isSuppressedByTyping
     }
 }
+
+// MARK: - Interactive Typo-Correction Benchmark
+
+/// One rescued typo commit recorded by the live engine in `eval_log.jsonl`.
+public struct IOSTypoRescueItem: Identifiable, Equatable, Sendable {
+    public let id: Int
+    public let keys: String
+    public let baselineDisplay: String
+    public let rescuedText: String
+    public let kindTag: String
+    public let wasEmptyCode: Bool
+
+    public var kindLabel: String {
+        switch kindTag {
+        case "touch": return "触点边界救回"
+        case "neighbor": return "邻键误触纠错"
+        case "transpose": return "换位误触纠错"
+        default: return "统计纠错"
+        }
+    }
+
+    public init(
+        id: Int,
+        keys: String,
+        baselineDisplay: String,
+        rescuedText: String,
+        kindTag: String,
+        wasEmptyCode: Bool
+    ) {
+        self.id = id
+        self.keys = keys
+        self.baselineDisplay = baselineDisplay
+        self.rescuedText = rescuedText
+        self.kindTag = kindTag
+        self.wasEmptyCode = wasEmptyCode
+    }
+}
+
+/// One segment in the side-by-side baseline vs. corrected text comparison.
+public struct IOSTypoDiffSegment: Identifiable, Equatable, Sendable {
+    public let id: Int
+    public let text: String
+    public let isRescued: Bool
+
+    public init(id: Int, text: String, isRescued: Bool) {
+        self.id = id
+        self.text = text
+        self.isRescued = isRescued
+    }
+}
+
+/// Summary of one live typing benchmark session built from real `eval_log.jsonl` events.
+public struct IOSTypoBenchmarkReport: Equatable, Sendable {
+    public let totalCommits: Int
+    public let rescuedCount: Int
+    public let top1Hits: Int
+    public let backspaceCount: Int
+    public let typedCharCount: Int
+    public let charsPerMinute: Int
+    public let baselineAccuracyPercent: Double
+    public let actualAccuracyPercent: Double
+    public let baselineSegments: [IOSTypoDiffSegment]
+    public let actualSegments: [IOSTypoDiffSegment]
+    public let rescues: [IOSTypoRescueItem]
+
+    public var top1RatePercent: Double {
+        totalCommits > 0 ? Double(top1Hits) * 100.0 / Double(totalCommits) : 0
+    }
+
+    public var accuracyGainPercent: Double {
+        max(0, actualAccuracyPercent - baselineAccuracyPercent)
+    }
+
+    public var shareSummaryText: String {
+        let gainStr = String(format: "+%.1f%%", accuracyGainPercent)
+        let baseStr = String(format: "%.1f%%", baselineAccuracyPercent)
+        let actStr = String(format: "%.1f%%", actualAccuracyPercent)
+        let top1Str = String(format: "%.0f%%", top1RatePercent)
+        var lines = [
+            "句序输入法 · 误触纠错实测对比",
+            "• 救回误触：\(rescuedCount) 次（共 \(totalCommits) 词上屏，首选直出 \(top1Str)）",
+            "• 准确率：无纠错 \(baseStr) → 句序纠错后 \(actStr)（\(gainStr)）",
+        ]
+        if charsPerMinute > 0 {
+            lines.append("• 输入速度：约 \(charsPerMinute) 字/分")
+        }
+        if !rescues.isEmpty {
+            let samples = rescues.prefix(4).map { item in
+                let raw = item.wasEmptyCode ? "\(item.keys)(空码)" : "\(item.keys)→\(item.baselineDisplay)"
+                return "\(raw) 救回为「\(item.rescuedText)」(\(item.kindLabel))"
+            }
+            lines.append("• 救回示例：" + samples.joined(separator: "；"))
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
+/// Evaluates real `eval_log.jsonl` commits recorded during an interactive typing test.
+public enum IOSTypoBenchmark {
+    public static let prompts: [String] = [
+        "今天下午我们开会讨论一下新版本的发布计划，记得把会议纪要发到群里。",
+        "刚才在地铁上顺手回了几条消息，发现手机打字快了很容易按偏相邻键。",
+        "这个输入法的触控热区会自动学习拇指落点，越用越顺手。",
+        "周末打算约几个朋友去公园散步，天气不错就顺便找家咖啡馆坐坐。",
+        "帮我确认一下明早十点的日程安排，有变动请提前在微信里通知我。",
+    ]
+
+    public static func evaluate(
+        jsonl: String,
+        sinceMs: UInt64,
+        typedText: String,
+        promptText: String?
+    ) -> IOSTypoBenchmarkReport? {
+        var totalCommits = 0
+        var top1Hits = 0
+        var backspaceCount = 0
+        var firstTs: UInt64?
+        var lastTs: UInt64?
+        var baselineSegments: [IOSTypoDiffSegment] = []
+        var actualSegments: [IOSTypoDiffSegment] = []
+        var rescues: [IOSTypoRescueItem] = []
+
+        for rawLine in jsonl.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard rawLine.first == "{",
+                  let data = rawLine.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let event = obj["event"] as? String else { continue }
+            let ts: UInt64
+            if let num = obj["ts"] as? NSNumber {
+                ts = num.uint64Value
+            } else {
+                continue
+            }
+            guard ts >= sinceMs else { continue }
+
+            if event == "backspace_after_commit" {
+                backspaceCount += 1
+                continue
+            }
+            guard event == "commit" || event == "partial_commit" else { continue }
+            guard let chosen = obj["chosen"] as? String, !chosen.isEmpty else { continue }
+
+            totalCommits += 1
+            if firstTs == nil { firstTs = ts }
+            lastTs = ts
+
+            let rank = (obj["rank"] as? NSNumber)?.intValue ?? 0
+            if rank == 0 { top1Hits += 1 }
+
+            let keys = obj["keys"] as? String ?? ""
+            let typo = obj["typo"] as? String ?? "none"
+            let isRescued = !typo.isEmpty && typo != "none"
+
+            let segID = baselineSegments.count
+            if isRescued {
+                var exactText: String?
+                if let cands = obj["cands"] as? [[String: Any]] {
+                    for c in cands {
+                        let isExact = (c["x"] as? NSNumber)?.intValue == 1
+                        if isExact, let t = c["t"] as? String, !t.isEmpty {
+                            exactText = t
+                            break
+                        }
+                    }
+                }
+                let wasEmptyCode = (exactText == nil)
+                let baselineDisplay = exactText ?? "[\(keys.isEmpty ? "?" : keys)]"
+                baselineSegments.append(IOSTypoDiffSegment(id: segID, text: baselineDisplay, isRescued: true))
+                actualSegments.append(IOSTypoDiffSegment(id: segID, text: chosen, isRescued: true))
+                rescues.append(
+                    IOSTypoRescueItem(
+                        id: rescues.count,
+                        keys: keys,
+                        baselineDisplay: baselineDisplay,
+                        rescuedText: chosen,
+                        kindTag: typo,
+                        wasEmptyCode: wasEmptyCode
+                    )
+                )
+            } else {
+                baselineSegments.append(IOSTypoDiffSegment(id: segID, text: chosen, isRescued: false))
+                actualSegments.append(IOSTypoDiffSegment(id: segID, text: chosen, isRescued: false))
+            }
+        }
+
+        guard totalCommits > 0 else { return nil }
+
+        let baselineJoined = baselineSegments.map(\.text).joined()
+        let actualJoined = actualSegments.map(\.text).joined()
+        let effectiveActual = typedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? actualJoined
+            : typedText
+
+        let cleanActual = normalizedForScore(effectiveActual)
+        let cleanBaseline = normalizedForScore(baselineJoined)
+        let typedCharCount = max(cleanActual.count, normalizedForScore(actualJoined).count)
+
+        let actualAccuracy: Double
+        let baselineAccuracy: Double
+        if let prompt = promptText, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let target = normalizedForScore(prompt)
+            // Compare against the prefix the user has typed so far when partially completed, or full prompt.
+            let refCount = min(target.count, max(cleanActual.count, 1))
+            let refSlice = String(target.prefix(cleanActual.count >= target.count * 3 / 4 ? target.count : refCount))
+            actualAccuracy = characterSimilarityPercent(candidate: cleanActual, reference: refSlice)
+            baselineAccuracy = min(actualAccuracy, characterSimilarityPercent(candidate: cleanBaseline, reference: refSlice))
+        } else {
+            // Free-typing mode: measure how much of the final intended text would have failed without correction.
+            let penalty = Double(backspaceCount) * 4.0
+            actualAccuracy = max(0, min(100, 100.0 - penalty / Double(max(1, totalCommits))))
+            let rawSim = characterSimilarityPercent(candidate: cleanBaseline, reference: normalizedForScore(actualJoined))
+            baselineAccuracy = min(actualAccuracy, rawSim)
+        }
+
+        var cpm = 0
+        if let f = firstTs, let l = lastTs, l > f {
+            let seconds = max(2.0, Double(l - f) / 1000.0)
+            cpm = Int((Double(typedCharCount) * 60.0 / seconds).rounded())
+        }
+
+        return IOSTypoBenchmarkReport(
+            totalCommits: totalCommits,
+            rescuedCount: rescues.count,
+            top1Hits: top1Hits,
+            backspaceCount: backspaceCount,
+            typedCharCount: typedCharCount,
+            charsPerMinute: cpm,
+            baselineAccuracyPercent: baselineAccuracy,
+            actualAccuracyPercent: actualAccuracy,
+            baselineSegments: baselineSegments,
+            actualSegments: actualSegments,
+            rescues: rescues
+        )
+    }
+
+    private static func normalizedForScore(_ s: String) -> String {
+        String(s.filter { !$0.isWhitespace && !$0.isNewline })
+    }
+
+    static func characterSimilarityPercent(candidate: String, reference: String) -> Double {
+        let a = Array(candidate)
+        let b = Array(reference)
+        guard !b.isEmpty else { return a.isEmpty ? 100.0 : 0.0 }
+        let dist = levenshtein(a, b)
+        let ratio = max(0.0, 1.0 - Double(dist) / Double(max(a.count, b.count)))
+        return ratio * 100.0
+    }
+
+    private static func levenshtein(_ a: [Character], _ b: [Character]) -> Int {
+        if a.isEmpty { return b.count }
+        if b.isEmpty { return a.count }
+        var prev = Array(0...b.count)
+        var curr = [Int](repeating: 0, count: b.count + 1)
+        for (i, ca) in a.enumerated() {
+            curr[0] = i + 1
+            for (j, cb) in b.enumerated() {
+                let cost = ca == cb ? 0 : 1
+                curr[j + 1] = min(prev[j + 1] + 1, curr[j] + 1, prev[j] + cost)
+            }
+            swap(&prev, &curr)
+        }
+        return prev[b.count]
+    }
+}
