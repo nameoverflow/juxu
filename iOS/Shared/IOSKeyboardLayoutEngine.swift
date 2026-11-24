@@ -100,9 +100,6 @@ public enum IOSSwipeUp {
     }
 }
 
-/// Chinese punctuation pairing: typing an opener also inserts its closer with the cursor in between.
-public typealias IOSPunctuationPairing = PunctuationPairing
-
 /// Plans the backspace swipe-up: delete leftward from the cursor, stopping at the current line's start.
 public enum IOSLineClear {
     public struct Plan: Equatable {
@@ -154,7 +151,7 @@ public struct IOSLineClearUndo: Equatable {
     public init() {}
 
     public mutating func push(text: String, contextBefore: String, documentID: UUID?) {
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty, let documentID else { return }
         records.append(Record(text: text, contextAfter: String(contextBefore.suffix(32)), documentID: documentID))
         if records.count > Self.maxRecords {
             records.removeFirst(records.count - Self.maxRecords)
@@ -162,7 +159,8 @@ public struct IOSLineClearUndo: Equatable {
     }
 
     public func restorableIndex(before: String, documentID: UUID?) -> Int? {
-        records.lastIndex { record in
+        guard let documentID else { return nil }
+        return records.lastIndex { record in
             guard record.documentID == documentID else { return false }
             return record.contextAfter.isEmpty ? before.isEmpty : before.hasSuffix(record.contextAfter)
         }

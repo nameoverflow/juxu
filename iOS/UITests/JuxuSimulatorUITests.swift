@@ -771,6 +771,109 @@ final class JuxuSimulatorUITests: XCTestCase {
     }
 
     @MainActor
+    func testFocusOutAndRefocusClearsUncommittedPreedit() throws {
+        let app = openLiveKeyboard()
+        app.launchArguments = ["--autofocus", "--dual-sandbox"]
+        app.launch()
+        let canvas = app.otherElements["JuxuKeyCanvas"]
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        let origin = canvas.coordinate(withNormalizedOffset: .zero)
+        let layout = IOSKeyboardLayoutEngine().computeLayout(in: canvas.frame.size)
+        func tapKey(_ ch: Character) throws {
+            let key = try XCTUnwrap(layout.keys.first { $0.primaryLabel == String(ch) })
+            origin.withOffset(CGVector(dx: key.frame.midX, dy: key.frame.midY)).tap()
+        }
+        func tapKind(_ kind: IOSKeyKind) throws {
+            let key = try XCTUnwrap(layout.keys.first { $0.kind == kind })
+            origin.withOffset(CGVector(dx: key.frame.midX, dy: key.frame.midY)).tap()
+        }
+
+        let f1 = app.textFields["JuxuSandboxPrimary"]
+        let f2 = app.textFields["JuxuSandboxSecondary"]
+        let tv = app.textViews["JuxuSandboxEditor"]
+        XCTAssertTrue(f1.waitForExistence(timeout: 3))
+        XCTAssertTrue(f2.waitForExistence(timeout: 3))
+        XCTAssertTrue(tv.waitForExistence(timeout: 3))
+
+        // 1. UITextField -> UITextField (type in f2!) -> UITextField:
+        //    Uncommitted `khk` in f1 must NOT leak into f2, and refocusing f1 clears orphaned `khk`.
+        for ch in "wqvb" { try tapKey(ch) } // "你好"
+        for ch in "khk" { try tapKey(ch) }
+        XCTAssertEqual(f1.value as? String, "你好khk")
+
+        f2.tap()
+        Thread.sleep(forTimeInterval: 0.25)
+        for ch in "trwu" { try tapKey(ch) } // "我们" in f2 without leaking "中" from f1!
+        XCTAssertEqual(f2.value as? String, "我们")
+
+        f1.tap()
+        Thread.sleep(forTimeInterval: 0.35)
+        XCTAssertEqual(f1.value as? String, "你好")
+        for ch in "trwu" { try tapKey(ch) }
+        XCTAssertEqual(f1.value as? String, "你好我们")
+
+        // 2. UITextView -> UITextField -> UITextView + Spacebar:
+        if app.buttons["清空"].exists { app.buttons["清空"].tap() }
+        tv.tap()
+        Thread.sleep(forTimeInterval: 0.25)
+        for ch in "trwukhk" { try tapKey(ch) }
+        XCTAssertEqual(tv.value as? String, "我们khk")
+
+        f2.tap()
+        Thread.sleep(forTimeInterval: 0.25)
+        tv.tap()
+        Thread.sleep(forTimeInterval: 0.35)
+        XCTAssertEqual(tv.value as? String, "我们")
+        try tapKind(.space)
+        XCTAssertEqual(tv.value as? String, "我们 ")
+
+        // 3. UITextView keyboard dismiss (`resignFirstResponder`) -> refocus -> Backspace & typing:
+        if app.buttons["清空"].exists { app.buttons["清空"].tap() }
+        tv.tap()
+        Thread.sleep(forTimeInterval: 0.25)
+        for ch in "trwukhk" { try tapKey(ch) }
+        XCTAssertEqual(tv.value as? String, "我们khk")
+
+        app.buttons["JuxuSandboxDone"].tap()
+        Thread.sleep(forTimeInterval: 0.6)
+        tv.tap()
+        XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+        Thread.sleep(forTimeInterval: 0.35)
+        XCTAssertEqual(tv.value as? String, "我们")
+        try tapKind(.backspace)
+        XCTAssertEqual(tv.value as? String, "我")
+        for ch in "trwu" { try tapKey(ch) }
+        XCTAssertEqual(tv.value as? String, "我我们")
+
+        // 4. WKWebView `<textarea>` field-switch AND keyboard-dismiss refocus:
+        let webBox = app.webViews.textViews.firstMatch
+        if webBox.waitForExistence(timeout: 3) {
+            webBox.tap()
+            XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+            Thread.sleep(forTimeInterval: 0.3)
+            for ch in "trwukhk" { try tapKey(ch) }
+            XCTAssertEqual(webBox.value as? String, "我们khk")
+
+            f2.tap()
+            Thread.sleep(forTimeInterval: 0.25)
+            webBox.tap()
+            Thread.sleep(forTimeInterval: 0.4)
+            XCTAssertEqual(webBox.value as? String, "我们")
+
+            for ch in "khk" { try tapKey(ch) }
+            XCTAssertEqual(webBox.value as? String, "我们khk")
+            app.buttons["JuxuSandboxDone"].tap()
+            Thread.sleep(forTimeInterval: 0.6)
+            webBox.tap()
+            XCTAssertTrue(canvas.waitForExistence(timeout: 5))
+            Thread.sleep(forTimeInterval: 0.4)
+            XCTAssertEqual(webBox.value as? String, "我们")
+            for ch in "trwu" { try tapKey(ch) }
+            XCTAssertEqual(webBox.value as? String, "我们我们")
+        }
+    }
+
+    @MainActor
     private func tapNorm(_ app: XCUIApplication, dx: CGFloat, dy: CGFloat) {
         app.coordinate(withNormalizedOffset: CGVector(dx: dx, dy: dy)).tap()
     }

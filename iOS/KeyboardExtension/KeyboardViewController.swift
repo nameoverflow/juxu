@@ -6,6 +6,8 @@ private final class ProxyDocumentSink: IOSMarkedTextDocumentSink {
     let proxy: any UITextDocumentProxy
     init(proxy: any UITextDocumentProxy) { self.proxy = proxy }
     var documentContextBeforeInput: String? { proxy.documentContextBeforeInput }
+    var documentContextAfterInput: String? { proxy.documentContextAfterInput }
+    var selectedText: String? { proxy.selectedText }
     func setMarkedText(_ markedText: String, selectedRange: NSRange) {
         proxy.setMarkedText(markedText, selectedRange: selectedRange)
     }
@@ -14,6 +16,9 @@ private final class ProxyDocumentSink: IOSMarkedTextDocumentSink {
     }
     func insertText(_ text: String) {
         proxy.insertText(text)
+    }
+    func adjustTextPosition(byCharacterOffset offset: Int) {
+        proxy.adjustTextPosition(byCharacterOffset: offset)
     }
 }
 
@@ -39,6 +44,11 @@ public final class KeyboardViewController: UIInputViewController {
     private var planeBeforePress: IOSKeyPlane = .letters
     private var inlineSession = IOSInlineMarkedTextSession()
     private var turnFlushScheduled = false
+    private var composingDocumentID: UUID?
+    private var lastKeyboardEditUptime: TimeInterval = 0
+    private var nilDocSweepWorkItem: DispatchWorkItem?
+    private var appearanceSweepWorkItem: DispatchWorkItem?
+    private var isKeyboardPresentingOrVisible = false
     private var proxySink: ProxyDocumentSink { ProxyDocumentSink(proxy: textDocumentProxy) }
     private let clipboardStore = IOSClipboardSuggestionStore()
     private var clipboardGate = IOSClipboardVisibilityGate()
@@ -87,14 +97,125 @@ public final class KeyboardViewController: UIInputViewController {
         .all
     }
 
+    /// `UITextDocumentProxy.documentIdentifier` is bridged as non-optional `UUID`, yet UIKit's
+    /// `_UITextDocumentInterface` returns Objective-C `nil` during focus transitions or when
+    /// refocusing a responder that still carries an orphaned `markedTextRange`.
+    private var currentDocumentIdentifier: UUID? {
+        (textDocumentProxy as AnyObject).value(forKey: "documentIdentifier") as? UUID
+    }
+
+    private func noteKeyboardProxyMutation() {
+        lastKeyboardEditUptime = ProcessInfo.processInfo.systemUptime
+    }
+
+    private func abandonCompositionForExternalFocusOrEdit(clearHostMarked: Bool, isDisappearing: Bool = false) {
+        nilDocSweepWorkItem?.cancel()
+        nilDocSweepWorkItem = nil
+        if isDisappearing {
+            appearanceSweepWorkItem?.cancel()
+            appearanceSweepWorkItem = nil
+        }
+        if clearHostMarked {
+            if !inlineSession.markedCode.isEmpty {
+                noteKeyboardProxyMutation()
+            }
+            cancelMarkedCode()
+            inlineSession.reset()
+        } else if isDisappearing {
+            inlineSession.recordKeyboardDisappear()
+        } else {
+            _ = inlineSession.recordFocusLoss()
+        }
+        composingDocumentID = nil
+        autoPairClosers.removeAll()
+        if !bridge.state.preedit.isEmpty {
+            bridge.abandonComposition(timestampMs: Self.nowMs())
+        }
+        if !expandedGrid.isHidden {
+            expandedIdleWords = nil
+            expandedGrid.isHidden = true
+            keyCanvas.isHidden = false
+            updateT9SidebarVisibility()
+            ribbonView.setExpanded(false)
+        }
+        calloutView.hideImmediately()
+        keyCanvas.coveredCalloutKeyId = nil
+        alternatesView.hide()
+        stopBackspaceRepeat()
+    }
+
+    private func sweepOrphanedMarkedTextNow() {
+        guard inlineSession.hasOrphanedMarkedInSession else { return }
+        noteKeyboardProxyMutation()
+        let outcome = inlineSession.sweepOrphanedMarkedText(in: proxySink)
+        scheduleTurnBoundaryFlushIfNeeded(outcome.needsAsyncFlush)
+        let expectedTail = outcome.expectedBeforeTail
+        guard !expectedTail.isEmpty else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
+            guard let self, self.isKeyboardPresentingOrVisible else { return }
+            self.noteKeyboardProxyMutation()
+            self.inlineSession.restoreCaretAfterOrphanedSweepIfNeeded(
+                expectedBeforeTail: expectedTail,
+                in: self.proxySink
+            )
+            self.syncContextFromProxyIfIdle()
+            self.syncEngineToUI()
+        }
+    }
+
+    private func scheduleAppearanceOrphanedSweepIfNeeded() {
+        appearanceSweepWorkItem?.cancel()
+        appearanceSweepWorkItem = nil
+        guard inlineSession.needsAppearanceSweep, isKeyboardPresentingOrVisible else { return }
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.appearanceSweepWorkItem = nil
+                guard self.isKeyboardPresentingOrVisible,
+                      self.inlineSession.needsAppearanceSweep,
+                      self.bridge.state.preedit.isEmpty,
+                      self.inlineSession.markedCode.isEmpty else { return }
+                self.sweepOrphanedMarkedTextNow()
+            }
+        }
+        appearanceSweepWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
+    }
+
+    private func scheduleNilDocOrphanedSweepIfNeeded() {
+        nilDocSweepWorkItem?.cancel()
+        nilDocSweepWorkItem = nil
+        guard inlineSession.hasOrphanedMarkedInSession,
+              !inlineSession.needsAppearanceSweep,
+              isKeyboardPresentingOrVisible,
+              currentDocumentIdentifier == nil else {
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.nilDocSweepWorkItem = nil
+                guard self.isKeyboardPresentingOrVisible,
+                      self.currentDocumentIdentifier == nil,
+                      self.bridge.state.preedit.isEmpty,
+                      self.inlineSession.markedCode.isEmpty else { return }
+                self.sweepOrphanedMarkedTextNow()
+            }
+        }
+        nilDocSweepWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
+    }
+
     public override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        isKeyboardPresentingOrVisible = true
         feedback.prepare()
         bridge.reloadConfigAndUserOnAppear { [weak self] in
             self?.syncEngineToUI()
         }
         autoPairClosers.removeAll()
         inlineSession.resetForAppearance()
+        scheduleAppearanceOrphanedSweepIfNeeded()
         clipboardGate.resetForKeyboardAppearance()
         applyDesiredTrayDimensions()
         syncContextFromProxyIfIdle()
@@ -105,9 +226,15 @@ public final class KeyboardViewController: UIInputViewController {
     public override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         hasAppeared = true
+        isKeyboardPresentingOrVisible = true
         applyDesiredTrayDimensions()
         refreshKeyboardLayout()
         disableTouchDelayOnContainerGestures()
+        if inlineSession.needsAppearanceSweep && appearanceSweepWorkItem == nil {
+            sweepOrphanedMarkedTextNow()
+        } else {
+            scheduleNilDocOrphanedSweepIfNeeded()
+        }
         // Trigger any uncached pasteboard read AFTER initial 4-row layout is on screen,
         // so an iOS "Allow Paste" system alert never freezes mid-layout!
         DispatchQueue.main.async { [weak self] in
@@ -128,13 +255,10 @@ public final class KeyboardViewController: UIInputViewController {
         lineClearUndo.removeAll()
         backspaceTapDeferred = false
         hasAppeared = false
-        stopBackspaceRepeat()
+        isKeyboardPresentingOrVisible = false
         keyCanvas.resetAllTouches()
-        calloutView.hideImmediately()
         saveUserDataTimer?.invalidate()
-        cancelMarkedCode()
-        bridge.clearComposition()
-        inlineSession.reset()
+        abandonCompositionForExternalFocusOrEdit(clearHostMarked: false, isDisappearing: true)
         bridge.flushUserDataAsync()
         bridge.flushPendingPersistence()
         feedback.suspend()
@@ -168,8 +292,58 @@ public final class KeyboardViewController: UIInputViewController {
         }
     }
 
+    public override func selectionDidChange(_ textInput: UITextInput?) {
+        super.selectionDidChange(textInput)
+        let isComposing = !bridge.state.preedit.isEmpty || !inlineSession.markedCode.isEmpty
+        guard isComposing else {
+            autoPairClosers.removeAll()
+            inlineSession.reconcileExternalContext(hostBefore: textDocumentProxy.documentContextBeforeInput)
+            syncContextFromProxyIfIdle()
+            syncEngineToUI()
+            return
+        }
+        let elapsed = ProcessInfo.processInfo.systemUptime - lastKeyboardEditUptime
+        guard elapsed > 0.08 else { return }
+        abandonCompositionForExternalFocusOrEdit(clearHostMarked: true)
+        syncContextFromProxyIfIdle()
+        syncEngineToUI()
+    }
+
     public override func textDidChange(_ textInput: UITextInput?) {
         super.textDidChange(textInput)
+        let docID = currentDocumentIdentifier
+        let isComposing = !bridge.state.preedit.isEmpty || !inlineSession.markedCode.isEmpty
+
+        if isComposing {
+            if docID == nil {
+                abandonCompositionForExternalFocusOrEdit(clearHostMarked: false)
+                syncEngineToUI()
+            } else if let compDoc = composingDocumentID, docID != compDoc {
+                abandonCompositionForExternalFocusOrEdit(clearHostMarked: false)
+                syncEngineToUI()
+            } else {
+                if composingDocumentID == nil {
+                    composingDocumentID = docID
+                }
+                let elapsed = ProcessInfo.processInfo.systemUptime - lastKeyboardEditUptime
+                if elapsed > 0.12, let base = inlineSession.compositionBaseContext {
+                    let currentBefore = textDocumentProxy.documentContextBeforeInput ?? ""
+                    if (!base.isEmpty && currentBefore.isEmpty)
+                        || (!currentBefore.isEmpty && !base.hasSuffix(currentBefore) && !currentBefore.hasSuffix(base)) {
+                        abandonCompositionForExternalFocusOrEdit(clearHostMarked: true)
+                        syncEngineToUI()
+                    }
+                }
+            }
+        }
+
+        if docID != nil {
+            nilDocSweepWorkItem?.cancel()
+            nilDocSweepWorkItem = nil
+        } else {
+            scheduleNilDocOrphanedSweepIfNeeded()
+        }
+
         bridge.suppressEvalLogging = isSensitiveEvalProxy()
         inlineSession.reconcileExternalContext(hostBefore: textDocumentProxy.documentContextBeforeInput)
         syncContextFromProxyIfIdle()
@@ -374,7 +548,7 @@ public final class KeyboardViewController: UIInputViewController {
                     && self.bridge.state.preedit.isEmpty
                     && self.lineClearUndo.restorableIndex(
                         before: self.textDocumentProxy.documentContextBeforeInput ?? "",
-                        documentID: self.textDocumentProxy.documentIdentifier
+                        documentID: self.currentDocumentIdentifier
                     ) != nil
                 self.keyCanvas.canUndoLineClear = canUndo
                 self.backspaceTapDeferred = canUndo
@@ -862,6 +1036,7 @@ public final class KeyboardViewController: UIInputViewController {
         case .space:
             markUserTypedForClipboard()
             if bridge.state.preedit.isEmpty {
+                noteKeyboardProxyMutation()
                 let needsFlush = inlineSession.insertPassthrough(" ", in: proxySink)
                 scheduleTurnBoundaryFlushIfNeeded(needsFlush)
                 syncContextFromProxyIfIdle()
@@ -874,6 +1049,7 @@ public final class KeyboardViewController: UIInputViewController {
         case .returnKey:
             markUserTypedForClipboard()
             if bridge.state.preedit.isEmpty {
+                noteKeyboardProxyMutation()
                 let needsFlush = inlineSession.insertPassthrough("\n", in: proxySink)
                 scheduleTurnBoundaryFlushIfNeeded(needsFlush)
                 syncContextFromProxyIfIdle()
@@ -890,6 +1066,7 @@ public final class KeyboardViewController: UIInputViewController {
     }
 
     private func insertSymbol(_ sym: String) {
+        noteKeyboardProxyMutation()
         commitPendingFirstIfComposing()
         var pairCloser: String?
         if isPunctuationPairingActive {
@@ -948,8 +1125,9 @@ public final class KeyboardViewController: UIInputViewController {
         guard bridge.state.preedit.isEmpty,
               let text = lineClearUndo.take(
                   before: textDocumentProxy.documentContextBeforeInput ?? "",
-                  documentID: textDocumentProxy.documentIdentifier
+                  documentID: currentDocumentIdentifier
               ) else { return }
+        noteKeyboardProxyMutation()
         clearLineGeneration &+= 1
         autoPairClosers.removeAll()
         inlineSession.autoSpaceTracker.invalidate()
@@ -995,7 +1173,7 @@ public final class KeyboardViewController: UIInputViewController {
         lineClearUndo.push(
             text: collected,
             contextBefore: remaining,
-            documentID: textDocumentProxy.documentIdentifier
+            documentID: currentDocumentIdentifier
         )
         bridge.setContext(String(remaining.suffix(32)))
         syncEngineToUI()
@@ -1058,6 +1236,8 @@ public final class KeyboardViewController: UIInputViewController {
 
     private func commitPendingFirstIfComposing() {
         guard !bridge.state.preedit.isEmpty else { return }
+        noteKeyboardProxyMutation()
+        composingDocumentID = nil
         let rawText = bridge.state.candidates.first?.text ?? bridge.state.preedit
         let needsFlush = inlineSession.commitPendingFirst(
             rawText,
@@ -1071,6 +1251,7 @@ public final class KeyboardViewController: UIInputViewController {
     private func performBackspace(acceleratedChunk: Bool = false) {
         backspaceTapDeferred = false
         markUserTypedForClipboard()
+        noteKeyboardProxyMutation()
         if !bridge.state.preedit.isEmpty {
             let out = bridge.handleKey(keyCode: 0x33, scalar: 0, hasCmdOrCtrl: false, timestampMs: Self.nowMs())
             applyEngineState(out)
@@ -1275,6 +1456,7 @@ public final class KeyboardViewController: UIInputViewController {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.turnFlushScheduled = false
+            self.noteKeyboardProxyMutation()
             self.inlineSession.flushTurnBoundary(in: self.proxySink)
         }
     }
@@ -1284,6 +1466,7 @@ public final class KeyboardViewController: UIInputViewController {
         splitInternal: Bool,
         overrideBefore: String? = nil
     ) {
+        noteKeyboardProxyMutation()
         let needsFlush = inlineSession.insertTextWithAutoSpace(
             text,
             splitInternal: splitInternal,
@@ -1295,6 +1478,12 @@ public final class KeyboardViewController: UIInputViewController {
     }
 
     private func applyEngineState(_ out: JuxuActionState) {
+        noteKeyboardProxyMutation()
+        if out.preedit.isEmpty {
+            composingDocumentID = nil
+        } else if let docID = currentDocumentIdentifier {
+            composingDocumentID = docID
+        }
         let res = inlineSession.applyEngineState(
             commitText: out.commitText,
             inlinePreedit: out.activeInlinePreedit,

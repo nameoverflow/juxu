@@ -593,6 +593,7 @@ struct IOSKeyboardTests {
         undo.push(text: "第二行", contextBefore: "第一行\n", documentID: docA)
         undo.push(text: "第三行", contextBefore: "第一行\n第二行\n", documentID: docA)
         assert(undo.restorableIndex(before: "第一行\n第二行\n", documentID: docB) == nil, "Must not restore into another field")
+        assert(undo.restorableIndex(before: "第一行\n第二行\n", documentID: nil) == nil, "Nil documentID during focus transition must never match")
         assert(undo.restorableIndex(before: "别的内容", documentID: docA) == nil, "Must not restore after the text changed")
         assert(undo.take(before: "第一行\n第二行\n", documentID: docA) == "第三行")
         assert(undo.take(before: "第一行\n", documentID: docA) == "第二行")
@@ -665,6 +666,17 @@ struct IOSKeyboardTests {
                 return storage.substring(with: NSRange(location: 0, length: selectedRange.location))
             }
 
+            var documentContextAfterInput: String? {
+                let end = selectedRange.location + selectedRange.length
+                guard end < storage.length else { return nil }
+                return storage.substring(with: NSRange(location: end, length: storage.length - end))
+            }
+
+            var selectedText: String? {
+                guard selectedRange.length > 0 else { return nil }
+                return storage.substring(with: selectedRange)
+            }
+
             func insertText(_ text: String) {
                 guard !text.isEmpty else { return }
                 let len = (text as NSString).length
@@ -707,6 +719,19 @@ struct IOSKeyboardTests {
                 // Exact `YYTextView.m` behavior: clears `_markedTextRange` without firing `textViewDidChange:`!
                 markedRange = nil
             }
+
+            func adjustTextPosition(byCharacterOffset offset: Int) {
+                let str = storage as String
+                let utf16 = str.utf16
+                let clampedLoc = max(0, min(utf16.count, selectedRange.location))
+                let curIdx = utf16.index(utf16.startIndex, offsetBy: clampedLoc)
+                if let charIdx = curIdx.samePosition(in: str) {
+                    let targetCharIdx = str.index(charIdx, offsetBy: offset, limitedBy: offset >= 0 ? str.endIndex : str.startIndex)
+                        ?? (offset >= 0 ? str.endIndex : str.startIndex)
+                    let newLoc = targetCharIdx.utf16Offset(in: str)
+                    selectedRange = NSRange(location: newLoc, length: 0)
+                }
+            }
         }
 
         @MainActor
@@ -714,6 +739,7 @@ struct IOSKeyboardTests {
             var storage = NSMutableString()
             var selectedRange = NSRange(location: 0, length: 0)
             var markedRange: NSRange?
+            var simulateReactivatedEmptyMarkedCaretJump = false
 
             init(initialText: String = "", cursor: Int? = nil) {
                 storage.setString(initialText)
@@ -728,6 +754,17 @@ struct IOSKeyboardTests {
                 return storage.substring(with: NSRange(location: 0, length: selectedRange.location))
             }
 
+            var documentContextAfterInput: String? {
+                let end = selectedRange.location + selectedRange.length
+                guard end < storage.length else { return nil }
+                return storage.substring(with: NSRange(location: end, length: storage.length - end))
+            }
+
+            var selectedText: String? {
+                guard selectedRange.length > 0 else { return nil }
+                return storage.substring(with: selectedRange)
+            }
+
             func insertText(_ text: String) {
                 let len = (text as NSString).length
                 let target = markedRange ?? selectedRange
@@ -740,13 +777,31 @@ struct IOSKeyboardTests {
                 let nsMarked = markedText as NSString
                 let target = markedRange ?? selectedRange
                 storage.replaceCharacters(in: target, with: markedText)
-                markedRange = NSRange(location: target.location, length: nsMarked.length)
-                selectedRange = NSRange(location: target.location + relSel.location, length: relSel.length)
+                if nsMarked.length == 0 && simulateReactivatedEmptyMarkedCaretJump {
+                    markedRange = nil
+                    selectedRange = NSRange(location: 0, length: 0)
+                } else {
+                    markedRange = NSRange(location: target.location, length: nsMarked.length)
+                    selectedRange = NSRange(location: target.location + relSel.location, length: relSel.length)
+                }
             }
 
             func unmarkText() {
                 // Standard UIKit commits whatever is currently in `markedRange` in place!
                 markedRange = nil
+            }
+
+            func adjustTextPosition(byCharacterOffset offset: Int) {
+                let str = storage as String
+                let utf16 = str.utf16
+                let clampedLoc = max(0, min(utf16.count, selectedRange.location))
+                let curIdx = utf16.index(utf16.startIndex, offsetBy: clampedLoc)
+                if let charIdx = curIdx.samePosition(in: str) {
+                    let targetCharIdx = str.index(charIdx, offsetBy: offset, limitedBy: offset >= 0 ? str.endIndex : str.startIndex)
+                        ?? (offset >= 0 ? str.endIndex : str.startIndex)
+                    let newLoc = targetCharIdx.utf16Offset(in: str)
+                    selectedRange = NSRange(location: newLoc, length: 0)
+                }
             }
         }
 
@@ -767,6 +822,12 @@ struct IOSKeyboardTests {
             }
 
             var documentContextBeforeInput: String? { host.documentContextBeforeInput }
+            var documentContextAfterInput: String? { host.documentContextAfterInput }
+            var selectedText: String? { host.selectedText }
+
+            func adjustTextPosition(byCharacterOffset offset: Int) {
+                host.adjustTextPosition(byCharacterOffset: offset)
+            }
 
             func insertText(_ text: String) {
                 turnInsertion += text
@@ -946,6 +1007,129 @@ struct IOSKeyboardTests {
             assert(txt.isEmpty && mr == nil, "Expected empty text after backspace, got '\(txt)'")
         }
 
-        print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi, T9 Pinyin & YYTextView inline commit tests passed!")
+        // 21. Focus-out and refocus while preedit is uncommitted (`recordFocusLoss` + `sweepOrphanedMarkedTextIfNeeded`)
+        //     across BOTH `YYTextView` and `StandardUITextView` under `TIKeyboardOutput` coalescing!
+        // 21a. Dismiss & refocus same field: orphaned `markedText` ("khk") is wiped cleanly, `markedRange == nil`,
+        //      and follow-up Space / typing works with zero residual raw code or reverse-order corruption.
+        for rawHost in [YYTextViewDocumentMock() as any IOSMarkedTextDocumentSink, StandardUITextViewMock()] {
+            IOSInlineMarkedTextSession.resetSharedOrphanedState()
+            bridge.clearComposition()
+            let proxy = TIKeyboardOutputProxyMock(host: rawHost)
+            var focusSession = IOSInlineMarkedTextSession()
+            for ch in "trwukhk".unicodeScalars {
+                let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 9400)
+                focusSession.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy)
+                proxy.drainTurn(session: &focusSession)
+            }
+            let preBlurText = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
+            let preBlurMarked = (rawHost as? YYTextViewDocumentMock)?.markedRange ?? (rawHost as! StandardUITextViewMock).markedRange
+            assert(preBlurText == "我们khk" && preBlurMarked == NSRange(location: 2, length: 3))
+
+            // Simulate keyboard disappearing (`KeyboardViewController` #1 deallocated -> fresh `IOSInlineMarkedTextSession` #2 on reopen!)
+            focusSession.recordKeyboardDisappear()
+            bridge.abandonComposition(timestampMs: 9450)
+            if let std = rawHost as? StandardUITextViewMock {
+                std.simulateReactivatedEmptyMarkedCaretJump = true
+            }
+            var reopenedSession = IOSInlineMarkedTextSession()
+            assert(reopenedSession.needsAppearanceSweep && bridge.state.preedit.isEmpty)
+
+            // Refocus same field on new VC instance: sweep clears orphaned "khk" AND restores TextKit 2 caret to {2, 0}!
+            let outcome = reopenedSession.sweepOrphanedMarkedText(in: proxy)
+            assert(outcome.needsAsyncFlush && outcome.expectedBeforeTail == "我们")
+            proxy.drainTurn(session: &reopenedSession)
+            reopenedSession.restoreCaretAfterOrphanedSweepIfNeeded(expectedBeforeTail: outcome.expectedBeforeTail, in: proxy)
+
+            let afterRefocusText = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
+            let afterRefocusMarked = (rawHost as? YYTextViewDocumentMock)?.markedRange ?? (rawHost as! StandardUITextViewMock).markedRange
+            let afterRefocusSel = (rawHost as? YYTextViewDocumentMock)?.selectedRange ?? (rawHost as! StandardUITextViewMock).selectedRange
+            assert(afterRefocusText == "我们" && afterRefocusMarked == nil && afterRefocusSel == NSRange(location: 2, length: 0),
+                   "Expected orphaned markedText cleared with cursor at {2,0}, got '\(afterRefocusText)' sel=\(afterRefocusSel) marked=\(String(describing: afterRefocusMarked))")
+
+            // Follow-up Space + new Wubi word `trwu` ("我们") must insert cleanly in forward order!
+            reopenedSession.insertPassthrough(" ", in: proxy)
+            proxy.drainTurn(session: &reopenedSession)
+            for ch in "trwu".unicodeScalars {
+                let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 9500)
+                reopenedSession.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy)
+                proxy.drainTurn(session: &reopenedSession)
+            }
+            let afterFollowUp = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
+            let afterFollowMarked = (rawHost as? YYTextViewDocumentMock)?.markedRange ?? (rawHost as! StandardUITextViewMock).markedRange
+            assert(afterFollowUp == "我们 我们" && afterFollowMarked == nil, "Got '\(afterFollowUp)'")
+        }
+
+        // 21b. Multi-field switch (`Field 1` with uncommitted "khk" -> `Field 2` with normal text ->
+        //      `Field 3` with active non-empty selection -> back to `Field 1`), plus same-turn immediate typing!
+        for isYY in [true, false] {
+            IOSInlineMarkedTextSession.resetSharedOrphanedState()
+            bridge.clearComposition()
+            let field1: any IOSMarkedTextDocumentSink = isYY ? YYTextViewDocumentMock(initialText: "你好") : StandardUITextViewMock(initialText: "你好")
+            let field2: any IOSMarkedTextDocumentSink = isYY ? YYTextViewDocumentMock(initialText: "第二框") : StandardUITextViewMock(initialText: "第二框")
+            let field3YY = YYTextViewDocumentMock(initialText: "选中文字")
+            field3YY.selectedRange = NSRange(location: 0, length: 2)
+            let field3Std = StandardUITextViewMock(initialText: "选中文字")
+            field3Std.selectedRange = NSRange(location: 0, length: 2)
+            let field3: any IOSMarkedTextDocumentSink = isYY ? field3YY : field3Std
+
+            let proxy1 = TIKeyboardOutputProxyMock(host: field1)
+            let proxy2 = TIKeyboardOutputProxyMock(host: field2)
+            let proxy3 = TIKeyboardOutputProxyMock(host: field3)
+            var session = IOSInlineMarkedTextSession()
+            session.reconcileExternalContext(hostBefore: proxy1.documentContextBeforeInput)
+
+            for ch in "khk".unicodeScalars {
+                let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 9600)
+                session.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy1)
+                proxy1.drainTurn(session: &session)
+            }
+            // Switch Field 1 -> Field 2 (`Field 2` gets normal non-nil `documentID`, so `Field 2` is NOT swept!)
+            assert(session.recordFocusLoss() == true)
+            bridge.abandonComposition(timestampMs: 9620)
+            for ch in "trwu".unicodeScalars {
+                let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 9630)
+                session.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy2)
+                proxy2.drainTurn(session: &session)
+            }
+            let f2Text = (field2 as? YYTextViewDocumentMock)?.text ?? (field2 as! StandardUITextViewMock).text
+            assert(f2Text == "第二框我们", "Typing in second field must stay clean while preserving orphaned sweep flag, got '\(f2Text)'")
+            assert(session.hasOrphanedMarkedInSession, "Orphaned sweep flag must survive typing in Field 2 until Field 1 is refocused")
+
+            // If sweep ever runs on Field 3 where "选中" is selected (`selectedText == "选中"`), selection MUST NOT be deleted!
+            var selGuardSession = IOSInlineMarkedTextSession()
+            _ = selGuardSession.applyEngineState(commitText: "", inlinePreedit: "khk", options: onOpts, in: TIKeyboardOutputProxyMock(host: StandardUITextViewMock()))
+            _ = selGuardSession.recordFocusLoss()
+            _ = selGuardSession.sweepOrphanedMarkedText(in: proxy3)
+            proxy3.drainTurn(session: &selGuardSession)
+            let f3Text = (field3 as? YYTextViewDocumentMock)?.text ?? (field3 as! StandardUITextViewMock).text
+            let f3Sel = (field3 as? YYTextViewDocumentMock)?.selectedRange ?? (field3 as! StandardUITextViewMock).selectedRange
+            assert(f3Text == "选中文字" && f3Sel == NSRange(location: 0, length: 2), "Active text selection must never be erased by sweep")
+
+            // Re-arm orphaned state from Field 1 ("你好" + "khk") and return to Field 1 + immediately type 't' in SAME turn!
+            var rearm = IOSInlineMarkedTextSession()
+            rearm.reconcileExternalContext(hostBefore: "你好")
+            _ = rearm.applyEngineState(commitText: "", inlinePreedit: "khk", options: onOpts, in: TIKeyboardOutputProxyMock(host: StandardUITextViewMock(initialText: "你好")))
+            _ = rearm.recordFocusLoss()
+
+            _ = session.sweepOrphanedMarkedText(in: proxy1)
+            let stT = bridge.handleKey(keyCode: 0, scalar: UnicodeScalar("t").value, hasCmdOrCtrl: false, timestampMs: 9650)
+            session.applyEngineState(commitText: stT.commitText, inlinePreedit: stT.activeInlinePreedit, options: onOpts, in: proxy1)
+            proxy1.drainTurn(session: &session)
+
+            let f1MidText = (field1 as? YYTextViewDocumentMock)?.text ?? (field1 as! StandardUITextViewMock).text
+            let f1MidMarked = (field1 as? YYTextViewDocumentMock)?.markedRange ?? (field1 as! StandardUITextViewMock).markedRange
+            assert(f1MidText == "你好t" && f1MidMarked == NSRange(location: 2, length: 1), "Same-turn refocus + key 't' must clear 'khk' and keep 't' marked, got '\(f1MidText)' marked=\(String(describing: f1MidMarked))")
+
+            for ch in "rwu".unicodeScalars {
+                let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 9680)
+                session.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy1)
+                proxy1.drainTurn(session: &session)
+            }
+            let f1FinalText = (field1 as? YYTextViewDocumentMock)?.text ?? (field1 as! StandardUITextViewMock).text
+            let f1FinalMarked = (field1 as? YYTextViewDocumentMock)?.markedRange ?? (field1 as! StandardUITextViewMock).markedRange
+            assert(f1FinalText == "你好我们" && f1FinalMarked == nil, "Got '\(f1FinalText)'")
+        }
+
+        print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi, T9 Pinyin, YYTextView inline commit & focus-loss recovery tests passed!")
     }
 }

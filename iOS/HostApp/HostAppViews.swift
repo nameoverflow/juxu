@@ -1,6 +1,21 @@
 import SwiftUI
 #if os(iOS)
 import UIKit
+import WebKit
+
+private struct SandboxWebView: UIViewRepresentable {
+    func makeUIView(context: Context) -> WKWebView {
+        let wv = WKWebView()
+        wv.loadHTMLString("""
+        <!doctype html><html><meta name="viewport" content="width=device-width,initial-scale=1">
+        <body style="margin:0;padding:4px">
+        <textarea id="wta" aria-label="WebBox" style="width:95%;height:44px;font-size:16px"></textarea>
+        </body></html>
+        """, baseURL: nil)
+        return wv
+    }
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
+}
 #endif
 
 public enum IOSHostTab: Int, CaseIterable, Identifiable {
@@ -34,7 +49,10 @@ public struct IOSHostRootView: View {
     @ObservedObject public var bridge: JuxuBridge
     @State public var selectedTab: IOSHostTab
     @State private var sandboxText: String = ""
+    @State private var sandboxSecondText: String = ""
+    @State private var sandboxEditorText: String = ""
     @FocusState private var sandboxFocused: Bool
+    @FocusState private var sandboxSecondFocused: Bool
     @State private var newWord: String = ""
     @FocusState private var newWordFocused: Bool
     @State private var wordFeedback: String = ""
@@ -175,14 +193,16 @@ public struct IOSHostRootView: View {
                             Label("键盘实时试手区", systemImage: "character.cursor.ibeam")
                                 .font(.system(size: 14, weight: .semibold))
                             Spacer()
-                            if !sandboxText.isEmpty {
+                            if !sandboxText.isEmpty || !sandboxSecondText.isEmpty || !sandboxEditorText.isEmpty {
                                 Button("清空") {
                                     sandboxText = ""
+                                    sandboxSecondText = ""
+                                    sandboxEditorText = ""
                                 }
                                 .font(.system(size: 13))
                                 .foregroundStyle(.secondary)
                             }
-                            if sandboxFocused {
+                            if sandboxFocused || ProcessInfo.processInfo.arguments.contains("--dual-sandbox") {
                                 Button("完成") {
                                     dismissKeyboard()
                                 }
@@ -194,10 +214,27 @@ public struct IOSHostRootView: View {
                         TextField("点此弹出键盘试打汉字、长按空格滑动移光标…", text: $sandboxText)
                             .textFieldStyle(.roundedBorder)
                             .focused($sandboxFocused)
+                            .accessibilityIdentifier("JuxuSandboxPrimary")
                             .submitLabel(.done)
                             .onSubmit {
                                 dismissKeyboard()
                             }
+                        if ProcessInfo.processInfo.arguments.contains("--dual-sandbox") {
+                            TextField("第二个输入框", text: $sandboxSecondText)
+                                .textFieldStyle(.roundedBorder)
+                                .focused($sandboxSecondFocused)
+                                .accessibilityIdentifier("JuxuSandboxSecondary")
+                                .submitLabel(.done)
+                            TextEditor(text: $sandboxEditorText)
+                                .frame(height: 54)
+                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
+                                .accessibilityIdentifier("JuxuSandboxEditor")
+                            #if os(iOS)
+                            SandboxWebView()
+                                .frame(height: 60)
+                                .accessibilityIdentifier("JuxuSandboxWeb")
+                            #endif
+                        }
                     }
                     .padding(14)
                     .background(iosCardBackground)

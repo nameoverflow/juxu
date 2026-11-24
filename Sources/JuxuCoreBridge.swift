@@ -1579,6 +1579,8 @@ public final class JuxuBridge: ObservableObject {
 // MARK: - Chinese / English Auto-Spacing Engine
 
 /// Chinese punctuation pairing: typing an opener also inserts its closer with the cursor in between.
+public typealias IOSPunctuationPairing = PunctuationPairing
+
 public enum PunctuationPairing {
     public enum Action: Equatable {
         case plain
@@ -2154,9 +2156,18 @@ public struct AutoSpaceContextTracker: Sendable {
 @MainActor
 public protocol IOSMarkedTextDocumentSink: AnyObject {
     var documentContextBeforeInput: String? { get }
+    var documentContextAfterInput: String? { get }
+    var selectedText: String? { get }
     func setMarkedText(_ markedText: String, selectedRange: NSRange)
     func unmarkText()
     func insertText(_ text: String)
+    func adjustTextPosition(byCharacterOffset offset: Int)
+}
+
+public extension IOSMarkedTextDocumentSink {
+    var documentContextAfterInput: String? { nil }
+    var selectedText: String? { nil }
+    func adjustTextPosition(byCharacterOffset offset: Int) {}
 }
 
 /// Coordinates inline `markedText` composition and committed text insertion on iOS `UITextDocumentProxy`.
@@ -2177,6 +2188,12 @@ public struct IOSInlineMarkedTextSession {
     public var markedCode: String {
         deferredInlinePreedit ?? hostMarkedCode
     }
+    /// Process-wide orphaned `markedText` state so keyboard dismiss -> `KeyboardViewController`
+    /// deallocation + re-instantiation inside the extension process preserves pending cleanup.
+    private static var sharedHasOrphanedMarked = false
+    private static var sharedNeedsAppearanceSweep = false
+    private static var sharedOrphanedExpectedBeforeTail = ""
+
     private var hostMarkedCode: String = ""
     private var turnUnmarkedCommit: String?
     public private(set) var deferredInlinePreedit: String?
@@ -2184,9 +2201,19 @@ public struct IOSInlineMarkedTextSession {
     public var autoSpaceTracker = AutoSpaceContextTracker()
     public private(set) var compositionBaseContext: String?
 
+    public var hasOrphanedMarkedInSession: Bool { Self.sharedHasOrphanedMarked }
+    public var needsAppearanceSweep: Bool { Self.sharedNeedsAppearanceSweep }
+
     public init() {}
 
+    public static func resetSharedOrphanedState() {
+        sharedHasOrphanedMarked = false
+        sharedNeedsAppearanceSweep = false
+        sharedOrphanedExpectedBeforeTail = ""
+    }
+
     public mutating func reset() {
+        hostMarkedCode = ""
         turnUnmarkedCommit = nil
         deferredInlinePreedit = nil
         autoSpaceTracker.invalidate()
@@ -2195,10 +2222,83 @@ public struct IOSInlineMarkedTextSession {
 
     public mutating func resetForAppearance() {
         hostMarkedCode = ""
-        turnUnmarkedCommit = nil
-        deferredInlinePreedit = nil
+        if turnUnmarkedCommit == nil {
+            deferredInlinePreedit = nil
+        }
         autoSpaceTracker.invalidate()
         compositionBaseContext = nil
+    }
+
+    /// Records that input focus left the composing field before `markedText` was committed.
+    /// Because UIKit resigns the outgoing responder before notifying `UIInputViewController`,
+    /// the outgoing field retains an orphaned `markedTextRange` until refocused and swept.
+    @discardableResult
+    public mutating func recordFocusLoss() -> Bool {
+        let hadMarked = !markedCode.isEmpty
+        if hadMarked {
+            Self.sharedHasOrphanedMarked = true
+            Self.sharedOrphanedExpectedBeforeTail = String((compositionBaseContext ?? autoSpaceTracker.currentShadowBefore).suffix(32))
+        }
+        reset()
+        return hadMarked
+    }
+
+    /// Records `viewWillDisappear`: UIKit deallocates `KeyboardViewController` on dismiss and creates
+    /// a new instance on reopen, so `sharedNeedsAppearanceSweep` persists at process scope.
+    public mutating func recordKeyboardDisappear() {
+        if !markedCode.isEmpty {
+            Self.sharedHasOrphanedMarked = true
+            Self.sharedOrphanedExpectedBeforeTail = String((compositionBaseContext ?? autoSpaceTracker.currentShadowBefore).suffix(32))
+        }
+        if Self.sharedHasOrphanedMarked {
+            Self.sharedNeedsAppearanceSweep = true
+        }
+        reset()
+    }
+
+    /// Clears any orphaned `markedTextRange` left in a refocused field from a prior aborted composition,
+    /// without disturbing active range selections (`selectedText`).
+    @discardableResult
+    public mutating func sweepOrphanedMarkedText(
+        in sink: any IOSMarkedTextDocumentSink
+    ) -> (needsAsyncFlush: Bool, expectedBeforeTail: String) {
+        guard Self.sharedHasOrphanedMarked else { return (false, "") }
+        guard hostMarkedCode.isEmpty && deferredInlinePreedit == nil && turnUnmarkedCommit == nil else {
+            return (false, "")
+        }
+        let tail = Self.sharedOrphanedExpectedBeforeTail
+        Self.sharedHasOrphanedMarked = false
+        Self.sharedNeedsAppearanceSweep = false
+        Self.sharedOrphanedExpectedBeforeTail = ""
+        if (sink.selectedText ?? "").isEmpty {
+            turnUnmarkedCommit = ""
+            sink.setMarkedText("", selectedRange: NSRange(location: 0, length: 0))
+            sink.unmarkText()
+            return (true, tail)
+        } else {
+            sink.unmarkText()
+            return (false, "")
+        }
+    }
+
+    /// Restores the caret after `sweepOrphanedMarkedText` on iOS 26 TextKit 2 (`UITextField`/`UITextView`),
+    /// which resets `selectedTextRange` to `{0, 0}` when `setMarkedText("", ...)` clears an orphaned range.
+    public mutating func restoreCaretAfterOrphanedSweepIfNeeded(
+        expectedBeforeTail: String,
+        in sink: any IOSMarkedTextDocumentSink
+    ) {
+        guard !expectedBeforeTail.isEmpty,
+              hostMarkedCode.isEmpty,
+              deferredInlinePreedit == nil else { return }
+        let before = sink.documentContextBeforeInput ?? ""
+        guard before.isEmpty else { return }
+        let after = sink.documentContextAfterInput ?? ""
+        guard let range = after.range(of: expectedBeforeTail) else { return }
+        let offset = after.distance(from: after.startIndex, to: range.upperBound)
+        if offset > 0 {
+            sink.adjustTextPosition(byCharacterOffset: offset)
+            autoSpaceTracker.reconcileExternalContext(hostBefore: String(after[..<range.upperBound]))
+        }
     }
 
     public mutating func reconcileExternalContext(hostBefore: String?) {
@@ -2245,11 +2345,15 @@ public struct IOSInlineMarkedTextSession {
         )
     }
 
+    private mutating func takeSameTurnPrefix() -> String? {
+        turnUnmarkedCommit
+    }
+
     private mutating func commitReplacingMarkedIfNeeded(
         _ formatted: String,
         in sink: any IOSMarkedTextDocumentSink
     ) -> Bool {
-        if let prev = turnUnmarkedCommit {
+        if let prev = takeSameTurnPrefix() {
             let combined = prev + formatted
             turnUnmarkedCommit = combined
             deferredInlinePreedit = nil
@@ -2292,7 +2396,7 @@ public struct IOSInlineMarkedTextSession {
             options: options,
             in: sink
         )
-        if let prev = turnUnmarkedCommit {
+        if let prev = takeSameTurnPrefix() {
             let combined = prev + formatted
             turnUnmarkedCommit = combined
             sink.setMarkedText(
@@ -2318,7 +2422,7 @@ public struct IOSInlineMarkedTextSession {
             hostBefore: sink.documentContextBeforeInput,
             hostBeforeIsAuthoritative: false
         )
-        if let prev = turnUnmarkedCommit {
+        if let prev = takeSameTurnPrefix() {
             let combined = prev + text
             turnUnmarkedCommit = combined
             sink.setMarkedText(
