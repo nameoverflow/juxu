@@ -837,7 +837,8 @@ class CorpusWriter:
 
     def _get_pool(self) -> ProcessPoolExecutor:
         if self._pool is None:
-            ctx = mp.get_context("fork" if sys.platform == "linux" else "spawn")
+            # Always use 'spawn' (never 'fork' after CUDA/ThreadPoolExecutor/hf_transfer init on Linux)
+            ctx = mp.get_context("spawn")
             self._pool = ProcessPoolExecutor(
                 max_workers=self.workers,
                 mp_context=ctx,
@@ -1034,7 +1035,7 @@ def pack(directory: Path, seed: Path, workers: int = 0):
 
     clean_path = directory / "clean.txt"
     n_workers = workers if workers > 0 else min(max(1, (os.cpu_count() or 4) - 1), 12)
-    ctx = mp.get_context("fork" if sys.platform == "linux" else "spawn")
+    ctx = mp.get_context("spawn")
 
     cjk_counts = np.zeros(0xA000, dtype=np.int64)
     ascii_words: Counter[str] = Counter()
