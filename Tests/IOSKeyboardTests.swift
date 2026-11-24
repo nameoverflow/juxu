@@ -1134,6 +1134,27 @@ struct IOSKeyboardTests {
             assert(f1FinalText == "你好我们" && f1FinalMarked == nil, "Got '\(f1FinalText)'")
         }
 
+        // Whole-keyboard long-press trackpad with delayed alternates promotion
+        assert(IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .space, wholeKeyboardEnabled: false))
+        assert(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .letter(UInt8(ascii: "a")), wholeKeyboardEnabled: false))
+        assert(IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .letter(UInt8(ascii: "a")), wholeKeyboardEnabled: true))
+        assert(IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .symbol("，"), wholeKeyboardEnabled: true))
+        assert(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .backspace, wholeKeyboardEnabled: true), "Backspace keeps repeat delete")
+        assert(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .globe, wholeKeyboardEnabled: true), "Globe keeps system switcher")
+        assert(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .planeSwitch(.numbers, label: "123"), wholeKeyboardEnabled: true), "Plane switch keeps hold-and-slide")
+        assert(IOSKeyboardTrackpadHold.trackpadHoldDelay(wholeKeyboardEnabled: true) < IOSKeyboardTrackpadHold.alternatesDelay(wholeKeyboardEnabled: true), "Trackpad activates before alternates popup")
+        assert(IOSKeyboardTrackpadHold.alternatesDelay(wholeKeyboardEnabled: false) == IOSKeyboardTrackpadHold.defaultAlternatesDelay)
+        let holdStart = CGPoint(x: 200, y: 180)
+        assert(!IOSKeyboardTrackpadHold.shouldCancelAlternatesOnMove(from: holdStart, to: CGPoint(x: 208, y: 184)), "Small jitter keeps alternates timer armed")
+        assert(IOSKeyboardTrackpadHold.shouldCancelAlternatesOnMove(from: holdStart, to: CGPoint(x: 215, y: 180)), "Cursor drag cancels pending alternates popup")
+        assert(!IOSKeyboardTrackpadHold.shouldCancelAlternatesInTrackpad(from: holdStart, to: CGPoint(x: 208, y: 184), dx: 0, dy: 0), "Stationary trackpad touch keeps alternates timer armed")
+        assert(IOSKeyboardTrackpadHold.shouldCancelAlternatesInTrackpad(from: holdStart, to: CGPoint(x: 210, y: 180), dx: 1, dy: 0), "Single horizontal cursor step (9.5pt < 12pt) must cancel pending alternates popup")
+        assert(IOSKeyboardTrackpadHold.shouldCancelAlternatesInTrackpad(from: holdStart, to: CGPoint(x: 200, y: 185), dx: 0, dy: 1), "Vertical cursor step must cancel pending alternates popup")
+        var holdCursorPrefs = JuxuPreferences()
+        assert(!holdCursorPrefs.keyboardHoldCursor, "Whole-keyboard hold cursor is opt-in")
+        holdCursorPrefs.keyboardHoldCursor = true
+        assert(JuxuPreferences.fromTOML(holdCursorPrefs.toTOML()).keyboardHoldCursor)
+
         // Bottom-row comma key: tap comma, swipe up period, behind its own toggle
         let commaSize = CGSize(width: 440, height: 220)
         func commaKey(_ snap: IOSKeyboardLayoutEngine.LayoutSnapshot) -> IOSKeySpec? {
