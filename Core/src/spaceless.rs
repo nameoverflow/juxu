@@ -518,10 +518,10 @@ impl Stream {
                     let estimate = if n_chars == 1 {
                         lp1
                     } else {
-                        let fast_total = decoder.model.score_phrase_fast(&parent.state, text)
-                            * (n_chars.min(MAX_CODE_LEN) as f32).powf(0.65);
-                        // Replace c1's raw logp with Neural-Cache-interpolated lp1
-                        fast_total - raw_lp1 + lp1
+                        let len_scale = (n_chars.min(MAX_CODE_LEN) as f32).powf(0.65);
+                        let fast_total = decoder.model.score_phrase_fast(&parent.state, text) * len_scale;
+                        // Replace c1's scaled raw logp with Neural-Cache-interpolated lp1
+                        fast_total + (lp1 - raw_lp1) * len_scale
                     };
                     steps.push(Step {
                         parent,

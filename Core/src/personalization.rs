@@ -172,12 +172,13 @@ impl Counts {
         };
         let mut support = 0.0;
         let mut matches = 0.0;
-        for (_, candidate, weight) in
+        for (distance, candidate, weight) in
             samples.filter(|(distance, _, _)| *distance <= nearest + STATE_NEIGHBORHOOD)
         {
-            support += weight;
+            let dw = weight / (1.0 + (distance - nearest) as f32);
+            support += dw;
             if candidate == ch {
-                matches += weight;
+                matches += dw;
             }
         }
         let similarity = 1.0 - nearest as f32 / 32.0;
@@ -235,9 +236,10 @@ impl Counts {
             }
             let dist = (sample.signature ^ signature).count_ones();
             if dist <= nearest + STATE_NEIGHBORHOOD {
-                support += w;
+                let dw = w / (1.0 + (dist - nearest) as f32);
+                support += dw;
                 if sample.continuation.ch == ch {
-                    matches += w;
+                    matches += dw;
                 }
             }
         }
@@ -536,7 +538,7 @@ impl PersonalContinuations {
         // 3. Fall back to 0-gram personal unigram prior ONLY for rare/surprising characters
         //    (`rwkv_logp < -5.5`), rescuing sentence-initial personal words (`卓威`, `哈基米`, `句序`)
         //    without ever distorting common high-probability characters (`是`, `上`, `这`, `的`).
-        if best_lambda * best_p < 1e-3 && rwkv_logp < -5.5 && !self.unigrams.is_empty() {
+        if best_lambda < 0.04 && rwkv_logp < -5.5 && !self.unigrams.is_empty() {
             let (p_uni, l_uni) = self.cache_unigram_prob(ch_u16);
             if l_uni * p_uni > best_lambda * best_p {
                 best_p = p_uni;

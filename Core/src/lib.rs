@@ -585,20 +585,21 @@ mod tests {
         let Ok(aux) = AuxView::open_mmap(&aux_path) else {
             return;
         };
-        let nv = aux.neural_view().expect("wubi_aux.wbaux should embed WBLM0001");
+        let nv = aux.neural_view().expect("wubi_aux.wbaux should embed WBLM0002");
         let s = nv.offs.summary;
-        assert_eq!((s.vocab_size, s.rank, s.d_model, s.n_heads, s.n_layers, s.ffn_dim), (8192, 192, 320, 10, 7, 1024));
-        assert!(nv.offs.has_punct_tokens, "V3 model must expose comma/period tokens");
-        assert!(nv.offs.has_eng_num_token, "V3 model must expose <ENG_NUM> token");
+        assert_eq!((s.vocab_size, s.rank, s.d_model, s.n_heads, s.n_layers, s.ffn_dim), (12288, 192, 320, 10, 7, 1024));
+        assert!(nv.offs.has_punct_tokens, "V4 model must expose comma/period tokens");
+        assert!(nv.offs.ascii_trie.is_some(), "V4 WBLM0002 model must embed 4,096-entry ASCII/English subword Trie");
+        assert!(!nv.offs.has_eng_num_token, "V4 WBLM0002 replaces <ENG_NUM> with native ASCII/English subwords");
         assert_eq!(nv.punct_to_token('，'), Some(crate::neural::TOK_COMMA));
         assert_eq!(nv.punct_to_token('。'), Some(crate::neural::TOK_PERIOD));
 
-        // Parity check against V3-Distill INT8 WBLM0001 ("今天天气真" -> 好/热; BF16 parity.json=-0.753486)
+        // Bit-exact INT8 parity check against V4-Bilingual-Distill WBLM0002 parity.json ("今天天气真" -> 好:-0.581890, 热:-4.775658)
         let mut tracker = crate::neural::NeuralContextTracker::default();
         tracker.set_context_str(&nv, "今天天气真");
         let sc_hao = nv.score_next_char(&tracker.active, '好');
         let sc_re = nv.score_next_char(&tracker.active, '热');
-        assert!((sc_hao - (-0.725084)).abs() < 1e-3, "unexpected score_hao={sc_hao}");
+        assert!((sc_hao - (-0.581890)).abs() < 1e-3, "unexpected score_hao={sc_hao}");
         assert!(sc_hao > sc_re);
 
         // Cross-clause state must survive comma & period, and differ from a reset clause
@@ -621,11 +622,14 @@ mod tests {
         let sc_dai_inc = nv.score_next_char(&t_inc.active, '带');
         assert!((sc_dai_inc - sc_dai_cross).abs() < 1e-5);
 
-        // Non-mapped boundary (newline) resets to BOS
+        // In WBLM0002, newline maps to TOK_PERIOD identically to '。', preserving sentence context
         let mut t_nl = crate::neural::NeuralContextTracker::default();
         t_nl.set_context_str(&nv, "今天下雨了\n我");
+        let mut t_period = crate::neural::NeuralContextTracker::default();
+        t_period.set_context_str(&nv, "今天下雨了。我");
         let sc_dai_nl = nv.score_next_char(&t_nl.active, '带');
-        assert!((sc_dai_nl - sc_dai_short).abs() < 1e-5);
+        let sc_dai_period = nv.score_next_char(&t_period.active, '带');
+        assert!((sc_dai_nl - sc_dai_period).abs() < 1e-5);
     }
 
     #[test]
