@@ -231,6 +231,18 @@ mod tests {
                 '我' as u32,
                 900_000,
             ),
+            (
+                PackedPinyin::from_bytes(b"jing").unwrap(),
+                "jìng".to_string(),
+                '镜' as u32,
+                750_000,
+            ),
+            (
+                PackedPinyin::from_bytes(b"leng").unwrap(),
+                "léng".to_string(),
+                '棱' as u32,
+                700_000,
+            ),
         ];
         // Strong corpus bigram: '入' -> '法' (`boost = 3.5` nats => `3.5 * 256 = 896`)
         let pair_key = (('入' as u64) << 32) | ('法' as u64);
@@ -353,21 +365,42 @@ mod tests {
         engine.set_aux(build_sample_aux());
 
         for ch in ['z', 'g', 'u', 'o'] {
-            let _ = engine.handle_key_event(0, Some(ch), false, 100);
+            let (cx, cy) = engine.key_layout.center_of(ch as u8);
+            let _ = engine.push_touch_letter(ch as u8, cx, cy, true, 100);
         }
         let cands = engine.page_candidates();
         assert!(!cands.is_empty());
         assert_eq!(cands[0].text, "国");
         assert_eq!(cands[0].badge, CandidateBadge::PinyinLookup);
         assert!(cands[0].comment.contains("lgyi"));
+        // Selecting a 4-key `z`+Pinyin reverse lookup candidate (`zguo` -> `lgyi`) must NOT feed
+        // Pinyin touch coordinates into Wubi key `'l'`'s touch calibration!
+        let _ = engine.select_page_candidate(0, 120).unwrap();
+        assert_eq!(engine.user.touch_profile.keys[(b'l' - b'a') as usize].samples, 0);
+
+        // 4-letter Pinyin (`zjing` / `zleng`, 5 keys total > Wubi max_code_len=4) must stay in `z` lookup mode!
+        for ch in "zjing".chars() {
+            let out = engine.handle_key_event(0, Some(ch), false, 150);
+            assert!(out.commit_text.is_empty());
+        }
+        assert_eq!(engine.page_candidates()[0].text, "镜");
+        assert_eq!(engine.page_candidates()[0].badge, CandidateBadge::PinyinLookup);
+        assert!(engine.page_candidates()[0].comment.contains("qujq"));
+        // Pressing uppercase `'A'` after `"zjing"` commits `"镜"` and starts `'A'` instead of `"zjingA"`
+        let out_upper = engine.handle_key_event(0, Some('A'), false, 180);
+        assert_eq!(out_upper.commit_text, "镜");
+        assert_eq!(out_upper.preedit, "A");
         engine.clear_composition();
 
-        // Wildcard `trzt` finds "我" (`trnt`)
+        // Wildcard `trzt` finds "我" (`trnt`) without polluting key `'n'` touch offsets
         for ch in ['t', 'r', 'z', 't'] {
-            let _ = engine.handle_key_event(0, Some(ch), false, 200);
+            let (cx, cy) = engine.key_layout.center_of(ch as u8);
+            let _ = engine.push_touch_letter(ch as u8, cx, cy, true, 200);
         }
         assert_eq!(engine.page_candidates()[0].text, "我");
         assert_eq!(engine.page_candidates()[0].comment, "trnt");
+        let _ = engine.select_page_candidate(0, 220).unwrap();
+        assert_eq!(engine.user.touch_profile.keys[(b'n' - b'a') as usize].samples, 0);
     }
 
     #[test]

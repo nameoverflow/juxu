@@ -1008,6 +1008,97 @@ fn real_dicts_cangjie_3_5_6_input_and_five_code_rules() {
         );
         engine.clear_composition();
     }
+
+    // 6. Verify 5..6-letter Pinyin (`zliang`, `zshuang`, `zzhuang`) in Cangjie 5 as well
+    engine.set_schema(InputSchema::Cangjie5);
+    for (keys, expected_ch) in [("zliang", "兩"), ("zshuang", "雙"), ("zzhuang", "裝")] {
+        for ch in keys.chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 950);
+        }
+        assert!(
+            engine
+                .all_candidates()
+                .iter()
+                .any(|c| c.badge == CandidateBadge::PinyinLookup && c.text == expected_ch),
+            "expected '{}' in Cangjie5 z-pinyin lookup for '{}', got {:?}",
+            expected_ch,
+            keys,
+            engine.all_candidates().iter().take(6).map(|c| &c.text).collect::<Vec<_>>()
+        );
+        engine.clear_composition();
+    }
+
+    // 7. Verify 4..6-letter Pinyin reverse lookup in Wubi 86 / 98 / 06 (including `z`-initial Pinyin and `spaceless` mode)
+    let wb86 = DictView::open_mmap(base.join("wubi86.wbdict")).expect("open wubi86.wbdict");
+    let wb98 = DictView::open_mmap(base.join("wubi98.wbdict")).expect("open wubi98.wbdict");
+    let wb06 = DictView::open_mmap(base.join("wubi06.wbdict")).expect("open wubi06.wbdict");
+    engine.load_dict(InputSchema::Wubi86, wb86);
+    engine.load_dict(InputSchema::Wubi98, wb98);
+    engine.load_dict(InputSchema::Wubi06, wb06);
+
+    for schema in [InputSchema::Wubi86, InputSchema::Wubi98, InputSchema::Wubi06] {
+        for spaceless in [false, true] {
+            let mut wcfg = engine.config.clone();
+            wcfg.schema = schema;
+            wcfg.spaceless = spaceless;
+            engine.set_config(wcfg);
+
+            for (keys, expected_ch) in [
+                ("zmian", "面"),
+                ("zquan", "全"),
+                ("zliang", "两"),
+                ("zshuang", "双"),
+                ("zchuang", "窗"),
+                ("zzhao", "找"),
+                ("zzhang", "张"),
+                ("zzhong", "中"),
+                ("zzhuang", "装"),
+            ] {
+                for (i, ch) in keys.chars().enumerate() {
+                    let out = engine.handle_key_event(0, Some(ch), false, 1000 + i as u64 * 20);
+                    assert!(
+                        out.commit_text.is_empty(),
+                        "unexpected premature commit '{}' while typing '{}' at char '{}' ({:?}, spaceless={})",
+                        out.commit_text,
+                        keys,
+                        ch,
+                        schema,
+                        spaceless
+                    );
+                }
+                assert_eq!(engine.preedit(), keys);
+                assert!(
+                    engine
+                        .all_candidates()
+                        .iter()
+                        .any(|c| c.badge == CandidateBadge::PinyinLookup && c.text == expected_ch),
+                    "expected '{}' in {:?} (spaceless={}) z-pinyin lookup for '{}', got {:?}",
+                    expected_ch,
+                    schema,
+                    spaceless,
+                    keys,
+                    engine.all_candidates().iter().take(8).map(|c| &c.text).collect::<Vec<_>>()
+                );
+                engine.clear_composition();
+            }
+        }
+    }
+
+    // 8. Verify 4-letter `zz` symbol code in Wubi 86 (`zzdx`) still push-commits on 5th key
+    let mut w86_cfg = engine.config.clone();
+    w86_cfg.schema = InputSchema::Wubi86;
+    w86_cfg.spaceless = false;
+    w86_cfg.fifth_code_push_commit = true;
+    engine.set_config(w86_cfg);
+    for ch in "zzdx".chars() {
+        let out = engine.handle_key_event(0, Some(ch), false, 2000);
+        assert!(out.commit_text.is_empty());
+    }
+    let sym_top1 = engine.page_candidates()[0].text.clone();
+    let out_push = engine.handle_key_event(0, Some('q'), false, 2100);
+    assert_eq!(out_push.commit_text, sym_top1);
+    assert_eq!(engine.preedit(), "q");
+    engine.clear_composition();
 }
 
 #[test]

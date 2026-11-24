@@ -753,6 +753,42 @@ impl JuxuEngine {
         self.uses_spaceless()
     }
 
+    pub(crate) fn is_z_lookup_mode(&self) -> bool {
+        self.config.schema.supports_z_pinyin()
+            && self.config.z_omnipotent
+            && self.raw_code.starts_with('z')
+            && !self.raw_code.bytes().any(|b| b.is_ascii_uppercase())
+            && self.raw_code.len() <= 7
+    }
+
+    fn is_zz_symbol_full_code(&self) -> bool {
+        if !self.raw_code.starts_with("zz") || self.raw_code.len() != 4 {
+            return false;
+        }
+        let Some(pc) = PackedCode::from_ascii(&self.raw_code) else {
+            return false;
+        };
+        self.active_dict()
+            .is_some_and(|d| !d.lookup_exact(pc, true).is_empty())
+    }
+
+    fn is_z_pinyin_stream(&self) -> bool {
+        if !self.is_z_lookup_mode() {
+            return false;
+        }
+        if !self.raw_code.starts_with("zz")
+            || self.raw_code.len() > self.config.schema.max_code_len()
+        {
+            return true;
+        }
+        if self.is_zz_symbol_full_code() {
+            return false;
+        }
+        self.aux
+            .as_ref()
+            .is_some_and(|a| !a.lookup_pinyin(&self.raw_code.as_bytes()[1..], 1).is_empty())
+    }
+
     pub(crate) fn uses_spaceless(&self) -> bool {
         !self.config.schema.is_pinyin()
             && self.config.spaceless
@@ -1290,9 +1326,15 @@ impl JuxuEngine {
                     eval_cands,
                 );
             }
+            let touch_code = (!cand.matched_code.is_empty()
+                && !matches!(
+                    cand.badge,
+                    CandidateBadge::PinyinLookup | CandidateBadge::Wildcard
+                ))
+            .then_some(cand.matched_code);
             self.finalize_commit_with_prestepped(
                 &cand.text,
-                Some(cand.matched_code),
+                touch_code,
                 timestamp_ms,
                 false,
                 true,
@@ -1884,7 +1926,8 @@ impl JuxuEngine {
             }
             let already_english = self.raw_code.is_empty()
                 || self.raw_code.bytes().any(|b| b.is_ascii_uppercase())
-                || self.raw_code.len() > self.config.schema.max_code_len();
+                || (!self.is_z_lookup_mode()
+                    && self.raw_code.len() > self.config.schema.max_code_len());
             if already_english {
                 return self.push_code_observation(obs);
             }
@@ -2019,10 +2062,7 @@ impl JuxuEngine {
             }
         }
 
-        let is_z_pinyin_mode = self.config.schema.supports_z_pinyin()
-            && self.config.z_omnipotent
-            && self.raw_code.starts_with('z')
-            && !self.raw_code.starts_with("zz");
+        let is_z_pinyin_mode = self.is_z_pinyin_stream();
         let schema_max_len = self.config.schema.max_code_len();
         let max_len = if is_z_pinyin_mode { 7 } else { schema_max_len };
 
@@ -2074,10 +2114,7 @@ impl JuxuEngine {
             self.rebuild_candidates();
         }
 
-        let now_z_pinyin = self.config.schema.supports_z_pinyin()
-            && self.config.z_omnipotent
-            && self.raw_code.starts_with('z')
-            && !self.raw_code.starts_with("zz");
+        let now_z_pinyin = self.is_z_pinyin_stream();
         let now_has_upper = self.raw_code.bytes().any(|b| b.is_ascii_uppercase());
 
         if !now_z_pinyin && !now_has_upper && self.raw_code.len() == schema_max_len {
@@ -2673,7 +2710,12 @@ impl JuxuEngine {
         );
         let _ =
             self.step_and_learn_commit_single_pass(&candidate.text, do_learn, false, None, false);
-        let code = (!candidate.matched_code.is_empty()).then_some(candidate.matched_code);
+        let code = (!candidate.matched_code.is_empty()
+            && !matches!(
+                candidate.badge,
+                CandidateBadge::PinyinLookup | CandidateBadge::Wildcard
+            ))
+        .then_some(candidate.matched_code);
         self.finalize_commit_with_prestepped(
             &candidate.text,
             code,
@@ -3017,18 +3059,18 @@ impl JuxuEngine {
             return;
         }
 
-        if self.raw_code.bytes().any(|b| b.is_ascii_uppercase())
-            || self.raw_code.len() > self.config.schema.max_code_len()
-        {
+        if self.raw_code.bytes().any(|b| b.is_ascii_uppercase()) {
             self.build_english_buffer_candidates();
             return;
         }
 
-        if self.config.schema.supports_z_pinyin()
-            && self.config.z_omnipotent
-            && self.raw_code.starts_with('z')
-        {
+        if self.is_z_lookup_mode() {
             self.build_z_mode_candidates(slot);
+            return;
+        }
+
+        if self.raw_code.len() > self.config.schema.max_code_len() {
+            self.build_english_buffer_candidates();
             return;
         }
 
