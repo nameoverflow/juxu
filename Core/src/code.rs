@@ -113,6 +113,19 @@ impl PackedCode {
     }
 }
 
+/// True if `ch` is a CJK ideograph (Unified CJK, Ext A, Ext B–I, Compatibility Ideographs, or `〇`).
+#[inline]
+pub fn is_cjk_ideograph(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x4E00..=0x9FFF
+            | 0x3400..=0x4DBF
+            | 0x20000..=0x323AF
+            | 0xF900..=0xFAFF
+            | 0x3007
+    )
+}
+
 /// Standard Cangjie radical glyph for ASCII letters `'a'..='z'`.
 #[inline]
 pub fn cangjie_radical_char(b: u8) -> Option<char> {

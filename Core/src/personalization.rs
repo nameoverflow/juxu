@@ -158,6 +158,47 @@ impl Counts {
         limit * support * preference
     }
 
+    /// Compute `(nearest_distance, weighted_support, weighted_matches)` across kNN state samples.
+    fn knn_state_stats(&self, sig: u128, ch: u16, decay: f32) -> Option<(u32, f32, f32)> {
+        let mut nearest = u32::MAX;
+        for sample in &self.states {
+            if sample.continuation.ch == 0 {
+                continue;
+            }
+            let w = sample.continuation.weight * decay;
+            if w < 0.1 {
+                continue;
+            }
+            let dist = (sample.signature ^ sig).count_ones();
+            if dist <= MAX_STATE_DISTANCE && dist < nearest {
+                nearest = dist;
+            }
+        }
+        if nearest == u32::MAX {
+            return None;
+        }
+        let mut support = 0.0f32;
+        let mut matches = 0.0f32;
+        for sample in &self.states {
+            if sample.continuation.ch == 0 {
+                continue;
+            }
+            let w = sample.continuation.weight * decay;
+            if w < 0.1 {
+                continue;
+            }
+            let dist = (sample.signature ^ sig).count_ones();
+            if dist <= nearest + STATE_NEIGHBORHOOD {
+                let dw = w / (1.0 + (dist - nearest) as f32);
+                support += dw;
+                if sample.continuation.ch == ch {
+                    matches += dw;
+                }
+            }
+        }
+        (support > 0.0).then_some((nearest, support, matches))
+    }
+
     fn state_bonus(&self, ch: u16, state: &RwkvState, now: u64) -> f32 {
         if !self
             .states
@@ -167,30 +208,11 @@ impl Counts {
             return 0.0;
         }
         let decay = self.decay(now);
-        let signature = state_signature(state);
-        let samples = self.states.iter().filter_map(|sample| {
-            let distance = (sample.signature ^ signature).count_ones();
-            let weight = sample.continuation.weight * decay;
-            (distance <= MAX_STATE_DISTANCE && weight >= 0.1).then_some((
-                distance,
-                sample.continuation.ch,
-                weight,
-            ))
-        });
-        let Some(nearest) = samples.clone().map(|(distance, _, _)| distance).min() else {
+        let Some((nearest, support, matches)) =
+            self.knn_state_stats(state_signature(state), ch, decay)
+        else {
             return 0.0;
         };
-        let mut support = 0.0;
-        let mut matches = 0.0;
-        for (distance, candidate, weight) in
-            samples.filter(|(distance, _, _)| *distance <= nearest + STATE_NEIGHBORHOOD)
-        {
-            let dw = weight / (1.0 + (distance - nearest) as f32);
-            support += dw;
-            if candidate == ch {
-                matches += dw;
-            }
-        }
         let similarity = 1.0 - nearest as f32 / 32.0;
         2.25 * similarity * (support / (support + 3.0)) * (matches / (support + 1.0))
     }
@@ -216,46 +238,11 @@ impl Counts {
     /// Estimate `(p_cache, lambda)` from RWKV `p1_q` 128-bit state-signature kNN samples.
     fn cache_state_prob(&self, ch: u16, state: &RwkvState, now: u64) -> (f32, f32) {
         let decay = self.decay(now);
-        let signature = state_signature(state);
-        let mut nearest = u32::MAX;
-        for sample in &self.states {
-            if sample.continuation.ch == 0 {
-                continue;
-            }
-            let w = sample.continuation.weight * decay;
-            if w < 0.1 {
-                continue;
-            }
-            let dist = (sample.signature ^ signature).count_ones();
-            if dist <= MAX_STATE_DISTANCE && dist < nearest {
-                nearest = dist;
-            }
-        }
-        if nearest == u32::MAX {
+        let Some((nearest, support, matches)) =
+            self.knn_state_stats(state_signature(state), ch, decay)
+        else {
             return (0.0, 0.0);
-        }
-        let mut support = 0.0f32;
-        let mut matches = 0.0f32;
-        for sample in &self.states {
-            if sample.continuation.ch == 0 {
-                continue;
-            }
-            let w = sample.continuation.weight * decay;
-            if w < 0.1 {
-                continue;
-            }
-            let dist = (sample.signature ^ signature).count_ones();
-            if dist <= nearest + STATE_NEIGHBORHOOD {
-                let dw = w / (1.0 + (dist - nearest) as f32);
-                support += dw;
-                if sample.continuation.ch == ch {
-                    matches += dw;
-                }
-            }
-        }
-        if support <= 0.0 {
-            return (0.0, 0.0);
-        }
+        };
         let similarity = (1.0 - nearest as f32 / 32.0).clamp(0.0, 1.0);
         let lambda = 0.68 * similarity * (support / (support + 1.5));
         let p_cache = (matches / (support + 0.5)).clamp(0.0, 0.99);
@@ -271,8 +258,7 @@ pub(crate) struct PersonalContinuations {
     tick: u64,
     rows: HashMap<u64, Counts>,
     /// 0-gram personal unigram prior `(last_tick, weight)` so rare sentence-initial characters
-    /// (e.g. `卓` in `卓威`, `哈` in `哈基米`, `傻` in `傻逼吗`) survive pure-char beam search
-    /// after a single explicit selection without any phrase dictionary rules.
+    /// survive pure-char beam search after a single explicit selection without phrase dictionary rules.
     unigrams: HashMap<u16, (u64, f32)>,
     uni_tick: u64,
     uni_total: f32,
@@ -355,7 +341,9 @@ impl PersonalContinuations {
                 .map(|(&k, &(t, w))| (k, w * (-(now.saturating_sub(t) as f32) / HALF_LIFE).exp2()))
                 .collect();
             let remove = by_w.len() - UNIGRAMS_AFTER_PRUNE;
-            by_w.select_nth_unstable_by(remove, |a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            by_w.select_nth_unstable_by(remove, |a, b| {
+                a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+            });
             for (k, _) in by_w.into_iter().take(remove) {
                 self.unigrams.remove(&k);
             }
@@ -378,21 +366,24 @@ impl PersonalContinuations {
         (p_uni, lambda)
     }
 
-    /// A rejected first choice increases evidence at every differing character.
-    pub fn observe(
+    #[allow(clippy::too_many_arguments)]
+    fn observe_with<F>(
         &mut self,
         prefix: &[char],
         text: &str,
         confirmed: bool,
         first_choice: Option<&str>,
-        mut neural: Option<(NeuralView<'_>, RwkvState)>,
-    ) {
-        if let Some((view, _)) = &neural {
-            if !self.matches_model(view) {
+        profile_id: Option<u64>,
+        mut on_char: F,
+    ) where
+        F: FnMut(usize, char, bool, Option<u64>, &mut HashMap<u64, Counts>, f32),
+    {
+        if let Some(pid) = profile_id {
+            if self.state_model != Some(pid) {
                 for row in self.rows.values_mut() {
                     row.states = [StateSample::default(); STATE_SAMPLES_PER_CONTEXT];
                 }
-                self.state_model = Some(view.offs.profile_id);
+                self.state_model = Some(pid);
             }
         }
         let base_weight = if confirmed { 1.0 } else { 0.25 };
@@ -413,29 +404,25 @@ impl PersonalContinuations {
             };
             if han(ch) {
                 self.tick = self.tick.saturating_add(1);
-                let weight = if different { base_weight + 2.5 } else { base_weight };
+                let weight = if different {
+                    base_weight + 2.5
+                } else {
+                    base_weight
+                };
                 for (key, _) in context.suffixes() {
                     self.rows
                         .entry(key)
                         .or_default()
                         .observe(ch as u16, weight, self.tick);
                 }
-                // Record 0-gram unigram prior for sentence-initial / explicitly corrected characters
                 if different {
                     self.observe_unigram(ch as u16, 3.5);
                 } else if confirmed && idx == 0 {
                     self.observe_unigram(ch as u16, 0.45);
                 }
-                if let Some((model, state)) = neural.as_mut() {
-                    if let Some(key) = context.three_chars() {
-                        if let Some(row) = self.rows.get_mut(&key) {
-                            row.observe_state(ch as u16, state_signature(state), weight);
-                        }
-                    }
-                    model.step_token(model.char_to_token(ch), state);
-                }
+                on_char(idx, ch, true, context.three_chars(), &mut self.rows, weight);
             } else {
-                neural = None;
+                on_char(idx, ch, false, None, &mut self.rows, 0.0);
             }
             context = context.push(ch);
         }
@@ -455,6 +442,39 @@ impl PersonalContinuations {
         }
     }
 
+    /// A rejected first choice increases evidence at every differing character.
+    pub fn observe(
+        &mut self,
+        prefix: &[char],
+        text: &str,
+        confirmed: bool,
+        first_choice: Option<&str>,
+        mut neural: Option<(NeuralView<'_>, RwkvState)>,
+    ) {
+        let profile_id = neural.as_ref().map(|(view, _)| view.offs.profile_id);
+        self.observe_with(
+            prefix,
+            text,
+            confirmed,
+            first_choice,
+            profile_id,
+            |_, ch, is_han, three_key, rows, weight| {
+                if !is_han {
+                    neural = None;
+                    return;
+                }
+                if let Some((model, state)) = neural.as_mut() {
+                    if let Some(key) = three_key {
+                        if let Some(row) = rows.get_mut(&key) {
+                            row.observe_state(ch as u16, state_signature(state), weight);
+                        }
+                    }
+                    model.step_token(model.char_to_token(ch), state);
+                }
+            },
+        );
+    }
+
     /// Observe a committed pure-CJK sequence using pre-stepped `state_signature`s collected during
     /// a single shared commit unroll, avoiding redundant `step_token` calls on commit.
     pub fn observe_prestepped_sigs(
@@ -466,64 +486,23 @@ impl PersonalContinuations {
         profile_id: u64,
         pre_step_sigs: &[u128],
     ) {
-        if self.state_model != Some(profile_id) {
-            for row in self.rows.values_mut() {
-                row.states = [StateSample::default(); STATE_SAMPLES_PER_CONTEXT];
-            }
-            self.state_model = Some(profile_id);
-        }
-        let base_weight = if confirmed { 1.0 } else { 0.25 };
-        let mut context = Context::with_chars(prefix.iter().copied());
-        let first_chars: Option<Vec<char>> = first_choice
-            .filter(|&fc| fc != text)
-            .map(|fc| fc.chars().collect());
-        let mut diverged = false;
-        for (idx, ch) in text.chars().enumerate() {
-            let different = if let Some(ref fc) = first_chars {
-                let d = fc.get(idx).copied() != Some(ch);
-                if d {
-                    diverged = true;
+        self.observe_with(
+            prefix,
+            text,
+            confirmed,
+            first_choice,
+            Some(profile_id),
+            |idx, ch, is_han, three_key, rows, weight| {
+                if !is_han {
+                    return;
                 }
-                d || diverged
-            } else {
-                false
-            };
-            if han(ch) {
-                self.tick = self.tick.saturating_add(1);
-                let weight = if different { base_weight + 2.5 } else { base_weight };
-                for (key, _) in context.suffixes() {
-                    self.rows
-                        .entry(key)
-                        .or_default()
-                        .observe(ch as u16, weight, self.tick);
-                }
-                if different {
-                    self.observe_unigram(ch as u16, 3.5);
-                } else if confirmed && idx == 0 {
-                    self.observe_unigram(ch as u16, 0.45);
-                }
-                if let (Some(key), Some(&sig)) = (context.three_chars(), pre_step_sigs.get(idx)) {
-                    if let Some(row) = self.rows.get_mut(&key) {
+                if let (Some(key), Some(&sig)) = (three_key, pre_step_sigs.get(idx)) {
+                    if let Some(row) = rows.get_mut(&key) {
                         row.observe_state(ch as u16, sig, weight);
                     }
                 }
-            }
-            context = context.push(ch);
-        }
-        if self.rows.len() > MAX_CONTEXTS {
-            let mut by_weight: Vec<_> = self
-                .rows
-                .iter()
-                .map(|(&key, row)| (key, row.total * row.decay(self.tick)))
-                .collect();
-            let remove = by_weight.len() - CONTEXTS_AFTER_PRUNE;
-            by_weight.select_nth_unstable_by(remove, |a, b| {
-                a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
-            });
-            for (key, _) in by_weight.into_iter().take(remove) {
-                self.rows.remove(&key);
-            }
-        }
+            },
+        );
     }
 
     pub fn score(&self, mut context: Context, text: &str) -> f32 {
@@ -582,9 +561,6 @@ impl PersonalContinuations {
         }
 
         // 2. Fall back to 1..=3 char suffix continuations when RWKV state kNN did not match.
-        //    Keep 1-char suffix interpolation conservative (`max_lambda = 0.22`, `support_k = 2.5`) so
-        //    a single incidental 1-char continuation never dethrones high-probability common words
-        //    (e.g. `这种`), while still lifting rare 1-shot personal words (`卓威`).
         if best_lambda < 0.04 {
             let max_lambdas = [0.22f32, 0.58, 0.75];
             let support_ks = [2.5f32, 1.5, 1.5];
@@ -593,7 +569,9 @@ impl PersonalContinuations {
                     let i = idx.min(2);
                     let (p_suf, l_suf) =
                         row.cache_suffix_prob(ch_u16, max_lambdas[i], support_ks[i], self.tick);
-                    if l_suf * p_suf > best_lambda * best_p || (best_lambda < 0.04 && l_suf > best_lambda) {
+                    if l_suf * p_suf > best_lambda * best_p
+                        || (best_lambda < 0.04 && l_suf > best_lambda)
+                    {
                         best_p = p_suf;
                         best_lambda = l_suf;
                     }
@@ -601,9 +579,7 @@ impl PersonalContinuations {
             }
         }
 
-        // 3. Fall back to 0-gram personal unigram prior ONLY for rare/surprising characters
-        //    (`rwkv_logp < -5.5`), rescuing sentence-initial personal words (`卓威`, `哈基米`, `句序`)
-        //    without ever distorting common high-probability characters (`是`, `上`, `这`, `的`).
+        // 3. Fall back to 0-gram personal unigram prior ONLY for rare/surprising characters (`rwkv_logp < -5.5`).
         if best_lambda < 0.04 && rwkv_logp < -5.5 && !self.unigrams.is_empty() {
             let (p_uni, l_uni) = self.cache_unigram_prob(ch_u16);
             if l_uni * p_uni > best_lambda * best_p {

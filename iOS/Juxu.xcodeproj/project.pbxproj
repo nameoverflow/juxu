@@ -7,22 +7,39 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		008725A433CF6C1CEBAC8B26 /* JuxuCoreBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA4851968512984F458C2F8B /* JuxuCoreBridge.swift */; };
-		05E3B6DEEB22BDBE4BA06924 /* JuxuCoreBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA4851968512984F458C2F8B /* JuxuCoreBridge.swift */; };
+		02C543189D06D7CC967D3854 /* SharedSettingsComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15EC8FE284288F8D1BC14249 /* SharedSettingsComponents.swift */; };
+		03075FD35836720C48283120 /* IOSInlineMarkedTextSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = FECC15641381DBD7EF1AF25D /* IOSInlineMarkedTextSession.swift */; };
 		0816F150C3383360292586F7 /* IOSClipboardSuggestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A2F23093302CAA84B17A813 /* IOSClipboardSuggestion.swift */; };
-		39D621C48C2CF0455B554F74 /* IOSKeyCanvasAndCallout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A37E7DC85A2DEF721A9FC0D /* IOSKeyCanvasAndCallout.swift */; };
+		0880AA98CDE758BB72D3AE54 /* IOSKeyCalloutAndAlternates.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC5123F5EF490059F55AA771 /* IOSKeyCalloutAndAlternates.swift */; };
+		22B43A9EEE77776D9A36538D /* IOSKeyboardFeedbackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1144F1DAF9AC306600141B98 /* IOSKeyboardFeedbackController.swift */; };
+		2B75509668A0FF8136EDC49E /* JuxuModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3900097D0CC5EEF4B1C3AECB /* JuxuModels.swift */; };
+		2F890DDE6A9E9C38748FA1E8 /* IOSKeyCalloutAndAlternates.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC5123F5EF490059F55AA771 /* IOSKeyCalloutAndAlternates.swift */; };
+		33F3CB3BDC66E11D076C56E8 /* IOSKeyCanvasView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15D567703C59B955BB30C7EB /* IOSKeyCanvasView.swift */; };
+		37A4C61B325E14D3E0BF1809 /* TextFormatting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C57B826421E52334A553E8F /* TextFormatting.swift */; };
 		5DCC91E5DFE8D70D278A31DC /* JuxuKeyboard.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = C253F25FDE1E8C779AFF9213 /* JuxuKeyboard.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		5EAA3BEE7A7BCDB7C06D7B7C /* IOSClipboardSuggestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A2F23093302CAA84B17A813 /* IOSClipboardSuggestion.swift */; };
 		624A67351A73C7FC58FBC829 /* JuxuIOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19A1D915964E6580B34439D6 /* JuxuIOSApp.swift */; };
 		6B31044FEF6F5F6C4767331D /* IOSCandidateViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BEB0944F1CB511242465F68 /* IOSCandidateViews.swift */; };
+		7DE46E49B6479F99A18451CB /* IOSInlineMarkedTextSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = FECC15641381DBD7EF1AF25D /* IOSInlineMarkedTextSession.swift */; };
 		7F84523776A38177D1B68795 /* HostAppViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 243163324BBE91D33C30790C /* HostAppViews.swift */; };
+		80416B32F3E7E09505E41DAF /* JuxuBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CB5CCC25E1CA1B65E902B2F /* JuxuBridge.swift */; };
 		83EE6DDED376BDD976C36DDD /* IOSKeyboardLayoutEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46BFE2C74F587006381BE169 /* IOSKeyboardLayoutEngine.swift */; };
-		BB5F70E39FF4E8327C6C5973 /* IOSKeyCanvasAndCallout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A37E7DC85A2DEF721A9FC0D /* IOSKeyCanvasAndCallout.swift */; };
+		881587E81B7A5E6C498E991B /* JuxuModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3900097D0CC5EEF4B1C3AECB /* JuxuModels.swift */; };
+		8BF7F75BD19D5FBF1045220D /* IOSKeyboardGesturesAndEditing.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBB47A9B592A9EEB9EBA2761 /* IOSKeyboardGesturesAndEditing.swift */; };
+		911B4FA1B4A6C2DB483B9A9B /* IOSKeyboardGesturesAndEditing.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBB47A9B592A9EEB9EBA2761 /* IOSKeyboardGesturesAndEditing.swift */; };
+		9462662B634F2027BB682D2B /* IOSKeyboardGesturesAndEditing.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBB47A9B592A9EEB9EBA2761 /* IOSKeyboardGesturesAndEditing.swift */; };
+		A58CC2CF5DE646E462EB0F97 /* TextFormatting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C57B826421E52334A553E8F /* TextFormatting.swift */; };
+		A782F2EC1D11650DDAA59381 /* IOSInlineMarkedTextSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = FECC15641381DBD7EF1AF25D /* IOSInlineMarkedTextSession.swift */; };
+		B7DB1B6261C355FFAA15D31B /* SharedSettingsComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15EC8FE284288F8D1BC14249 /* SharedSettingsComponents.swift */; };
+		BB72014DB668AF9B2ADCEAB1 /* JuxuModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3900097D0CC5EEF4B1C3AECB /* JuxuModels.swift */; };
 		C3DAD1A3AB6810D8E6F020BB /* Dicts in Resources */ = {isa = PBXBuildFile; fileRef = 4D60E7763D07F95ABBAEB1FB /* Dicts */; };
 		CF542AEFBBE5DA069467D84C /* IOSClipboardSuggestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A2F23093302CAA84B17A813 /* IOSClipboardSuggestion.swift */; };
+		D02809F7224EA47379C1A085 /* JuxuBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CB5CCC25E1CA1B65E902B2F /* JuxuBridge.swift */; };
 		DBB3D262269A132D137F2053 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = DB10A68869F7E8CF905F22CE /* Assets.xcassets */; };
 		DCA3497C2C8296A691DCDD73 /* IOSKeyboardLayoutEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46BFE2C74F587006381BE169 /* IOSKeyboardLayoutEngine.swift */; };
 		EB0F49300595A101B917AE53 /* JuxuSimulatorUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4805FBA9279DF629D5764A1 /* JuxuSimulatorUITests.swift */; };
+		ECC7F7C885F7E19585A20EFE /* IOSKeyCanvasView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15D567703C59B955BB30C7EB /* IOSKeyCanvasView.swift */; };
+		F1831EC4A203BF69AC0ED6C3 /* TextFormatting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C57B826421E52334A553E8F /* TextFormatting.swift */; };
 		F6F77395A230984DE25EBF82 /* IOSKeyboardLayoutEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46BFE2C74F587006381BE169 /* IOSKeyboardLayoutEngine.swift */; };
 		FAE742F298440BE241429A50 /* KeyboardViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41095DFC764371A82348C216 /* KeyboardViewController.swift */; };
 /* End PBXBuildFile section */
@@ -59,20 +76,27 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		0C57B826421E52334A553E8F /* TextFormatting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextFormatting.swift; sourceTree = "<group>"; };
+		1144F1DAF9AC306600141B98 /* IOSKeyboardFeedbackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSKeyboardFeedbackController.swift; sourceTree = "<group>"; };
+		15D567703C59B955BB30C7EB /* IOSKeyCanvasView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSKeyCanvasView.swift; sourceTree = "<group>"; };
+		15EC8FE284288F8D1BC14249 /* SharedSettingsComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedSettingsComponents.swift; sourceTree = "<group>"; };
 		19A1D915964E6580B34439D6 /* JuxuIOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JuxuIOSApp.swift; sourceTree = "<group>"; };
 		243163324BBE91D33C30790C /* HostAppViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostAppViews.swift; sourceTree = "<group>"; };
-		3A37E7DC85A2DEF721A9FC0D /* IOSKeyCanvasAndCallout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSKeyCanvasAndCallout.swift; sourceTree = "<group>"; };
+		3900097D0CC5EEF4B1C3AECB /* JuxuModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JuxuModels.swift; sourceTree = "<group>"; };
 		3BEB0944F1CB511242465F68 /* IOSCandidateViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSCandidateViews.swift; sourceTree = "<group>"; };
 		41095DFC764371A82348C216 /* KeyboardViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardViewController.swift; sourceTree = "<group>"; };
 		46BFE2C74F587006381BE169 /* IOSKeyboardLayoutEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSKeyboardLayoutEngine.swift; sourceTree = "<group>"; };
 		4D60E7763D07F95ABBAEB1FB /* Dicts */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Dicts; path = ../Resources/Dicts; sourceTree = SOURCE_ROOT; };
+		5CB5CCC25E1CA1B65E902B2F /* JuxuBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JuxuBridge.swift; sourceTree = "<group>"; };
 		7A2F23093302CAA84B17A813 /* IOSClipboardSuggestion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSClipboardSuggestion.swift; sourceTree = "<group>"; };
 		9D9959B2E33DB0F350D4E94B /* JuxuApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = JuxuApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AC5123F5EF490059F55AA771 /* IOSKeyCalloutAndAlternates.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSKeyCalloutAndAlternates.swift; sourceTree = "<group>"; };
 		C253F25FDE1E8C779AFF9213 /* JuxuKeyboard.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = JuxuKeyboard.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		DB10A68869F7E8CF905F22CE /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		EBDA5FF7141F3B13707A961D /* JuxuUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = JuxuUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F4805FBA9279DF629D5764A1 /* JuxuSimulatorUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JuxuSimulatorUITests.swift; sourceTree = "<group>"; };
-		FA4851968512984F458C2F8B /* JuxuCoreBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JuxuCoreBridge.swift; sourceTree = "<group>"; };
+		FBB47A9B592A9EEB9EBA2761 /* IOSKeyboardGesturesAndEditing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSKeyboardGesturesAndEditing.swift; sourceTree = "<group>"; };
+		FECC15641381DBD7EF1AF25D /* IOSInlineMarkedTextSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSInlineMarkedTextSession.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -88,6 +112,8 @@
 			isa = PBXGroup;
 			children = (
 				7A2F23093302CAA84B17A813 /* IOSClipboardSuggestion.swift */,
+				FECC15641381DBD7EF1AF25D /* IOSInlineMarkedTextSession.swift */,
+				FBB47A9B592A9EEB9EBA2761 /* IOSKeyboardGesturesAndEditing.swift */,
 				46BFE2C74F587006381BE169 /* IOSKeyboardLayoutEngine.swift */,
 			);
 			path = Shared;
@@ -97,10 +123,24 @@
 			isa = PBXGroup;
 			children = (
 				3BEB0944F1CB511242465F68 /* IOSCandidateViews.swift */,
-				3A37E7DC85A2DEF721A9FC0D /* IOSKeyCanvasAndCallout.swift */,
+				1144F1DAF9AC306600141B98 /* IOSKeyboardFeedbackController.swift */,
+				AC5123F5EF490059F55AA771 /* IOSKeyCalloutAndAlternates.swift */,
+				15D567703C59B955BB30C7EB /* IOSKeyCanvasView.swift */,
 				41095DFC764371A82348C216 /* KeyboardViewController.swift */,
 			);
 			path = KeyboardExtension;
+			sourceTree = "<group>";
+		};
+		6F3754401B153FC09D791353 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				5CB5CCC25E1CA1B65E902B2F /* JuxuBridge.swift */,
+				3900097D0CC5EEF4B1C3AECB /* JuxuModels.swift */,
+				15EC8FE284288F8D1BC14249 /* SharedSettingsComponents.swift */,
+				0C57B826421E52334A553E8F /* TextFormatting.swift */,
+			);
+			name = Shared;
+			path = ../Shared;
 			sourceTree = "<group>";
 		};
 		7C74B5C2C3BC5DDB4069DE97 /* HostApp */ = {
@@ -120,7 +160,7 @@
 				7C74B5C2C3BC5DDB4069DE97 /* HostApp */,
 				4BE52C0E76E45D3B29237412 /* KeyboardExtension */,
 				0E0CEDC418B431815D5D612D /* Shared */,
-				AA05DB9794ECE7E3EEB21DCE /* Sources */,
+				6F3754401B153FC09D791353 /* Shared */,
 				054A2D4E661547530E0DDAFA /* UITests */,
 				A85EA8039CF1560E6492EC6A /* Products */,
 			);
@@ -134,15 +174,6 @@
 				EBDA5FF7141F3B13707A961D /* JuxuUITests.xctest */,
 			);
 			name = Products;
-			sourceTree = "<group>";
-		};
-		AA05DB9794ECE7E3EEB21DCE /* Sources */ = {
-			isa = PBXGroup;
-			children = (
-				FA4851968512984F458C2F8B /* JuxuCoreBridge.swift */,
-			);
-			name = Sources;
-			path = ../Sources;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -306,9 +337,14 @@
 			buildActionMask = 2147483647;
 			files = (
 				0816F150C3383360292586F7 /* IOSClipboardSuggestion.swift in Sources */,
-				BB5F70E39FF4E8327C6C5973 /* IOSKeyCanvasAndCallout.swift in Sources */,
+				7DE46E49B6479F99A18451CB /* IOSInlineMarkedTextSession.swift in Sources */,
+				0880AA98CDE758BB72D3AE54 /* IOSKeyCalloutAndAlternates.swift in Sources */,
+				ECC7F7C885F7E19585A20EFE /* IOSKeyCanvasView.swift in Sources */,
+				9462662B634F2027BB682D2B /* IOSKeyboardGesturesAndEditing.swift in Sources */,
 				F6F77395A230984DE25EBF82 /* IOSKeyboardLayoutEngine.swift in Sources */,
+				BB72014DB668AF9B2ADCEAB1 /* JuxuModels.swift in Sources */,
 				EB0F49300595A101B917AE53 /* JuxuSimulatorUITests.swift in Sources */,
+				F1831EC4A203BF69AC0ED6C3 /* TextFormatting.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -318,10 +354,17 @@
 			files = (
 				6B31044FEF6F5F6C4767331D /* IOSCandidateViews.swift in Sources */,
 				CF542AEFBBE5DA069467D84C /* IOSClipboardSuggestion.swift in Sources */,
-				39D621C48C2CF0455B554F74 /* IOSKeyCanvasAndCallout.swift in Sources */,
+				A782F2EC1D11650DDAA59381 /* IOSInlineMarkedTextSession.swift in Sources */,
+				2F890DDE6A9E9C38748FA1E8 /* IOSKeyCalloutAndAlternates.swift in Sources */,
+				33F3CB3BDC66E11D076C56E8 /* IOSKeyCanvasView.swift in Sources */,
+				22B43A9EEE77776D9A36538D /* IOSKeyboardFeedbackController.swift in Sources */,
+				8BF7F75BD19D5FBF1045220D /* IOSKeyboardGesturesAndEditing.swift in Sources */,
 				DCA3497C2C8296A691DCDD73 /* IOSKeyboardLayoutEngine.swift in Sources */,
-				008725A433CF6C1CEBAC8B26 /* JuxuCoreBridge.swift in Sources */,
+				D02809F7224EA47379C1A085 /* JuxuBridge.swift in Sources */,
+				881587E81B7A5E6C498E991B /* JuxuModels.swift in Sources */,
 				FAE742F298440BE241429A50 /* KeyboardViewController.swift in Sources */,
+				02C543189D06D7CC967D3854 /* SharedSettingsComponents.swift in Sources */,
+				37A4C61B325E14D3E0BF1809 /* TextFormatting.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -331,9 +374,14 @@
 			files = (
 				7F84523776A38177D1B68795 /* HostAppViews.swift in Sources */,
 				5EAA3BEE7A7BCDB7C06D7B7C /* IOSClipboardSuggestion.swift in Sources */,
+				03075FD35836720C48283120 /* IOSInlineMarkedTextSession.swift in Sources */,
+				911B4FA1B4A6C2DB483B9A9B /* IOSKeyboardGesturesAndEditing.swift in Sources */,
 				83EE6DDED376BDD976C36DDD /* IOSKeyboardLayoutEngine.swift in Sources */,
-				05E3B6DEEB22BDBE4BA06924 /* JuxuCoreBridge.swift in Sources */,
+				80416B32F3E7E09505E41DAF /* JuxuBridge.swift in Sources */,
 				624A67351A73C7FC58FBC829 /* JuxuIOSApp.swift in Sources */,
+				2B75509668A0FF8136EDC49E /* JuxuModels.swift in Sources */,
+				B7DB1B6261C355FFAA15D31B /* SharedSettingsComponents.swift in Sources */,
+				A58CC2CF5DE646E462EB0F97 /* TextFormatting.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -1,6 +1,19 @@
 import AppKit
 import SwiftUI
 
+private func check(
+    _ condition: @autoclosure () -> Bool,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #file,
+    line: UInt = #line
+) {
+    if !condition() {
+        fputs("Check failed: \(message()) at \(file):\(line)\n", stderr)
+        fflush(stderr)
+        exit(1)
+    }
+}
+
 @main
 struct SwiftBridgeTests {
     @MainActor
@@ -11,16 +24,16 @@ struct SwiftBridgeTests {
         let bridge = JuxuBridge(customDictsDir: dictsURL, inMemoryOnly: true)
 
         // 1. Verify 86 / 98 / 06 schema switching & dynamic phrase re-encoding
-        assert(bridge.state.schemaId == 86)
+        check(bridge.state.schemaId == 86)
         let code86 = bridge.addUserPhrase("棱五笔", persist: false)
-        assert(!code86.isEmpty, "Expected 86 phrase code for 棱五笔")
+        check(!code86.isEmpty, "Expected 86 phrase code for 棱五笔")
 
         bridge.switchSchema(98, persist: false)
-        assert(bridge.state.schemaId == 98)
-        assert(bridge.userPhrases.contains(where: { $0.text == "棱五笔" && !$0.code.isEmpty }))
+        check(bridge.state.schemaId == 98)
+        check(bridge.userPhrases.contains(where: { $0.text == "棱五笔" && !$0.code.isEmpty }))
 
         bridge.switchSchema(6, persist: false)
-        assert(bridge.state.schemaId == 6)
+        check(bridge.state.schemaId == 6)
 
         // Switch back to 86 for typing & touch tests
         bridge.switchSchema(86, persist: false)
@@ -28,39 +41,116 @@ struct SwiftBridgeTests {
         // 2. Verify 4-code unique auto-commit ("我们" = trwu)
         for ch in "trw".unicodeScalars {
             let s = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 100)
-            assert(s.commitText.isEmpty)
+            check(s.commitText.isEmpty)
         }
         let s4 = bridge.handleKey(keyCode: 0, scalar: UnicodeScalar("u").value, hasCmdOrCtrl: false, timestampMs: 120)
-        assert(s4.commitText == "我们", "Expected auto-commit 我们, got \(s4.commitText)")
+        check(s4.commitText == "我们", "Expected auto-commit 我们, got \(s4.commitText)")
 
         // 3. Verify continuous touch boundary Bayesian typo rescue (`yrwu` near T/Y border -> "我们")
         _ = bridge.pushTouch(reportedAscii: UInt8(ascii: "y"), x: 4.54, y: 0.03, isNormalized: true, timestampMs: 200)
         _ = bridge.pushTouch(reportedAscii: UInt8(ascii: "r"), x: 3.00, y: 0.00, isNormalized: true, timestampMs: 260)
         _ = bridge.pushTouch(reportedAscii: UInt8(ascii: "w"), x: 1.00, y: 0.00, isNormalized: true, timestampMs: 320)
         let touchOut = bridge.pushTouch(reportedAscii: UInt8(ascii: "u"), x: 6.00, y: 0.00, isNormalized: true, timestampMs: 380)
-        assert(
+        check(
             touchOut.candidates.first?.text == "我们",
             "Expected Bayesian touch rescue #1 == 我们, got \(String(describing: touchOut.candidates.first?.text))"
         )
         let confirm = bridge.handleKey(keyCode: 0x31, scalar: 32, hasCmdOrCtrl: false, timestampMs: 420)
-        assert(confirm.commitText == "我们")
-        assert(confirm.calibratedKeyCount >= 1, "Expected online touch adaptation to record calibrated keys")
+        check(confirm.commitText == "我们")
+        check(confirm.calibratedKeyCount >= 1, "Expected online touch adaptation to record calibrated keys")
 
-        // 4. Verify TOML round-trip
+        // 4. Verify TOML & JSON round-trip (including all 8 UI booleans + JuxuBridge save & reload)
         var prefs = bridge.prefs
-        assert(prefs.autoSpaceZhEn == true)
-        assert(prefs.autoSpaceDigits == true)
-        assert(prefs.spaceless == false)
+        check(prefs.autoSpaceZhEn == true)
+        check(prefs.autoSpaceDigits == true)
+        check(prefs.spaceless == false)
         prefs.strictShortcode = true
         prefs.spaceless = true
         prefs.promoteThreshold = 0.86
         prefs.autoSpaceDigits = false
         let decoded = JuxuPreferences.fromTOML(prefs.toTOML())
-        assert(decoded.strictShortcode == true)
-        assert(decoded.spaceless == true)
-        assert(abs(decoded.promoteThreshold - 0.86) < 0.005)
-        assert(decoded.autoSpaceZhEn == true)
-        assert(decoded.autoSpaceDigits == false)
+        check(decoded.strictShortcode == true)
+        check(decoded.spaceless == true)
+        check(abs(decoded.promoteThreshold - 0.86) < 0.005)
+        check(decoded.autoSpaceZhEn == true)
+        check(decoded.autoSpaceDigits == false)
+
+        do {
+            var uiPrefs = JuxuPreferences()
+            // Flip all 8 UI booleans away from their defaults
+            uiPrefs.spaceCommaKey = true
+            uiPrefs.keyboardHoldCursor = true
+            uiPrefs.keySwipeUpInput = true
+            uiPrefs.keyLongPressAlternates = true
+            uiPrefs.backspaceSwipeClear = true
+            uiPrefs.clipboardSuggestion = false
+            uiPrefs.cangjieKeycapRadicals = false
+            uiPrefs.wubiKeycapRadicals = true
+
+            // (a) Codable JSON round-trip
+            let jsonData = try! JSONEncoder().encode(uiPrefs)
+            let jsonDecoded = try! JSONDecoder().decode(JuxuPreferences.self, from: jsonData)
+            check(jsonDecoded == uiPrefs)
+            check(jsonDecoded.spaceCommaKey == true)
+            check(jsonDecoded.keyboardHoldCursor == true)
+            check(jsonDecoded.keySwipeUpInput == true)
+            check(jsonDecoded.keyLongPressAlternates == true)
+            check(jsonDecoded.backspaceSwipeClear == true)
+            check(jsonDecoded.clipboardSuggestion == false)
+            check(jsonDecoded.cangjieKeycapRadicals == false)
+            check(jsonDecoded.wubiKeycapRadicals == true)
+
+            // (b) TOML round-trip via JuxuPreferences.fromTOML(prefs.toTOML())
+            let tomlString = uiPrefs.toTOML()
+            let tomlDecoded = JuxuPreferences.fromTOML(tomlString)
+            check(tomlDecoded == uiPrefs)
+            check(tomlDecoded.spaceCommaKey == true)
+            check(tomlDecoded.keyboardHoldCursor == true)
+            check(tomlDecoded.keySwipeUpInput == true)
+            check(tomlDecoded.keyLongPressAlternates == true)
+            check(tomlDecoded.backspaceSwipeClear == true)
+            check(tomlDecoded.clipboardSuggestion == false)
+            check(tomlDecoded.cangjieKeycapRadicals == false)
+            check(tomlDecoded.wubiKeycapRadicals == true)
+
+            // (c) JuxuBridge save + reload round-trip
+            let prefsBridge = JuxuBridge(customDictsDir: dictsURL, inMemoryOnly: true)
+            prefsBridge.applyAndSavePreferences(uiPrefs, persist: false)
+            prefsBridge.prefs = JuxuPreferences()
+            check(prefsBridge.prefs != uiPrefs)
+            prefsBridge.loadConfigAndUser(refreshPublishedLists: false)
+            check(prefsBridge.prefs == uiPrefs)
+            check(prefsBridge.prefs.spaceCommaKey == true)
+            check(prefsBridge.prefs.keyboardHoldCursor == true)
+            check(prefsBridge.prefs.keySwipeUpInput == true)
+            check(prefsBridge.prefs.keyLongPressAlternates == true)
+            check(prefsBridge.prefs.backspaceSwipeClear == true)
+            check(prefsBridge.prefs.clipboardSuggestion == false)
+            check(prefsBridge.prefs.cangjieKeycapRadicals == false)
+            check(prefsBridge.prefs.wubiKeycapRadicals == true)
+
+            // (d) Disk TOML file save + load round-trip via C ABI without touching user home config
+            let tempTomlURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("juxu-prefs-roundtrip-\(UUID().uuidString).toml")
+            defer { try? FileManager.default.removeItem(at: tempTomlURL) }
+            let cfgH1 = juxu_engine_new()!
+            let cfgH2 = juxu_engine_new()!
+            defer {
+                juxu_engine_free(cfgH1)
+                juxu_engine_free(cfgH2)
+            }
+            let jsonStr = String(data: jsonData, encoding: .utf8)!
+            jsonStr.withCString { juxu_engine_set_config_json(cfgH1, $0) }
+            let savedOk = tempTomlURL.path.withCString { juxu_engine_save_config(cfgH1, $0) }
+            check(savedOk)
+            let loadedOk = tempTomlURL.path.withCString { juxu_engine_load_config(cfgH2, $0) }
+            check(loadedOk)
+            let reloadedJsonPtr = juxu_engine_get_config_json(cfgH2)!
+            let reloadedJson = String(cString: reloadedJsonPtr)
+            juxu_string_free(reloadedJsonPtr)
+            let diskDecoded = try! JSONDecoder().decode(JuxuPreferences.self, from: Data(reloadedJson.utf8))
+            check(diskDecoded == uiPrefs)
+        }
 
         // No-space 98 input through both ABI entry points. Backspace must edit a stroke
         // in the marked tail even after the engine has committed part of the sentence.
@@ -74,43 +164,46 @@ struct SwiftBridgeTests {
             let state = bridge.pushTouch(
                 reportedAscii: key, x: 0, y: 0, isNormalized: false, timestampMs: 500
             )
-            assert(state.consumed && !state.bell)
+            check(state.consumed && !state.bell)
             committed += state.commitText
         }
         let beforeLast = bridge.state.preedit
         let last = UInt32(codes.utf8.last!)
         let afterLast = bridge.handleKey(keyCode: 0, scalar: last, hasCmdOrCtrl: false, timestampMs: 501)
         committed += afterLast.commitText
-        assert(committed == "今天天气真好我们一起")
-        assert(afterLast.preedit == "去吃饭吧")
-        assert(afterLast.macOSPreedit == "fcu·ktqn·kc")
-        assert(afterLast.segmentedCode.hasSuffix("│ fcu·ktqn·kc"))
-        assert(afterLast.segmentedCode.filter(\.isLetter) == codes)
-        assert(afterLast.candidates.contains { $0.text == "吧" })
-        assert(bridge.handleKey(keyCode: 0x33, scalar: 0, hasCmdOrCtrl: false, timestampMs: 502).preedit == beforeLast)
+        check(committed == "今天天气真好我们一起")
+        check(afterLast.preedit == "去吃饭吧")
+        check(afterLast.macOSPreedit == "fcu·ktqn·kc")
+        check(afterLast.segmentedCode.hasSuffix("│ fcu·ktqn·kc"))
+        check(afterLast.segmentedCode.filter(\.isLetter) == codes)
+        check(afterLast.candidates.contains { $0.text == "吧" })
+        let afterBackspace = bridge.handleKey(keyCode: 0x33, scalar: 0, hasCmdOrCtrl: false, timestampMs: 502)
+        check(afterBackspace.preedit == beforeLast)
         _ = bridge.handleKey(keyCode: 0, scalar: last, hasCmdOrCtrl: false, timestampMs: 503)
         let punct = bridge.handleKey(keyCode: 0, scalar: 46, hasCmdOrCtrl: false, timestampMs: 504)
-        assert(punct.commitText == "去吃饭吧。" && punct.preedit.isEmpty)
-        assert(punct.segmentedCode.isEmpty)
+        check(punct.commitText == "去吃饭吧。" && punct.preedit.isEmpty)
+        check(punct.segmentedCode.isEmpty)
         for enterKey: UInt16 in [0x24, 0x4c] {
             for key in "hello".unicodeScalars {
                 let state = bridge.handleKey(keyCode: 0, scalar: key.value, hasCmdOrCtrl: false, timestampMs: 505)
-                assert(state.commitText.isEmpty)
+                check(state.commitText.isEmpty)
             }
             let enter = bridge.handleKey(keyCode: enterKey, scalar: 13, hasCmdOrCtrl: false, timestampMs: 506)
-            assert(enter.commitText == "hello" && enter.preedit.isEmpty && enter.segmentedCode.isEmpty)
+            check(enter.commitText == "hello" && enter.preedit.isEmpty && enter.segmentedCode.isEmpty)
         }
         for key in "qbh".unicodeScalars {
             _ = bridge.handleKey(keyCode: 0, scalar: key.value, hasCmdOrCtrl: false, timestampMs: 507)
         }
         let singleIndex = bridge.allCandidates(maxCount: 30).firstIndex { $0.text == "邜" }!
-        assert(bridge.selectAbsCandidate(absIndex: singleIndex, timestampMs: 508).commitText == "邜")
+        let selectedSingle = bridge.selectAbsCandidate(absIndex: singleIndex, timestampMs: 508)
+        check(selectedSingle.commitText == "邜")
         bridge.setContext("")
         for key in codes.unicodeScalars {
             _ = bridge.handleKey(keyCode: 0, scalar: key.value, hasCmdOrCtrl: false, timestampMs: 509)
         }
         let tailIndex = bridge.state.candidates.firstIndex { $0.text == "吧" }!
-        assert(bridge.selectCandidate(pageRelIndex: tailIndex, timestampMs: 510).commitText == "去吃饭吧")
+        let selectedTail = bridge.selectCandidate(pageRelIndex: tailIndex, timestampMs: 510)
+        check(selectedTail.commitText == "去吃饭吧")
 
         // 4b. Verify Chinese/English auto-spacing formatter & edge cases
         let allOn = AutoSpaceOptions(enabled: true, spaceDigits: true)
@@ -118,115 +211,165 @@ struct SwiftBridgeTests {
         let allOff = AutoSpaceOptions(enabled: false, spaceDigits: true)
 
         // Basic CJK <-> EN & Digits
-        assert(AutoSpaceFormatter.format(before: "你好", inserting: "hello", splitInternal: false, options: allOn).text == " hello")
-        assert(AutoSpaceFormatter.format(before: "hello", inserting: "世界", splitInternal: false, options: allOn).text == " 世界")
-        assert(AutoSpaceFormatter.format(before: "第", inserting: "1", splitInternal: false, options: allOn).text == " 1")
-        assert(AutoSpaceFormatter.format(before: "2026", inserting: "年", splitInternal: false, options: allOn).text == " 年")
+        check(AutoSpaceFormatter.format(before: "你好", inserting: "hello", splitInternal: false, options: allOn).text == " hello")
+        check(AutoSpaceFormatter.format(before: "hello", inserting: "世界", splitInternal: false, options: allOn).text == " 世界")
+        check(AutoSpaceFormatter.format(before: "第", inserting: "1", splitInternal: false, options: allOn).text == " 1")
+        check(AutoSpaceFormatter.format(before: "2026", inserting: "年", splitInternal: false, options: allOn).text == " 年")
 
         // Digits toggle (`spaceDigits: false` keeps `2026年` / `第1`, yet still spaces `iPhone17 手机` / `5G 网络`)
-        assert(AutoSpaceFormatter.format(before: "第", inserting: "1", splitInternal: false, options: noDigits).text == "1")
-        assert(AutoSpaceFormatter.format(before: "2026", inserting: "年", splitInternal: false, options: noDigits).text == "年")
-        assert(AutoSpaceFormatter.format(before: "3.14", inserting: "倍", splitInternal: false, options: noDigits).text == "倍")
-        assert(AutoSpaceFormatter.format(before: "iPhone17", inserting: "手机", splitInternal: false, options: noDigits).text == " 手机")
-        assert(AutoSpaceFormatter.format(before: "看", inserting: "3D", splitInternal: false, options: noDigits).text == " 3D")
+        check(AutoSpaceFormatter.format(before: "第", inserting: "1", splitInternal: false, options: noDigits).text == "1")
+        check(AutoSpaceFormatter.format(before: "2026", inserting: "年", splitInternal: false, options: noDigits).text == "年")
+        check(AutoSpaceFormatter.format(before: "3.14", inserting: "倍", splitInternal: false, options: noDigits).text == "倍")
+        check(AutoSpaceFormatter.format(before: "iPhone17", inserting: "手机", splitInternal: false, options: noDigits).text == " 手机")
+        check(AutoSpaceFormatter.format(before: "看", inserting: "3D", splitInternal: false, options: noDigits).text == " 3D")
 
         // Disabled mode
-        assert(AutoSpaceFormatter.format(before: "你好", inserting: "hello", splitInternal: false, options: allOff).text == "hello")
+        check(AutoSpaceFormatter.format(before: "你好", inserting: "hello", splitInternal: false, options: allOff).text == "hello")
 
         // Existing whitespace / newline / fullwidth space -> never double-space
-        assert(AutoSpaceFormatter.format(before: "", inserting: "hello", splitInternal: false, options: allOn).text == "hello")
-        assert(AutoSpaceFormatter.format(before: "你好 ", inserting: "hello", splitInternal: false, options: allOn).text == "hello")
-        assert(AutoSpaceFormatter.format(before: "你好\n", inserting: "hello", splitInternal: false, options: allOn).text == "hello")
-        assert(AutoSpaceFormatter.format(before: "你好\t", inserting: "hello", splitInternal: false, options: allOn).text == "hello")
-        assert(AutoSpaceFormatter.format(before: "你好\u{3000}", inserting: "hello", splitInternal: false, options: allOn).text == "hello")
-        assert(AutoSpaceFormatter.format(before: "你好", inserting: " hello", splitInternal: false, options: allOn).text == " hello")
+        check(AutoSpaceFormatter.format(before: "", inserting: "hello", splitInternal: false, options: allOn).text == "hello")
+        check(AutoSpaceFormatter.format(before: "你好 ", inserting: "hello", splitInternal: false, options: allOn).text == "hello")
+        check(AutoSpaceFormatter.format(before: "你好\n", inserting: "hello", splitInternal: false, options: allOn).text == "hello")
+        check(AutoSpaceFormatter.format(before: "你好\t", inserting: "hello", splitInternal: false, options: allOn).text == "hello")
+        check(AutoSpaceFormatter.format(before: "你好\u{3000}", inserting: "hello", splitInternal: false, options: allOn).text == "hello")
+        check(AutoSpaceFormatter.format(before: "你好", inserting: " hello", splitInternal: false, options: allOn).text == " hello")
 
         // Fullwidth Chinese punctuation & halfwidth code/markdown punctuation -> never insert space
-        assert(AutoSpaceFormatter.format(before: "你好，", inserting: "world", splitInternal: false, options: allOn).text == "world")
-        assert(AutoSpaceFormatter.format(before: "hello", inserting: "，", splitInternal: false, options: allOn).text == "，")
-        assert(AutoSpaceFormatter.format(before: "（", inserting: "test", splitInternal: false, options: allOn).text == "test")
-        assert(AutoSpaceFormatter.format(before: "（test）", inserting: "的", splitInternal: false, options: allOn).text == "的")
-        assert(AutoSpaceFormatter.format(before: "函数", inserting: "(", splitInternal: false, options: allOn).text == "(")
-        assert(AutoSpaceFormatter.format(before: "[", inserting: "链接", splitInternal: false, options: allOn).text == "链接")
-        assert(AutoSpaceFormatter.format(before: "中/", inserting: "English", splitInternal: false, options: allOn).text == "English")
-        assert(AutoSpaceFormatter.format(before: "中文", inserting: "/", splitInternal: false, options: allOn).text == "/")
-        assert(AutoSpaceFormatter.format(before: "#", inserting: "话题", splitInternal: false, options: allOn).text == "话题")
-        assert(AutoSpaceFormatter.format(before: "`", inserting: "代码", splitInternal: false, options: allOn).text == "代码")
-        assert(AutoSpaceFormatter.format(before: "你好", inserting: "😀", splitInternal: false, options: allOn).text == "😀")
+        check(AutoSpaceFormatter.format(before: "你好，", inserting: "world", splitInternal: false, options: allOn).text == "world")
+        check(AutoSpaceFormatter.format(before: "hello", inserting: "，", splitInternal: false, options: allOn).text == "，")
+        check(AutoSpaceFormatter.format(before: "（", inserting: "test", splitInternal: false, options: allOn).text == "test")
+        check(AutoSpaceFormatter.format(before: "（test）", inserting: "的", splitInternal: false, options: allOn).text == "的")
+        check(AutoSpaceFormatter.format(before: "函数", inserting: "(", splitInternal: false, options: allOn).text == "(")
+        check(AutoSpaceFormatter.format(before: "[", inserting: "链接", splitInternal: false, options: allOn).text == "链接")
+        check(AutoSpaceFormatter.format(before: "中/", inserting: "English", splitInternal: false, options: allOn).text == "English")
+        check(AutoSpaceFormatter.format(before: "中文", inserting: "/", splitInternal: false, options: allOn).text == "/")
+        check(AutoSpaceFormatter.format(before: "#", inserting: "话题", splitInternal: false, options: allOn).text == "话题")
+        check(AutoSpaceFormatter.format(before: "`", inserting: "代码", splitInternal: false, options: allOn).text == "代码")
+        check(AutoSpaceFormatter.format(before: "你好", inserting: "😀", splitInternal: false, options: allOn).text == "😀")
 
         // URLs with CJK paths stay intact, while prose after ASCII URL gets space
-        assert(AutoSpaceFormatter.format(before: "https://zh.wikipedia.org/wiki/五笔", inserting: "86", splitInternal: false, options: allOn).text == "86")
-        assert(AutoSpaceFormatter.format(before: "https://example.com?q=五笔", inserting: "v2", splitInternal: false, options: allOn).text == "v2")
-        assert(AutoSpaceFormatter.format(before: "看 https://github.com/nameoverflow/formordo", inserting: "仓库", splitInternal: false, options: allOn).text == " 仓库")
-        assert(AutoSpaceFormatter.format(before: "https://example.com/docs/", inserting: "文档", splitInternal: false, options: allOn).text == "文档")
+        check(AutoSpaceFormatter.format(before: "https://zh.wikipedia.org/wiki/五笔", inserting: "86", splitInternal: false, options: allOn).text == "86")
+        check(AutoSpaceFormatter.format(before: "https://example.com?q=五笔", inserting: "v2", splitInternal: false, options: allOn).text == "v2")
+        check(AutoSpaceFormatter.format(before: "看 https://github.com/nameoverflow/formordo", inserting: "仓库", splitInternal: false, options: allOn).text == " 仓库")
+        check(AutoSpaceFormatter.format(before: "https://example.com/docs/", inserting: "文档", splitInternal: false, options: allOn).text == "文档")
 
         // Special language tokens & percent
-        assert(AutoSpaceFormatter.format(before: "用 C++", inserting: "写", splitInternal: false, options: allOn).text == " 写")
-        assert(AutoSpaceFormatter.format(before: "用 g++", inserting: "编译", splitInternal: false, options: allOn).text == " 编译")
-        assert(AutoSpaceFormatter.format(before: "用 C#", inserting: "开发", splitInternal: false, options: allOn).text == " 开发")
-        assert(AutoSpaceFormatter.format(before: "增长 50%", inserting: "左右", splitInternal: false, options: allOn).text == " 左右")
-        assert(AutoSpaceFormatter.format(before: "增长 50%", inserting: "左右", splitInternal: false, options: noDigits).text == "左右")
-        assert(AutoSpaceFormatter.format(before: "%50%", inserting: "测试", splitInternal: false, options: allOn).text == "测试")
+        check(AutoSpaceFormatter.format(before: "用 C++", inserting: "写", splitInternal: false, options: allOn).text == " 写")
+        check(AutoSpaceFormatter.format(before: "用 g++", inserting: "编译", splitInternal: false, options: allOn).text == " 编译")
+        check(AutoSpaceFormatter.format(before: "用 C#", inserting: "开发", splitInternal: false, options: allOn).text == " 开发")
+        check(AutoSpaceFormatter.format(before: "增长 50%", inserting: "左右", splitInternal: false, options: allOn).text == " 左右")
+        check(AutoSpaceFormatter.format(before: "增长 50%", inserting: "左右", splitInternal: false, options: noDigits).text == "左右")
+        check(AutoSpaceFormatter.format(before: "%50%", inserting: "测试", splitInternal: false, options: allOn).text == "测试")
 
         // Internal mixed boundary (`我们A`) vs clipboard (`splitInternal: false`)
-        assert(AutoSpaceFormatter.format(before: "hello", inserting: "我们A", splitInternal: true, options: allOn).text == " 我们 A")
-        assert(AutoSpaceFormatter.format(before: "你好", inserting: "我们A", splitInternal: true, options: allOn).text == "我们 A")
-        assert(AutoSpaceFormatter.format(before: "", inserting: "我用rust写了", splitInternal: true, options: allOn).text == "我用 rust 写了")
-        assert(AutoSpaceFormatter.format(before: "", inserting: "我用rust写了", splitInternal: true, options: allOff).text == "我用rust写了")
-        assert(AutoSpaceFormatter.format(before: "", inserting: "使用iOS18系统", splitInternal: true, options: noDigits).text == "使用 iOS18 系统")
-        assert(AutoSpaceFormatter.format(before: "", inserting: "第1名", splitInternal: true, options: noDigits).text == "第1名")
-        assert(AutoSpaceFormatter.format(before: "", inserting: "第1名", splitInternal: true, options: allOn).text == "第 1 名")
-        assert(AutoSpaceFormatter.format(before: "使用", inserting: "iOS开发", splitInternal: false, options: allOn).text == " iOS开发")
+        check(AutoSpaceFormatter.format(before: "hello", inserting: "我们A", splitInternal: true, options: allOn).text == " 我们 A")
+        check(AutoSpaceFormatter.format(before: "你好", inserting: "我们A", splitInternal: true, options: allOn).text == "我们 A")
+        check(AutoSpaceFormatter.format(before: "", inserting: "我用rust写了", splitInternal: true, options: allOn).text == "我用 rust 写了")
+        check(AutoSpaceFormatter.format(before: "", inserting: "我用rust写了", splitInternal: true, options: allOff).text == "我用rust写了")
+        check(AutoSpaceFormatter.format(before: "", inserting: "使用iOS18系统", splitInternal: true, options: noDigits).text == "使用 iOS18 系统")
+        check(AutoSpaceFormatter.format(before: "", inserting: "第1名", splitInternal: true, options: noDigits).text == "第1名")
+        check(AutoSpaceFormatter.format(before: "", inserting: "第1名", splitInternal: true, options: allOn).text == "第 1 名")
+        check(AutoSpaceFormatter.format(before: "使用", inserting: "iOS开发", splitInternal: false, options: allOn).text == " iOS开发")
 
-        // Punctuation pairing (corner brackets, book titles, quotes)
-        assert(PunctuationPairing.action(for: "「", after: nil, openClosers: []) == .insertPair(close: "」"))
-        assert(PunctuationPairing.action(for: "『", after: nil, openClosers: []) == .insertPair(close: "』"))
-        assert(PunctuationPairing.action(for: "《", after: "。", openClosers: []) == .insertPair(close: "》"))
-        assert(PunctuationPairing.action(for: "〈", after: nil, openClosers: []) == .insertPair(close: "〉"))
-        assert(PunctuationPairing.action(for: "」", after: "」", openClosers: ["」"]) == .skipClose)
-        assert(PunctuationPairing.shouldDeletePair(before: "「", after: "」", openClosers: ["」"]))
+        // Punctuation pairing (corner brackets, book titles, quotes) + PunctuationPairingTracker state machine
+        check(PunctuationPairing.action(for: "「", after: nil, openClosers: []) == .insertPair(close: "」"))
+        check(PunctuationPairing.action(for: "『", after: nil, openClosers: []) == .insertPair(close: "』"))
+        check(PunctuationPairing.action(for: "《", after: "。", openClosers: []) == .insertPair(close: "》"))
+        check(PunctuationPairing.action(for: "〈", after: nil, openClosers: []) == .insertPair(close: "〉"))
+        check(PunctuationPairing.action(for: "」", after: "」", openClosers: ["」"]) == .skipClose)
+        check(PunctuationPairing.shouldDeletePair(before: "「", after: "」", openClosers: ["」"]))
+
+        do {
+            var pairTracker = PunctuationPairingTracker()
+            // 1) Pair open & nested pair open
+            let openOuter = pairTracker.handleSymbol("（", after: "，后文")
+            check(openOuter == .insertPair(close: "）"))
+            check(pairTracker.openClosers == ["）"] && pairTracker.openPairTail == "，后文")
+
+            let openInner = pairTracker.handleSymbol("“", after: "），后文")
+            check(openInner == .insertPair(close: "”"))
+            check(pairTracker.openClosers == ["）", "”"] && pairTracker.openPairTail == "，后文")
+
+            // 2) Skip-close pops inner then outer
+            let skipInner = pairTracker.handleSymbol("”", after: "”），后文")
+            check(skipInner == .skipClose)
+            check(pairTracker.openClosers == ["）"] && pairTracker.openPairTail == "，后文")
+
+            let skipOuter = pairTracker.handleSymbol("）", after: "），后文")
+            check(skipOuter == .skipClose)
+            check(pairTracker.openClosers.isEmpty && pairTracker.openPairTail.isEmpty)
+
+            // 3) Backspace pair delete (only when untouched empty pair)
+            let openCorner = pairTracker.handleSymbol("「", after: nil)
+            check(openCorner == .insertPair(close: "」"))
+            let keepWithText = pairTracker.consumeBackspacePairIfNeeded(before: "你好「字", after: "」")
+            check(!keepWithText && pairTracker.openClosers == ["」"])
+            let deletedEmptyPair = pairTracker.consumeBackspacePairIfNeeded(before: "你好「", after: "」")
+            check(deletedEmptyPair && pairTracker.openClosers.isEmpty && pairTracker.openPairTail.isEmpty)
+
+            // 4) Cursor-move prune
+            let openBook = pairTracker.handleSymbol("《", after: "。原文")
+            check(openBook == .insertPair(close: "》"))
+            pairTracker.pruneOnCursorChange(after: "》别的段落")
+            check(pairTracker.openClosers.isEmpty && pairTracker.openPairTail.isEmpty)
+
+            let openQuote = pairTracker.handleSymbol("“", after: nil)
+            check(openQuote == .insertPair(close: "”"))
+            pairTracker.pruneOnCursorChange(after: "光标移走")
+            check(pairTracker.openClosers.isEmpty && pairTracker.openPairTail.isEmpty)
+        }
 
         // CJK Extension B surrogate pair + Latin extended
-        assert(AutoSpaceFormatter.format(before: "𠮷", inserting: "a", splitInternal: false, options: allOn).text == " a")
-        assert(AutoSpaceFormatter.format(before: "café", inserting: "店", splitInternal: false, options: allOn).text == " 店")
+        check(AutoSpaceFormatter.format(before: "𠮷", inserting: "a", splitInternal: false, options: allOn).text == " a")
+        check(AutoSpaceFormatter.format(before: "café", inserting: "店", splitInternal: false, options: allOn).text == " 店")
 
         // Backspace-deleted auto-space suppression & tracker state tests (authoritative macOS & optimistic iOS)
         var macTracker = AutoSpaceContextTracker()
-        assert(macTracker.prepareCommit("T", hostBefore: "", hostBeforeIsAuthoritative: true, splitInternal: true, options: allOn) == "T")
-        assert(macTracker.prepareCommit("恤", hostBefore: "T", hostBeforeIsAuthoritative: true, splitInternal: true, options: allOn) == " 恤")
+        let mac1 = macTracker.prepareCommit("T", hostBefore: "", hostBeforeIsAuthoritative: true, splitInternal: true, options: allOn)
+        check(mac1 == "T")
+        let mac2 = macTracker.prepareCommit("恤", hostBefore: "T", hostBeforeIsAuthoritative: true, splitInternal: true, options: allOn)
+        check(mac2 == " 恤")
         // User deletes '恤', then deletes ' ' -> suppresses auto-space at "T"
         macTracker.willDeleteBackward(hostBefore: "T 恤", hostBeforeIsAuthoritative: true)
         macTracker.willDeleteBackward(hostBefore: "T ", hostBeforeIsAuthoritative: true)
-        assert(macTracker.prepareCommit("恤", hostBefore: "T", hostBeforeIsAuthoritative: true, splitInternal: true, options: allOn) == "恤")
+        let mac3 = macTracker.prepareCommit("恤", hostBefore: "T", hostBeforeIsAuthoritative: true, splitInternal: true, options: allOn)
+        check(mac3 == "恤")
 
         // Deleting a single wrong letter keeps the space when typing replacement letter
         var macTracker2 = AutoSpaceContextTracker()
-        assert(macTracker2.prepareCommit("a", hostBefore: "你好", hostBeforeIsAuthoritative: true, splitInternal: false, options: allOn) == " a")
+        let mac2a = macTracker2.prepareCommit("a", hostBefore: "你好", hostBeforeIsAuthoritative: true, splitInternal: false, options: allOn)
+        check(mac2a == " a")
         macTracker2.willDeleteBackward(hostBefore: "你好 a", hostBeforeIsAuthoritative: true)
-        assert(macTracker2.prepareCommit("b", hostBefore: "你好 ", hostBeforeIsAuthoritative: true, splitInternal: false, options: allOn) == "b")
+        let mac2b = macTracker2.prepareCommit("b", hostBefore: "你好 ", hostBeforeIsAuthoritative: true, splitInternal: false, options: allOn)
+        check(mac2b == "b")
 
         // Deleting a whole multi-key word (>2 commits) does NOT suppress space for a fresh word
         var macTracker3 = AutoSpaceContextTracker()
-        assert(macTracker3.prepareCommit("a", hostBefore: "你好", hostBeforeIsAuthoritative: true, splitInternal: false, options: allOn) == " a")
+        let mac3a = macTracker3.prepareCommit("a", hostBefore: "你好", hostBeforeIsAuthoritative: true, splitInternal: false, options: allOn)
+        check(mac3a == " a")
         macTracker3.recordPassthrough("b", hostBefore: "你好 a", hostBeforeIsAuthoritative: true)
         macTracker3.recordPassthrough("c", hostBefore: "你好 ab", hostBeforeIsAuthoritative: true)
         macTracker3.willDeleteBackward(hostBefore: "你好 abc", hostBeforeIsAuthoritative: true)
         macTracker3.willDeleteBackward(hostBefore: "你好 ab", hostBeforeIsAuthoritative: true)
         macTracker3.willDeleteBackward(hostBefore: "你好 a", hostBeforeIsAuthoritative: true)
         macTracker3.willDeleteBackward(hostBefore: "你好 ", hostBeforeIsAuthoritative: true)
-        assert(macTracker3.prepareCommit("x", hostBefore: "你好", hostBeforeIsAuthoritative: true, splitInternal: false, options: allOn) == " x")
+        let mac3x = macTracker3.prepareCommit("x", hostBefore: "你好", hostBeforeIsAuthoritative: true, splitInternal: false, options: allOn)
+        check(mac3x == " x")
 
         // iOS stale-XPC optimistic tracking: host stays stale across rapid commit + EN key + Backspace x2 + retype
         var iosTracker = AutoSpaceContextTracker()
-        assert(iosTracker.prepareCommit("我们", hostBefore: "hello", hostBeforeIsAuthoritative: false, splitInternal: true, options: allOn) == " 我们")
+        let ios1 = iosTracker.prepareCommit("我们", hostBefore: "hello", hostBeforeIsAuthoritative: false, splitInternal: true, options: allOn)
+        check(ios1 == " 我们")
         // Host still reports "hello" (XPC lag!) when user immediately types 'a'
-        assert(iosTracker.prepareCommit("a", hostBefore: "hello", hostBeforeIsAuthoritative: false, splitInternal: false, options: allOn) == " a")
+        let ios2 = iosTracker.prepareCommit("a", hostBefore: "hello", hostBeforeIsAuthoritative: false, splitInternal: false, options: allOn)
+        check(ios2 == " a")
         // Rapid Backspace x2 while host STILL reports "hello"
         iosTracker.willDeleteBackward(hostBefore: "hello", hostBeforeIsAuthoritative: false)
         iosTracker.willDeleteBackward(hostBefore: "hello", hostBeforeIsAuthoritative: false)
         // Re-type 'a' while host catches up to "hello 我们"
         iosTracker.reconcileExternalContext(hostBefore: "hello 我们")
-        assert(iosTracker.prepareCommit("a", hostBefore: "hello 我们", hostBeforeIsAuthoritative: false, splitInternal: false, options: allOn) == "a")
+        let ios3 = iosTracker.prepareCommit("a", hostBefore: "hello 我们", hostBeforeIsAuthoritative: false, splitInternal: false, options: allOn)
+        check(ios3 == "a")
 
         // 5. Verify pure AppKit NativeCandidateContentView NEVER wraps lines even across narrow->wide transitions
         let candidateView = NativeCandidateContentView(frame: NSRect(x: 0, y: 0, width: 90, height: 30))
@@ -238,7 +381,7 @@ struct SwiftBridgeTests {
         )
         candidateView.state = narrowState
         let sz1 = candidateView.computeFittingSize()
-        assert(sz1.height == 30.0, "Expected exact 30pt single-line bar height, got \(sz1.height)")
+        check(sz1.height == 30.0, "Expected exact 30pt single-line bar height, got \(sz1.height)")
 
         let wideMultiPhraseState = JuxuActionState(
             consumed: true, bell: false, asciiMode: false, schemaId: 86, page: 0, totalPages: 3, vertical: false,
@@ -253,8 +396,8 @@ struct SwiftBridgeTests {
         )
         candidateView.state = wideMultiPhraseState
         let sz2 = candidateView.computeFittingSize()
-        assert(sz2.height == 30.0, "Expected strictly single-line 30pt height without wrapping, got \(sz2.height)")
-        assert(sz2.width > sz1.width + 200.0, "Expected horizontal candidate bar to expand cleanly on single line")
+        check(sz2.height == 30.0, "Expected strictly single-line 30pt height without wrapping, got \(sz2.height)")
+        check(sz2.width > sz1.width + 200.0, "Expected horizontal candidate bar to expand cleanly on single line")
 
         bridge.setContext("")
         for key in "qdgip".unicodeScalars {
@@ -263,10 +406,10 @@ struct SwiftBridgeTests {
         candidateView.state = bridge.state
         candidateView.frame.size = candidateView.computeFittingSize()
         candidateView.layout()
-        assert(bridge.state.preedit == "我感觉" && bridge.state.macOSPreedit == "q·dgip")
-        assert(candidateView.frame.height == 30 && candidateView.subviews.isEmpty)
+        check(bridge.state.preedit == "我感觉" && bridge.state.macOSPreedit == "q·dgip")
+        check(candidateView.frame.height == 30 && candidateView.subviews.isEmpty)
         candidateView.state = narrowState
-        assert(narrowState.macOSPreedit == "g")
+        check(narrowState.macOSPreedit == "g")
 
         // 6. Verify macOS Voice MVP: strict lazy-loading, preset resolution, preferences persistence, WAV/multipart, prompts & local polisher
         precondition(VoicePreferences().enabled == false, "Voice entry must be disabled by default")
@@ -405,7 +548,7 @@ struct SwiftBridgeTests {
             .appendingPathComponent("juxu-voice-test-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: tempVoiceURL) }
         let voiceStore = VoicePreferencesStore(fileURL: tempVoiceURL, inMemoryOnly: false)
-        precondition(!voiceStore.prefs.enabled)
+        check(!voiceStore.prefs.enabled)
         voiceStore.update {
             $0.enabled = true
             $0.providerMode = .local
@@ -414,11 +557,11 @@ struct SwiftBridgeTests {
             $0.customVocabulary = "句序, Juxu，RWKV-7\nTypeless"
         }
         let reloadedStore = VoicePreferencesStore(fileURL: tempVoiceURL, inMemoryOnly: false)
-        precondition(reloadedStore.prefs.enabled == true)
-        precondition(reloadedStore.prefs.providerMode == .local)
-        precondition(reloadedStore.prefs.localASRPreset == .whisperTurbo)
-        precondition(reloadedStore.prefs.localLLMPreset == .qwen15B)
-        precondition(reloadedStore.prefs.parsedCustomVocabulary == ["句序", "Juxu", "RWKV-7", "Typeless"])
+        check(reloadedStore.prefs.enabled == true)
+        check(reloadedStore.prefs.providerMode == .local)
+        check(reloadedStore.prefs.localASRPreset == .whisperTurbo)
+        check(reloadedStore.prefs.localLLMPreset == .qwen15B)
+        check(reloadedStore.prefs.parsedCustomVocabulary == ["句序", "Juxu", "RWKV-7", "Typeless"])
 
         // Trigger lazy load and verify disabling voice unloads session, HUD, and local installer
         _ = VoiceSessionController.shared
@@ -657,27 +800,27 @@ struct SwiftBridgeTests {
         precondition(migrated == .qwen15B, "Legacy rule_based must migrate to .qwen15B")
 
         // Verify app-aware tone & Speak-to-Edit prompt builder
-        precondition(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.tencent.xinWeChat").contains("即时聊天"))
-        precondition(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.apple.dt.Xcode").contains("技术术语"))
+        check(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.tencent.xinWeChat").contains("即时聊天"))
+        check(VoiceAppStyleClassifier.styleInstruction(toneMode: .autoByApp, bundleIdentifier: "com.apple.dt.Xcode").contains("技术术语"))
         let normalMsgs = VoicePromptBuilder.polishMessages(
             rawTranscript: "测试一下",
             toneMode: .autoByApp,
             context: VoiceContext(bundleIdentifier: "com.apple.mail", personalVocabulary: ["句序", "句序", "Juxu"])
         )
-        precondition(normalMsgs.count == 2)
-        precondition(normalMsgs[0]["content"]?.contains("句序、Juxu") == true)
+        check(normalMsgs.count == 2)
+        check(normalMsgs[0]["content"]?.contains("句序、Juxu") == true)
         let editMsgs = VoicePromptBuilder.polishMessages(
             rawTranscript: "翻成英文",
             toneMode: .professional,
             context: VoiceContext(selectedText: "你好世界")
         )
-        precondition(editMsgs[1]["content"]?.contains("你好世界") == true && editMsgs[1]["content"]?.contains("翻成英文") == true)
+        check(editMsgs[1]["content"]?.contains("你好世界") == true && editMsgs[1]["content"]?.contains("翻成英文") == true)
 
         // Verify WAV header & multipart form builder
         let wav = VoiceWAVEncoder.encodePCM16Mono(samples: [0, 1000, -1000, 32767], sampleRate: 16_000)
-        precondition(wav.count == 44 + 8)
-        precondition(String(data: wav.prefix(4), encoding: .ascii) == "RIFF")
-        precondition(String(data: wav.subdata(in: 8..<12), encoding: .ascii) == "WAVE")
+        check(wav.count == 44 + 8)
+        check(String(data: wav.prefix(4), encoding: .ascii) == "RIFF")
+        check(String(data: wav.subdata(in: 8..<12), encoding: .ascii) == "WAVE")
         let multipart = VoiceMultipartBuilder.buildAudioTranscriptionBody(
             boundary: "TESTBOUNDARY",
             wavData: wav,
@@ -685,21 +828,21 @@ struct SwiftBridgeTests {
             language: "zh",
             prompt: "句序"
         )
-        let multipartPrefix = String(decoding: multipart.prefix(512), as: UTF8.self)
-        precondition(multipartPrefix.contains("--TESTBOUNDARY"))
-        precondition(multipartPrefix.contains("whisper-large-v3-turbo"))
-        precondition(multipartPrefix.contains("speech.wav"))
+        let bodyHead = String(decoding: multipart.prefix(640), as: UTF8.self)
+        check(bodyHead.contains("--TESTBOUNDARY"))
+        check(bodyHead.contains("whisper-large-v3-turbo"))
+        check(bodyHead.contains("filename=\"speech.wav\""), "Expected filename=\"speech.wav\" in multipart head, got: \(bodyHead)")
 
         // 7. Verify Cangjie 3 / 5 / 6 schema switching, categories, TOML round-trip, and 5-code input
         for (sid, expectedName, expectedTag) in [(UInt32(33), "仓颉三代", "cangjie3"), (UInt32(35), "仓颉五代", "cangjie5"), (UInt32(36), "仓颉六代", "cangjie6")] {
             bridge.switchSchema(sid, persist: false)
-            assert(bridge.state.schemaId == sid)
-            assert(bridge.state.schemaName == expectedName, "Expected \(expectedName), got \(bridge.state.schemaName)")
-            assert(bridge.prefs.schemaCategory == .cangjie)
-            assert(bridge.prefs.isCangjieFamily)
+            check(bridge.state.schemaId == sid)
+            check(bridge.state.schemaName == expectedName, "Expected \(expectedName), got \(bridge.state.schemaName)")
+            check(bridge.prefs.schemaCategory == .cangjie)
+            check(bridge.prefs.isCangjieFamily)
             let toml = bridge.prefs.toTOML()
-            assert(toml.contains("schema = \"\(expectedTag)\""))
-            assert(JuxuPreferences.fromTOML(toml).schemaId == sid)
+            check(toml.contains("schema = \"\(expectedTag)\""))
+            check(JuxuPreferences.fromTOML(toml).schemaId == sid)
         }
         bridge.switchSchema(35, persist: false)
         var cjPrefs = bridge.prefs
@@ -707,11 +850,81 @@ struct SwiftBridgeTests {
         bridge.applyAndSavePreferences(cjPrefs, persist: false)
         for ch in "grmb".unicodeScalars {
             let s = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 700)
-            assert(s.commitText.isEmpty)
+            check(s.commitText.isEmpty)
         }
-        assert(bridge.state.preedit == "土口一月", "Expected Cangjie radicals 土口一月, got \(bridge.state.preedit)")
+        check(bridge.state.preedit == "土口一月", "Expected Cangjie radicals 土口一月, got \(bridge.state.preedit)")
         let cj5Out = bridge.handleKey(keyCode: 0, scalar: UnicodeScalar("c").value, hasCmdOrCtrl: false, timestampMs: 720)
-        assert(cj5Out.commitText == "頡", "Expected Cangjie 5-code auto-commit 頡, got \(cj5Out.commitText)")
+        check(cj5Out.commitText == "頡", "Expected Cangjie 5-code auto-commit 頡, got \(cj5Out.commitText)")
+
+        // 7b. Verify JuxuBridge.commitPending(timestampMs:) commits active Wubi and multi-syllable Pinyin into Chinese text (never raw code!)
+        do {
+            var pendingPrefs = bridge.prefs
+            pendingPrefs.schemaId = 86
+            pendingPrefs.spaceless = false
+            bridge.applyAndSavePreferences(pendingPrefs, persist: false)
+            bridge.clearComposition()
+            for ch in "khk".unicodeScalars {
+                let s = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 800)
+                check(s.commitText.isEmpty)
+            }
+            check(bridge.state.preedit == "khk")
+            let wbCommitted = bridge.commitPending(timestampMs: 810)
+            check(wbCommitted.commitText == "中", "Expected Wubi commitPending to commit '中', got '\(wbCommitted.commitText)'")
+            check(wbCommitted.preedit.isEmpty && bridge.state.preedit.isEmpty)
+
+            // Multi-syllable Pinyin composition ("nihaoshijie" -> "你好世界")
+            bridge.switchSchema(20, persist: false)
+            bridge.clearComposition()
+            bridge.setContext("")
+            for ch in "nihaoshijie".unicodeScalars {
+                let s = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 815)
+                check(s.commitText.isEmpty)
+            }
+            check(!bridge.state.preedit.isEmpty)
+            let pyCommitted = bridge.commitPending(timestampMs: 820)
+            check(pyCommitted.commitText == "你好世界", "Expected Pinyin commitPending to commit '你好世界', got '\(pyCommitted.commitText)'")
+            check(!pyCommitted.commitText.contains(where: { $0.isASCII && $0.isLetter }))
+            check(pyCommitted.preedit.isEmpty && bridge.state.preedit.isEmpty)
+
+            // Idle commitPending is a clean no-op
+            let idleCommitted = bridge.commitPending(timestampMs: 825)
+            check(idleCommitted.commitText.isEmpty && idleCommitted.preedit.isEmpty)
+        }
+
+        // 7c. Verify JuxuBridge.resetQuoteState() resets smart quote pairing across focus/context changes
+        do {
+            var quotePrefs = bridge.prefs
+            quotePrefs.schemaId = 86
+            quotePrefs.smartPunctuation = true
+            quotePrefs.semicolonQuoteSelect = false
+            bridge.applyAndSavePreferences(quotePrefs, persist: false)
+            bridge.clearComposition()
+            if bridge.state.asciiMode {
+                _ = bridge.toggleAsciiMode()
+            }
+            bridge.resetQuoteState()
+
+            // Normal pair: first `"` -> `“`, second `"` -> `”`
+            let q1 = bridge.handleKey(keyCode: 0, scalar: UnicodeScalar("\"").value, hasCmdOrCtrl: false, timestampMs: 830)
+            let q2 = bridge.handleKey(keyCode: 0, scalar: UnicodeScalar("\"").value, hasCmdOrCtrl: false, timestampMs: 831)
+            check(q1.commitText == "“" && q2.commitText == "”", "Expected normal quote pair “”, got '\(q1.commitText)' and '\(q2.commitText)'")
+
+            // Dangling `“` before context reset must NOT turn the next `"` into `”`
+            let danglingDouble = bridge.handleKey(keyCode: 0, scalar: UnicodeScalar("\"").value, hasCmdOrCtrl: false, timestampMs: 832)
+            check(danglingDouble.commitText == "“")
+            bridge.resetQuoteState()
+            let freshDouble = bridge.handleKey(keyCode: 0, scalar: UnicodeScalar("\"").value, hasCmdOrCtrl: false, timestampMs: 833)
+            check(freshDouble.commitText == "“", "Expected '“' after resetQuoteState(), got '\(freshDouble.commitText)'")
+
+            // Dangling `‘` before context reset must NOT turn the next `'` into `’`
+            bridge.resetQuoteState()
+            let danglingSingle = bridge.handleKey(keyCode: 0, scalar: UnicodeScalar("'").value, hasCmdOrCtrl: false, timestampMs: 834)
+            check(danglingSingle.commitText == "‘")
+            bridge.resetQuoteState()
+            let freshSingle = bridge.handleKey(keyCode: 0, scalar: UnicodeScalar("'").value, hasCmdOrCtrl: false, timestampMs: 835)
+            check(freshSingle.commitText == "‘", "Expected '‘' after resetQuoteState(), got '\(freshSingle.commitText)'")
+            bridge.resetQuoteState()
+        }
 
         // 8. Verify ShiftTapDetector only triggers on bare Shift taps, never on Shift key combinations
         do {
@@ -724,62 +937,76 @@ struct SwiftBridgeTests {
 
             // (a) Bare Left/Right Shift taps within threshold toggle
             var d = ShiftTapDetector()
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 10.0))
-            assert(d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 10.12))
-            assert(!d.handleFlagsChanged(keyCode: rShift, modifiers: .shift, timestamp: 11.0))
-            assert(d.handleFlagsChanged(keyCode: rShift, modifiers: [], timestamp: 11.20))
+            let tap1Down = d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 10.0)
+            check(!tap1Down)
+            let tap1Up = d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 10.12)
+            check(tap1Up)
+            let tap2Down = d.handleFlagsChanged(keyCode: rShift, modifiers: .shift, timestamp: 11.0)
+            check(!tap2Down)
+            let tap2Up = d.handleFlagsChanged(keyCode: rShift, modifiers: [], timestamp: 11.20)
+            check(tap2Up)
 
             // (b) Slow Shift hold (>= 0.35s) does not toggle
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 12.0))
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 12.40))
+            let holdDown = d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 12.0)
+            check(!holdDown)
+            let holdUp = d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 12.40)
+            check(!holdUp)
 
             // (c) Cmd+Shift+S releasing Cmd before Shift must NOT toggle
-            assert(!d.handleFlagsChanged(keyCode: lCmd, modifiers: .command, timestamp: 13.0))
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [.command, .shift], timestamp: 13.05))
+            let c1 = d.handleFlagsChanged(keyCode: lCmd, modifiers: .command, timestamp: 13.0)
+            let c2 = d.handleFlagsChanged(keyCode: lShift, modifiers: [.command, .shift], timestamp: 13.05)
             d.handleKeyDown()
-            assert(!d.handleFlagsChanged(keyCode: lCmd, modifiers: .shift, timestamp: 13.15))
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 13.20))
+            let c3 = d.handleFlagsChanged(keyCode: lCmd, modifiers: .shift, timestamp: 13.15)
+            let c4 = d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 13.20)
+            check(!c1 && !c2 && !c3 && !c4)
 
             // (d) Shift+Cmd releasing Cmd before Shift (even without IMK keyDown) must NOT toggle
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 14.0))
-            assert(!d.handleFlagsChanged(keyCode: lCmd, modifiers: [.shift, .command], timestamp: 14.03))
-            assert(!d.handleFlagsChanged(keyCode: lCmd, modifiers: .shift, timestamp: 14.10))
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 14.15))
+            let d1 = d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 14.0)
+            let d2 = d.handleFlagsChanged(keyCode: lCmd, modifiers: [.shift, .command], timestamp: 14.03)
+            let d3 = d.handleFlagsChanged(keyCode: lCmd, modifiers: .shift, timestamp: 14.10)
+            let d4 = d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 14.15)
+            check(!d1 && !d2 && !d3 && !d4)
 
             // (e) Ctrl+Shift, Opt+Shift, Fn+Shift releasing other modifier first must NOT toggle
             for (code, mod) in [(lCtrl, ShiftTapModifiers.control), (lOpt, .option), (fnKey, .function)] {
-                assert(!d.handleFlagsChanged(keyCode: code, modifiers: mod, timestamp: 15.0))
-                assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [mod, .shift], timestamp: 15.02))
-                assert(!d.handleFlagsChanged(keyCode: code, modifiers: .shift, timestamp: 15.08))
-                assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 15.12))
+                let e1 = d.handleFlagsChanged(keyCode: code, modifiers: mod, timestamp: 15.0)
+                let e2 = d.handleFlagsChanged(keyCode: lShift, modifiers: [mod, .shift], timestamp: 15.02)
+                let e3 = d.handleFlagsChanged(keyCode: code, modifiers: .shift, timestamp: 15.08)
+                let e4 = d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 15.12)
+                check(!e1 && !e2 && !e3 && !e4)
             }
 
             // (f) Focus switch while holding Cmd+Shift (reset detector, then Cmd up -> Shift up) must NOT toggle
             d.reset()
-            assert(!d.handleFlagsChanged(keyCode: lCmd, modifiers: .shift, timestamp: 16.0))
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 16.05))
+            let f1 = d.handleFlagsChanged(keyCode: lCmd, modifiers: .shift, timestamp: 16.0)
+            let f2 = d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 16.05)
+            check(!f1 && !f2)
 
             // (g) Shift + regular keyDown (e.g. Shift+A) must NOT toggle
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 17.0))
+            let g1 = d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 17.0)
             d.handleKeyDown()
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 17.10))
+            let g2 = d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 17.10)
+            check(!g1 && !g2)
 
             // (h) Shift + intercepted key/mouse (e.g. Shift+Tab, Shift+Click) caught via HID callback must NOT toggle
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 18.0))
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 18.10, hadInterveningHIDEvent: { downTs in
-                assert(downTs == 18.0)
+            let h1 = d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 18.0)
+            let h2 = d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 18.10, hadInterveningHIDEvent: { downTs in
+                check(downTs == 18.0)
                 return true
-            }))
+            })
+            check(!h1 && !h2)
 
             // (i) Left Shift + Right Shift chord must NOT toggle
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 19.0))
-            assert(!d.handleFlagsChanged(keyCode: rShift, modifiers: .shift, timestamp: 19.05))
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 19.10))
-            assert(!d.handleFlagsChanged(keyCode: rShift, modifiers: [], timestamp: 19.15))
+            let i1 = d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 19.0)
+            let i2 = d.handleFlagsChanged(keyCode: rShift, modifiers: .shift, timestamp: 19.05)
+            let i3 = d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 19.10)
+            let i4 = d.handleFlagsChanged(keyCode: rShift, modifiers: [], timestamp: 19.15)
+            check(!i1 && !i2 && !i3 && !i4)
 
             // (j) Subsequent bare Shift tap after combinations still works normally
-            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 20.0))
-            assert(d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 20.08))
+            let j1 = d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 20.0)
+            let j2 = d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 20.08)
+            check(!j1 && j2)
         }
 
         // 9. Verify in-memory user_data TSV export/import & zlib round-trip (iOS Keychain sync path)
@@ -792,8 +1019,10 @@ struct SwiftBridgeTests {
             }
             let dict98 = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
                 .appendingPathComponent("Resources/Dicts/wubi98.wbdict").path
-            assert(dict98.withCString { juxu_engine_load_dict_mmap(h1, 98, $0) })
-            assert(dict98.withCString { juxu_engine_load_dict_mmap(h2, 98, $0) })
+            let loaded1 = dict98.withCString { juxu_engine_load_dict_mmap(h1, 98, $0) }
+            let loaded2 = dict98.withCString { juxu_engine_load_dict_mmap(h2, 98, $0) }
+            check(loaded1)
+            check(loaded2)
             "schema = \"wubi98\"".withCString {
                 juxu_engine_set_config_toml(h1, $0)
                 juxu_engine_set_config_toml(h2, $0)
@@ -802,19 +1031,20 @@ struct SwiftBridgeTests {
             let codePtr = "句序测试".withCString { juxu_engine_add_user_phrase(h1, $0) }
             if let codePtr { juxu_string_free(codePtr) }
             let seq1 = juxu_engine_user_data_seq(h1)
-            assert(seq1 > seq0, "Expected user_data seq to increment after adding phrase")
+            check(seq1 > seq0, "Expected user_data seq to increment after adding phrase")
             let tsvPtr = juxu_engine_export_user_data_tsv(h1)!
             let tsv = String(cString: tsvPtr)
             juxu_string_free(tsvPtr)
             let compressed = try! (Data(tsv.utf8) as NSData).compressed(using: .zlib) as Data
             let inflated = try! (compressed as NSData).decompressed(using: .zlib) as Data
             let roundtripTSV = String(data: inflated, encoding: .utf8)!
-            assert(roundtripTSV.withCString { juxu_engine_import_user_data_tsv(h2, $0) })
-            assert(juxu_engine_user_data_seq(h2) == seq1)
+            let imported = roundtripTSV.withCString { juxu_engine_import_user_data_tsv(h2, $0) }
+            check(imported)
+            check(juxu_engine_user_data_seq(h2) == seq1)
             let listPtr = juxu_engine_list_user_phrases_json(h2)!
             let listJSON = String(cString: listPtr)
             juxu_string_free(listPtr)
-            assert(listJSON.contains("句序测试"), "Expected imported user phrase in h2, got \(listJSON)")
+            check(listJSON.contains("句序测试"), "Expected imported user phrase in h2, got \(listJSON)")
         }
 
         // 10. Verify SettingsWindow handles Cmd+W close shortcut without requiring a main menu
@@ -849,15 +1079,15 @@ struct SwiftBridgeTests {
         let cmdA = makeKeyEvent(chars: "a", ignoringModifiers: "a", modifiers: .command, keyCode: 0)
         let cmdWKeyUp = makeKeyEvent(type: .keyUp, chars: "w", ignoringModifiers: "w", modifiers: .command)
 
-        assert(SettingsWindow.isCloseWindowShortcut(cmdW))
-        assert(SettingsWindow.isCloseWindowShortcut(cmdCapsW))
-        assert(SettingsWindow.isCloseWindowShortcut(cmdNonLatinW))
-        assert(!SettingsWindow.isCloseWindowShortcut(cmdShiftW))
-        assert(!SettingsWindow.isCloseWindowShortcut(cmdOptW))
-        assert(!SettingsWindow.isCloseWindowShortcut(cmdCtrlW))
-        assert(!SettingsWindow.isCloseWindowShortcut(plainW))
-        assert(!SettingsWindow.isCloseWindowShortcut(cmdA))
-        assert(!SettingsWindow.isCloseWindowShortcut(cmdWKeyUp))
+        check(SettingsWindow.isCloseWindowShortcut(cmdW))
+        check(SettingsWindow.isCloseWindowShortcut(cmdCapsW))
+        check(SettingsWindow.isCloseWindowShortcut(cmdNonLatinW))
+        check(!SettingsWindow.isCloseWindowShortcut(cmdShiftW))
+        check(!SettingsWindow.isCloseWindowShortcut(cmdOptW))
+        check(!SettingsWindow.isCloseWindowShortcut(cmdCtrlW))
+        check(!SettingsWindow.isCloseWindowShortcut(plainW))
+        check(!SettingsWindow.isCloseWindowShortcut(cmdA))
+        check(!SettingsWindow.isCloseWindowShortcut(cmdWKeyUp))
 
         final class CloseSpy: NSObject, NSWindowDelegate {
             var closeCount = 0
@@ -876,12 +1106,14 @@ struct SwiftBridgeTests {
         settingsWin.isReleasedWhenClosed = false
         settingsWin.contentView = NSHostingView(rootView: SettingsRootView(bridge: bridge))
         settingsWin.delegate = spy
-        assert(!settingsWin.performKeyEquivalent(with: cmdShiftW))
-        assert(!settingsWin.performKeyEquivalent(with: plainW))
-        assert(!settingsWin.performKeyEquivalent(with: cmdA))
-        assert(spy.closeCount == 0)
-        assert(settingsWin.performKeyEquivalent(with: cmdW))
-        assert(spy.closeCount == 1, "Expected Cmd+W to close SettingsWindow, got closeCount=\(spy.closeCount)")
+        let handledShiftW = settingsWin.performKeyEquivalent(with: cmdShiftW)
+        let handledPlainW = settingsWin.performKeyEquivalent(with: plainW)
+        let handledCmdA = settingsWin.performKeyEquivalent(with: cmdA)
+        check(!handledShiftW && !handledPlainW && !handledCmdA)
+        check(spy.closeCount == 0)
+        let handledCmdW = settingsWin.performKeyEquivalent(with: cmdW)
+        check(handledCmdW)
+        check(spy.closeCount == 1, "Expected Cmd+W to close SettingsWindow, got closeCount=\(spy.closeCount)")
 
         print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Cangjie, Bayesian typo, SettingsWindow Cmd+W & macOS Voice MVP tests passed!")
     }

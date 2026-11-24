@@ -9,42 +9,20 @@
 //!    - Systematic Thumb Bias (+0.20, +0.12) Online Adaptation Curve (first 12 vs last 12 sentences)
 //! 3. Large-Scale Multi-Domain Held-Out Benchmark (1,000+ sentences across tieba/xhs/zhihu/zhwiki/duplex/slang/CCI3)
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use juxu_core::config::{JuxuConfig, InputSchema};
+use juxu_core::config::{InputSchema, JuxuConfig};
 use juxu_core::engine::JuxuEngine;
+use juxu_core::english::EnDictView;
+use juxu_core::eval_support::{
+    build_char_to_pinyin, char_accuracy as char_acc, horizontal_neighbor, XorshiftRng as Rng,
+};
 use juxu_core::format::AuxView;
 use juxu_core::pinyin_dict::PinyinDictView;
 use juxu_core::typo::KeyLayout;
 use juxu_core::user_data::TouchProfile;
-
-/// Deterministic xorshift64* PRNG with Box-Muller Gaussian sampling.
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed.max(1))
-    }
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn next_f32(&mut self) -> f32 {
-        (((self.next_u64() >> 40) as f32) + 0.5) / ((1u32 << 24) as f32)
-    }
-    fn next_gaussian(&mut self) -> (f32, f32) {
-        let u1 = self.next_f32().clamp(1e-6, 1.0 - 1e-6);
-        let u2 = self.next_f32();
-        let r = (-2.0 * u1.ln()).sqrt();
-        let theta = 2.0 * std::f32::consts::PI * u2;
-        (r * theta.cos(), r * theta.sin())
-    }
-}
 
 /// Core 48 clean sentences with verified exact pinyin for touch simulation & online adaptation.
 const TOUCH_SENTENCES: &[(&str, &str)] = &[
@@ -118,32 +96,6 @@ const GOLD_CASES: &[(&str, &str, &str, bool)] = &[
     ("数据库查询太慢了，", "zuihaogeizhegeziduanjiayigesuoyin", "最好给这个字段加一个索引", true),
 ];
 
-fn char_acc(expected: &str, predicted: &str) -> (usize, usize) {
-    let e: Vec<char> = expected.chars().collect();
-    let p: Vec<char> = predicted.chars().collect();
-    let hits = e.iter().enumerate().filter(|&(i, &c)| p.get(i).copied() == Some(c)).count();
-    (hits, e.len())
-}
-
-fn horizontal_neighbor(layout: &KeyLayout, ch: u8) -> Option<u8> {
-    let (cx0, cy0) = layout.center_of(ch);
-    let mut best: Option<(f32, u8)> = None;
-    for d in 0..26u8 {
-        let k = b'a' + d;
-        if k == ch {
-            continue;
-        }
-        let (cx, cy) = layout.center_of(k);
-        if (cy - cy0).abs() < 0.1 {
-            let dx = (cx - cx0).abs();
-            if dx <= 1.05 && best.map_or(true, |b| dx < b.0) {
-                best = Some((dx, k));
-            }
-        }
-    }
-    best.map(|b| b.1)
-}
-
 fn make_engine(schema: InputSchema, aux_path: &PathBuf, typo_enabled: bool, adapt: bool) -> JuxuEngine {
     let mut cfg = JuxuConfig::default();
     cfg.schema = schema;
@@ -155,25 +107,11 @@ fn make_engine(schema: InputSchema, aux_path: &PathBuf, typo_enabled: bool, adap
     let pydict = PinyinDictView::from_file(dir.join("pinyin.pydict")).expect("load pinyin.pydict");
     let aux = AuxView::open_mmap(aux_path).expect("load wbaux");
     engine.load_pinyin_dict(pydict);
+    if let Ok(endict) = EnDictView::open_mmap(dir.join("english.endict")) {
+        engine.load_english_dict(endict);
+    }
     engine.set_aux(aux);
     engine
-}
-
-fn build_char_to_pinyin(dict: &PinyinDictView) -> HashMap<char, String> {
-    let mut best: HashMap<char, (u32, String)> = HashMap::new();
-    for sid in 0..dict.syllable_count() {
-        let syl = dict.syllable_str(sid as u16);
-        for e in dict.lookup_chars(sid as u16, false) {
-            let mut cs = e.text.chars();
-            if let (Some(ch), None) = (cs.next(), cs.next()) {
-                let entry = best.entry(ch).or_insert_with(|| (0, String::new()));
-                if e.weight > entry.0 {
-                    *entry = (e.weight, syl.to_owned());
-                }
-            }
-        }
-    }
-    best.into_iter().map(|(c, (_, s))| (c, s)).collect()
 }
 
 fn main() {

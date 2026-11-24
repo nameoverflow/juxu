@@ -3,10 +3,10 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use juxu_core::code::{PackedCode, PackedPinyin, Stem2};
-use juxu_core::english::{serialize_endict, EN_FLAG_ABBR, EN_FLAG_HIGH_FREQ, EN_FLAG_TECH};
+use juxu_core::english::{serialize_endict, BUILTIN_WORDS, EN_FLAG_ABBR};
 use juxu_core::format::{
-    pack_trigram, serialize_wbaux, serialize_wbdict, AuxBuildInput, CharMeta, DictBuildInput,
-    ENTRY_FLAG_EXT_RARE, ENTRY_FLAG_SINGLE_CHAR, ENTRY_FLAG_SYMBOL,
+    pack_trigram, serialize_wbaux, serialize_wbdict, AuxBuildInput, AuxView, CharMeta,
+    DictBuildInput, ENTRY_FLAG_EXT_RARE, ENTRY_FLAG_SINGLE_CHAR, ENTRY_FLAG_SYMBOL,
 };
 use juxu_core::pinyin_dict::{serialize_pydict, PinyinDictBuildInput, PY_FLAG_EXT_RARE};
 
@@ -319,6 +319,7 @@ fn build_aux_data(
     global_char_weights: &HashMap<u32, u64>,
     all_phrases: &[(String, u64)],
     corpus_lm_dir: Option<&Path>,
+    preserved_lm: Option<(Vec<(u32, u16)>, Vec<(u64, u16)>, Vec<u64>, Vec<u8>)>,
 ) -> AuxBuildInput {
     // 1. Parse kTGHZ2013.txt + pinyin.txt (BMP + TGHZ characters)
     let mut py_items = Vec::<(PackedPinyin, String, u32, u32)>::new();
@@ -379,6 +380,23 @@ fn build_aux_data(
         println!(
             "Loaded corpus LM from {}: {} unigrams, {} bigrams, {} trigrams, neural={:.2} MB",
             lm_dir.display(),
+            unigrams.len(),
+            bigrams.len(),
+            trigrams.len(),
+            neural_blob.len() as f64 / (1024.0 * 1024.0)
+        );
+        return AuxBuildInput {
+            pinyin_items: py_items,
+            bigrams,
+            unigrams,
+            trigrams,
+            neural_blob,
+        };
+    }
+
+    if let Some((unigrams, bigrams, trigrams, neural_blob)) = preserved_lm {
+        println!(
+            "Preserved existing LM sections from wubi_aux.wbaux: {} unigrams, {} bigrams, {} trigrams, neural={:.2} MB",
             unigrams.len(),
             bigrams.len(),
             trigrams.len(),
@@ -821,26 +839,46 @@ fn main() {
         return;
     }
 
+    let aux_path = out_dir.join("wubi_aux.wbaux");
+    let preserved_lm = if corpus_lm_dir.is_none() && aux_path.exists() {
+        AuxView::from_mmap(&aux_path).ok().and_then(|existing| {
+            let sections = existing.export_lm_sections();
+            if !sections.0.is_empty()
+                || !sections.1.is_empty()
+                || !sections.2.is_empty()
+                || !sections.3.is_empty()
+            {
+                Some(sections)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
     let aux_input = build_aux_data(
         &pinyin_dir,
         &global_char_weights,
         &all_phrases,
         corpus_lm_dir.as_deref(),
+        preserved_lm,
     );
     let py_cnt = aux_input.pinyin_items.len();
     let uni_cnt = aux_input.unigrams.len();
     let bg_cnt = aux_input.bigrams.len();
     let tri_cnt = aux_input.trigrams.len();
+    let neural_mb = aux_input.neural_blob.len() as f64 / (1024.0 * 1024.0);
     let aux_blob = serialize_wbaux(aux_input);
-    let aux_path = out_dir.join("wubi_aux.wbaux");
     fs::write(&aux_path, &aux_blob).expect("failed to write wbaux");
     println!(
-        "Built wubi_aux.wbaux ({:.2} MB): {} pinyin, {} unigrams, {} bigrams, {} trigrams",
+        "Built wubi_aux.wbaux ({:.2} MB): {} pinyin, {} unigrams, {} bigrams, {} trigrams, neural={:.2} MB",
         aux_blob.len() as f64 / (1024.0 * 1024.0),
         py_cnt,
         uni_cnt,
         bg_cnt,
-        tri_cnt
+        tri_cnt,
+        neural_mb
     );
 }
 
@@ -1170,10 +1208,7 @@ fn build_pinyin_dict(ice_dir: &Path, tghz_set: &HashSet<u32>) -> Vec<u8> {
         }
     }
 
-    serialize_pydict(PinyinDictBuildInput {
-        chars,
-        phrases: Vec::new(),
-    })
+    serialize_pydict(PinyinDictBuildInput { chars })
 }
 
 fn build_english_dict(ice_dir: &Path) -> (Vec<u8>, usize) {
@@ -1196,18 +1231,19 @@ fn build_english_dict(ice_dir: &Path) -> (Vec<u8>, usize) {
         if !(2..=40).contains(&lower.len()) || !lower.bytes().all(|b| b.is_ascii_lowercase()) {
             return;
         }
+        let clean_flags = flags & EN_FLAG_ABBR;
         let has_upper = disp.bytes().any(|b| b.is_ascii_uppercase());
         map.entry(lower)
             .and_modify(|e| {
                 if weight > e.1 {
                     e.1 = weight;
                 }
-                e.2 |= flags;
+                e.2 |= clean_flags;
                 if has_upper && e.0 == e.0.to_ascii_lowercase() {
                     e.0 = disp.to_owned();
                 }
             })
-            .or_insert_with(|| (disp.to_owned(), weight, flags));
+            .or_insert_with(|| (disp.to_owned(), weight, clean_flags));
     };
 
     // 2a. Parse `en.dict.yaml` (core 20k+ English words with canonical casing)
@@ -1229,24 +1265,22 @@ fn build_english_dict(ice_dir: &Path) -> (Vec<u8>, usize) {
                 continue;
             }
             let lower = disp.to_ascii_lowercase();
-            let (weight, flags) = if let Some(&rank) = freq_rank.get(&lower) {
-                let w = if rank < 1000 {
+            let weight = if let Some(&rank) = freq_rank.get(&lower) {
+                if rank < 1000 {
                     62_000 - (rank as u16) * 10
                 } else if rank < 5000 {
                     52_000 - ((rank - 1000) as u16) * 4
                 } else {
                     (36_000u32.saturating_sub(((rank - 5000) as u32) * 2)).max(8_000) as u16
-                };
-                let f = if rank < 5000 { EN_FLAG_HIGH_FREQ } else { 0 };
-                (w, f)
+                }
             } else {
-                (14_000, 0)
+                14_000
             };
-            insert_word(disp, weight, flags);
+            insert_word(disp, weight, 0);
         }
     }
 
-    // 2b. Parse `en_ext.dict.yaml` (tech, internet, brand & abbreviation words)
+    // 2b. Parse `en_ext.dict.yaml` (domain, brand & abbreviation words; zero EN_FLAG_TECH/HIGH_FREQ)
     if let Ok(content) = fs::read_to_string(ice_dir.join("en_ext.dict.yaml")) {
         let mut in_body = false;
         for raw_line in content.lines() {
@@ -1265,10 +1299,7 @@ fn build_english_dict(ice_dir: &Path) -> (Vec<u8>, usize) {
                 continue;
             }
             let is_abbr = disp.len() <= 4 && disp.bytes().all(|b| b.is_ascii_uppercase());
-            let mut flags = EN_FLAG_TECH | EN_FLAG_HIGH_FREQ;
-            if is_abbr {
-                flags |= EN_FLAG_ABBR;
-            }
+            let flags = if is_abbr { EN_FLAG_ABBR } else { 0 };
             insert_word(disp, 44_000, flags);
         }
     }
@@ -1282,49 +1313,26 @@ fn build_english_dict(ice_dir: &Path) -> (Vec<u8>, usize) {
         } else {
             (34_000u32.saturating_sub(((*rank - 5000) as u32) * 2)).max(8_000) as u16
         };
-        let flags = if *rank < 5000 { EN_FLAG_HIGH_FREQ } else { 0 };
-        insert_word(w, weight, flags);
+        insert_word(w, weight, 0);
     }
     drop(insert_word);
 
-    // 2d. Curated modern tech/AI canonical-case overrides (2024–2026)
-    let tech_overrides: &[(&str, u16, u16)] = &[
-        ("Rust", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("Python", 56_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("Swift", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("TypeScript", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("JavaScript", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("GitHub", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("iOS", 56_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
-        ("macOS", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("iPhone", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("iPad", 52_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("Mac", 52_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("Claude", 52_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("Gemini", 52_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("DeepSeek", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("Qwen", 48_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("Cursor", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("GPT", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
-        ("AI", 58_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
-        ("LLM", 52_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
-        ("API", 56_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
-        ("PR", 52_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
-        ("MCP", 48_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ | EN_FLAG_ABBR),
-        ("RWKV", 48_000, EN_FLAG_TECH | EN_FLAG_ABBR),
-        ("Xcode", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("Docker", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("Kubernetes", 48_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("PyTorch", 50_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("CUDA", 48_000, EN_FLAG_TECH | EN_FLAG_ABBR),
-        ("MLX", 46_000, EN_FLAG_TECH | EN_FLAG_ABBR),
-        ("bug", 56_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("demo", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-        ("Git", 54_000, EN_FLAG_TECH | EN_FLAG_HIGH_FREQ),
-    ];
-    for &(disp, w, f) in tech_overrides {
+    // 2d. Apply shared canonical-case & fallback entries from `juxu_core::english::BUILTIN_WORDS`
+    for &(disp, w, f) in BUILTIN_WORDS {
         let lower = disp.to_ascii_lowercase();
-        map.insert(lower, (disp.to_owned(), w, f));
+        let clean_flags = f & EN_FLAG_ABBR;
+        let has_upper = disp.bytes().any(|b| b.is_ascii_uppercase());
+        map.entry(lower)
+            .and_modify(|e| {
+                if w > e.1 {
+                    e.1 = w;
+                }
+                e.2 |= clean_flags;
+                if has_upper {
+                    e.0 = disp.to_owned();
+                }
+            })
+            .or_insert_with(|| (disp.to_owned(), w, clean_flags));
     }
 
     let entries: Vec<(String, String, u16, u16)> = map

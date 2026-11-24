@@ -8,16 +8,15 @@ public final class JuxuInputController: IMKInputController {
     private weak var activeClient: (any IMKTextInput & NSObjectProtocol)?
     private var shiftTapDetector = ShiftTapDetector()
     private var autoSpaceTracker = AutoSpaceContextTracker()
+    private var pairingTracker = PunctuationPairingTracker()
     private var lastExpectedAnchor: Int? = nil
     private var sawClientSupportForRanges: Bool = false
+    private var needsEngineContextSync: Bool = true
     private var saveUserDataTimer: Timer?
-    private var autoPairClosers: [String] = []
-    private var autoPairTail: String = ""
 
     public override init!(server: IMKServer!, delegate: Any!, client inputClient: Any!) {
         super.init(server: server, delegate: delegate, client: inputClient)
         self.activeClient = inputClient as? (any IMKTextInput & NSObjectProtocol)
-        configurePanelCallbacks()
     }
 
     private func configurePanelCallbacks() {
@@ -45,11 +44,10 @@ public final class JuxuInputController: IMKInputController {
         super.activateServer(sender)
         self.activeClient = sender as? (any IMKTextInput & NSObjectProtocol)
         shiftTapDetector.reset()
-        autoSpaceTracker.invalidate()
-        lastExpectedAnchor = nil
+        invalidateContextAndQuoteState()
         sawClientSupportForRanges = false
-        autoPairClosers.removeAll()
         configurePanelCallbacks()
+        syncEngineContextFromClient(self.activeClient)
         VoiceGlobalCommitter.setInputMethodSink(owner: self) { [weak self] text, replaceSelection in
             guard let self, self.activeClient != nil else { return false }
             self.commitVoiceText(text, replaceSelection: replaceSelection, client: self.activeClient)
@@ -66,10 +64,8 @@ public final class JuxuInputController: IMKInputController {
         JuxuBridge.shared.flushUserDataAsync()
         JuxuBridge.shared.flushPendingPersistence()
         shiftTapDetector.reset()
-        autoSpaceTracker.invalidate()
-        lastExpectedAnchor = nil
+        invalidateContextAndQuoteState()
         sawClientSupportForRanges = false
-        autoPairClosers.removeAll()
         super.deactivateServer(sender)
     }
 
@@ -77,18 +73,35 @@ public final class JuxuInputController: IMKInputController {
         saveUserDataTimer?.invalidate()
         saveUserDataTimer = nil
         commitPendingAndHide(sender)
-        JuxuBridge.shared.flushUserDataAsync()
+    }
+
+    private func invalidateContextAndQuoteState() {
+        autoSpaceTracker.invalidate()
+        pairingTracker.reset()
+        lastExpectedAnchor = nil
+        needsEngineContextSync = true
+        JuxuBridge.shared.resetQuoteState()
     }
 
     private func commitPendingAndHide(_ sender: Any!) {
         let clientObj = (sender as? (any IMKTextInput & NSObjectProtocol)) ?? activeClient
-        let pre = JuxuBridge.shared.state.preedit
-        if !pre.isEmpty {
-            let rawText = JuxuBridge.shared.state.candidates.first?.text ?? pre
-            let formatted = formatTextForCommit(rawText, splitInternal: true, client: clientObj)
-            clientObj?.insertText(formatted, replacementRange: NSRange(location: NSNotFound, length: NSNotFound))
-            advanceExpectedAnchor(by: formatted.utf16.count)
-            JuxuBridge.shared.clearComposition()
+        if !JuxuBridge.shared.state.preedit.isEmpty {
+            let out = JuxuBridge.shared.commitPending(timestampMs: Self.nowMs())
+            if !out.commitText.isEmpty {
+                let formatted = formatTextForCommit(out.commitText, splitInternal: true, client: clientObj)
+                clientObj?.insertText(
+                    formatted,
+                    replacementRange: NSRange(location: NSNotFound, length: NSNotFound)
+                )
+                advanceExpectedAnchor(by: formatted.utf16.count)
+            } else {
+                clientObj?.setMarkedText(
+                    "",
+                    selectionRange: NSRange(location: 0, length: 0),
+                    replacementRange: NSRange(location: NSNotFound, length: NSNotFound)
+                )
+            }
+            JuxuBridge.shared.flushUserDataAsync()
         }
         CandidatePanelController.shared.hide()
         ModeIndicatorPanelController.shared.hide()
@@ -97,6 +110,10 @@ public final class JuxuInputController: IMKInputController {
     public override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
         guard let event else { return false }
         let clientObj = (sender as? (any IMKTextInput & NSObjectProtocol)) ?? activeClient
+        if let clientObj, let prev = activeClient, (clientObj as AnyObject) !== (prev as AnyObject) {
+            sawClientSupportForRanges = false
+            invalidateContextAndQuoteState()
+        }
         self.activeClient = clientObj
         JuxuBridge.shared.suppressEvalLogging = IsSecureEventInputEnabled()
 
@@ -165,13 +182,15 @@ public final class JuxuInputController: IMKInputController {
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let hasCmdOrOption = mods.contains(.command) || mods.contains(.option)
         if hasCmdOrOption {
-            autoSpaceTracker.invalidate()
-            lastExpectedAnchor = nil
-            autoPairClosers.removeAll()
+            invalidateContextAndQuoteState()
             return false
         }
         let hasCtrl = mods.contains(.control)
         let scalar: UInt32 = event.characters?.unicodeScalars.first?.value ?? 0
+
+        if !hasCtrl && JuxuBridge.shared.state.preedit.isEmpty {
+            syncEngineContextBeforeFreshCompositionIfNeeded(client: clientObj)
+        }
 
         let out = JuxuBridge.shared.handleKey(
             keyCode: event.keyCode,
@@ -423,8 +442,8 @@ public final class JuxuInputController: IMKInputController {
             let sel = targetClient.selectedRange()
             if sel.location != NSNotFound && sel.length > 0 {
                 targetClient.insertText(trimmed, replacementRange: sel)
-                autoSpaceTracker.invalidate()
-                lastExpectedAnchor = nil
+                invalidateContextAndQuoteState()
+                JuxuBridge.shared.setContext(String(trimmed.suffix(32)))
                 return
             }
         }
@@ -434,10 +453,111 @@ public final class JuxuInputController: IMKInputController {
             replacementRange: NSRange(location: NSNotFound, length: NSNotFound)
         )
         advanceExpectedAnchor(by: formatted.utf16.count)
+        JuxuBridge.shared.setContext(String(autoSpaceTracker.currentShadowBefore.suffix(32)))
     }
 
     public override func showPreferences(_ sender: Any!) {
         SettingsWindowController.shared.show()
+    }
+
+    // MARK: - RWKV Surrounding Context Sync & Host Range Guards
+
+    private func syncEngineContextBeforeFreshCompositionIfNeeded(
+        client: (any IMKTextInput & NSObjectProtocol)?
+    ) {
+        guard JuxuBridge.shared.state.preedit.isEmpty else { return }
+        guard !IsSecureEventInputEnabled(), let client else {
+            if needsEngineContextSync {
+                JuxuBridge.shared.setContext("")
+                needsEngineContextSync = false
+            }
+            return
+        }
+
+        let marked = client.markedRange()
+        if marked.location != NSNotFound && marked.length > 0 {
+            return
+        }
+
+        let sel = client.selectedRange()
+        guard sel.location != NSNotFound && sel.location >= 0 else {
+            if needsEngineContextSync {
+                JuxuBridge.shared.setContext("")
+                needsEngineContextSync = false
+            }
+            return
+        }
+
+        let docLen = client.length()
+        let safeAnchor = (docLen != NSNotFound && docLen >= 0) ? min(sel.location, docLen) : sel.location
+        let cursorMovedExternally: Bool
+        if let expected = lastExpectedAnchor {
+            cursorMovedExternally = (safeAnchor != expected)
+        } else {
+            cursorMovedExternally = false
+        }
+
+        guard needsEngineContextSync || cursorMovedExternally else { return }
+        if cursorMovedExternally {
+            autoSpaceTracker.invalidate()
+            pairingTracker.reset()
+            JuxuBridge.shared.resetQuoteState()
+        }
+        syncEngineContextFromClient(client)
+    }
+
+    private func syncEngineContextFromClient(_ client: (any IMKTextInput & NSObjectProtocol)?) {
+        needsEngineContextSync = false
+        guard JuxuBridge.shared.state.preedit.isEmpty else { return }
+        guard !IsSecureEventInputEnabled(), let client else {
+            JuxuBridge.shared.setContext("")
+            return
+        }
+
+        let marked = client.markedRange()
+        if marked.location != NSNotFound && marked.length > 0 {
+            return
+        }
+
+        let sel = client.selectedRange()
+        guard sel.location != NSNotFound && sel.location >= 0 else {
+            lastExpectedAnchor = nil
+            JuxuBridge.shared.setContext("")
+            return
+        }
+
+        let docLen = client.length()
+        let safeAnchor = (docLen != NSNotFound && docLen >= 0) ? min(sel.location, docLen) : sel.location
+
+        if safeAnchor == 0 && (docLen == NSNotFound || docLen == 0) && !sawClientSupportForRanges {
+            lastExpectedAnchor = 0
+            JuxuBridge.shared.setContext(String(autoSpaceTracker.currentShadowBefore.suffix(32)))
+            return
+        }
+
+        lastExpectedAnchor = safeAnchor
+        if safeAnchor == 0 {
+            if docLen != NSNotFound && docLen > 0 {
+                sawClientSupportForRanges = true
+            }
+            JuxuBridge.shared.setContext("")
+            return
+        }
+
+        // Fetch up to 64 UTF-16 code units (safely covering >= 32 BMP or astral characters)
+        let fetchLen = min(safeAnchor, 64)
+        let start = safeAnchor - fetchLen
+        var sub = client.attributedSubstring(from: NSRange(location: start, length: fetchLen))?.string
+        if sub == nil && fetchLen > 1 {
+            // Guard against starting mid-surrogate pair at `start`
+            sub = client.attributedSubstring(from: NSRange(location: start + 1, length: fetchLen - 1))?.string
+        }
+        if let sub, !sub.isEmpty {
+            sawClientSupportForRanges = true
+            JuxuBridge.shared.setContext(String(sub.suffix(32)))
+        } else {
+            JuxuBridge.shared.setContext(String(autoSpaceTracker.currentShadowBefore.suffix(32)))
+        }
     }
 
     private func handlePassthroughAutoSpace(
@@ -446,9 +566,7 @@ public final class JuxuInputController: IMKInputController {
         client: (any IMKTextInput & NSObjectProtocol)?
     ) -> Bool {
         if hasCtrl {
-            autoSpaceTracker.invalidate()
-            lastExpectedAnchor = nil
-            autoPairClosers.removeAll()
+            invalidateContextAndQuoteState()
             return false
         }
 
@@ -457,48 +575,51 @@ public final class JuxuInputController: IMKInputController {
             let hostBefore = readHostContextBefore(client: client)
             if JuxuBridge.shared.prefs.smartPunctuation,
                !JuxuBridge.shared.state.asciiMode,
-               !autoPairClosers.isEmpty,
+               !pairingTracker.openClosers.isEmpty,
                CGPreflightPostEventAccess()
             {
                 let hostAfter = readHostContextAfter(client: client)
-                refreshAutoPairs(after: hostAfter)
-                if PunctuationPairing.shouldDeletePair(before: hostBefore, after: hostAfter, openClosers: autoPairClosers) {
+                if pairingTracker.consumeBackspacePairIfNeeded(before: hostBefore, after: hostAfter) {
                     Self.postVirtualKey(0x75) // ForwardDelete removes closer on the right
-                    autoPairClosers.removeLast()
                     autoSpaceTracker.invalidate()
                 }
             }
             let eff = autoSpaceTracker.effectiveBefore(hostBefore: hostBefore, hostBeforeIsAuthoritative: true)
+            if !eff.isEmpty {
+                JuxuBridge.shared.notifyPostCommitBackspace(timestampMs: Self.nowMs())
+            }
             let delUtf16 = eff.last?.utf16.count ?? 1
             autoSpaceTracker.willDeleteBackward(hostBefore: hostBefore, hostBeforeIsAuthoritative: true)
             if let anchor = lastExpectedAnchor {
                 lastExpectedAnchor = max(0, anchor - delUtf16)
             }
+            needsEngineContextSync = true
             return false
 
         case 0x24, 0x4C: // Return / KP Enter
             let hostBefore = readHostContextBefore(client: client)
             autoSpaceTracker.recordPassthrough("\n", hostBefore: hostBefore, hostBeforeIsAuthoritative: true)
             advanceExpectedAnchor(by: 1)
+            needsEngineContextSync = true
             return false
 
         case 0x30: // Tab
             let hostBefore = readHostContextBefore(client: client)
             autoSpaceTracker.recordPassthrough("\t", hostBefore: hostBefore, hostBeforeIsAuthoritative: true)
             advanceExpectedAnchor(by: 1)
+            needsEngineContextSync = true
             return false
 
         case 0x31: // Space
             let hostBefore = readHostContextBefore(client: client)
             autoSpaceTracker.recordPassthrough(" ", hostBefore: hostBefore, hostBeforeIsAuthoritative: true)
             advanceExpectedAnchor(by: 1)
+            needsEngineContextSync = true
             return false
 
         case 0x35, 0x73, 0x74, 0x75, 0x77, 0x79, 0x7B, 0x7C, 0x7D, 0x7E:
             // Esc, Home, PgUp, ForwardDel, End, PgDn, Left, Right, Down, Up
-            autoSpaceTracker.invalidate()
-            lastExpectedAnchor = nil
-            autoPairClosers.removeAll()
+            invalidateContextAndQuoteState()
             return false
 
         default:
@@ -513,13 +634,13 @@ public final class JuxuInputController: IMKInputController {
             || (firstScalar.value >= 0xF700 && firstScalar.value <= 0xF8FF)
             || firstScalar.value == 0x7F
         {
-            autoSpaceTracker.invalidate()
-            lastExpectedAnchor = nil
+            invalidateContextAndQuoteState()
             return false
         }
 
         let hostBefore = readHostContextBefore(client: client)
         let options = AutoSpaceOptions(prefs: JuxuBridge.shared.prefs)
+        needsEngineContextSync = true
         if !IsSecureEventInputEnabled(),
            AutoSpaceFormatter.isAutoSpaceRightTrigger(chars, options: options)
         {
@@ -589,6 +710,8 @@ public final class JuxuInputController: IMKInputController {
 
         if let expected = lastExpectedAnchor, safeAnchor != expected {
             autoSpaceTracker.invalidate()
+            pairingTracker.reset()
+            JuxuBridge.shared.resetQuoteState()
         }
         lastExpectedAnchor = safeAnchor
 
@@ -624,13 +747,6 @@ public final class JuxuInputController: IMKInputController {
         return client.attributedSubstring(from: NSRange(location: anchor, length: len))?.string
     }
 
-    private func refreshAutoPairs(after: String?) {
-        autoPairClosers = PunctuationPairing.pruned(autoPairClosers, after: after)
-        if !PunctuationPairing.cursorStaysInPairs(autoPairClosers, tail: autoPairTail, after: after) {
-            autoPairClosers.removeAll()
-        }
-    }
-
     private func commitWithOptionalPairing(
         _ out: JuxuActionState,
         client: (any IMKTextInput & NSObjectProtocol)?
@@ -645,31 +761,29 @@ public final class JuxuInputController: IMKInputController {
         }
         let sym = String(lastScalar)
         let hasPrefix = out.commitText.count > 1
+        if hasPrefix && PunctuationPairing.closer(for: sym) == nil {
+            return false
+        }
         let hostAfter = readHostContextAfter(client: client)
-        refreshAutoPairs(after: hostAfter)
 
-        switch PunctuationPairing.action(for: sym, after: hostAfter, openClosers: autoPairClosers) {
-        case .skipClose where !hasPrefix:
+        switch pairingTracker.handleSymbol(sym, after: hostAfter) {
+        case .skipClose:
             Self.postVirtualKey(0x7C) // Right Arrow skips over auto-inserted closer
-            autoPairClosers.removeLast()
             autoSpaceTracker.invalidate()
             advanceExpectedAnchor(by: sym.utf16.count)
+            needsEngineContextSync = true
             return true
         case .insertPair(let close):
-            if autoPairClosers.isEmpty {
-                autoPairTail = hostAfter ?? ""
-            }
             let formatted = formatTextForCommit(out.commitText, splitInternal: true, client: client)
             client?.insertText(
                 formatted + close,
                 replacementRange: NSRange(location: NSNotFound, length: NSNotFound)
             )
             Self.postVirtualKey(0x7B) // Left Arrow places caret inside the pair
-            autoPairClosers.append(close)
             advanceExpectedAnchor(by: formatted.utf16.count)
             autoSpaceTracker.invalidate()
             return true
-        default:
+        case .plain:
             return false
         }
     }

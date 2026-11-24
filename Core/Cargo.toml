@@ -3,6 +3,7 @@ name = "juxu-core"
 version = "0.1.4"
 edition = "2021"
 license = "WTFPL"
+autobins = false
 
 [lib]
 name = "juxu_core"
@@ -11,6 +12,26 @@ crate-type = ["staticlib", "rlib"]
 [[bin]]
 name = "build-dicts"
 path = "src/bin/build_dicts.rs"
+
+[[bin]]
+name = "eval_pinyin"
+path = "src/bin/eval_pinyin.rs"
+
+[[bin]]
+name = "eval_missed_space"
+path = "src/bin/eval_missed_space.rs"
+
+[[bin]]
+name = "eval_touch_and_bmk"
+path = "src/bin/eval_touch_and_bmk.rs"
+
+[[bin]]
+name = "eval_typo"
+path = "src/bin/eval_typo.rs"
+
+[[bin]]
+name = "eval_english_mix"
+path = "src/bin/eval_english_mix.rs"
 
 [dependencies]
 

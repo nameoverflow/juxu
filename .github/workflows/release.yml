@@ -49,7 +49,9 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ steps.meta.outputs.build }}" Resources/Info.plist
 
       - name: Run Tests
-        run: make test
+        run: |
+          export DEVELOPER_DIR="$(xcode-select -p)"
+          make test
 
       - name: Build, Sign & Package macOS Installer (.pkg / .dmg / .zip)
         env:
@@ -62,9 +64,12 @@ jobs:
           NOTARY_PRIVATE_KEY: ${{ secrets.APPLE_NOTARY_PRIVATE_KEY }}
         run: |
           set -euo pipefail
+          export DEVELOPER_DIR="$(xcode-select -p)"
           VERSION="${{ steps.meta.outputs.version }}"
           mkdir -p dist/dmg-root
           INSTALLER_SIGN_ID=""
+
+          make app CODESIGN_IDENTITY="-"
 
           if [ -n "$CERT_P12" ] && [ -n "$CERT_PASSWORD" ]; then
             KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
@@ -81,7 +86,6 @@ jobs:
             security set-key-partition-list -S apple-tool:,apple:,codesign:,productsign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
             security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
 
-            make app CODESIGN_IDENTITY=dist
             SIGN_ID="$(sh Scripts/resolve-codesign-identity.sh dist)"
             codesign --force --options runtime --timestamp --sign "$SIGN_ID" build/Juxu.app/Contents/MacOS/juxu-qwen-asr
             codesign --force --deep --options runtime --timestamp --sign "$SIGN_ID" build/Juxu.app
@@ -98,8 +102,6 @@ jobs:
                 --wait
               xcrun stapler staple build/Juxu.app
             fi
-          else
-            make app CODESIGN_IDENTITY="-"
           fi
 
           # 1. Build native .pkg guided installer (installs to /Library/Input Methods + auto-registers & enables!)
@@ -117,49 +119,10 @@ jobs:
           # 2. Build portable .zip (also consumed by Scripts/install-macos.sh)
           ditto -c -k --sequesterRsrc --keepParent build/Juxu.app "dist/Juxu-${VERSION}-macOS-arm64.zip"
 
-          # 3. Build .dmg with double-clickable local installer helper
+          # 3. Build .dmg with double-clickable local installer helper sharing Scripts/install-macos.sh
           cp -R build/Juxu.app dist/dmg-root/Juxu.app
-          cat <<'EOF' > "dist/dmg-root/双击安装句序.command"
-          #!/bin/sh
-          set -eu
-          export COPYFILE_DISABLE=1
-          SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
-          SYS_APP="/Library/Input Methods/Juxu.app"
-          USER_APP="$HOME/Library/Input Methods/Juxu.app"
-          LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-
-          pkill -TERM -x Juxu 2>/dev/null || true
-          pkill -TERM -x PrisWubi 2>/dev/null || true
-          sleep 0.3
-          if [ -d "$USER_APP" ]; then
-            "$LSREGISTER" -u "$USER_APP" 2>/dev/null || true
-            rm -rf "$USER_APP" 2>/dev/null || true
-          fi
-          if LC_ALL=C grep -q -a "im.juxu.inputmethod.Juxu" /System/Library/Caches/com.apple.IntlDataCache.le.kbdx 2>/dev/null && [ -d "$SYS_APP" ] && [ -w "$SYS_APP" ]; then
-            rm -rf "$SYS_APP/Contents"
-            cp -R "$SRC_DIR/Juxu.app/Contents" "$SYS_APP/Contents"
-            "$LSREGISTER" -f -R -trusted "$SYS_APP" 2>/dev/null || true
-          else
-            sudo rm -rf "$SYS_APP"
-            sudo cp -R "$SRC_DIR/Juxu.app" "$SYS_APP"
-            sudo chown -R root:staff "$SYS_APP"
-            sudo chmod -R ug+rwX,o+rX "$SYS_APP"
-            sudo "$LSREGISTER" -f -R -trusted "$SYS_APP" 2>/dev/null || true
-            sudo "$SYS_APP/Contents/MacOS/Juxu" --register-system-cache
-          fi
-          xattr -cr "$SYS_APP" 2>/dev/null || true
-          USER_CACHE_DIR="$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null || true)"
-          if [ -n "$USER_CACHE_DIR" ] && [ -d "$USER_CACHE_DIR" ]; then
-            rm -f "${USER_CACHE_DIR}"com.apple.IntlDataCache* "${USER_CACHE_DIR}"*/com.apple.IntlDataCache* 2>/dev/null || true
-          fi
-          killall KeyboardSettings TextInputMenuAgent TextInputSwitcher imklaunchagent 2>/dev/null || true
-          sleep 0.3
-          "$SYS_APP/Contents/MacOS/Juxu" --register-and-enable
-          open -g "$SYS_APP"
-          echo ""
-          echo "✓ 句序 (Juxu) 已安装至 /Library/Input Methods/Juxu.app！无需注销，按 Ctrl+Space 或地球键即可开始输入。"
-          EOF
-          chmod 0755 "dist/dmg-root/双击安装句序.command"
+          cp Scripts/install-macos.sh "dist/dmg-root/双击安装句序输入法.command"
+          chmod 0755 "dist/dmg-root/双击安装句序输入法.command"
           for attempt in 1 2 3; do
             hdiutil create -volname "Juxu ${VERSION}" -srcfolder dist/dmg-root -ov -format UDZO "dist/Juxu-${VERSION}-macOS-arm64.dmg" && break
             echo "hdiutil create busy on attempt ${attempt}, retrying..."

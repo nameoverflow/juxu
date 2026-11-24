@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 use juxu_core::code::PackedCode;
-use juxu_core::config::{JuxuConfig, InputSchema};
+use juxu_core::config::{InputSchema, JuxuConfig};
 use juxu_core::engine::{JuxuEngine, KEY_SPACE};
+use juxu_core::eval_support::{pct, segment_wubi_sentence, wubi_neighbor_keys, XorshiftRng};
 use juxu_core::format::{AuxView, DictView};
 use juxu_core::typo::KeyLayout;
 
@@ -115,67 +116,6 @@ const SENTENCES: &[&str] = &[
     "去年买的那件羽绒服今年穿着还是很暖和",
 ];
 
-/// Segment sentence into realistic Wubi tokens `(text, code)` using either:
-/// - `prefer_single_short = false`: phrase-first blind typing (2..4 char phrases when #1, else primary short/full char)
-/// - `prefer_single_short = true`: single-char-heavy typing (exercises many 3-code full/short chars like 好/去/来/说/天/可/想!)
-fn segment_sentence(dict: &DictView, sent: &str, single_char_mode: bool) -> Vec<(String, String)> {
-    let chars: Vec<char> = sent.chars().collect();
-    let mut tokens = Vec::new();
-    let mut i = 0usize;
-    while i < chars.len() {
-        if !single_char_mode {
-            let mut matched: Option<(usize, String, String)> = None;
-            for len in (2..=4).rev() {
-                if i + len > chars.len() {
-                    continue;
-                }
-                let sub: String = chars[i..i + len].iter().collect();
-                if let Some(code) = dict.encode_phrase(&sub) {
-                    let hits = dict.lookup_exact(code, false);
-                    if hits.first().map(|e| e.text == sub).unwrap_or(false) {
-                        matched = Some((len, sub, code.as_string()));
-                        break;
-                    }
-                }
-            }
-            if let Some((len, text, code)) = matched {
-                tokens.push((text, code));
-                i += len;
-                continue;
-            }
-        }
-        let ch = chars[i];
-        let mut pushed = false;
-        if let Some(meta) = dict.char_meta(ch) {
-            // In single_char_mode, prefer full_code if it's 3-letter (realistic for users who type 3-code full chars like 好 vbg, 去 fcu, 来 goi, 说 yuk!)
-            let candidates_codes = if single_char_mode && meta.full_code.len() == 3 {
-                [meta.full_code, meta.primary_short_code, meta.shortest_code]
-            } else {
-                [meta.primary_short_code, meta.shortest_code, meta.full_code]
-            };
-            for code in candidates_codes {
-                if code.is_empty() {
-                    continue;
-                }
-                let cs = code.as_string();
-                if !cs.is_empty() && cs.bytes().all(|b| (b'a'..=b'y').contains(&b)) {
-                    let hits = dict.lookup_exact(code, false);
-                    if hits.first().map(|e| e.text == ch.to_string()).unwrap_or(false) {
-                        tokens.push((ch.to_string(), cs));
-                        pushed = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if !pushed {
-            tokens.push((ch.to_string(), String::new()));
-        }
-        i += 1;
-    }
-    tokens
-}
-
 fn type_code_and_space(engine: &mut JuxuEngine, code: &str, need_space: bool, ts: &mut u64) -> String {
     let mut committed = String::new();
     for b in code.bytes() {
@@ -200,21 +140,14 @@ struct BucketStat {
 }
 
 impl BucketStat {
-    fn pct(a: usize, b: usize) -> f64 {
-        if b == 0 {
-            0.0
-        } else {
-            100.0 * (a as f64) / (b as f64)
-        }
-    }
     fn fmt_line(&self, name: &str) -> String {
         format!(
             "{:<28} | n={:4} | Exact={:6.2}% | Top2={:6.2}% | BellBlock={:5.2}%",
             name,
             self.total,
-            Self::pct(self.exact_ok, self.total),
-            Self::pct(self.top2_ok, self.total),
-            Self::pct(self.blocked_bell, self.total),
+            pct(self.exact_ok, self.total),
+            pct(self.top2_ok, self.total),
+            pct(self.blocked_bell, self.total),
         )
     }
 }
@@ -257,7 +190,7 @@ fn eval_schema(schema: InputSchema, dict_path: &PathBuf, aux_path: &PathBuf, ena
         for &sent in SENTENCES {
             let tokens = {
                 let d = engine.active_dict().unwrap();
-                segment_sentence(d, sent, single_mode)
+                segment_wubi_sentence(d, sent, single_mode)
             };
             if tokens.iter().any(|(_, c)| c.is_empty()) {
                 continue;
@@ -430,7 +363,7 @@ fn eval_schema(schema: InputSchema, dict_path: &PathBuf, aux_path: &PathBuf, ena
     for &sent in SENTENCES.iter().take(40) {
         let tokens = {
             let d = engine.active_dict().unwrap();
-            segment_sentence(d, sent, false)
+            segment_wubi_sentence(d, sent, false)
         };
         engine.clear_composition();
         engine.clear_context();
@@ -453,10 +386,10 @@ fn eval_schema(schema: InputSchema, dict_path: &PathBuf, aux_path: &PathBuf, ena
         "Normal Typing Guardrail      | SentExact={}/{} ({:.2}%) | 4code_held={}/{} ({:.2}%) | SentFP={}",
         normal_sent_exact,
         normal_sent_total,
-        BucketStat::pct(normal_sent_exact, normal_sent_total),
+        pct(normal_sent_exact, normal_sent_total),
         normal_4code_held,
         normal_4code_total,
-        BucketStat::pct(normal_4code_held, normal_4code_total),
+        pct(normal_4code_held, normal_4code_total),
         normal_4code_fp_split,
     );
 
@@ -476,24 +409,6 @@ fn eval_schema(schema: InputSchema, dict_path: &PathBuf, aux_path: &PathBuf, ena
             }
         }
     }
-}
-
-fn neighbor_keys(layout: &KeyLayout, ch: u8) -> Vec<u8> {
-    let (cx0, cy0) = layout.center_of(ch);
-    let mut out = Vec::new();
-    for d in 0..25u8 {
-        let k = b'a' + d;
-        if k == ch {
-            continue;
-        }
-        let (cx, cy) = layout.center_of(k);
-        let dx = (cx - cx0).abs();
-        let dy = (cy - cy0).abs();
-        if (dy < 0.1 && dx <= 1.05) || (dy <= 1.05 && dx <= 0.85) {
-            out.push(k);
-        }
-    }
-    out
 }
 
 fn eval_typo_regression(schema: InputSchema, dict_path: &PathBuf, aux_path: &PathBuf, enabled: bool) {
@@ -517,18 +432,12 @@ fn eval_typo_regression(schema: InputSchema, dict_path: &PathBuf, aux_path: &Pat
     let (mut te_n, mut te_1) = (0usize, 0usize);
     let (mut pe_n, mut pe_1) = (0usize, 0usize);
     let (mut fp_n, mut fp_bad) = (0usize, 0usize);
-    let mut seed = 20261119u64;
-    let mut next_u64 = || {
-        seed ^= seed >> 12;
-        seed ^= seed << 25;
-        seed ^= seed >> 27;
-        seed.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    };
+    let mut rng = XorshiftRng::new(20261119);
 
     for &sent in SENTENCES {
         let tokens = {
             let d = engine.active_dict().unwrap();
-            segment_sentence(d, sent, false)
+            segment_wubi_sentence(d, sent, false)
         };
         engine.clear_composition();
         engine.clear_context();
@@ -541,7 +450,7 @@ fn eval_typo_regression(schema: InputSchema, dict_path: &PathBuf, aux_path: &Pat
                 {
                     let d = engine.active_dict().unwrap();
                     for pos in 0..cl {
-                        for nb in neighbor_keys(&layout, cb[pos]) {
+                        for nb in wubi_neighbor_keys(&layout, cb[pos]) {
                             let mut mc = cb.to_vec();
                             mc[pos] = nb;
                             if let Some(pc) = PackedCode::from_bytes(&mc) {
@@ -556,7 +465,7 @@ fn eval_typo_regression(schema: InputSchema, dict_path: &PathBuf, aux_path: &Pat
                     }
                 }
                 if !coll.is_empty() {
-                    let (pos, nb) = coll[(next_u64() as usize) % coll.len()];
+                    let (pos, nb) = coll[rng.range(coll.len())];
                     let alpha = 0.56f32;
                     engine.clear_composition();
                     for j in 0..cl {
@@ -592,7 +501,7 @@ fn eval_typo_regression(schema: InputSchema, dict_path: &PathBuf, aux_path: &Pat
                     }
                 }
                 if !empty.is_empty() {
-                    let (pos, nb) = empty[(next_u64() as usize) % empty.len()];
+                    let (pos, nb) = empty[rng.range(empty.len())];
                     let alpha = 0.58f32;
                     engine.clear_composition();
                     for j in 0..cl {
@@ -627,10 +536,10 @@ fn eval_typo_regression(schema: InputSchema, dict_path: &PathBuf, aux_path: &Pat
     println!(
         "  TypoRegression(ms={:<5}) | TouchColl({:3})={:5.2}% | TouchEmpty({:3})={:5.2}% | PhysEmpty({:3})={:5.2}% | BorderFP({:3})={:5.2}%",
         enabled,
-        tc_n, BucketStat::pct(tc_1, tc_n),
-        te_n, BucketStat::pct(te_1, te_n),
-        pe_n, BucketStat::pct(pe_1, pe_n),
-        fp_n, BucketStat::pct(fp_bad, fp_n),
+        tc_n, pct(tc_1, tc_n),
+        te_n, pct(te_1, te_n),
+        pe_n, pct(pe_1, pe_n),
+        fp_n, pct(fp_bad, fp_n),
     );
 }
 

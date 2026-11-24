@@ -13,10 +13,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
-      - name: Run Core & macOS Tests + Build App
-        run: make test app
+      - name: Run Core, macOS & iOS Tests + Build App
+        run: |
+          export DEVELOPER_DIR="$(xcode-select -p)"
+          make test app CODESIGN_IDENTITY="-"
       - name: Generate & Build iOS Host App + Keyboard Extension (Simulator)
         run: |
+          export DEVELOPER_DIR="$(xcode-select -p)"
           brew install xcodegen
           cd iOS && xcodegen generate
           xcodebuild -project Juxu.xcodeproj \

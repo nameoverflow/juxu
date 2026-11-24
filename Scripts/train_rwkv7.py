@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 End-to-end Cloud GPU corpus builder + Micro-RWKV-7 trainer + QAT & Wubi-neighborhood
-fine-tuner + WBLM0001 INT8 binary exporter for Formordo (形序).
+fine-tuner + WBLM0003 INT8 binary exporter for Juxu (句序).
 """
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ import torch.nn.functional as F
 import zstandard as zstd
 from opencc import OpenCC
 
-WBLM_MAGIC = b"WBLM0001"
+WBLM_MAGIC = b"WBLM0003"
 CJK_LUT_BASE = 0x3400
 CJK_LUT_LEN = 0xA000 - 0x3400
 HEAD_DIM = 32
@@ -1159,7 +1159,14 @@ def build_wubi_confusable_table(meta: dict, code_to_words: dict, word_to_code: d
     return conf_toks
 
 
-def export_model_wblm(model: MicroRwkv7Model, lut: np.ndarray, out_path: Path, parity_json_path: Path):
+def export_model_wblm(
+    model: MicroRwkv7Model,
+    lut: np.ndarray,
+    out_path: Path,
+    parity_json_path: Path,
+    ext_base_id: int | None = None,
+    ext_vocab: list[str] | None = None,
+):
     model_cpu = model.cpu().eval()
 
     def q_rows(t: torch.Tensor):
@@ -1227,8 +1234,23 @@ def export_model_wblm(model: MicroRwkv7Model, lut: np.ndarray, out_path: Path, p
     wmh_b = model_cpu.w_mtp_h.bias.detach().float().numpy().astype("<f4")
     wmh_q, wmh_sc = put_qm(model_cpu.w_mtp_h.weight, model_cpu.w_mtp_h.bias)
     wmc_q, wmc_sc = put_qm(model_cpu.w_mtp_c1.weight, None)
-    # WBLM0003 omits the scheme-specific w_key1 head altogether; if exporting WBLM0003 with ext_vocab,
-    # append pack_wblm0002_ext_vocab_bytes(ext_base_id, ext_vocab) directly after w_mtp_c1 (4-byte aligned).
+
+    # Scheme-free WBLM0003 omits legacy head_key1 and appends 4-byte-aligned EXT_VOCAB
+    # ([u32 ext_base_id][u32 ext_count] + optional [u8 len][ascii_bytes] entries).
+    ext_entries = list(ext_vocab) if ext_vocab else []
+    resolved_ext_base = (model_cpu.vocab_size - len(ext_entries)) if ext_base_id is None else int(ext_base_id)
+    if resolved_ext_base < 0 or resolved_ext_base + len(ext_entries) > model_cpu.vocab_size:
+        raise ValueError(
+            f"Invalid WBLM0003 ext_vocab range: base={resolved_ext_base}, count={len(ext_entries)}, vocab={model_cpu.vocab_size}"
+        )
+    ext_section = bytearray(struct.pack("<II", resolved_ext_base, len(ext_entries)))
+    for s in ext_entries:
+        b = s.encode("ascii")
+        if not (1 <= len(b) <= 255):
+            raise ValueError(f"Invalid ext_vocab token byte length: {len(b)}")
+        ext_section.append(len(b))
+        ext_section.extend(b)
+    put(bytes(ext_section))
 
     out_path.write_bytes(bytes(buf))
     print(f"[export] Wrote {out_path} ({len(buf)/(1024*1024):.2f} MB)", flush=True)
@@ -1303,6 +1325,9 @@ def export_model_wblm(model: MicroRwkv7Model, lut: np.ndarray, out_path: Path, p
     }
     parity_json_path.write_text(json.dumps(parity, indent=2, ensure_ascii=False))
     print(f"[parity sample] '{ctx_str}' -> 好:{parity['score_hao']:.3f}, 热:{parity['score_re']:.3f} vs 油:{parity['score_you']:.3f}, 突:{parity['score_tun']:.3f}", flush=True)
+
+
+export_wblm = export_model_wblm
 
 
 def run_training(work_dir: Path, seed_dir: Path, smoke_test: bool = False):
@@ -1427,7 +1452,14 @@ def run_training(work_dir: Path, seed_dir: Path, smoke_test: bool = False):
 
     wblm_path = out_dir / "neural_rwkv7.wblm"
     parity_path = out_dir / "parity_check.json"
-    export_model_wblm(model, lut, wblm_path, parity_path)
+    export_model_wblm(
+        model,
+        lut,
+        wblm_path,
+        parity_path,
+        ext_base_id=meta.get("ext_base_id"),
+        ext_vocab=meta.get("ext_vocab"),
+    )
 
     # Tar-gz all needed artifacts into a single ~3MB archive for instant download
     bundle_path = work_dir / "rwkv7_artifacts.tar.gz"
@@ -1444,7 +1476,7 @@ def run_training(work_dir: Path, seed_dir: Path, smoke_test: bool = False):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train Formordo Micro-RWKV-7 (WBLM0001) & N-gram tables")
+    parser = argparse.ArgumentParser(description="Train Juxu Micro-RWKV-7 (WBLM0003) & N-gram tables")
     parser.add_argument("--work-dir", type=Path, default=None, help="Working directory for corpus & model outputs")
     parser.add_argument("--seed-dir", type=Path, default=None, help="Directory containing wubi86.dict.yaml & eval TSVs")
     parser.add_argument("--smoke", action="store_true", help="Run fast tiny smoke test")

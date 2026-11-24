@@ -47,7 +47,7 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
         }
     }
 
-    private final class Connection {
+    private final class Connection: @unchecked Sendable {
         let process: Process
         let stdin: FileHandle
         let writer = DispatchQueue(label: "juxu.qwen.helper.writer")

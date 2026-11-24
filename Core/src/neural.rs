@@ -1,23 +1,22 @@
-//! Zero-copy `mmap` inference engine for `Micro-RWKV-7` (`WBLM0001`).
+//! Zero-copy `mmap` inference engine for scheme-free `Micro-RWKV-7` (`WBLM0002` / `WBLM0003`).
 //!
 //! Designed specifically for mobile IME constraints (iOS Keyboard Extension `< 50 MB` Jetsam limit,
 //! 120Hz `< 0.2 ms` keystroke budget, zero external crates):
 //! - All weights live in read-only `mmap` pages (`Dirty RSS = 0` for weights).
 //! - Symmetric per-row `INT8` quantization accelerated with ARM64 `sdot` NEON intrinsics.
-//! - Constant-size recurrent matrix state (`L * H * 32 * 32` floats = `72 KB` for `L=3, H=6`),
-//!   with an 8-step ring buffer (`~600 KB` total dirty RAM) for instant `O(1)` Backspace rollback.
-//! - Self-normalized character output head + conditional `MTP-2` phrase head + 25-key first-stroke head.
+//! - Constant-size recurrent matrix state (`L * H * 32 * 32` floats),
+//!   with an 8-step ring buffer for instant `O(1)` Backspace rollback.
+//! - Self-normalized character output head + conditional `MTP-2` phrase head + runtime first-key projection.
 
+use crate::mmap_buf::{read_f32, read_u16, read_u32};
 use std::io;
 
-pub const WBLM_MAGIC: &[u8; 8] = b"WBLM0001";
 pub const WBLM_MAGIC_V2: &[u8; 8] = b"WBLM0002";
 pub const WBLM_MAGIC_V3: &[u8; 8] = b"WBLM0003";
 pub const TOK_BOS: usize = 0;
 pub const TOK_UNK: usize = 1;
 pub const TOK_COMMA: usize = 2;
 pub const TOK_PERIOD: usize = 3;
-pub const TOK_ENG_NUM: usize = 4;
 pub const CJK_LUT_BASE: u32 = 0x3400;
 pub const CJK_LUT_LEN: usize = 0xA000 - 0x3400; // 27,648 BMP CJK codepoints (0x3400..=0x9FFF)
 const HEADER_LEN: usize = 64;
@@ -29,7 +28,7 @@ struct TrieNode {
     edges: Vec<(u8, u32)>,
 }
 
-/// Compact greedy longest-match Trie for ASCII/English subwords (`WBLM0002`, RWKV-World style).
+/// Compact greedy longest-match Trie for ASCII/English subwords (`WBLM0002` / `WBLM0003`).
 #[derive(Clone)]
 pub struct AsciiTrie {
     nodes: Vec<TrieNode>,
@@ -125,21 +124,6 @@ impl AsciiTrie {
             }
         }
     }
-}
-
-#[inline]
-fn read_u16(b: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([b[off], b[off + 1]])
-}
-
-#[inline]
-fn read_u32(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
-
-#[inline]
-fn read_f32(b: &[u8], off: usize) -> f32 {
-    f32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
 #[inline]
@@ -600,11 +584,10 @@ struct LayerOffsets {
     tm_out: QuantMatOff,  // [D, D] (no bias)
     ln2_off: usize,
     mu_cm_off: usize,
-    cm_up: QuantMatOff,   // [ffn_dim, D] + bias [ffn_dim]
-    cm_dn: QuantMatOff,   // [D, ffn_dim] (no bias)
+    cm_up: QuantMatOff, // [ffn_dim, D] + bias [ffn_dim]
+    cm_dn: QuantMatOff, // [D, ffn_dim] (no bias)
 }
 
-/// Zero-copy view into a `WBLM0001` blob slice (inside `AuxView`'s `mmap` buffer).
 #[derive(Clone, Copy)]
 pub struct NeuralLmSummary {
     pub vocab_size: usize,
@@ -620,8 +603,7 @@ pub struct NeuralOffsets {
     pub summary: NeuralLmSummary,
     pub tok_to_char: Vec<char>,
     pub has_punct_tokens: bool,
-    pub has_eng_num_token: bool,
-    pub ascii_trie: Option<AsciiTrie>,
+    pub ascii_trie: AsciiTrie,
     pub(crate) profile_id: u64,
     lut_off: usize,
     emb_w_off: usize,
@@ -637,16 +619,14 @@ pub struct NeuralOffsets {
 
 impl NeuralOffsets {
     pub fn parse(blob: &[u8]) -> io::Result<Self> {
-        let (has_ext_vocab, has_legacy_key1) = if blob.len() >= HEADER_LEN && &blob[0..8] == WBLM_MAGIC_V3 {
-            (true, false)
+        let has_legacy_key1 = if blob.len() >= HEADER_LEN && &blob[0..8] == WBLM_MAGIC_V3 {
+            false
         } else if blob.len() >= HEADER_LEN && &blob[0..8] == WBLM_MAGIC_V2 {
-            (true, true)
-        } else if blob.len() >= HEADER_LEN && &blob[0..8] == WBLM_MAGIC {
-            (false, true)
+            true
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid WBLM0001/WBLM0002/WBLM0003 magic",
+                "invalid WBLM0002/WBLM0003 magic",
             ));
         };
         let vocab_size = read_u32(blob, 8) as usize;
@@ -668,19 +648,31 @@ impl NeuralOffsets {
             || ffn_dim == 0
             || ffn_dim > 2048
         {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid WBLM0001 dims"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid WBLM dims",
+            ));
         }
 
         fn take(cur: &mut usize, total: usize, n: usize) -> io::Result<usize> {
             let aligned = (*cur + 3) & !3;
             if aligned + n > total {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated WBLM0001 section"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated WBLM section",
+                ));
             }
             *cur = aligned + n;
             Ok(aligned)
         }
 
-        fn take_qmat(cur: &mut usize, total: usize, rows: usize, cols: usize, has_bias: bool) -> io::Result<QuantMatOff> {
+        fn take_qmat(
+            cur: &mut usize,
+            total: usize,
+            rows: usize,
+            cols: usize,
+            has_bias: bool,
+        ) -> io::Result<QuantMatOff> {
             let w_len = rows * cols;
             let w_off = take(cur, total, w_len)?;
             let sc_len = rows * 4;
@@ -738,7 +730,7 @@ impl NeuralOffsets {
         let w_mtp_h = take_qmat(&mut cur, total, rank, d_model, true)?;
         let w_mtp_c1 = take_qmat(&mut cur, total, rank, rank, false)?;
         if has_legacy_key1 {
-            // Legacy WBLM0001/WBLM0002 carried an 86-Wubi key1 head; skip over its bytes cleanly.
+            // Legacy WBLM0002 carried a 25xD key1 head; skip over its bytes cleanly.
             // WBLM0003+ is 100% scheme-free and omits it altogether.
             let _ = take_qmat(&mut cur, total, 25, d_model, true)?;
         }
@@ -759,38 +751,35 @@ impl NeuralOffsets {
 
         // Trailing EXT_VOCAB table in WBLM0002 / WBLM0003:
         // [u32 ext_base_id][u32 ext_count] followed by ext_count records of [u8 len][len bytes].
-        let ascii_trie = if has_ext_vocab {
-            let hdr_off = take(&mut cur, total, 8)?;
-            let ext_base_id = read_u32(blob, hdr_off) as usize;
-            let ext_count = read_u32(blob, hdr_off + 4) as usize;
-            if ext_base_id + ext_count > vocab_size {
+        let hdr_off = take(&mut cur, total, 8)?;
+        let ext_base_id = read_u32(blob, hdr_off) as usize;
+        let ext_count = read_u32(blob, hdr_off + 4) as usize;
+        if ext_base_id + ext_count > vocab_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WBLM ext_vocab exceeds vocab_size",
+            ));
+        }
+        let mut entries: Vec<&[u8]> = Vec::with_capacity(ext_count);
+        for _ in 0..ext_count {
+            if cur >= total {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "WBLM ext_vocab exceeds vocab_size",
+                    "truncated WBLM ext_vocab",
                 ));
             }
-            let mut entries: Vec<&[u8]> = Vec::with_capacity(ext_count);
-            for _ in 0..ext_count {
-                if cur >= total {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated WBLM ext_vocab"));
-                }
-                let blen = blob[cur] as usize;
-                cur += 1;
-                if cur + blen > total {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated WBLM ext_vocab entry"));
-                }
-                entries.push(&blob[cur..cur + blen]);
-                cur += blen;
+            let blen = blob[cur] as usize;
+            cur += 1;
+            if cur + blen > total {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated WBLM ext_vocab entry",
+                ));
             }
-            Some(AsciiTrie::build(ext_base_id, &entries))
-        } else {
-            None
-        };
-
-        let has_eng_num_token = !has_ext_vocab
-            && has_punct_tokens
-            && vocab_size > TOK_ENG_NUM
-            && tok_to_char[TOK_ENG_NUM] == '\0';
+            entries.push(&blob[cur..cur + blen]);
+            cur += blen;
+        }
+        let ascii_trie = AsciiTrie::build(ext_base_id, &entries);
 
         Ok(Self {
             summary: NeuralLmSummary {
@@ -803,7 +792,6 @@ impl NeuralOffsets {
             },
             tok_to_char,
             has_punct_tokens,
-            has_eng_num_token,
             ascii_trie,
             profile_id: blob.iter().step_by((blob.len() / 64).max(1)).fold(
                 blob.len() as u64,
@@ -832,12 +820,12 @@ pub struct NeuralView<'a> {
 /// Compact recurrent state + cached output projections at one position in the sentence.
 #[derive(Clone, Default)]
 pub struct RwkvState {
-    pub mat_state: Vec<f32>,  // L * H * 32 * 32
-    pub prev_tm: Vec<f32>,    // L * D
-    pub prev_cm: Vec<f32>,    // L * D
-    pub p1_q: Vec<i8>,        // [rank] quantized +1 char query vector
+    pub mat_state: Vec<f32>, // L * H * 32 * 32
+    pub prev_tm: Vec<f32>,   // L * D
+    pub prev_cm: Vec<f32>,   // L * D
+    pub p1_q: Vec<i8>,       // [rank] quantized +1 char query vector
     pub p1_scale: f32,
-    pub mtp_h: Vec<f32>,      // [rank] context component of MTP-2
+    pub mtp_h: Vec<f32>, // [rank] context component of MTP-2
 }
 
 impl RwkvState {
@@ -937,44 +925,14 @@ impl NeuralContextTracker {
     pub fn encode_context_tokens(nv: &NeuralView<'_>, text: &str) -> (Vec<u16>, bool) {
         let mut out: Vec<u16> = Vec::with_capacity(text.len());
         let mut saw_reset = false;
-        if nv.offs.ascii_trie.is_some() {
-            let mut raw_toks = Vec::with_capacity(text.len());
-            nv.encode_mixed_str(text, &mut raw_toks);
-            for tok in raw_toks {
-                if tok == TOK_BOS {
-                    out.clear();
-                    saw_reset = true;
-                } else {
-                    out.push(tok as u16);
-                }
-            }
-            return (out, saw_reset);
-        }
-        let mut prev_special: Option<usize> = None;
-        for ch in text.chars() {
-            let u = ch as u32;
-            if (CJK_LUT_BASE..0xA000).contains(&u) {
-                out.push(nv.char_to_token(ch) as u16);
-                prev_special = None;
-            } else if let Some(ptok) = nv.punct_to_token(ch) {
-                if prev_special != Some(ptok) {
-                    out.push(ptok as u16);
-                    prev_special = Some(ptok);
-                }
-            } else if nv.offs.has_eng_num_token && ch.is_ascii_alphanumeric() {
-                if prev_special != Some(TOK_ENG_NUM) {
-                    out.push(TOK_ENG_NUM as u16);
-                    prev_special = Some(TOK_ENG_NUM);
-                }
-            } else if nv.offs.has_eng_num_token
-                && prev_special == Some(TOK_ENG_NUM)
-                && matches!(ch, ' ' | '-' | '_' | '.' | '+' | '/')
-            {
-                // Keep bridging ASCII tokens inside a single <ENG_NUM> span
-            } else {
+        let mut raw_toks = Vec::with_capacity(text.len());
+        nv.encode_mixed_str(text, &mut raw_toks);
+        for tok in raw_toks {
+            if tok == TOK_BOS {
                 out.clear();
                 saw_reset = true;
-                prev_special = None;
+            } else {
+                out.push(tok as u16);
             }
         }
         (out, saw_reset)
@@ -984,7 +942,7 @@ impl NeuralContextTracker {
         let n = toks.len();
         for (i, &t) in toks.iter().enumerate() {
             let is_last = i + 1 == n;
-            nv.step_token_heads(t as usize, st, is_last, is_last);
+            nv.step_token_heads(t as usize, st, is_last);
         }
     }
 
@@ -995,14 +953,11 @@ impl NeuralContextTracker {
                 Self::copy_state_from(&mut self.active, bos);
             }
             self.active_tokens.clear();
-        } else if let (Some(&last_prev), Some(&first_new)) = (self.active_tokens.last(), toks.first()) {
+        } else if let (Some(&last_prev), Some(&first_new)) =
+            (self.active_tokens.last(), toks.first())
+        {
             // Coalesce duplicate special tokens across incremental commit boundaries
-            if last_prev == first_new
-                && matches!(
-                    first_new as usize,
-                    TOK_COMMA | TOK_PERIOD | TOK_ENG_NUM
-                )
-            {
+            if last_prev == first_new && matches!(first_new as usize, TOK_COMMA | TOK_PERIOD) {
                 Self::step_token_slice_into(nv, &toks[1..], &mut self.active);
                 self.active_tokens.extend_from_slice(&toks[1..]);
                 return;
@@ -1026,7 +981,12 @@ impl NeuralContextTracker {
     }
 
     /// Adopt a pre-stepped `new_state` for a pure CJK commit without repeating `step_token` calls.
-    pub fn adopt_cjk_commit_state(&mut self, nv: &NeuralView<'_>, cjk_tokens: &[u16], new_state: RwkvState) {
+    pub fn adopt_cjk_commit_state(
+        &mut self,
+        nv: &NeuralView<'_>,
+        cjk_tokens: &[u16],
+        new_state: RwkvState,
+    ) {
         if !self.is_ready() {
             self.init_with_model(nv);
         }
@@ -1104,42 +1064,40 @@ impl NeuralContextTracker {
 }
 
 impl<'a> NeuralView<'a> {
-    /// Mixed Chinese (char-level LUT) + ASCII/English (greedy longest-match Trie) tokenizer (`WBLM0002`).
-    /// Must stay bit-exact with `Scripts/corpus_v4.py::encode_mixed_line`.
+    /// Mixed Chinese (char-level LUT) + ASCII/English (greedy longest-match Trie) tokenizer (`WBLM0002` / `WBLM0003`).
     pub fn encode_mixed_str(&self, text: &str, out: &mut Vec<usize>) {
-        let Some(ref trie) = self.offs.ascii_trie else {
-            return;
-        };
+        let trie = &self.offs.ascii_trie;
         let mut ascii_buf: Vec<u8> = Vec::new();
         let mut prev_punct: Option<usize> = None;
 
-        let flush_ascii = |buf: &mut Vec<u8>, out: &mut Vec<usize>, prev_punct: &mut Option<usize>| {
-            if buf.is_empty() {
-                return;
-            }
-            // Collapse runs of spaces and trim outer spaces
-            let mut norm: Vec<u8> = Vec::with_capacity(buf.len());
-            let mut last_sp = true;
-            for &b in buf.iter() {
-                if b == b' ' {
-                    if !last_sp {
-                        norm.push(b' ');
-                        last_sp = true;
-                    }
-                } else {
-                    norm.push(b);
-                    last_sp = false;
+        let flush_ascii =
+            |buf: &mut Vec<u8>, out: &mut Vec<usize>, prev_punct: &mut Option<usize>| {
+                if buf.is_empty() {
+                    return;
                 }
-            }
-            while norm.last() == Some(&b' ') {
-                norm.pop();
-            }
-            buf.clear();
-            if !norm.is_empty() {
-                trie.encode_ascii(&norm, out);
-                *prev_punct = None;
-            }
-        };
+                // Collapse runs of spaces and trim outer spaces
+                let mut norm: Vec<u8> = Vec::with_capacity(buf.len());
+                let mut last_sp = true;
+                for &b in buf.iter() {
+                    if b == b' ' {
+                        if !last_sp {
+                            norm.push(b' ');
+                            last_sp = true;
+                        }
+                    } else {
+                        norm.push(b);
+                        last_sp = false;
+                    }
+                }
+                while norm.last() == Some(&b' ') {
+                    norm.pop();
+                }
+                buf.clear();
+                if !norm.is_empty() {
+                    trie.encode_ascii(&norm, out);
+                    *prev_punct = None;
+                }
+            };
 
         let chars: Vec<char> = text.chars().collect();
         let n = chars.len();
@@ -1186,10 +1144,8 @@ impl<'a> NeuralView<'a> {
                 } else {
                     ascii_buf.push(ch as u8);
                 }
-            } else if ch.is_whitespace() {
-                if !ascii_buf.is_empty() {
-                    ascii_buf.push(b' ');
-                }
+            } else if ch.is_whitespace() && !ascii_buf.is_empty() {
+                ascii_buf.push(b' ');
             }
         }
         flush_ascii(&mut ascii_buf, out, &mut prev_punct);
@@ -1217,11 +1173,19 @@ impl<'a> NeuralView<'a> {
                 return tok;
             }
         }
-        1 // <UNK>
+        TOK_UNK
     }
 
     #[inline]
-    fn eval_qmat(&self, qm: &QuantMatOff, x_q: &[i8], x_scale: f32, rows: usize, cols: usize, out: &mut [f32]) {
+    fn eval_qmat(
+        &self,
+        qm: &QuantMatOff,
+        x_q: &[i8],
+        x_scale: f32,
+        rows: usize,
+        cols: usize,
+        out: &mut [f32],
+    ) {
         let w = &self.blob[qm.w_off..qm.w_off + qm.w_len];
         let sc = &self.blob[qm.sc_off..qm.sc_off + qm.sc_len];
         let bias = qm.bias_off.map(|(bo, bl)| &self.blob[bo..bo + bl]);
@@ -1252,6 +1216,26 @@ impl<'a> NeuralView<'a> {
         let sc = read_f32(self.blob, self.offs.emb_sc_off + tok * 4);
         let ub = read_f32(self.blob, self.offs.uni_bias_off + tok * 4);
         (row, sc, ub)
+    }
+
+    #[inline]
+    fn eval_vocab_scores(&self, state: &RwkvState, count: usize) -> Vec<f32> {
+        let r = self.offs.summary.rank;
+        let emb_w = &self.blob[self.offs.emb_w_off..self.offs.emb_w_off + count * r];
+        let emb_sc = &self.blob[self.offs.emb_sc_off..self.offs.emb_sc_off + count * 4];
+        let uni_b = &self.blob[self.offs.uni_bias_off..self.offs.uni_bias_off + count * 4];
+        let mut scores = vec![f32::NEG_INFINITY; count];
+        int8_matvec(
+            emb_w,
+            emb_sc,
+            Some(uni_b),
+            &state.p1_q[..r],
+            state.p1_scale,
+            count,
+            r,
+            &mut scores,
+        );
+        scores
     }
 
     #[inline(always)]
@@ -1315,7 +1299,11 @@ impl<'a> NeuralView<'a> {
                     j = 0;
                     while j < HEAD_DIM {
                         let n0 = vfmaq_f32(vld1q_f32(sp.add(j)), delta_v, vld1q_f32(kp.add(j)));
-                        let n1 = vfmaq_f32(vld1q_f32(sp.add(j + 4)), delta_v, vld1q_f32(kp.add(j + 4)));
+                        let n1 = vfmaq_f32(
+                            vld1q_f32(sp.add(j + 4)),
+                            delta_v,
+                            vld1q_f32(kp.add(j + 4)),
+                        );
                         vst1q_f32(sp.add(j), n0);
                         vst1q_f32(sp.add(j + 4), n1);
                         ro0 = vfmaq_f32(ro0, n0, vld1q_f32(rp.add(j)));
@@ -1354,12 +1342,11 @@ impl<'a> NeuralView<'a> {
 
     /// Advance recurrent state by 1 token and update all cached output heads (`p1`, `mtp_h`).
     pub fn step_token(&self, tok: usize, state: &mut RwkvState) {
-        self.step_token_heads(tok, state, true, false);
+        self.step_token_heads(tok, state, true);
     }
 
     /// Advance recurrent state by 1 token, computing `p1` and optionally `mtp_h`.
-    /// (`_compute_key1` is retained only for API compatibility; first-key priors are projected scheme-freely in the engine.)
-    pub fn step_token_heads(&self, tok: usize, state: &mut RwkvState, compute_mtp: bool, _compute_key1: bool) {
+    pub fn step_token_heads(&self, tok: usize, state: &mut RwkvState, compute_mtp: bool) {
         let s = &self.offs.summary;
         let d = s.d_model;
         let h = s.n_heads;
@@ -1386,7 +1373,11 @@ impl<'a> NeuralView<'a> {
         let layer_state_stride = h * HEAD_DIM * HEAD_DIM;
         for (l, loff) in self.offs.layers.iter().enumerate() {
             // --- TimeMix ---
-            rms_norm(&x[..d], &self.blob[loff.ln1_off..loff.ln1_off + d * 4], &mut u[..d]);
+            rms_norm(
+                &x[..d],
+                &self.blob[loff.ln1_off..loff.ln1_off + d * 4],
+                &mut u[..d],
+            );
             let prev_tm = &mut state.prev_tm[l * d..(l + 1) * d];
             for i in 0..d {
                 let mu = read_f32(self.blob, loff.mu_tm_off + i * 4);
@@ -1395,7 +1386,14 @@ impl<'a> NeuralView<'a> {
             }
 
             let tm_sc = quantize_act_i8(&s_shift[..d], &mut q_buf[..d]);
-            self.eval_qmat(&loff.tm_proj, &q_buf[..d], tm_sc, 6 * d, d, &mut proj_6d[..6 * d]);
+            self.eval_qmat(
+                &loff.tm_proj,
+                &q_buf[..d],
+                tm_sc,
+                6 * d,
+                d,
+                &mut proj_6d[..6 * d],
+            );
 
             let st_l = &mut state.mat_state[l * layer_state_stride..(l + 1) * layer_state_stride];
             self.step_layer_heads(loff, d, h, &proj_6d[..6 * d], st_l, &mut y_tm[..d]);
@@ -1407,7 +1405,11 @@ impl<'a> NeuralView<'a> {
             }
 
             // --- ChannelMix (ReLU^2 FFN) ---
-            rms_norm(&x[..d], &self.blob[loff.ln2_off..loff.ln2_off + d * 4], &mut u[..d]);
+            rms_norm(
+                &x[..d],
+                &self.blob[loff.ln2_off..loff.ln2_off + d * 4],
+                &mut u[..d],
+            );
             let prev_cm = &mut state.prev_cm[l * d..(l + 1) * d];
             for i in 0..d {
                 let mu = read_f32(self.blob, loff.mu_cm_off + i * 4);
@@ -1427,8 +1429,12 @@ impl<'a> NeuralView<'a> {
             }
         }
 
-        // 3. Final RMSNorm & cached output heads (`p1`, optional `mtp_h`, optional `key1_logp`)
-        rms_norm(&x[..d], &self.blob[self.offs.ln_out_off..self.offs.ln_out_off + d * 4], &mut u[..d]);
+        // 3. Final RMSNorm & cached output heads (`p1` and optional `mtp_h`)
+        rms_norm(
+            &x[..d],
+            &self.blob[self.offs.ln_out_off..self.offs.ln_out_off + d * 4],
+            &mut u[..d],
+        );
         let h_sc = quantize_act_i8(&u[..d], &mut q_buf[..d]);
 
         let mut p1_fp = [0.0f32; 512];
@@ -1436,14 +1442,21 @@ impl<'a> NeuralView<'a> {
         state.p1_scale = quantize_act_i8(&p1_fp[..r], &mut state.p1_q[..r]);
 
         if compute_mtp {
-            self.eval_qmat(&self.offs.w_mtp_h, &q_buf[..d], h_sc, r, d, &mut state.mtp_h[..r]);
+            self.eval_qmat(
+                &self.offs.w_mtp_h,
+                &q_buf[..d],
+                h_sc,
+                r,
+                d,
+                &mut state.mtp_h[..r],
+            );
         }
     }
 
-    /// Batched RWKV-7 single-token transition across multiple independent `(tok, state, compute_mtp, compute_key1)`
-    /// beam hypotheses. Streams the 9.8 MB INT8 weight matrices ONCE per chunk of 8 paths instead of 8 times,
+    /// Batched RWKV-7 single-token transition across multiple independent `(tok, state, compute_mtp)`
+    /// beam hypotheses. Streams the INT8 weight matrices ONCE per chunk of 8 paths instead of 8 times,
     /// cutting memory traffic & power while remaining 100% bit-exact with `step_token_heads`.
-    pub fn step_tokens_batch(&self, items: &mut [(usize, &mut RwkvState, bool, bool)]) {
+    pub fn step_tokens_batch(&self, items: &mut [(usize, &mut RwkvState, bool)]) {
         if items.is_empty() {
             return;
         }
@@ -1457,8 +1470,8 @@ impl<'a> NeuralView<'a> {
         for chunk in items.chunks_mut(BATCH_CHUNK) {
             let cb = chunk.len();
             if cb == 1 {
-                let (tok, ref mut st, mtp, key1) = chunk[0];
-                self.step_token_heads(tok, st, mtp, key1);
+                let (tok, ref mut st, mtp) = chunk[0];
+                self.step_token_heads(tok, st, mtp);
                 continue;
             }
 
@@ -1482,7 +1495,14 @@ impl<'a> NeuralView<'a> {
                 let q_refs: [&[i8]; BATCH_CHUNK] = std::array::from_fn(|b| &q_batch[b][..r]);
                 let mut outs: Vec<&mut [f32]> =
                     work[..cb].iter_mut().map(|buf| &mut buf[..d]).collect();
-                self.eval_qmat_batch(&self.offs.w_up, &q_refs[..cb], &q_scales[..cb], d, r, &mut outs);
+                self.eval_qmat_batch(
+                    &self.offs.w_up,
+                    &q_refs[..cb],
+                    &q_scales[..cb],
+                    d,
+                    r,
+                    &mut outs,
+                );
             }
             for b in 0..cb {
                 x[b][..d].copy_from_slice(&work[b][..d]);
@@ -1527,7 +1547,14 @@ impl<'a> NeuralView<'a> {
                     let q_refs: [&[i8]; BATCH_CHUNK] = std::array::from_fn(|b| &q_batch[b][..d]);
                     let mut outs: Vec<&mut [f32]> =
                         work[..cb].iter_mut().map(|buf| &mut buf[..d]).collect();
-                    self.eval_qmat_batch(&loff.tm_out, &q_refs[..cb], &q_scales[..cb], d, d, &mut outs);
+                    self.eval_qmat_batch(
+                        &loff.tm_out,
+                        &q_refs[..cb],
+                        &q_scales[..cb],
+                        d,
+                        d,
+                        &mut outs,
+                    );
                 }
                 for b in 0..cb {
                     for i in 0..d {
@@ -1552,7 +1579,14 @@ impl<'a> NeuralView<'a> {
                     let q_refs: [&[i8]; BATCH_CHUNK] = std::array::from_fn(|b| &q_batch[b][..d]);
                     let mut outs: Vec<&mut [f32]> =
                         work[..cb].iter_mut().map(|buf| &mut buf[..ffn]).collect();
-                    self.eval_qmat_batch(&loff.cm_up, &q_refs[..cb], &q_scales[..cb], ffn, d, &mut outs);
+                    self.eval_qmat_batch(
+                        &loff.cm_up,
+                        &q_refs[..cb],
+                        &q_scales[..cb],
+                        ffn,
+                        d,
+                        &mut outs,
+                    );
                 }
 
                 for b in 0..cb {
@@ -1567,7 +1601,14 @@ impl<'a> NeuralView<'a> {
                     let q_refs: [&[i8]; BATCH_CHUNK] = std::array::from_fn(|b| &q_batch[b][..ffn]);
                     let mut outs: Vec<&mut [f32]> =
                         work[..cb].iter_mut().map(|buf| &mut buf[..d]).collect();
-                    self.eval_qmat_batch(&loff.cm_dn, &q_refs[..cb], &q_scales[..cb], d, ffn, &mut outs);
+                    self.eval_qmat_batch(
+                        &loff.cm_dn,
+                        &q_refs[..cb],
+                        &q_scales[..cb],
+                        d,
+                        ffn,
+                        &mut outs,
+                    );
                 }
                 for b in 0..cb {
                     for i in 0..d {
@@ -1586,7 +1627,14 @@ impl<'a> NeuralView<'a> {
                 let q_refs: [&[i8]; BATCH_CHUNK] = std::array::from_fn(|b| &q_batch[b][..d]);
                 let mut outs: Vec<&mut [f32]> =
                     work[..cb].iter_mut().map(|buf| &mut buf[..r]).collect();
-                self.eval_qmat_batch(&self.offs.w_dn, &q_refs[..cb], &q_scales[..cb], r, d, &mut outs);
+                self.eval_qmat_batch(
+                    &self.offs.w_dn,
+                    &q_refs[..cb],
+                    &q_scales[..cb],
+                    r,
+                    d,
+                    &mut outs,
+                );
             }
             for b in 0..cb {
                 chunk[b].1.p1_scale = quantize_act_i8(&work[b][..r], &mut chunk[b].1.p1_q[..r]);
@@ -1616,7 +1664,7 @@ impl<'a> NeuralView<'a> {
         int8_dot_row(e_row, e_sc, &state.p1_q, state.p1_scale) + ub
     }
 
-    /// Fast self-normalized log-probability `log P(ch | state)` (`~0.02 µs` — single `r=128` dot product!).
+    /// Fast self-normalized log-probability `log P(ch | state)` (`~0.02 µs`).
     #[inline]
     pub fn score_next_char(&self, state: &RwkvState, ch: char) -> f32 {
         let tok = self.char_to_token(ch);
@@ -1624,41 +1672,34 @@ impl<'a> NeuralView<'a> {
     }
 
     /// Fast zero-unroll estimate of `log P(latin_word | state)` for beam-search ranking.
-    /// Keeps the contextual language-switch / word-onset `lp0` 100% unscaled (`T == 1` is exact `lp0`),
-    /// and scales intra-word subword/char fallback tokens so multi-char words align on the same nats
-    /// scale as CJK without ever diluting `lp0` on long strings.
     pub fn estimate_latin_logp(&self, state: &RwkvState, word: &str) -> f32 {
         if word.is_empty() {
             return 0.0;
         }
-        if let Some(ref trie) = self.offs.ascii_trie {
-            let mut toks = Vec::with_capacity(4);
-            trie.encode_ascii(word.as_bytes(), &mut toks);
-            if let Some(&first_tok) = toks.first() {
-                let lp0 = self.score_next_token(state, first_tok);
-                if toks.len() == 1 {
-                    return lp0;
-                }
-                let bare_est = lp0 - 1.05 * ((toks.len() - 1) as f32);
-                if !word.starts_with(' ') && trie.has_leading_space_vocab() {
-                    let mut sp_bytes = Vec::with_capacity(word.len() + 1);
-                    sp_bytes.push(b' ');
-                    sp_bytes.extend_from_slice(word.as_bytes());
-                    let mut sp_toks = Vec::with_capacity(4);
-                    trie.encode_ascii(&sp_bytes, &mut sp_toks);
-                    if let Some(&sp0) = sp_toks.first() {
-                        if sp0 != trie.single_ascii[0] as usize {
-                            let sp_lp0 = self.score_next_token(state, sp0);
-                            let sp_est = sp_lp0 - 1.05 * ((sp_toks.len() - 1) as f32);
-                            return bare_est.max(sp_est);
-                        }
+        let trie = &self.offs.ascii_trie;
+        let mut toks = Vec::with_capacity(4);
+        trie.encode_ascii(word.as_bytes(), &mut toks);
+        if let Some(&first_tok) = toks.first() {
+            let lp0 = self.score_next_token(state, first_tok);
+            if toks.len() == 1 {
+                return lp0;
+            }
+            let bare_est = lp0 - 1.05 * ((toks.len() - 1) as f32);
+            if !word.starts_with(' ') && trie.has_leading_space_vocab() {
+                let mut sp_bytes = Vec::with_capacity(word.len() + 1);
+                sp_bytes.push(b' ');
+                sp_bytes.extend_from_slice(word.as_bytes());
+                let mut sp_toks = Vec::with_capacity(4);
+                trie.encode_ascii(&sp_bytes, &mut sp_toks);
+                if let Some(&sp0) = sp_toks.first() {
+                    if sp0 != trie.single_ascii[0] as usize {
+                        let sp_lp0 = self.score_next_token(state, sp0);
+                        let sp_est = sp_lp0 - 1.05 * ((sp_toks.len() - 1) as f32);
+                        return bare_est.max(sp_est);
                     }
                 }
-                return bare_est;
             }
-        }
-        if self.offs.has_eng_num_token {
-            return self.score_next_token(state, TOK_ENG_NUM);
+            return bare_est;
         }
         -3.2
     }
@@ -1669,98 +1710,61 @@ impl<'a> NeuralView<'a> {
         base_state: &RwkvState,
         word: &str,
         compute_mtp: bool,
-        compute_key1: bool,
     ) -> (f32, RwkvState) {
-        let mut st = base_state.clone();
         if word.is_empty() {
-            return (0.0, st);
+            return (0.0, base_state.clone());
         }
-        if let Some(ref trie) = self.offs.ascii_trie {
-            let mut toks = Vec::with_capacity(6);
-            trie.encode_ascii(word.as_bytes(), &mut toks);
-            if !toks.is_empty() {
-                if toks.len() > 1 && !word.starts_with(' ') && trie.has_leading_space_vocab() {
-                    let mut sp_bytes = Vec::with_capacity(word.len() + 1);
-                    sp_bytes.push(b' ');
-                    sp_bytes.extend_from_slice(word.as_bytes());
-                    let mut sp_toks = Vec::with_capacity(6);
-                    trie.encode_ascii(&sp_bytes, &mut sp_toks);
-                    if !sp_toks.is_empty() && sp_toks[0] != trie.single_ascii[0] as usize {
-                        let eval_seq = |seq: &[usize]| -> (f32, RwkvState) {
-                            let mut s = base_state.clone();
-                            let last = seq.len() - 1;
-                            let mut l0 = 0.0f32;
-                            let mut lrest = 0.0f32;
-                            for (i, &tk) in seq.iter().enumerate() {
-                                let slp = self.score_next_token(&s, tk);
-                                if i == 0 {
-                                    l0 = slp;
-                                } else {
-                                    lrest += slp;
-                                }
-                                let is_last = i == last;
-                                self.step_token_heads(
-                                    tk,
-                                    &mut s,
-                                    compute_mtp && is_last,
-                                    compute_key1 && is_last,
-                                );
-                            }
-                            let tot = if seq.len() == 1 {
-                                l0
-                            } else {
-                                l0 + 0.35 * lrest
-                            };
-                            (tot, s)
-                        };
-                        let (bare_lp, bare_st) = eval_seq(&toks);
-                        let (sp_lp, sp_st) = eval_seq(&sp_toks);
-                        if sp_lp > bare_lp {
-                            return (sp_lp, sp_st);
-                        }
-                        return (bare_lp, bare_st);
-                    }
-                }
-                let last_idx = toks.len() - 1;
-                let mut lp0 = 0.0f32;
-                let mut rest_lp = 0.0f32;
-                for (i, &tok) in toks.iter().enumerate() {
-                    let step_lp = self.score_next_token(&st, tok);
-                    if i == 0 {
-                        lp0 = step_lp;
-                    } else {
-                        rest_lp += step_lp;
-                    }
-                    let is_last = i == last_idx;
-                    self.step_token_heads(tok, &mut st, compute_mtp && is_last, compute_key1 && is_last);
-                }
-                let total_lp = if toks.len() == 1 {
-                    lp0
+        let trie = &self.offs.ascii_trie;
+        let mut toks = Vec::with_capacity(6);
+        trie.encode_ascii(word.as_bytes(), &mut toks);
+        if toks.is_empty() {
+            return (-3.2, base_state.clone());
+        }
+
+        let eval_seq = |seq: &[usize]| -> (f32, RwkvState) {
+            let mut s = base_state.clone();
+            let last = seq.len() - 1;
+            let mut l0 = 0.0f32;
+            let mut lrest = 0.0f32;
+            for (i, &tk) in seq.iter().enumerate() {
+                let slp = self.score_next_token(&s, tk);
+                if i == 0 {
+                    l0 = slp;
                 } else {
-                    lp0 + 0.35 * rest_lp
-                };
-                return (total_lp, st);
+                    lrest += slp;
+                }
+                self.step_token_heads(tk, &mut s, compute_mtp && i == last);
+            }
+            let tot = if seq.len() == 1 {
+                l0
+            } else {
+                l0 + 0.35 * lrest
+            };
+            (tot, s)
+        };
+
+        let (bare_lp, bare_st) = eval_seq(&toks);
+        if toks.len() > 1 && !word.starts_with(' ') && trie.has_leading_space_vocab() {
+            let mut sp_bytes = Vec::with_capacity(word.len() + 1);
+            sp_bytes.push(b' ');
+            sp_bytes.extend_from_slice(word.as_bytes());
+            let mut sp_toks = Vec::with_capacity(6);
+            trie.encode_ascii(&sp_bytes, &mut sp_toks);
+            if !sp_toks.is_empty() && sp_toks[0] != trie.single_ascii[0] as usize {
+                let (sp_lp, sp_st) = eval_seq(&sp_toks);
+                if sp_lp > bare_lp {
+                    return (sp_lp, sp_st);
+                }
             }
         }
-        if self.offs.has_eng_num_token {
-            let lp = self.score_next_token(&st, TOK_ENG_NUM);
-            self.step_token_heads(TOK_ENG_NUM, &mut st, compute_mtp, compute_key1);
-            return (lp, st);
-        }
-        (-3.2, st)
+        (bare_lp, bare_st)
     }
 
     /// Compute `(self_norm_score, log_z)` over the full vocabulary for calibration & exact-NLL evaluation.
     /// Exact log-probability is `self_norm_score - log_z`. Not used on the hot typing path.
     pub fn eval_next_char_calibration(&self, state: &RwkvState, ch: char) -> (f32, f32) {
-        let s = &self.offs.summary;
-        let v = s.vocab_size;
-        let r = s.rank;
-        let emb_w = &self.blob[self.offs.emb_w_off..self.offs.emb_w_off + v * r];
-        let emb_sc = &self.blob[self.offs.emb_sc_off..self.offs.emb_sc_off + v * 4];
-        let uni_b = &self.blob[self.offs.uni_bias_off..self.offs.uni_bias_off + v * 4];
-        let mut scores = vec![f32::NEG_INFINITY; v];
-        int8_matvec(emb_w, emb_sc, Some(uni_b), &state.p1_q[..r], state.p1_scale, v, r, &mut scores);
+        let v = self.offs.summary.vocab_size;
+        let scores = self.eval_vocab_scores(state, v);
         let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum_exp = 0.0f64;
         for &sc in &scores {
@@ -1774,26 +1778,16 @@ impl<'a> NeuralView<'a> {
     /// Retrieve top-K highest-probability next CJK characters `(ch, log_prob)` from cached `p1_q` (`~25 µs`).
     pub fn top_next_chars(&self, state: &RwkvState, top_k: usize) -> Vec<(char, f32)> {
         let s = &self.offs.summary;
-        let v_cjk = self
-            .offs
-            .ascii_trie
-            .as_ref()
-            .map_or(s.vocab_size, |t| t.ext_base_id.min(s.vocab_size));
-        let r = s.rank;
+        let v_cjk = self.offs.ascii_trie.ext_base_id.min(s.vocab_size);
         if top_k == 0 || v_cjk <= 2 {
             return Vec::new();
         }
-        let emb_w = &self.blob[self.offs.emb_w_off..self.offs.emb_w_off + v_cjk * r];
-        let emb_sc = &self.blob[self.offs.emb_sc_off..self.offs.emb_sc_off + v_cjk * 4];
-        let uni_b = &self.blob[self.offs.uni_bias_off..self.offs.uni_bias_off + v_cjk * 4];
-        let mut scores = vec![f32::NEG_INFINITY; v_cjk];
-        int8_matvec(emb_w, emb_sc, Some(uni_b), &state.p1_q[..r], state.p1_scale, v_cjk, r, &mut scores);
+        let scores = self.eval_vocab_scores(state, v_cjk);
 
         let k = top_k.min(v_cjk.saturating_sub(2));
         let mut best: Vec<(char, f32)> = Vec::with_capacity(k + 1);
         let mut floor = f32::NEG_INFINITY;
-        for tok in 2..v_cjk {
-            let lp = scores[tok];
+        for (tok, &lp) in scores.iter().enumerate().skip(2) {
             if best.len() == k && lp <= floor {
                 continue;
             }
@@ -1826,29 +1820,23 @@ impl<'a> NeuralView<'a> {
         let v_cjk = self
             .offs
             .ascii_trie
-            .as_ref()
-            .map_or(s.vocab_size, |t| t.ext_base_id.min(s.vocab_size))
+            .ext_base_id
+            .min(s.vocab_size)
             .min(tok_key_masks.len());
-        let r = s.rank;
         if v_cjk <= 4 {
             return None;
         }
-        let emb_w = &self.blob[self.offs.emb_w_off..self.offs.emb_w_off + v_cjk * r];
-        let emb_sc = &self.blob[self.offs.emb_sc_off..self.offs.emb_sc_off + v_cjk * 4];
-        let uni_b = &self.blob[self.offs.uni_bias_off..self.offs.uni_bias_off + v_cjk * 4];
-        let mut scores = vec![f32::NEG_INFINITY; v_cjk];
-        int8_matvec(emb_w, emb_sc, Some(uni_b), &state.p1_q[..r], state.p1_scale, v_cjk, r, &mut scores);
+        let scores = self.eval_vocab_scores(state, v_cjk);
 
         let k = 48usize.min(v_cjk.saturating_sub(2));
         let mut best: [(usize, f32); 48] = [(0, f32::NEG_INFINITY); 48];
         let mut len = 0usize;
         let mut floor = f32::NEG_INFINITY;
-        for tok in 2..v_cjk {
+        for (tok, &lp) in scores.iter().enumerate().skip(2) {
             let mask = tok_key_masks[tok];
             if mask == 0 {
                 continue;
             }
-            let lp = scores[tok];
             if len == k && lp <= floor {
                 continue;
             }
@@ -1873,9 +1861,9 @@ impl<'a> NeuralView<'a> {
             let mask = tok_key_masks[tok];
             let p = lp.clamp(-13.5, 0.0).exp();
             let share = p / (mask.count_ones() as f32);
-            for idx in 0..26usize {
+            for (idx, m) in mass.iter_mut().enumerate() {
                 if (mask & (1u32 << idx)) != 0 {
-                    mass[idx] += share;
+                    *m += share;
                 }
             }
             total += p;
@@ -1894,15 +1882,18 @@ impl<'a> NeuralView<'a> {
     }
 
     /// Compute isolated `<BOS>` lexical cohesion `(mean_cond_logp, mean_pmi)` for a `2..=4` CJK candidate
-    /// independent of the preceding sentence context, cleanly separating true words/colloquial phrases
-    /// (including function-word phrases like `来个`, `买的`, `最快的`) from accidental cross-word seams (`洁一`, `点我`).
-    pub fn isolated_phrase_cohesion(&self, bos_state: &RwkvState, phrase: &str) -> Option<(f32, f32)> {
+    /// independent of the preceding sentence context.
+    pub fn isolated_phrase_cohesion(
+        &self,
+        bos_state: &RwkvState,
+        phrase: &str,
+    ) -> Option<(f32, f32)> {
         let chars: Vec<char> = phrase.chars().collect();
         if chars.len() < 2 || chars.len() > 4 {
             return None;
         }
         let mut st = bos_state.clone();
-        self.step_token_heads(self.char_to_token(chars[0]), &mut st, false, false);
+        self.step_token_heads(self.char_to_token(chars[0]), &mut st, false);
         let mut sum_cond = 0.0f32;
         let mut sum_uncond = 0.0f32;
         for (idx, &ch) in chars[1..].iter().enumerate() {
@@ -1911,7 +1902,7 @@ impl<'a> NeuralView<'a> {
             sum_cond += lp_cond;
             sum_uncond += lp_uncond;
             if idx + 2 < chars.len() {
-                self.step_token_heads(self.char_to_token(ch), &mut st, false, false);
+                self.step_token_heads(self.char_to_token(ch), &mut st, false);
             }
         }
         let n = (chars.len() - 1) as f32;
@@ -1919,7 +1910,6 @@ impl<'a> NeuralView<'a> {
     }
 
     /// Precompute quantized `MTP-2` conditional projection `p2_q` for `c1` given `state.mtp_h` (`~0.4 µs`).
-    /// Reuse `p2_q` across many `c2` candidates via `score_mtp2_char` (`~0.02 µs` each).
     #[inline]
     pub fn prepare_mtp2_vec(&self, state: &RwkvState, c1: char, p2_q: &mut [i8; 512]) -> f32 {
         let r = self.offs.summary.rank;
@@ -1930,7 +1920,14 @@ impl<'a> NeuralView<'a> {
             e1_q[k] = e1_row[k] as i8;
         }
         let mut c1_contrib = [0.0f32; 512];
-        self.eval_qmat(&self.offs.w_mtp_c1, &e1_q[..r], e1_sc, r, r, &mut c1_contrib[..r]);
+        self.eval_qmat(
+            &self.offs.w_mtp_c1,
+            &e1_q[..r],
+            e1_sc,
+            r,
+            r,
+            &mut c1_contrib[..r],
+        );
         for k in 0..r {
             c1_contrib[k] += state.mtp_h[k];
         }
@@ -1957,24 +1954,9 @@ impl<'a> NeuralView<'a> {
         let Some(c2) = chars.next() else {
             return lp1;
         };
-        let r = self.offs.summary.rank;
-        let tok1 = self.char_to_token(c1);
-        let (e1_row, e1_sc, _) = self.emb_row(tok1);
-        let mut e1_q = [0i8; 512];
-        for k in 0..r {
-            e1_q[k] = e1_row[k] as i8;
-        }
-        let mut c1_contrib = [0.0f32; 512];
-        self.eval_qmat(&self.offs.w_mtp_c1, &e1_q[..r], e1_sc, r, r, &mut c1_contrib[..r]);
-        for k in 0..r {
-            c1_contrib[k] += state.mtp_h[k];
-        }
         let mut p2_q = [0i8; 512];
-        let p2_sc = quantize_act_i8(&c1_contrib[..r], &mut p2_q[..r]);
-
-        let tok2 = self.char_to_token(c2);
-        let (e2_row, e2_sc, ub2) = self.emb_row(tok2);
-        let lp2 = int8_dot_row(e2_row, e2_sc, &p2_q[..r], p2_sc) + ub2;
+        let p2_sc = self.prepare_mtp2_vec(state, c1, &mut p2_q);
+        let lp2 = self.score_mtp2_char(&p2_q, p2_sc, c2);
 
         // Average per-char log-prob * sublinear length factor so 2..4 char phrases calibrate cleanly against 1-char
         let mut sum_lp = lp1 + lp2;
@@ -2109,13 +2091,18 @@ mod tests {
 
         let blob = build_tiny_wblm0002(&ext_refs);
         let offs = NeuralOffsets::parse(&blob).expect("parse WBLM0002");
-        assert!(offs.ascii_trie.is_some());
-        assert!(!offs.has_eng_num_token);
-        let nv = NeuralView { blob: &blob, offs: &offs };
+        assert_eq!(offs.ascii_trie.ext_count, ext_refs.len());
+        let nv = NeuralView {
+            blob: &blob,
+            offs: &offs,
+        };
 
         let mut toks = Vec::new();
         nv.encode_mixed_str("用 Rust 写 v2.1，𠮷好。", &mut toks);
-        assert_eq!(toks, vec![4, rust_id, 5, v21_id, TOK_COMMA, TOK_UNK, 6, TOK_PERIOD]);
+        assert_eq!(
+            toks,
+            vec![4, rust_id, 5, v21_id, TOK_COMMA, TOK_UNK, 6, TOK_PERIOD]
+        );
 
         let mut tracker = NeuralContextTracker::default();
         tracker.set_context_str(&nv, "用 Rust 写 v2.1，𠮷好。");
@@ -2124,25 +2111,6 @@ mod tests {
 
     #[test]
     fn wblm0003_scheme_free_without_key1_head() {
-        // Build a WBLM0003 blob omitting the legacy 25xD w_key1 matrix completely
-        let mut v3 = build_tiny_wblm0002(&[]);
-        // Strip trailing ext_vocab (8 bytes) + w_key1 (25*32 + 25*4 + 25*4 = 1000 bytes), rewrite WBLM0003 + ext_vocab
-        let old_ext_off = v3.len() - 8;
-        let w_key1_bytes = 25 * 32 + 25 * 4 + 25 * 4;
-        v3.truncate(old_ext_off - w_key1_bytes);
-        v3[0..8].copy_from_slice(WBLM_MAGIC_V3);
-        while v3.len() % 4 != 0 {
-            v3.push(0);
-        }
-        v3.extend_from_slice(&(32u32).to_le_bytes());
-        v3.extend_from_slice(&(2u32).to_le_bytes());
-        for entry in [&b"review"[..], &b"commit"[..]] {
-            v3.push(entry.len() as u8);
-            v3.extend_from_slice(entry);
-        }
-        // Adjust vocab_size in header to 34
-        v3[8..12].copy_from_slice(&(34u32).to_le_bytes());
-        // Resize emb_w / emb_sc / uni_bias? Easier: build directly from helper logic:
         let vocab_size: usize = 34;
         let rank: usize = 16;
         let d_model: usize = 32;
@@ -2198,17 +2166,13 @@ mod tests {
             blob.extend_from_slice(entry);
         }
         let offs = NeuralOffsets::parse(&blob).expect("parse WBLM0003 without w_key1");
-        assert_eq!(offs.ascii_trie.as_ref().unwrap().ext_count, 2);
+        assert_eq!(offs.ascii_trie.ext_count, 2);
     }
 
     #[test]
     fn batch_step_matches_single_step_and_tracker_deduplicates() {
-        let mut blob = build_tiny_wblm0002(&[b"a", b"b", b"Rust"]);
-        // Populate deterministic pseudo-random non-zero weights/scales after LUT so matmuls exercise non-trivial values
-        let lut_end = HEADER_LEN + CJK_LUT_LEN * 2;
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
-        // Re-build with realistic small scales by filling weight bytes and 1.0/16.0 scales cleanly via helper:
-        blob.clear();
+        let mut blob = Vec::new();
         let vocab_size: usize = 35;
         let rank: usize = 32;
         let d_model: usize = 64;
@@ -2252,19 +2216,21 @@ mod tests {
                 b.extend_from_slice(&f.to_le_bytes());
             }
         };
-        let push_qmat = |b: &mut Vec<u8>, rows: usize, cols: usize, has_bias: bool, rng: &mut dyn FnMut() -> u8| {
+        let push_qmat = |b: &mut Vec<u8>,
+                         rows: usize,
+                         cols: usize,
+                         has_bias: bool,
+                         rng: &mut dyn FnMut() -> u8| {
             push_i8(b, rows * cols, rng);
             push_pos_f32(b, rows, 0.01, rng);
             if has_bias {
                 push_f32(b, rows, 0.05, rng);
             }
         };
-        let _ = lut_end;
         align4(&mut blob);
         let lut_start = blob.len();
         blob.resize(lut_start + CJK_LUT_LEN * 2, 0);
-        for (i, ch_u32) in (CJK_LUT_BASE..(CJK_LUT_BASE + 20)).enumerate() {
-            let _ = ch_u32;
+        for i in 0..20 {
             let off = lut_start + i * 2;
             blob[off..off + 2].copy_from_slice(&((4 + i) as u16).to_le_bytes());
         }
@@ -2297,7 +2263,10 @@ mod tests {
         }
 
         let offs = NeuralOffsets::parse(&blob).expect("parse synthetic WBLM0002");
-        let nv = NeuralView { blob: &blob, offs: &offs };
+        let nv = NeuralView {
+            blob: &blob,
+            offs: &offs,
+        };
 
         for bsz in [1usize, 2, 5, 8, 11] {
             let mut base = RwkvState::new_zero(&offs.summary);
@@ -2307,29 +2276,37 @@ mod tests {
             let toks: Vec<usize> = (0..bsz).map(|i| 4 + (i % 16)).collect();
             let mtp_flags: Vec<bool> = (0..bsz).map(|i| i < 2 || i % 3 == 0).collect();
 
-            let key1_flags: Vec<bool> = (0..bsz).map(|i| i % 4 == 0).collect();
-
             for i in 0..bsz {
-                nv.step_token_heads(toks[i], &mut single_states[i], mtp_flags[i], key1_flags[i]);
+                nv.step_token_heads(toks[i], &mut single_states[i], mtp_flags[i]);
             }
-            let mut refs: Vec<(usize, &mut RwkvState, bool, bool)> = toks
+            let mut refs: Vec<(usize, &mut RwkvState, bool)> = toks
                 .iter()
                 .copied()
                 .zip(batch_states.iter_mut())
                 .zip(mtp_flags.iter().copied())
-                .zip(key1_flags.iter().copied())
-                .map(|(((t, s), m), k)| (t, s, m, k))
+                .map(|((t, s), m)| (t, s, m))
                 .collect();
             nv.step_tokens_batch(&mut refs);
 
             for i in 0..bsz {
-                assert_eq!(single_states[i].p1_q, batch_states[i].p1_q, "p1_q mismatch at bsz={bsz} i={i}");
+                assert_eq!(
+                    single_states[i].p1_q, batch_states[i].p1_q,
+                    "p1_q mismatch at bsz={bsz} i={i}"
+                );
                 assert!((single_states[i].p1_scale - batch_states[i].p1_scale).abs() < 1e-6);
-                for (a, b) in single_states[i].mat_state.iter().zip(batch_states[i].mat_state.iter()) {
+                for (a, b) in single_states[i]
+                    .mat_state
+                    .iter()
+                    .zip(batch_states[i].mat_state.iter())
+                {
                     assert!((a - b).abs() < 1e-5, "mat_state diff {a} vs {b}");
                 }
                 if mtp_flags[i] {
-                    for (a, b) in single_states[i].mtp_h.iter().zip(batch_states[i].mtp_h.iter()) {
+                    for (a, b) in single_states[i]
+                        .mtp_h
+                        .iter()
+                        .zip(batch_states[i].mtp_h.iter())
+                    {
                         assert!((a - b).abs() < 1e-5, "mtp_h diff {a} vs {b}");
                     }
                 }

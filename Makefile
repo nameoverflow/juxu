@@ -6,26 +6,29 @@ RAW_TABLES_DIR ?= Resources/RawTables
 
 export MACOSX_DEPLOYMENT_TARGET := 14.0
 MACOS_TARGET = -target arm64-apple-macosx14.0
-LSREGISTER = /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
 CORE_LIB = Core/target/release/libjuxu_core.a
 CORE_HEADER = Core/include/juxu_core.h
 CORE_FLAGS = -import-objc-header $(CORE_HEADER) $(CORE_LIB)
-CORE_SOURCES = Core/Cargo.toml $(wildcard Core/src/*.rs) $(wildcard Core/src/bin/*.rs)
+CORE_SOURCES = Core/Cargo.toml $(wildcard Core/src/*.rs)
 
+SHARED_SOURCES = Shared/JuxuModels.swift Shared/JuxuBridge.swift Shared/TextFormatting.swift Shared/SharedSettingsComponents.swift
+SHARED_CORE_SOURCES = Shared/JuxuModels.swift Shared/JuxuBridge.swift Shared/TextFormatting.swift
+IOS_SHARED_SOURCES = iOS/Shared/IOSInlineMarkedTextSession.swift iOS/Shared/IOSKeyboardLayoutEngine.swift iOS/Shared/IOSKeyboardGesturesAndEditing.swift iOS/Shared/IOSClipboardSuggestion.swift
 VOICE_SOURCES = Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoicePartialStabilizer.swift Sources/VoiceSessionTimeline.swift Sources/VoiceQwenHelper.swift Sources/VoiceASREngine.swift Sources/VoiceGlobalHotkey.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Sources/VoiceSettingsView.swift
-UI_SOURCES = Sources/JuxuCoreBridge.swift Sources/CandidatePanel.swift $(VOICE_SOURCES) Sources/SettingsWindow.swift
-APP_SOURCES = $(UI_SOURCES) Sources/InputController.swift Sources/main.swift
+UI_SOURCES = $(SHARED_SOURCES) Sources/FloatingHUDPanel.swift Sources/CandidatePanel.swift $(VOICE_SOURCES) Sources/SettingsWindow.swift
+APP_SOURCES = $(UI_SOURCES) Sources/ShiftTapDetector.swift Sources/InputController.swift Sources/main.swift
 FRAMEWORKS = -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework Carbon -framework AVFoundation -framework Speech -framework Security -framework Accelerate
 
 all: build/Juxu
 
 $(CORE_LIB): $(CORE_SOURCES)
-	cargo build --release --manifest-path Core/Cargo.toml
+	cargo build --release --manifest-path Core/Cargo.toml --lib
 
 CORPUS_LM ?= $(if $(JUXU_CORPUS_LM),$(JUXU_CORPUS_LM),$(FORMORDO_CORPUS_LM))
 
-dicts: $(CORE_LIB)
+dicts:
+	cargo build --release --manifest-path Core/Cargo.toml --bin build-dicts
 	@if [ -n "$(CORPUS_LM)" ]; then \
 	  Core/target/release/build-dicts "$(RAW_TABLES_DIR)" Resources/Dicts --corpus-lm "$(CORPUS_LM)"; \
 	else \
@@ -75,49 +78,21 @@ pkg: app
 	sh Scripts/build-macos-pkg.sh build/Juxu.app "$$ver" "build/Juxu-$$ver-macOS-arm64.pkg"
 
 install: app
-	pkill -TERM -x Juxu || true
-	pkill -TERM -x PrisWubi || true
-	sleep 0.3
-	@if [ -d "$$HOME/Library/Input Methods/Juxu.app" ]; then \
-	  "$(LSREGISTER)" -u "$$HOME/Library/Input Methods/Juxu.app" 2>/dev/null || true; \
-	  rm -rf "$$HOME/Library/Input Methods/Juxu.app"; \
-	fi
-	@if LC_ALL=C grep -q -a "im.juxu.inputmethod.Juxu" /System/Library/Caches/com.apple.IntlDataCache.le.kbdx 2>/dev/null && [ -d "/Library/Input Methods/Juxu.app" ] && [ -w "/Library/Input Methods/Juxu.app" ]; then \
-	  rm -rf "/Library/Input Methods/Juxu.app/Contents"; \
-	  cp -R build/Juxu.app/Contents "/Library/Input Methods/Juxu.app/Contents"; \
-	  chmod -R ug+rwX,o+rX "/Library/Input Methods/Juxu.app" 2>/dev/null || true; \
-	  "$(LSREGISTER)" -f -R -trusted "/Library/Input Methods/Juxu.app"; \
-	elif [ -t 0 ] && sudo -v 2>/dev/null; then \
-	  sudo rm -rf "/Library/Input Methods/Juxu.app"; \
-	  sudo cp -R build/Juxu.app "/Library/Input Methods/Juxu.app"; \
-	  sudo chown -R root:staff "/Library/Input Methods/Juxu.app"; \
-	  sudo chmod -R ug+rwX,o+rX "/Library/Input Methods/Juxu.app"; \
-	  sudo "$(LSREGISTER)" -f -R -trusted "/Library/Input Methods/Juxu.app"; \
-	  sudo "/Library/Input Methods/Juxu.app/Contents/MacOS/Juxu" --register-system-cache; \
-	else \
-	  osascript -e 'do shell script "rm -rf \"/Library/Input Methods/Juxu.app\" && cp -R \"" & (POSIX path of (POSIX file "build/Juxu.app")) & "\" \"/Library/Input Methods/Juxu.app\" && chown -R root:staff \"/Library/Input Methods/Juxu.app\" && chmod -R ug+rwX,o+rX \"/Library/Input Methods/Juxu.app\" && \"$(LSREGISTER)\" -f -R -trusted \"/Library/Input Methods/Juxu.app\" && \"/Library/Input Methods/Juxu.app/Contents/MacOS/Juxu\" --register-system-cache" with administrator privileges'; \
-	fi
-	@uc="$$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null || true)"; \
-	if [ -n "$$uc" ] && [ -d "$$uc" ]; then rm -f "$${uc}"com.apple.IntlDataCache* "$${uc}"*/com.apple.IntlDataCache* 2>/dev/null || true; fi
-	killall KeyboardSettings TextInputMenuAgent TextInputSwitcher imklaunchagent 2>/dev/null || true
-	sleep 0.3
-	"/Library/Input Methods/Juxu.app/Contents/MacOS/Juxu" --register-and-enable
-	open -g "/Library/Input Methods/Juxu.app"
-	@echo "Installed and launched /Library/Input Methods/Juxu.app"
+	sh Scripts/install-macos.sh --local-app build/Juxu.app
 
 rust-test:
 	cargo test --release --manifest-path Core/Cargo.toml
 
 swift-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc -O $(MACOS_TARGET) $(UI_SOURCES) Tests/SwiftBridgeTests.swift $(CORE_FLAGS) $(FRAMEWORKS) -o build/swift-bridge-tests
+	swiftc -Onone $(MACOS_TARGET) $(UI_SOURCES) Sources/ShiftTapDetector.swift Tests/SwiftBridgeTests.swift $(CORE_FLAGS) $(FRAMEWORKS) -o build/swift-bridge-tests
 	build/swift-bridge-tests
 
 test: rust-test swift-test ios-test
 
 ios-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc -O $(MACOS_TARGET) Sources/JuxuCoreBridge.swift iOS/Shared/IOSKeyboardLayoutEngine.swift iOS/Shared/IOSClipboardSuggestion.swift Tests/IOSKeyboardTests.swift $(CORE_FLAGS) -framework Foundation -framework CoreGraphics -o build/ios-keyboard-tests
+	swiftc -Onone $(MACOS_TARGET) $(SHARED_CORE_SOURCES) $(IOS_SHARED_SOURCES) Tests/IOSKeyboardTests.swift $(CORE_FLAGS) -framework Foundation -framework CoreGraphics -framework Security -o build/ios-keyboard-tests
 	build/ios-keyboard-tests
 
 previews: $(CORE_LIB)
@@ -127,7 +102,7 @@ previews: $(CORE_LIB)
 
 ios-previews: $(CORE_LIB)
 	mkdir -p build/ios-previews
-	swiftc -O $(MACOS_TARGET) Sources/JuxuCoreBridge.swift iOS/Shared/IOSKeyboardLayoutEngine.swift iOS/HostApp/HostAppViews.swift Scripts/RenderIOSPreviews.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -o build/render-ios-previews
+	swiftc -O $(MACOS_TARGET) $(SHARED_SOURCES) $(IOS_SHARED_SOURCES) iOS/HostApp/HostAppViews.swift Scripts/RenderIOSPreviews.swift $(CORE_FLAGS) -framework Cocoa -framework SwiftUI -o build/render-ios-previews
 	build/render-ios-previews build/ios-previews
 
 ios-project:

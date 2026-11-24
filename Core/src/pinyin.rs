@@ -8,7 +8,6 @@ use crate::code::PackedCode;
 use crate::config::JuxuConfig;
 use crate::engine::{Candidate, CandidateBadge};
 use crate::english::{resolve_english_display, EnDictView};
-use crate::format::AuxView;
 use crate::neural::{NeuralView, RwkvState, TOK_UNK};
 use crate::personalization::Context as PersonalContext;
 use crate::pinyin_dict::{base_initial_id, PinyinDictView, SylConstraint};
@@ -133,7 +132,6 @@ pub struct PinyinCandidate {
 pub struct PinyinDecoder<'a> {
     pub dict: &'a PinyinDictView,
     pub english: &'a EnDictView,
-    pub aux: Option<&'a AuxView>,
     pub model: Option<NeuralView<'a>>,
     pub config: &'a JuxuConfig,
     pub user: &'a UserStore,
@@ -1621,11 +1619,11 @@ fn materialize_paths_batch(
     }
 
     {
-        let mut batch: Vec<(usize, &mut RwkvState, bool, bool)> = indices
+        let mut batch: Vec<(usize, &mut RwkvState, bool)> = indices
             .iter()
             .zip(toks.iter())
             .zip(states.iter_mut())
-            .map(|((&path_idx, &tok), st)| (tok, st, path_idx < 2, false))
+            .map(|((&path_idx, &tok), st)| (tok, st, path_idx < 2))
             .collect();
         model.step_tokens_batch(&mut batch);
     }
@@ -1678,11 +1676,11 @@ fn materialize_multi_layers_batch(
         return;
     }
     {
-        let mut batch: Vec<(usize, &mut RwkvState, bool, bool)> = coords
+        let mut batch: Vec<(usize, &mut RwkvState, bool)> = coords
             .iter()
             .zip(toks.iter())
             .zip(states.iter_mut())
-            .map(|((&(_, path_idx), &tok), st)| (tok, st, path_idx < 2, false))
+            .map(|((&(_, path_idx), &tok), st)| (tok, st, path_idx < 2))
             .collect();
         model.step_tokens_batch(&mut batch);
     }
@@ -2413,7 +2411,7 @@ fn extend_pinyin_layer(
             if step.is_latin {
                 let est = nv.estimate_latin_logp(step.parent_rc.as_ref(), &step.text);
                 let (lp, st) =
-                    nv.score_and_step_latin(step.parent_rc.as_ref(), &step.text, true, false);
+                    nv.score_and_step_latin(step.parent_rc.as_ref(), &step.text, true);
                 score = score - est + lp;
                 for ch in step.text.chars() {
                     personal_context = personal_context.push(ch);
@@ -2687,10 +2685,10 @@ fn extend_pinyin_layer(
                 .map(|(r, _)| (**r.gp_rc).clone())
                 .collect();
             {
-                let mut batch: Vec<(usize, &mut RwkvState, bool, bool)> = active_rescues
+                let mut batch: Vec<(usize, &mut RwkvState, bool)> = active_rescues
                     .iter()
                     .zip(c1_states.iter_mut())
-                    .map(|((r, _), st)| (nv.char_to_token(r.c1), st, false, false))
+                    .map(|((r, _), st)| (nv.char_to_token(r.c1), st, false))
                     .collect();
                 nv.step_tokens_batch(&mut batch);
             }
@@ -3242,8 +3240,8 @@ fn build_pinyin_candidates(
         let insert_at = out.len().min(3);
         let mut inserted = 0usize;
         for disp in en_cands.into_iter().take(3) {
+            let pos = (insert_at + inserted).min(out.len());
             if seen.insert(disp.clone()) {
-                let pos = (insert_at + inserted).min(out.len());
                 out.insert(
                     pos,
                     PinyinCandidate {
@@ -3259,6 +3257,12 @@ fn build_pinyin_candidates(
                         boundaries: Vec::new(),
                     },
                 );
+                inserted += 1;
+            } else if let Some(existing_idx) = out.iter().position(|c| c.candidate.text == disp) {
+                if existing_idx > pos {
+                    let cand = out.remove(existing_idx);
+                    out.insert(pos, cand);
+                }
                 inserted += 1;
             }
         }
@@ -3283,15 +3287,8 @@ fn build_pinyin_candidates(
         let insert_at = out.len().min(3);
         let mut inserted = 0usize;
         for disp in t9_en.into_iter().take(2) {
-            if let Some(existing_idx) = out.iter().position(|c| c.candidate.text == disp) {
-                let target = insert_at + inserted;
-                if existing_idx > target {
-                    let item = out.remove(existing_idx);
-                    out.insert(target.min(out.len()), item);
-                    inserted += 1;
-                }
-            } else if seen.insert(disp.clone()) {
-                let pos = (insert_at + inserted).min(out.len());
+            let pos = (insert_at + inserted).min(out.len());
+            if seen.insert(disp.clone()) {
                 out.insert(
                     pos,
                     PinyinCandidate {
@@ -3307,6 +3304,12 @@ fn build_pinyin_candidates(
                         boundaries: Vec::new(),
                     },
                 );
+                inserted += 1;
+            } else if let Some(existing_idx) = out.iter().position(|c| c.candidate.text == disp) {
+                if existing_idx > pos {
+                    let cand = out.remove(existing_idx);
+                    out.insert(pos, cand);
+                }
                 inserted += 1;
             }
         }

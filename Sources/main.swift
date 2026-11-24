@@ -149,7 +149,7 @@ final class JuxuAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         VoiceASRRegistry.stopAll()
-        JuxuBridge.shared.flushUserDataIfNeeded()
+        JuxuBridge.shared.flushUserDataSync()
     }
 }
 

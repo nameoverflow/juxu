@@ -21,17 +21,38 @@ public enum SettingsSection: String, CaseIterable, Identifiable {
     }
 }
 
+@MainActor
+public final class SettingsNavigationModel: ObservableObject {
+    @Published public var selectedSection: SettingsSection
+
+    public init(selectedSection: SettingsSection = .schema) {
+        self.selectedSection = selectedSection
+    }
+}
+
 public struct SettingsRootView: View {
     @ObservedObject public var bridge: JuxuBridge
-    @State public var selectedSection: SettingsSection
+    @ObservedObject private var navigation: SettingsNavigationModel
+    /// Dedicated in-memory bridge so simulator taps never pollute live composition, personal lexicon, or `eval_log.jsonl`.
+    @StateObject private var simBridge = JuxuBridge(inMemoryOnly: true)
     @State private var newPhraseInput: String = ""
     @State private var phraseBanner: String = ""
     @State private var labCommittedText: String = "输入"
     @State private var lastTouchInfo: String = "点按下方键帽或两键交界处体验连续高斯热区与 N-gram 置信度纠错"
 
+    public var selectedSection: SettingsSection {
+        get { navigation.selectedSection }
+        nonmutating set { navigation.selectedSection = newValue }
+    }
+
     public init(bridge: JuxuBridge, initialSection: SettingsSection = .schema) {
         self.bridge = bridge
-        self._selectedSection = State(initialValue: initialSection)
+        self.navigation = SettingsNavigationModel(selectedSection: initialSection)
+    }
+
+    public init(bridge: JuxuBridge, navigation: SettingsNavigationModel) {
+        self.bridge = bridge
+        self.navigation = navigation
     }
 
     public var body: some View {
@@ -71,23 +92,23 @@ public struct SettingsRootView: View {
 
                 ForEach(SettingsSection.allCases) { sec in
                     Button {
-                        selectedSection = sec
+                        navigation.selectedSection = sec
                     } label: {
                         HStack(spacing: 8) {
                             Image(systemName: sec.symbolName)
                                 .font(.system(size: 13, weight: .medium))
                                 .frame(width: 18)
-                                .foregroundStyle(selectedSection == sec ? Color.white : Color.accentColor)
+                                .foregroundStyle(navigation.selectedSection == sec ? Color.white : Color.accentColor)
                             Text(sec.rawValue)
-                                .font(.system(size: 13, weight: selectedSection == sec ? .medium : .regular))
-                                .foregroundStyle(selectedSection == sec ? Color.white : Color.primary)
+                                .font(.system(size: 13, weight: navigation.selectedSection == sec ? .medium : .regular))
+                                .foregroundStyle(navigation.selectedSection == sec ? Color.white : Color.primary)
                             Spacer()
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6.5)
                         .background(
                             RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .fill(selectedSection == sec ? Color.accentColor : Color.clear)
+                                .fill(navigation.selectedSection == sec ? Color.accentColor : Color.clear)
                         )
                         .contentShape(Rectangle())
                     }
@@ -115,7 +136,7 @@ public struct SettingsRootView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    switch selectedSection {
+                    switch navigation.selectedSection {
                     case .schema:
                         schemaSectionView
                     case .typo:
@@ -133,6 +154,21 @@ public struct SettingsRootView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 680, minHeight: 540)
+        .onAppear {
+            syncSimulatorBridge()
+        }
+        .onChange(of: bridge.prefs) { _, newPrefs in
+            simBridge.applyAndSavePreferences(newPrefs, persist: false)
+        }
+        .onChange(of: bridge.touchCalibrations) { _, newCal in
+            simBridge.applyTouchCalibrations(newCal)
+        }
+    }
+
+    private func syncSimulatorBridge() {
+        simBridge.applyAndSavePreferences(bridge.prefs, persist: false)
+        simBridge.applyTouchCalibrations(bridge.touchCalibrations)
+        simBridge.setContext(String(labCommittedText.suffix(32)))
     }
 
     // MARK: - Section 1: Schema & Core Typing
@@ -140,8 +176,10 @@ public struct SettingsRootView: View {
     private var schemaSectionView: some View {
         let activeCategory = bridge.prefs.schemaCategory
         let isCangjie = bridge.prefs.isCangjieFamily
-        let maxCodeLabel = isCangjie ? "五" : "四"
-        let pushCodeLabel = isCangjie ? "六" : "五"
+        let maxCodeLabel = SharedSchemaDisplayHelpers.maxCodeChineseNumeral(isCangjie: isCangjie)
+        let pushCodeLabel = SharedSchemaDisplayHelpers.pushCodeChineseNumeral(isCangjie: isCangjie)
+        let maxCodeNum = SharedSchemaDisplayHelpers.maxCodeDigits(isCangjie: isCangjie)
+        let pushCodeNum = SharedSchemaDisplayHelpers.pushCodeDigits(isCangjie: isCangjie)
         return VStack(alignment: .leading, spacing: 16) {
             sectionHeader(
                 title: "输入方案与编码规则",
@@ -193,7 +231,7 @@ public struct SettingsRootView: View {
                         Divider()
                         toggleRow(
                             title: "第\(pushCodeLabel)码顶字上屏",
-                            subtitle: "\(maxCodeLabel)码存在重码时，继续敲第 \(isCangjie ? "6" : "5") 码自动将首选词顶上屏并开始新编码",
+                            subtitle: "\(maxCodeLabel)码存在重码时，继续敲第 \(pushCodeNum) 码自动将首选词顶上屏并开始新编码",
                             isOn: binding(\.fifthCodePushCommit)
                         )
                         Divider()
@@ -207,7 +245,7 @@ public struct SettingsRootView: View {
                             }
                             Spacer()
                             Picker("", selection: binding(\.fourthEmptyBehavior)) {
-                                Text("阻断第 \(isCangjie ? "5" : "4") 码并提示").tag("block")
+                                Text("阻断第 \(maxCodeNum) 码并提示").tag("block")
                                 Text("自动清空重输").tag("clear")
                             }
                             .labelsHidden()
@@ -342,12 +380,13 @@ public struct SettingsRootView: View {
                     }
                     Divider()
                     HStack {
-                        Text("已学习热区偏移按键数：\(bridge.state.calibratedKeyCount) / 26")
+                        Text("已学习热区偏移按键数：\(SharedCalibrationFormatting.calibratedProgressText(calibratedCount: bridge.state.calibratedKeyCount))")
                             .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                         Spacer()
                         Button("重置热区校准") {
                             bridge.resetTouchCalibration()
+                            simBridge.resetTouchCalibration(persist: false)
                             lastTouchInfo = "已清空全部按键的个人热区偏移校准记录"
                         }
                         .controlSize(.small)
@@ -355,7 +394,7 @@ public struct SettingsRootView: View {
                 }
             }
 
-            // Interactive iOS 26-Key Touch Hitbox Simulator!
+            // Interactive iOS 26-Key Touch Hitbox Simulator (isolated on in-memory `simBridge`)
             settingsCard {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
@@ -366,8 +405,9 @@ public struct SettingsRootView: View {
                             .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
                         Button("清空") {
-                            bridge.clearComposition()
+                            simBridge.clearComposition()
                             labCommittedText = ""
+                            simBridge.setContext("")
                         }
                         .controlSize(.mini)
                     }
@@ -376,20 +416,20 @@ public struct SettingsRootView: View {
                         .font(.system(size: 11.5, design: .monospaced))
                         .foregroundStyle(.secondary)
 
-                    if !bridge.state.preedit.isEmpty {
+                    if !simBridge.state.preedit.isEmpty {
                         // The bar reports its content width. Scroll it so long candidates cannot widen
                         // the card and move the keys under the pointer between taps.
                         ScrollView(.horizontal, showsIndicators: false) {
                             CandidateBarView(
-                                state: bridge.state,
+                                state: simBridge.state,
                                 onSelectCandidate: { idx in
-                                    let res = bridge.selectCandidate(pageRelIndex: idx, timestampMs: currentMs())
+                                    let res = simBridge.selectCandidate(pageRelIndex: idx, timestampMs: currentMs())
                                     if !res.commitText.isEmpty {
                                         labCommittedText += res.commitText
                                     }
                                 },
                                 onTurnPage: { d in
-                                    _ = bridge.turnPage(delta: d)
+                                    _ = simBridge.turnPage(delta: d)
                                 }
                             )
                         }
@@ -404,7 +444,7 @@ public struct SettingsRootView: View {
                     }
 
                     TouchKeyboardSimulatorView { ch, normX, normY in
-                        let out = bridge.pushTouch(
+                        let out = simBridge.pushTouch(
                             reportedAscii: ch,
                             x: normX,
                             y: normY,
@@ -420,9 +460,9 @@ public struct SettingsRootView: View {
                             normX, normY, String(Character(scalar)), out.preedit
                         )
                     } onBackspace: {
-                        _ = bridge.handleKey(keyCode: 0x33, scalar: 0, hasCmdOrCtrl: false, timestampMs: currentMs())
+                        _ = simBridge.handleKey(keyCode: 0x33, scalar: 0, hasCmdOrCtrl: false, timestampMs: currentMs())
                     } onSpace: {
-                        let out = bridge.handleKey(keyCode: 0x31, scalar: 32, hasCmdOrCtrl: false, timestampMs: currentMs())
+                        let out = simBridge.handleKey(keyCode: 0x31, scalar: 32, hasCmdOrCtrl: false, timestampMs: currentMs())
                         if !out.commitText.isEmpty {
                             labCommittedText += out.commitText
                         }
@@ -440,12 +480,9 @@ public struct SettingsRootView: View {
                     Divider()
                     let s = bridge.evalLogSummary
                     HStack(spacing: 12) {
-                        macEvalStatBox(title: "总上屏", value: "\(s.commits)")
-                        macEvalStatBox(title: "Top-1 命中率", value: s.commits > 0 ? String(format: "%.1f%%", s.top1RatePercent) : "—")
-                        macEvalStatBox(title: "手选非首选", value: "\(s.manualSelects)")
-                        macEvalStatBox(title: "策略压制模型", value: "\(s.lmOverruled)")
-                        macEvalStatBox(title: "退格重打", value: "\(s.backspaceAfterCommit)")
-                        macEvalStatBox(title: "纠错触发", value: "\(s.typoTriggered)")
+                        ForEach(EvalLogMetricItem.metrics(from: s)) { metric in
+                            SharedEvalMetricCell(item: metric)
+                        }
                     }
                     HStack(spacing: 8) {
                         Button("刷新统计") {
@@ -476,23 +513,6 @@ public struct SettingsRootView: View {
                 }
             }
         }
-    }
-
-    private func macEvalStatBox(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title)
-                .font(.system(size: 10.5))
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.system(size: 14, weight: .semibold, design: .monospaced))
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color.primary.opacity(0.045))
-        )
     }
 
     // MARK: - Section 3: Auto-Phrase & Personal Lexicon
@@ -583,17 +603,7 @@ public struct SettingsRootView: View {
                                 HStack {
                                     Text(item.text)
                                         .font(.system(size: 13.5, weight: .medium))
-                                    Text(item.code)
-                                        .font(.system(size: 11.5, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 1)
-                                        .background(Color.primary.opacity(0.06), in: Capsule())
-                                    if item.auto {
-                                        Text("自动组词")
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(.teal)
-                                    }
+                                    SharedUserPhraseCodePill(code: item.code, isAutoPhrase: item.auto)
                                     Spacer()
                                     Text("频次 \(item.count)")
                                         .font(.system(size: 11))
@@ -1043,10 +1053,13 @@ final class SettingsWindow: NSWindow {
 public final class SettingsWindowController {
     public static let shared = SettingsWindowController()
     private var window: NSWindow?
+    private var hostingView: NSHostingView<SettingsRootView>?
+    private let navigation = SettingsNavigationModel()
 
     private init() {}
 
     public func show(section: SettingsSection = .schema) {
+        navigation.selectedSection = section
         if window == nil {
             let win = SettingsWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 720, height: 580),
@@ -1058,10 +1071,15 @@ public final class SettingsWindowController {
             win.toolbarStyle = .unified
             win.center()
             win.isReleasedWhenClosed = false
+            let host = NSHostingView(rootView: SettingsRootView(bridge: .shared, navigation: navigation))
+            win.contentView = host
+            self.hostingView = host
             self.window = win
         }
         guard let win = window else { return }
-        win.contentView = NSHostingView(rootView: SettingsRootView(bridge: .shared, initialSection: section))
+        if let hostingView, win.contentView !== hostingView {
+            win.contentView = hostingView
+        }
         let bringToFront: @MainActor () -> Void = {
             NSApp.activate(ignoringOtherApps: true)
             win.makeKeyAndOrderFront(nil)

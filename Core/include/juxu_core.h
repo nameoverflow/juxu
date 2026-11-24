@@ -26,19 +26,18 @@ bool juxu_engine_load_config(JuxuEngineHandle *handle, const char *path);
 bool juxu_engine_save_config(const JuxuEngineHandle *handle, const char *path);
 void juxu_engine_set_config_toml(JuxuEngineHandle *handle, const char *toml_str);
 char *juxu_engine_get_config_toml(const JuxuEngineHandle *handle);
+void juxu_engine_set_config_json(JuxuEngineHandle *handle, const char *json_str);
+char *juxu_engine_get_config_json(const JuxuEngineHandle *handle);
+char *juxu_config_toml_to_json(const char *toml_str);
+char *juxu_config_json_to_toml(const char *json_str);
 
 bool juxu_engine_load_user_data(JuxuEngineHandle *handle, const char *path);
-bool juxu_engine_save_user_data(JuxuEngineHandle *handle, const char *path);
 bool juxu_engine_import_user_data_tsv(JuxuEngineHandle *handle, const char *tsv_str);
 uint64_t juxu_engine_user_data_seq(const JuxuEngineHandle *handle);
 char *juxu_engine_export_user_data_tsv(JuxuEngineHandle *handle);
 bool juxu_engine_is_user_dirty(const JuxuEngineHandle *handle);
 
-void juxu_engine_set_schema(JuxuEngineHandle *handle, uint32_t schema_id);
 uint32_t juxu_engine_get_schema(const JuxuEngineHandle *handle);
-
-void juxu_engine_set_ascii_mode(JuxuEngineHandle *handle, bool ascii_mode);
-bool juxu_engine_get_ascii_mode(const JuxuEngineHandle *handle);
 char *juxu_engine_toggle_ascii_json(JuxuEngineHandle *handle);
 
 void juxu_engine_set_key_layout(
@@ -64,12 +63,6 @@ void juxu_engine_set_touch_profile(
     const float *offsets_xy_52,
     const uint32_t *counts_26
 );
-// Offsets and sample counts are indexed by T9 physical key, from '2' to '9'.
-void juxu_engine_set_t9_touch_profile(
-    JuxuEngineHandle *handle,
-    const float *offsets_xy_16,
-    const uint32_t *counts_8
-);
 
 char *juxu_engine_add_user_phrase(JuxuEngineHandle *handle, const char *phrase);
 bool juxu_engine_remove_user_phrase(JuxuEngineHandle *handle, const char *phrase);
@@ -78,7 +71,8 @@ char *juxu_engine_list_user_phrases_json(const JuxuEngineHandle *handle);
 void juxu_engine_clear(JuxuEngineHandle *handle);
 void juxu_engine_abandon(JuxuEngineHandle *handle, uint64_t timestamp_ms);
 void juxu_engine_notify_post_commit_backspace(JuxuEngineHandle *handle, uint64_t timestamp_ms);
-bool juxu_engine_is_composing(const JuxuEngineHandle *handle);
+char *juxu_engine_commit_pending_json(JuxuEngineHandle *handle, uint64_t timestamp_ms);
+void juxu_engine_reset_quote_state(JuxuEngineHandle *handle);
 
 char *juxu_engine_handle_key_json(
     JuxuEngineHandle *handle,

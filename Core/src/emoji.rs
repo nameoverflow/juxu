@@ -162,7 +162,6 @@ mod tests {
                 ("kao".into(), "考".into(), 8000, 0),
                 ("hao".into(), "好".into(), 9500, 0),
             ],
-            phrases: vec![(vec!["si".into(), "kao".into()], "思考".into(), 50000, 0)],
         });
         let mut cfg = JuxuConfig::default();
         cfg.schema = schema;

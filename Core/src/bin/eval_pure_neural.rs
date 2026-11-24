@@ -7,60 +7,13 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use juxu_core::config::{InputSchema, JuxuConfig};
 use juxu_core::english::EnDictView;
+use juxu_core::eval_support::{extract_json_str as extract_str, make_obs};
 use juxu_core::format::AuxView;
 use juxu_core::neural::NeuralContextTracker;
 use juxu_core::pinyin::{decode_pinyin, PinyinDecoder};
 use juxu_core::pinyin_dict::PinyinDictView;
-use juxu_core::typo::{KeyLayout, KeyObs};
+use juxu_core::typo::KeyLayout;
 use juxu_core::user_data::UserStore;
-
-fn extract_str(line: &str, key: &str) -> String {
-    let pat = format!("\"{}\":\"", key);
-    let Some(start) = line.find(&pat) else {
-        return String::new();
-    };
-    let rest = &line[start + pat.len()..];
-    let mut out = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => break,
-            '\\' => match chars.next() {
-                Some('"') => out.push('"'),
-                Some('\\') => out.push('\\'),
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('t') => out.push('\t'),
-                Some(other) => out.push(other),
-                None => break,
-            },
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-fn make_obs(keys: &str, layout: &KeyLayout) -> Vec<KeyObs> {
-    keys.bytes()
-        .enumerate()
-        .map(|(i, b)| {
-            let ch = b.to_ascii_lowercase();
-            let (cx, cy) = if ch.is_ascii_lowercase() {
-                layout.center_of(ch)
-            } else {
-                (0.0, 0.0)
-            };
-            KeyObs {
-                ch,
-                is_upper: b.is_ascii_uppercase(),
-                norm_x: cx,
-                norm_y: cy,
-                has_touch: false,
-                timestamp_ms: 1000 + (i as u64) * 65,
-            }
-        })
-        .collect()
-}
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -113,7 +66,6 @@ fn main() {
         let dec0 = PinyinDecoder {
             dict: &dict,
             english: &english,
-            aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
             user: &user,
@@ -137,7 +89,6 @@ fn main() {
         let dec1 = PinyinDecoder {
             dict: &dict,
             english: &english,
-            aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
             user: &user,

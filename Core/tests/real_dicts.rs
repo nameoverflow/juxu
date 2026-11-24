@@ -367,9 +367,9 @@ fn real_dicts_full_pinyin_and_xiaohe_sentence_and_typo() {
     let xh_dict = DictView::open_mmap(base.join("xiaohe.wbdict")).expect("open xiaohe.wbdict");
     let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
 
-    let (syl_cnt, char_cnt, phrase_cnt) = pdict.stats();
-    println!("Loaded pinyin.pydict: {} syllables, {} chars, {} phrases", syl_cnt, char_cnt, phrase_cnt);
-    assert!(syl_cnt > 390 && char_cnt > 8000 && phrase_cnt == 0);
+    let (syl_cnt, char_cnt) = pdict.stats();
+    println!("Loaded pinyin.pydict (PYDICT02): {} syllables, {} chars", syl_cnt, char_cnt);
+    assert!(syl_cnt > 390 && char_cnt > 8000);
 
     // 1. Full Pinyin real-dict sentence + abbr + apostrophe + touch typo + latency
     let mut cfg = JuxuConfig::default();
@@ -586,7 +586,7 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
     for round in 0..3u64 {
         engine.clear_context();
         let base_t = 5000 + round * 1000;
-        let _ = engine.user.record_commit_with_surprisal(
+        let _ = engine.user.record_commit(
             "",
             "我",
             base_t,
@@ -594,9 +594,10 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
             2,
             engine.dicts[0].as_ref(),
             engine.pinyin_dict.as_ref(),
-            Some(2.0),
+            false,
+            None,
         );
-        let _ = engine.user.record_commit_with_surprisal(
+        let _ = engine.user.record_commit(
             "我",
             "的",
             base_t + 200,
@@ -604,7 +605,8 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
             2,
             engine.dicts[0].as_ref(),
             engine.pinyin_dict.as_ref(),
-            Some(0.8), // very low surprisal (RWKV strongly predicts '的' after '我')
+            false,
+            None,
         );
     }
     assert!(
@@ -612,12 +614,12 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
         "low-surprisal glue pair '我的' must not be promoted into user phrases"
     );
 
-    // Rare coined term "星锚" (high surprisal = 8.5 nats) requires repeat (2 bursts) so accidental
+    // Rare coined term "星锚" requires repeat (2 bursts) so accidental
     // cross-word pairs don't pollute phrases, then immediately indexes into Full Pinyin!
     let mut promoted = None;
     for round in 0..2u64 {
         let base_t = 9000 + round * 1000;
-        let _ = engine.user.record_commit_with_surprisal(
+        let _ = engine.user.record_commit(
             "",
             "星",
             base_t,
@@ -625,9 +627,10 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
             2,
             engine.dicts[0].as_ref(),
             engine.pinyin_dict.as_ref(),
-            Some(5.0),
+            false,
+            None,
         );
-        promoted = engine.user.record_commit_with_surprisal(
+        promoted = engine.user.record_commit(
             "星",
             "锚",
             base_t + 200,
@@ -635,7 +638,8 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
             2,
             engine.dicts[0].as_ref(),
             engine.pinyin_dict.as_ref(),
-            Some(8.5),
+            false,
+            None,
         );
     }
     assert_eq!(promoted.as_deref(), Some("星锚"));
@@ -774,7 +778,7 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
         engine.user.break_single_burst();
         if round == 0 {
             for (i, ch) in ["哈", "基", "米"].iter().enumerate() {
-                let _ = engine.user.record_commit_with_surprisal(
+                let _ = engine.user.record_commit(
                     "",
                     ch,
                     base_t + i as u64 * 150,
@@ -782,12 +786,13 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
                     2,
                     engine.dicts[0].as_ref(),
                     engine.pinyin_dict.as_ref(),
-                    Some(5.5),
+                    false,
+                    None,
                 );
             }
         } else {
             // Mixed 2-char + 1-char burst ("哈基" + "米")
-            let _ = engine.user.record_commit_with_surprisal(
+            let _ = engine.user.record_commit(
                 "",
                 "哈基",
                 base_t,
@@ -795,9 +800,10 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
                 2,
                 engine.dicts[0].as_ref(),
                 engine.pinyin_dict.as_ref(),
-                Some(5.5),
+                false,
+                None,
             );
-            let _ = engine.user.record_commit_with_surprisal(
+            let _ = engine.user.record_commit(
                 "哈基",
                 "米",
                 base_t + 150,
@@ -805,7 +811,8 @@ fn integrated_cross_mode_auto_phrase_and_rwkv_next_key_priors() {
                 2,
                 engine.dicts[0].as_ref(),
                 engine.pinyin_dict.as_ref(),
-                Some(5.5),
+                false,
+                None,
             );
         }
     }
@@ -1117,6 +1124,8 @@ fn real_dicts_log_driven_strategy_regressions_pinyin_and_spaceless_wubi98() {
         "expected genuine word at #1 for 'haoshi', got top3={:?}",
         haoshi_top3
     );
+    // With PYDICT02's corrected char_emission_logp weight offset, misread polyphone '好似' (si vs shi)
+    // is properly penalized out of top-3 while genuine '好事' stays #1 and '号是' stays out of top-3.
     assert!(
         haoshi_top3[0] != "好是"
             && !haoshi_top3.contains(&"号是".to_string())
@@ -1779,4 +1788,398 @@ fn real_dicts_zero_hardcode_mixed_cn_en_and_unified_pinyin() {
         "1-shot learned new word 'Agy' must immediately appear in T9 ('249'), got {:?}",
         t9_cands
     );
+}
+
+#[test]
+fn config_json_toml_roundtrip_and_ffi_exports() {
+    use juxu_core::config::{
+        CandidateOrientation, FourthEmptyBehavior, ShiftToggleMode, TypoConfig,
+    };
+    use juxu_core::ffi::{
+        juxu_config_json_to_toml, juxu_config_toml_to_json, juxu_engine_free,
+        juxu_engine_get_config_json, juxu_engine_new, juxu_engine_set_config_json,
+        juxu_string_free,
+    };
+    use std::ffi::{CStr, CString};
+
+    // Check exact default values of the 8 UI booleans
+    let def = JuxuConfig::default();
+    assert!(def.clipboard_suggestion);
+    assert!(def.cangjie_keycap_radicals);
+    assert!(!def.wubi_keycap_radicals);
+    assert!(!def.key_swipe_up_input);
+    assert!(!def.space_comma_key);
+    assert!(!def.key_long_press_alternates);
+    assert!(!def.backspace_swipe_clear);
+    assert!(!def.keyboard_hold_cursor);
+
+    let custom = JuxuConfig {
+        schema: InputSchema::Cangjie5,
+        page_size: 7,
+        orientation: CandidateOrientation::Vertical,
+        shift_toggle_mode: ShiftToggleMode::CommitFirst,
+        smart_punctuation: false,
+        semicolon_quote_select: true,
+        auto_space_zh_en: false,
+        auto_space_digits: false,
+        clipboard_suggestion: false,
+        cangjie_keycap_radicals: false,
+        wubi_keycap_radicals: true,
+        key_swipe_up_input: true,
+        space_comma_key: true,
+        key_long_press_alternates: true,
+        backspace_swipe_clear: true,
+        keyboard_hold_cursor: true,
+        eval_logging: true,
+        emoji_candidates: false,
+        fourth_code_auto_commit: false,
+        fifth_code_push_commit: false,
+        fourth_empty_behavior: FourthEmptyBehavior::Clear,
+        shortest_code_first: false,
+        strict_shortcode: true,
+        spaceless: true,
+        show_shortcode_hint: false,
+        dynamic_word_freq: false,
+        dynamic_char_freq: true,
+        auto_phrase: false,
+        auto_phrase_threshold: 4,
+        z_omnipotent: false,
+        enable_rare_charset: true,
+        pinyin_initial_abbr: false,
+        pinyin_t9_layout: true,
+        typo: TypoConfig {
+            enabled: false,
+            touch_hitbox_adapt: false,
+            promote_threshold: 0.77,
+            suggest_threshold: 0.31,
+            suppress_auto_commit_on_correction: false,
+            missed_space_correction: false,
+        },
+    };
+
+    let json = custom.to_json_string();
+    assert!(json.contains("\"schemaId\":35"));
+    assert!(json.contains("\"shiftToggleMode\":\"commit_cand\""));
+    assert!(json.contains("\"clipboardSuggestion\":false"));
+    assert!(json.contains("\"wubiKeycapRadicals\":true"));
+    assert!(json.contains("\"keyboardHoldCursor\":true"));
+
+    let from_json = JuxuConfig::from_json_str(&json);
+    let toml = from_json.to_toml_string();
+    let roundtrip = JuxuConfig::from_toml_str(&toml);
+
+    assert_eq!(roundtrip.schema, InputSchema::Cangjie5);
+    assert_eq!(roundtrip.page_size, 7);
+    assert_eq!(roundtrip.orientation, CandidateOrientation::Vertical);
+    assert_eq!(roundtrip.shift_toggle_mode, ShiftToggleMode::CommitFirst);
+    assert!(!roundtrip.smart_punctuation);
+    assert!(roundtrip.semicolon_quote_select);
+    assert!(!roundtrip.auto_space_zh_en);
+    assert!(!roundtrip.auto_space_digits);
+    assert!(!roundtrip.clipboard_suggestion);
+    assert!(!roundtrip.cangjie_keycap_radicals);
+    assert!(roundtrip.wubi_keycap_radicals);
+    assert!(roundtrip.key_swipe_up_input);
+    assert!(roundtrip.space_comma_key);
+    assert!(roundtrip.key_long_press_alternates);
+    assert!(roundtrip.backspace_swipe_clear);
+    assert!(roundtrip.keyboard_hold_cursor);
+    assert!(roundtrip.eval_logging);
+    assert!(!roundtrip.emoji_candidates);
+    assert!(!roundtrip.fourth_code_auto_commit);
+    assert!(!roundtrip.fifth_code_push_commit);
+    assert_eq!(roundtrip.fourth_empty_behavior, FourthEmptyBehavior::Clear);
+    assert!(!roundtrip.shortest_code_first);
+    assert!(roundtrip.strict_shortcode);
+    assert!(roundtrip.spaceless);
+    assert!(!roundtrip.show_shortcode_hint);
+    assert!(!roundtrip.dynamic_word_freq);
+    assert!(roundtrip.dynamic_char_freq);
+    assert!(!roundtrip.auto_phrase);
+    assert_eq!(roundtrip.auto_phrase_threshold, 4);
+    assert!(!roundtrip.z_omnipotent);
+    assert!(roundtrip.enable_rare_charset);
+    assert!(!roundtrip.pinyin_initial_abbr);
+    assert!(roundtrip.pinyin_t9_layout);
+    assert!(!roundtrip.typo.enabled);
+    assert!(!roundtrip.typo.touch_hitbox_adapt);
+    assert!((roundtrip.typo.promote_threshold - 0.77).abs() < 1e-4);
+    assert!((roundtrip.typo.suggest_threshold - 0.31).abs() < 1e-4);
+    assert!(!roundtrip.typo.suppress_auto_commit_on_correction);
+    assert!(!roundtrip.typo.missed_space_correction);
+
+    // Exercise C FFI TOML <-> JSON converters and engine JSON config getters/setters
+    unsafe {
+        let c_toml = CString::new(toml).unwrap();
+        let json_ptr = juxu_config_toml_to_json(c_toml.as_ptr());
+        assert!(!json_ptr.is_null());
+        let ffi_json = CStr::from_ptr(json_ptr).to_str().unwrap().to_owned();
+        juxu_string_free(json_ptr);
+
+        let c_json = CString::new(ffi_json).unwrap();
+        let toml_ptr = juxu_config_json_to_toml(c_json.as_ptr());
+        assert!(!toml_ptr.is_null());
+        let ffi_toml = CStr::from_ptr(toml_ptr).to_str().unwrap().to_owned();
+        juxu_string_free(toml_ptr);
+        assert_eq!(JuxuConfig::from_toml_str(&ffi_toml).schema, InputSchema::Cangjie5);
+
+        let handle = juxu_engine_new();
+        assert!(!handle.is_null());
+        juxu_engine_set_config_json(handle, c_json.as_ptr());
+        let got_ptr = juxu_engine_get_config_json(handle);
+        let got_cfg = JuxuConfig::from_json_str(CStr::from_ptr(got_ptr).to_str().unwrap());
+        juxu_string_free(got_ptr);
+        juxu_engine_free(handle);
+        assert!(got_cfg.wubi_keycap_radicals);
+        assert!(got_cfg.keyboard_hold_cursor);
+        assert_eq!(got_cfg.page_size, 7);
+    }
+}
+
+#[test]
+fn commit_pending_wubi_pinyin_and_ffi() {
+    use juxu_core::ffi::{
+        juxu_engine_commit_pending_json, juxu_engine_free, juxu_engine_handle_key_json,
+        juxu_engine_load_dict_mmap, juxu_engine_new, juxu_engine_set_touch_profile,
+        juxu_string_free,
+    };
+    use juxu_core::pinyin_dict::PinyinDictView;
+    use std::ffi::{CStr, CString};
+
+    let base = dicts_dir();
+    let d86 = DictView::open_mmap(base.join("wubi86.wbdict")).expect("open wubi86.wbdict");
+    let pdict = PinyinDictView::from_file(base.join("pinyin.pydict")).expect("open pinyin.pydict");
+    let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
+
+    let mut engine = JuxuEngine::new(JuxuConfig::default());
+    engine.load_dict(InputSchema::Wubi86, d86);
+    engine.load_pinyin_dict(pdict);
+    engine.set_aux(aux);
+
+    // 1. Idle engine -> non-consumed empty output
+    let idle = engine.commit_pending(100);
+    assert!(!idle.consumed);
+    assert!(idle.commit_text.is_empty());
+
+    // 2. Wubi composing ("lgy" -> 3-key prefix with "国" at #1, not yet auto-committed) -> commit_pending commits #1
+    for ch in "lgy".chars() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 200);
+    }
+    assert!(engine.is_composing());
+    let wb_out = engine.commit_pending(250);
+    assert!(wb_out.consumed);
+    assert_eq!(wb_out.commit_text, "国");
+    assert!(!engine.is_composing());
+
+    // 3. Multi-syllable Full Pinyin + partial prefix selection + commit_pending flush
+    engine.set_schema(InputSchema::Pinyin);
+    for (i, ch) in "womenshurufa".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 300 + i as u64 * 20);
+    }
+    let py_out = engine.commit_pending(600);
+    assert!(py_out.consumed);
+    assert_eq!(py_out.commit_text, "我们输入法");
+    assert!(py_out.preedit.is_empty());
+    assert!(!engine.is_composing());
+
+    // Partial selection first ("zhegejianpan" -> select "这"), then commit_pending flushes remaining "个键盘"
+    for (i, ch) in "zhegejianpan".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 700 + i as u64 * 20);
+    }
+    let idx_zhe = engine.all_candidates().iter().position(|c| c.text == "这").unwrap();
+    let part = engine.select_abs_candidate(idx_zhe, 950).unwrap();
+    assert_eq!(part.commit_text, "这");
+    assert!(engine.is_composing());
+    let rest = engine.commit_pending(1000);
+    assert!(rest.consumed);
+    assert_eq!(rest.commit_text, "个键盘");
+    assert!(!engine.is_composing());
+
+    // 4. C FFI `juxu_engine_commit_pending_json`
+    unsafe {
+        let handle = juxu_engine_new();
+        let wb_cpath = CString::new(base.join("wubi86.wbdict").to_str().unwrap()).unwrap();
+        assert!(juxu_engine_load_dict_mmap(handle, 86, wb_cpath.as_ptr()));
+        let mut offsets = [0.0f32; 52];
+        let mut counts = [0u32; 26];
+        offsets[0] = -0.10;
+        counts[0] = 5;
+        juxu_engine_set_touch_profile(handle, offsets.as_ptr(), counts.as_ptr());
+
+        let k_ptr = juxu_engine_handle_key_json(handle, 0, 'q' as u32, false, 1100);
+        let k_json = CStr::from_ptr(k_ptr).to_str().unwrap().to_owned();
+        juxu_string_free(k_ptr);
+        // Non-committing keystroke must omit touchOffsets arrays even when calibrated_keys > 0
+        assert!(!k_json.contains("\"touchOffsets\""));
+
+        let cp_ptr = juxu_engine_commit_pending_json(handle, 1150);
+        let cp_json = CStr::from_ptr(cp_ptr).to_str().unwrap().to_owned();
+        juxu_string_free(cp_ptr);
+        assert!(cp_json.contains("\"commitText\":\"我\""));
+        assert!(cp_json.contains("\"preedit\":\"\""));
+        assert!(cp_json.contains("\"touchOffsets\""));
+        juxu_engine_free(handle);
+    }
+}
+
+#[test]
+fn smart_quote_state_reset_on_clear_context_and_reset_quote_state() {
+    use juxu_core::ffi::{
+        juxu_engine_free, juxu_engine_handle_key_json, juxu_engine_new,
+        juxu_engine_reset_quote_state, juxu_string_free,
+    };
+    use std::ffi::CStr;
+
+    let mut eng = JuxuEngine::new(JuxuConfig::default());
+
+    // Open both double and single smart quotes, then verify clear_context() resets both!
+    assert_eq!(eng.handle_key_event(0, Some('"'), false, 100).commit_text, "“");
+    assert_eq!(eng.handle_key_event(0, Some('\''), false, 120).commit_text, "‘");
+    eng.clear_context();
+    assert_eq!(eng.handle_key_event(0, Some('"'), false, 140).commit_text, "“");
+    assert_eq!(eng.handle_key_event(0, Some('\''), false, 160).commit_text, "‘");
+
+    // Verify reset_quote_state() resets both while keeping normal toggle afterward
+    eng.reset_quote_state();
+    assert_eq!(eng.handle_key_event(0, Some('"'), false, 180).commit_text, "“");
+    assert_eq!(eng.handle_key_event(0, Some('"'), false, 200).commit_text, "”");
+    assert_eq!(eng.handle_key_event(0, Some('\''), false, 220).commit_text, "‘");
+    assert_eq!(eng.handle_key_event(0, Some('\''), false, 240).commit_text, "’");
+
+    // Verify C FFI `juxu_engine_reset_quote_state`
+    unsafe {
+        let handle = juxu_engine_new();
+        let p1 = juxu_engine_handle_key_json(handle, 0, '"' as u32, false, 300);
+        assert!(CStr::from_ptr(p1).to_str().unwrap().contains("\"commitText\":\"“\""));
+        juxu_string_free(p1);
+
+        juxu_engine_reset_quote_state(handle);
+        let p2 = juxu_engine_handle_key_json(handle, 0, '"' as u32, false, 350);
+        assert!(CStr::from_ptr(p2).to_str().unwrap().contains("\"commitText\":\"“\""));
+        juxu_string_free(p2);
+        juxu_engine_free(handle);
+    }
+}
+
+#[test]
+fn page_turn_preserves_pinyin_segmented_preedit_and_ffi() {
+    use juxu_core::engine::{KEY_EQUAL, KEY_MINUS};
+    use juxu_core::ffi::{
+        juxu_engine_free, juxu_engine_handle_key_json, juxu_engine_load_aux_mmap,
+        juxu_engine_load_pinyin_dict_mmap, juxu_engine_new, juxu_engine_page_turn_json,
+        juxu_engine_set_config_json, juxu_string_free,
+    };
+    use juxu_core::pinyin_dict::PinyinDictView;
+    use std::ffi::{CStr, CString};
+
+    let base = dicts_dir();
+    let pdict = PinyinDictView::from_file(base.join("pinyin.pydict")).expect("open pinyin.pydict");
+    let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
+
+    let mut cfg = JuxuConfig::default();
+    cfg.schema = InputSchema::Pinyin;
+    cfg.page_size = 5;
+    let mut engine = JuxuEngine::new(cfg.clone());
+    engine.load_pinyin_dict(pdict);
+    engine.set_aux(aux);
+
+    for (i, ch) in "shishijiu".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 100 + i as u64 * 25);
+    }
+    let expected_preedit = engine.preedit();
+    assert_ne!(expected_preedit, "shishijiu", "Pinyin preedit should be decoded/segmented");
+
+    let next_eq = engine.handle_key_event(0, Some('='), false, 400);
+    assert_eq!(next_eq.preedit, expected_preedit);
+    let prev_minus = engine.handle_key_event(0, Some('-'), false, 420);
+    assert_eq!(prev_minus.preedit, expected_preedit);
+    let next_vk = engine.handle_key_event(KEY_EQUAL, None, false, 440);
+    assert_eq!(next_vk.preedit, expected_preedit);
+    let prev_vk = engine.handle_key_event(KEY_MINUS, None, false, 460);
+    assert_eq!(prev_vk.preedit, expected_preedit);
+
+    // Verify FFI `juxu_engine_page_turn_json` preserves decoded/segmented Pinyin preedit
+    unsafe {
+        let handle = juxu_engine_new();
+        let cfg_json = CString::new(cfg.to_json_string()).unwrap();
+        juxu_engine_set_config_json(handle, cfg_json.as_ptr());
+        let py_path = CString::new(base.join("pinyin.pydict").to_str().unwrap()).unwrap();
+        let aux_path = CString::new(base.join("wubi_aux.wbaux").to_str().unwrap()).unwrap();
+        assert!(juxu_engine_load_pinyin_dict_mmap(handle, py_path.as_ptr()));
+        assert!(juxu_engine_load_aux_mmap(handle, aux_path.as_ptr()));
+
+        for (i, &b) in b"shishijiu".iter().enumerate() {
+            let p = juxu_engine_handle_key_json(handle, 0, b as u32, false, 500 + i as u64 * 20);
+            juxu_string_free(p);
+        }
+        let pt = juxu_engine_page_turn_json(handle, 1);
+        let pt_str = CStr::from_ptr(pt).to_str().unwrap().to_owned();
+        juxu_string_free(pt);
+        let expected_tag = format!("\"preedit\":\"{}\"", expected_preedit);
+        assert!(
+            pt_str.contains(&expected_tag),
+            "expected FFI page turn JSON to contain {}, got {}",
+            expected_tag,
+            pt_str
+        );
+        juxu_engine_free(handle);
+    }
+}
+
+#[test]
+fn user_data_cap_prunes_to_6144_without_freezing_learning() {
+    let mut store = UserStore::default();
+
+    // Populate 6144 high-count entries (count = 3) and 2048 single-shot entries (count = 1) => total 8192
+    let ch_a0 = char::from_u32(0x4E00).unwrap();
+    let ch_b0 = char::from_u32(0x4F00).unwrap();
+    for i in 0..8192u32 {
+        let ch_a = char::from_u32(0x4E00 + (i / 96)).unwrap();
+        let ch_b = char::from_u32(0x4F00 + (i % 96)).unwrap();
+        let prev = format!("前{i}{ch_a}");
+        let curr = format!("{ch_b}后{i}");
+        let cnt = if i < 6144 { 3 } else { 1 };
+        store.unigram_counts.insert(curr.clone(), cnt);
+        store.word_bigrams.insert((prev, curr), cnt);
+        store.char_bigrams.insert((ch_a, ch_b), cnt);
+    }
+    assert_eq!(store.unigram_counts.len(), 8192);
+    assert_eq!(store.word_bigrams.len(), 8192);
+    assert_eq!(store.char_bigrams.len(), 8192);
+
+    // 1. Existing keys at 8192 cap must STILL increment without triggering pruning
+    let existing_prev = format!("前0{ch_a0}");
+    let existing_curr = format!("{ch_b0}后0");
+    let _ = store.record_commit(&existing_prev, &existing_curr, 1_000, false, 2, None, None, false, None);
+    assert_eq!(store.unigram_counts.len(), 8192);
+    assert_eq!(store.word_bigrams.len(), 8192);
+    assert_eq!(store.char_bigrams.len(), 8192);
+    assert_eq!(store.unigram_counts.get(&existing_curr), Some(&4));
+    assert_eq!(store.word_bigrams.get(&(existing_prev, existing_curr.clone())), Some(&4));
+    assert_eq!(store.char_bigrams.get(&(ch_a0, ch_b0)), Some(&4));
+
+    // 2. Inserting a brand-new 8193rd entry prunes lowest-count entries down to 6144 across all 3 maps
+    //    while keeping the newly learned entry and preserving high-count entries!
+    let _ = store.record_commit("新左", "新右", 2_000, false, 2, None, None, false, None);
+    assert_eq!(store.unigram_counts.len(), 6144);
+    assert_eq!(store.word_bigrams.len(), 6144);
+    assert_eq!(store.char_bigrams.len(), 6144);
+    assert_eq!(store.unigram_counts.get("新右"), Some(&1), "new unigram must survive pruning");
+    assert_eq!(
+        store.word_bigrams.get(&("新左".to_string(), "新右".to_string())),
+        Some(&1),
+        "new word bigram must be learned instead of frozen at 8192"
+    );
+    assert_eq!(
+        store.char_bigrams.get(&('左', '新')),
+        Some(&1),
+        "new char bigram must be learned instead of frozen at 8192"
+    );
+    assert_eq!(store.unigram_counts.get(&existing_curr), Some(&4));
+
+    // Verify TSV header written on export is `# Juxu User Data v1` and round-trips cleanly
+    let tsv = store.to_tsv_string();
+    assert!(tsv.starts_with("# Juxu User Data v1\n"));
+    let reloaded = UserStore::from_tsv_str(&tsv);
+    assert_eq!(reloaded.unigram_counts.get(&existing_curr), Some(&4));
 }

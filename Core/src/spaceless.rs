@@ -733,7 +733,7 @@ impl Stream {
             let state = if step.is_latin {
                 let (lp, st) = decoder
                     .model
-                    .score_and_step_latin(&step.parent.state, &step.text, true, true);
+                    .score_and_step_latin(&step.parent.state, &step.text, true);
                 score += lp;
                 for ch in step.text.chars() {
                     personal_context = personal_context.push(ch);

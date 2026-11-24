@@ -1,6 +1,19 @@
 import CoreGraphics
 import Foundation
 
+private func check(
+    _ condition: @autoclosure () -> Bool,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #file,
+    line: UInt = #line
+) {
+    if !condition() {
+        fputs("Check failed: \(message()) at \(file):\(line)\n", stderr)
+        fflush(stderr)
+        exit(1)
+    }
+}
+
 @main
 struct IOSKeyboardTests {
     @MainActor
@@ -8,11 +21,11 @@ struct IOSKeyboardTests {
         // 1. Verify exact iOS 26 440pt Pro Max grid alignment against Apple reference telemetry!
         var layout = IOSKeyboardLayoutEngine()
         let snap = layout.computeLayout(in: CGSize(width: 440, height: 225))
-        assert(snap.keys.count == 32, "Expected 26 letters + Shift + Del + 4 bottom keys = 32, got \(snap.keys.count)")
+        check(snap.keys.count == 32, "Expected 26 letters + Shift + Del + 4 bottom keys = 32, got \(snap.keys.count)")
 
         let qKey = snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })!
-        assert(qKey.primaryLabel == "q", "Expected lowercase 'q' in iOS 26 default mode, got \(qKey.primaryLabel)")
-        assert(abs(qKey.frame.width - 37.27) < 0.25, "Expected ~37.27pt key width on 440pt canvas, got \(qKey.frame.width)")
+        check(qKey.primaryLabel == "q", "Expected lowercase 'q' in iOS 26 default mode, got \(qKey.primaryLabel)")
+        check(abs(qKey.frame.width - 37.27) < 0.25, "Expected ~37.27pt key width on 440pt canvas, got \(qKey.frame.width)")
 
         // Verify column-for-column invariants: `z` == `s`, `Space` == `d..j`, `Return` == `k..p`!
         let sKey = snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "s")) })!
@@ -23,61 +36,63 @@ struct IOSKeyboardTests {
         let spaceKey = snap.keys.first(where: { $0.kind == .space })!
         let returnKey = snap.keys.first(where: { $0.kind == .returnKey })!
 
-        assert(abs(zKey.frame.minX - sKey.frame.minX) < 0.01, "z.minX must equal s.minX")
-        assert(abs(spaceKey.frame.minX - dKey.frame.minX) < 0.01, "Space.minX must equal d.minX")
-        assert(abs(spaceKey.frame.maxX - jKey.frame.maxX) < 0.01, "Space.maxX must equal j.maxX")
-        assert(abs(returnKey.frame.minX - kKey.frame.minX) < 0.01, "Return.minX must equal k.minX")
-        assert(spaceKey.cornerSubscript == "五", "Spacebar must show subtle corner '五'")
-        assert(returnKey.systemSymbol == "return.left", "Normal return key must use return.left symbol")
+        check(abs(zKey.frame.minX - sKey.frame.minX) < 0.01, "z.minX must equal s.minX")
+        check(abs(spaceKey.frame.minX - dKey.frame.minX) < 0.01, "Space.minX must equal d.minX")
+        check(abs(spaceKey.frame.maxX - jKey.frame.maxX) < 0.01, "Space.maxX must equal j.maxX")
+        check(abs(returnKey.frame.minX - kKey.frame.minX) < 0.01, "Return.minX must equal k.minX")
+        check(spaceKey.cornerSubscript == "五", "Spacebar must show subtle corner '五'")
+        check(returnKey.systemSymbol == "return.left", "Normal return key must use return.left symbol")
 
         // 2. Test Voronoi gutter hit-testing
         let tKey = snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "t")) })!
         let yKey = snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "y")) })!
         let gutterMid = CGPoint(x: (tKey.frame.maxX + yKey.frame.minX) * 0.5 - 0.5, y: tKey.frame.midY)
         let gutterHit = IOSKeyboardLayoutEngine.hitTest(point: gutterMid, in: snap)
-        assert(gutterHit?.kind == .letter(UInt8(ascii: "t")))
+        check(gutterHit?.kind == .letter(UInt8(ascii: "t")))
 
         // 3. Test Shift -> Uppercase (`Q`) -> Double-tap CapsLock -> Lowercase (`q`)
         layout.tapShift(at: 10.0)
-        assert(layout.shiftState == .upperOnce)
+        check(layout.shiftState == .upperOnce)
         let upperSnap = layout.computeLayout(in: CGSize(width: 440, height: 225))
         let upperQ = upperSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })!
-        assert(upperQ.primaryLabel == "Q")
+        check(upperQ.primaryLabel == "Q")
         layout.tapShift(at: 10.20)
-        assert(layout.shiftState == .capsLocked)
+        check(layout.shiftState == .capsLocked)
         layout.tapShift(at: 11.0)
-        assert(layout.shiftState == .lower)
+        check(layout.shiftState == .lower)
 
         // 4. Test Numbers (123) and Symbols (#+=) planes + native stay-vs-return rules
         layout.switchPlane(.numbers)
         let numSnap = layout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(numSnap.keys.contains(where: { $0.primaryLabel == "1" }))
-        assert(numSnap.keys.contains(where: { $0.primaryLabel == "，" }))
-        assert(numSnap.keys.contains(where: { $0.primaryLabel == "." }))
-        assert(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("5", on: .numbers))
-        assert(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("-", on: .numbers))
-        assert(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("/", on: .numbers))
-        assert(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("：", on: .numbers))
-        assert(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol(".", on: .numbers))
-        assert(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("￥", on: .numbers))
-        assert(IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("，", on: .numbers))
-        assert(IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("。", on: .numbers))
-        assert(IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("（", on: .numbers))
-        assert(IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("；", on: .numbers))
+        check(numSnap.keys.contains(where: { $0.primaryLabel == "1" }))
+        check(numSnap.keys.contains(where: { $0.primaryLabel == "，" }))
+        check(numSnap.keys.contains(where: { $0.primaryLabel == "." }))
+        check(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("5", on: .numbers))
+        check(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("-", on: .numbers))
+        check(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("/", on: .numbers))
+        check(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("：", on: .numbers))
+        check(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol(".", on: .numbers))
+        check(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("￥", on: .numbers))
+        check(IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("，", on: .numbers))
+        check(IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("。", on: .numbers))
+        check(IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("（", on: .numbers))
+        check(IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("；", on: .numbers))
         layout.switchPlane(.symbols)
         let symSnap = layout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(symSnap.keys.contains(where: { $0.primaryLabel == "《" }))
-        assert(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("～", on: .symbols))
-        assert(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("…", on: .symbols))
-        assert(IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("《", on: .symbols))
-        assert(IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("+", on: .symbols))
+        check(symSnap.keys.contains(where: { $0.primaryLabel == "《" }))
+        check(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("～", on: .symbols))
+        check(!IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("…", on: .symbols))
+        check(IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("《", on: .symbols))
+        check(IOSKeyboardLayoutEngine.shouldReturnToLettersAfterSymbol("+", on: .symbols))
         layout.switchPlane(.letters)
 
         // 5. Test Spacebar Trackpad Cursor Accumulator
         var trackpad = SpaceTrackpadAccumulator()
         trackpad.begin(at: 180.0)
-        assert(trackpad.update(x: 200.0) == 2)
-        assert(trackpad.update(x: 189.0) == -1)
+        let stepRight = trackpad.update(x: 200.0)
+        check(stepRight == 2)
+        let stepLeft = trackpad.update(x: 189.0)
+        check(stepLeft == -1)
         trackpad.end()
 
         // 6. Test end-to-end iOS 26 view coordinates -> Rust juxu-core touch slip rescue & drift learning!
@@ -101,18 +116,18 @@ struct IOSKeyboardTests {
         _ = bridge.pushTouch(reportedAscii: UInt8(ascii: "r"), x: Float(rKey.frame.midX), y: Float(rKey.frame.midY), isNormalized: false, timestampMs: 1070)
         _ = bridge.pushTouch(reportedAscii: UInt8(ascii: "w"), x: Float(wKey.frame.midX), y: Float(wKey.frame.midY), isNormalized: false, timestampMs: 1140)
         let out = bridge.pushTouch(reportedAscii: UInt8(ascii: "u"), x: Float(uKey.frame.midX), y: Float(uKey.frame.midY), isNormalized: false, timestampMs: 1210)
-        assert(out.candidates.first?.text == "我们", "Expected iOS 26 view-space touch slip rescue '我们'")
+        check(out.candidates.first?.text == "我们", "Expected iOS 26 view-space touch slip rescue '我们'")
 
         // 7. Verify clean typographic mode toggle key (`中/英`), ergonomic downward Y-bias,
         //    and dynamic Wubi valid-next-key hitbox expansion!
         let modeKey = snap.keys.first(where: { $0.kind == .modeToggle })!
-        assert(modeKey.primaryLabel == "中" && modeKey.secondaryInlineLabel == "/英" && modeKey.systemSymbol == nil)
+        check(modeKey.primaryLabel == "中" && modeKey.secondaryInlineLabel == "/英" && modeKey.systemSymbol == nil)
 
         // Ergonomic thumb bias: tapping 2.2pt below `g`'s bottom edge (inside Row 1 -> Row 2 gutter) stays on `g`!
         let gKey = snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "g")) })!
         let lowThumbTap = CGPoint(x: gKey.frame.midX, y: gKey.frame.maxY + 6.5)
         let biasedHit = IOSKeyboardLayoutEngine.hitTest(point: lowThumbTap, in: snap)
-        assert(biasedHit?.kind == .letter(UInt8(ascii: "g")), "Expected ergonomic thumb Y-bias to keep low tap on 'g'")
+        check(biasedHit?.kind == .letter(UInt8(ascii: "g")), "Expected ergonomic thumb Y-bias to keep low tap on 'g'")
 
         // Dynamic next-key hitbox expansion: after typing "trw", 'u' is valid in Wubi 86 while 'i' is dead!
         bridge.clearComposition()
@@ -122,38 +137,38 @@ struct IOSKeyboardTests {
         let iKey = snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "i")) })!
         let uBit = UInt32(1) << UInt32(UInt8(ascii: "u") - UInt8(ascii: "a"))
         let iBit = UInt32(1) << UInt32(UInt8(ascii: "i") - UInt8(ascii: "a"))
-        assert((afterTrw.validNextMask & uBit) != 0 && (afterTrw.validNextMask & iBit) == 0, "Expected 'u' valid and 'i' invalid after 'trw'")
+        check((afterTrw.validNextMask & uBit) != 0 && (afterTrw.validNextMask & iBit) == 0, "Expected 'u' valid and 'i' invalid after 'trw'")
 
         // Tap 2.4pt inside `i`'s left border: dynamic hitbox expansion snaps cleanly to valid 'u' and auto-commits "我们"!
         let edgeInsideI = CGPoint(x: iKey.frame.minX + 2.4, y: uKey.frame.midY)
         let dynHit = IOSKeyboardLayoutEngine.hitTest(point: edgeInsideI, in: snap, validNextMask: afterTrw.validNextMask)
-        assert(dynHit?.kind == .letter(UInt8(ascii: "u")), "Expected dynamic hitbox expansion to snap border tap inside 'i' onto valid 'u'")
+        check(dynHit?.kind == .letter(UInt8(ascii: "u")), "Expected dynamic hitbox expansion to snap border tap inside 'i' onto valid 'u'")
         let commitOut = bridge.pushTouch(reportedAscii: UInt8(ascii: "u"), x: Float(edgeInsideI.x), y: Float(edgeInsideI.y), isNormalized: false, timestampMs: 2180)
-        assert(commitOut.commitText == "我们", "Expected clean 4-code auto-commit '我们' via dynamic next-key expansion, got '\(commitOut.commitText)'")
+        check(commitOut.commitText == "我们", "Expected clean 4-code auto-commit '我们' via dynamic next-key expansion, got '\(commitOut.commitText)'")
 
         // 8. Verify top-edge Spacebar tap during short-code composing (`validNextMask != all`) is NOT stolen by Row 2!
         bridge.clearComposition()
         let kState = bridge.pushTouch(reportedAscii: UInt8(ascii: "k"), x: Float(kKey.frame.midX), y: Float(kKey.frame.midY), isNormalized: false, timestampMs: 3000)
         let topEdgeSpaceTap = CGPoint(x: spaceKey.frame.midX, y: spaceKey.frame.minY - 4.0)
         let spaceHit = IOSKeyboardLayoutEngine.hitTest(point: topEdgeSpaceTap, in: snap, validNextMask: kState.validNextMask)
-        assert(spaceHit?.kind == .space, "Expected top-edge Spacebar tap during short-code composing to hit Space, got \(String(describing: spaceHit?.kind))")
+        check(spaceHit?.kind == .space, "Expected top-edge Spacebar tap during short-code composing to hit Space, got \(String(describing: spaceHit?.kind))")
 
         // 9. Verify Sacred Keycap Core: light off-center tap >= 3.0pt inside a non-continuation key ('i' after 'trw')
         //    is NEVER hijacked by adjacent valid key ('u'), while < 3.0pt bevel slip still snaps!
         let interiorInsideI = CGPoint(x: iKey.frame.minX + 3.5, y: uKey.frame.midY)
         let sacredHit = IOSKeyboardLayoutEngine.hitTest(point: interiorInsideI, in: snap, validNextMask: afterTrw.validNextMask)
-        assert(sacredHit?.kind == .letter(UInt8(ascii: "i")), "Expected sacred keycap core to preserve tap inside 'i', got \(String(describing: sacredHit?.kind))")
+        check(sacredHit?.kind == .letter(UInt8(ascii: "i")), "Expected sacred keycap core to preserve tap inside 'i', got \(String(describing: sacredHit?.kind))")
 
         // 10. Verify portrait 220pt canvas (`273pt - 53pt` ribbon) matches native 45pt keyH + 11pt rowGap + 7.0pt catch margin,
         //     and outer-margin corner tap beside 'z' never mutates to 'a' in Rust `push_touch_letter`!
         let snap220 = layout.computeLayout(in: CGSize(width: 440, height: 220))
         let space220 = snap220.keys.first(where: { $0.kind == .space })!
         let q220 = snap220.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })!
-        assert(abs(q220.frame.height - 45.0) < 0.01, "Expected 45pt key height, got \(q220.frame.height)")
-        assert(220.0 - space220.frame.maxY >= 6.5, "Expected >= 6.5pt bottom catch margin below Spacebar, got \(220.0 - space220.frame.maxY)")
+        check(abs(q220.frame.height - 45.0) < 0.01, "Expected 45pt key height, got \(q220.frame.height)")
+        check(220.0 - space220.frame.maxY >= 6.5, "Expected >= 6.5pt bottom catch margin below Spacebar, got \(220.0 - space220.frame.maxY)")
         let bottomRimSpaceTap = CGPoint(x: space220.frame.midX, y: 219.5)
         let bottomSpaceHit = IOSKeyboardLayoutEngine.hitTest(point: bottomRimSpaceTap, in: snap220, validNextMask: kState.validNextMask)
-        assert(bottomSpaceHit?.kind == .space, "Expected bottom-rim tap at y=219.5 to hit Spacebar")
+        check(bottomSpaceHit?.kind == .space, "Expected bottom-rim tap at y=219.5 to hit Spacebar")
 
         bridge.clearComposition()
         bridge.setKeyLayout(
@@ -164,54 +179,58 @@ struct IOSKeyboardTests {
             pitchY: snap220.pitchY
         )
         let z220 = snap220.keys.first(where: { $0.kind == .letter(UInt8(ascii: "z")) })!
-        let zCorner = CGPoint(x: z220.frame.minX - 9.0, y: z220.frame.minY + 3.0)
-        let zHit = IOSKeyboardLayoutEngine.hitTest(point: zCorner, in: snap220)
-        assert(zHit?.kind == .letter(UInt8(ascii: "z")), "Expected gutter tap beside 'z' to hit 'z'")
-        let zOut = bridge.pushTouch(reportedAscii: UInt8(ascii: "z"), x: Float(zCorner.x), y: Float(zCorner.y), isNormalized: false, timestampMs: 4000)
-        assert(zOut.preedit == "z", "Expected Rust view-space touch to preserve UI hit-tested 'z', got '\(zOut.preedit)'")
+        let shiftPoint = CGPoint(x: z220.frame.minX - 9.0, y: z220.frame.midY)
+        let shiftHit = IOSKeyboardLayoutEngine.hitTest(point: shiftPoint, in: snap220)
+        check(shiftHit?.kind == .shift, "Expected tap at z.minX - 9.0 (inside Shift key) to hit .shift, got \(String(describing: shiftHit?.kind))")
+
+        let zGutter = CGPoint(x: z220.frame.minX - 2.0, y: z220.frame.midY)
+        let zHit = IOSKeyboardLayoutEngine.hitTest(point: zGutter, in: snap220)
+        check(zHit?.kind == .letter(UInt8(ascii: "z")), "Expected gutter tap at z.minX - 2.0 beside 'z' to hit 'z', got \(String(describing: zHit?.kind))")
+        let zOut = bridge.pushTouch(reportedAscii: UInt8(ascii: "z"), x: Float(zGutter.x), y: Float(zGutter.y), isNormalized: false, timestampMs: 4000)
+        check(zOut.preedit == "z", "Expected Rust view-space touch to preserve UI hit-tested 'z', got '\(zOut.preedit)'")
 
         // 11. Verify native centered clipboard suggestion parser, smart OTP extraction, and changeCount caching!
         // 11a. Normal multiline text keeps original insertText and collapses displayText to single line
         let multi = IOSClipboardParser.parse(raw: "  第一行\n\n  第二行\t内容  ", changeCount: 1)!
-        assert(!multi.isOTP && multi.subtitle == "来自剪贴板")
-        assert(multi.insertText == "  第一行\n\n  第二行\t内容  ")
-        assert(multi.displayText == "第一行 第二行 内容", "Got '\(multi.displayText)'")
-        assert(IOSClipboardParser.parse(raw: "  \n\t ", changeCount: 1) == nil)
+        check(!multi.isOTP && multi.subtitle == "来自剪贴板")
+        check(multi.insertText == "  第一行\n\n  第二行\t内容  ")
+        check(multi.displayText == "第一行 第二行 内容", "Got '\(multi.displayText)'")
+        check(IOSClipboardParser.parse(raw: "  \n\t ", changeCount: 1) == nil)
 
         // 11b. Chinese & English SMS/email OTP extraction with noise filtering (years, bank card tail, URLs)
         let bankSMS = IOSClipboardParser.parse(
             raw: "【招商银行】2026年11月19日您尾号8812的卡验证码为394810，5分钟内有效。",
             changeCount: 2
         )!
-        assert(bankSMS.isOTP && bankSMS.insertText == "394810" && bankSMS.subtitle == "剪贴板验证码", "Got \(bankSMS)")
+        check(bankSMS.isOTP && bankSMS.insertText == "394810" && bankSMS.subtitle == "剪贴板验证码", "Got \(bankSMS)")
 
         let googleSMS = IOSClipboardParser.parse(
             raw: "G-591024 is your Google verification code.",
             changeCount: 3
         )!
-        assert(googleSMS.isOTP && googleSMS.insertText == "591024", "Got \(googleSMS)")
+        check(googleSMS.isOTP && googleSMS.insertText == "591024", "Got \(googleSMS)")
 
         let appleGrouped = IOSClipboardParser.parse(
             raw: "Your Apple Account verification code is: 904 281",
             changeCount: 4
         )!
-        assert(appleGrouped.isOTP && appleGrouped.insertText == "904281", "Got \(appleGrouped)")
+        check(appleGrouped.isOTP && appleGrouped.insertText == "904281", "Got \(appleGrouped)")
 
         // Non-OTP text with numbers or URLs must NOT trigger OTP extraction
         let meetingNote = IOSClipboardParser.parse(raw: "2026年11月19日开会，房间号1024", changeCount: 5)!
-        assert(!meetingNote.isOTP && meetingNote.insertText == "2026年11月19日开会，房间号1024")
+        check(!meetingNote.isOTP && meetingNote.insertText == "2026年11月19日开会，房间号1024")
 
         let otpURL = IOSClipboardParser.parse(raw: "https://example.com/otp/123456", changeCount: 6)!
-        assert(!otpURL.isOTP && otpURL.insertText == "https://example.com/otp/123456")
+        check(!otpURL.isOTP && otpURL.insertText == "https://example.com/otp/123456")
 
         let sentenceWithURL = IOSClipboardParser.parse(raw: "请打开 https://example.com/otp/123456 查看", changeCount: 7)!
-        assert(!sentenceWithURL.isOTP && sentenceWithURL.insertText == "请打开 https://example.com/otp/123456 查看")
+        check(!sentenceWithURL.isOTP && sentenceWithURL.insertText == "请打开 https://example.com/otp/123456 查看")
 
         // Pure 6-digit code promotes subtitle when focused in `.oneTimeCode` field
         let pureCodeNormal = IOSClipboardParser.parse(raw: "482916", changeCount: 8, prefersOTP: false)!
-        assert(!pureCodeNormal.isOTP && pureCodeNormal.insertText == "482916")
+        check(!pureCodeNormal.isOTP && pureCodeNormal.insertText == "482916")
         let pureCodeOTP = IOSClipboardParser.parse(raw: "482916", changeCount: 8, prefersOTP: true)!
-        assert(pureCodeOTP.isOTP && pureCodeOTP.subtitle == "剪贴板验证码" && pureCodeOTP.insertText == "482916")
+        check(pureCodeOTP.isOTP && pureCodeOTP.subtitle == "剪贴板验证码" && pureCodeOTP.insertText == "482916")
 
         // 11c. IOSClipboardSuggestionStore: readString called ONCE per changeCount, TTL, consume, dismiss
         final class InMemoryKV: IOSClipboardKeyValueStore {
@@ -230,52 +249,53 @@ struct IOSKeyboardTests {
         let clipStore = IOSClipboardSuggestionStore(store: kv, ttlSeconds: 180)
         var readCalls = 0
         // No full access -> never reads pasteboard
-        assert(clipStore.refresh(hasFullAccess: false, enabled: true, hasStrings: true, changeCount: 10, prefersOTP: false, now: 1000) {
+        let sNoAccess = clipStore.refresh(hasFullAccess: false, enabled: true, hasStrings: true, changeCount: 10, prefersOTP: false, now: 1000) {
             readCalls += 1; return "hello"
-        } == nil)
-        assert(readCalls == 0)
+        }
+        check(sNoAccess == nil)
+        check(readCalls == 0)
 
         // First observation reads once and caches
         let s1 = clipStore.refresh(hasFullAccess: true, enabled: true, hasStrings: true, changeCount: 10, prefersOTP: false, now: 1000) {
             readCalls += 1; return "482916"
         }
-        assert(s1?.insertText == "482916" && readCalls == 1)
+        check(s1?.insertText == "482916" && readCalls == 1)
 
         // Second observation with same changeCount uses cache (0 extra pasteboard reads!) and respects prefersOTP dynamically
         let s2 = clipStore.refresh(hasFullAccess: true, enabled: true, hasStrings: true, changeCount: 10, prefersOTP: true, now: 1030) {
             readCalls += 1; return "482916"
         }
-        assert(s2?.isOTP == true && readCalls == 1)
+        check(s2?.isOTP == true && readCalls == 1)
 
         // TTL expiry hides suggestion without re-reading pasteboard
         let sExpired = clipStore.refresh(hasFullAccess: true, enabled: true, hasStrings: true, changeCount: 10, prefersOTP: false, now: 1200) {
             readCalls += 1; return "482916"
         }
-        assert(sExpired == nil && readCalls == 1)
+        check(sExpired == nil && readCalls == 1)
 
         // New changeCount reads once again, then consume() permanently suppresses it
         let s3 = clipStore.refresh(hasFullAccess: true, enabled: true, hasStrings: true, changeCount: 11, prefersOTP: false, now: 1300) {
             readCalls += 1; return "新复制文本"
         }
-        assert(s3?.insertText == "新复制文本" && readCalls == 2)
+        check(s3?.insertText == "新复制文本" && readCalls == 2)
         clipStore.consume(changeCount: 11)
         let sAfterConsume = clipStore.refresh(hasFullAccess: true, enabled: true, hasStrings: true, changeCount: 11, prefersOTP: false, now: 1305) {
             readCalls += 1; return "新复制文本"
         }
-        assert(sAfterConsume == nil && readCalls == 2)
+        check(sAfterConsume == nil && readCalls == 2)
 
         // Preference TOML round-trip
         var prefs = JuxuPreferences()
-        assert(prefs.clipboardSuggestion == true)
-        assert(prefs.autoSpaceZhEn == true)
-        assert(prefs.autoSpaceDigits == true)
+        check(prefs.clipboardSuggestion == true)
+        check(prefs.autoSpaceZhEn == true)
+        check(prefs.autoSpaceDigits == true)
         prefs.clipboardSuggestion = false
         prefs.autoSpaceZhEn = false
         prefs.autoSpaceDigits = false
         let parsedPrefs = JuxuPreferences.fromTOML(prefs.toTOML())
-        assert(parsedPrefs.clipboardSuggestion == false)
-        assert(parsedPrefs.autoSpaceZhEn == false)
-        assert(parsedPrefs.autoSpaceDigits == false)
+        check(parsedPrefs.clipboardSuggestion == false)
+        check(parsedPrefs.autoSpaceZhEn == false)
+        check(parsedPrefs.autoSpaceDigits == false)
 
         // iOS-specific auto-space composition flow with `overrideBefore` (simulating `markedCode` isolation + 5th-code push)
         var iosCompTracker = AutoSpaceContextTracker()
@@ -283,66 +303,74 @@ struct IOSKeyboardTests {
         let baseBeforeMarked = iosCompTracker.effectiveBefore(hostBefore: "hello", hostBeforeIsAuthoritative: false)
         // 5th-code push commits "国" with leading space while `markedCode` becomes "q"
         let pushCommit = iosCompTracker.prepareCommit("国", hostBefore: "hello", hostBeforeIsAuthoritative: false, overrideBefore: baseBeforeMarked, splitInternal: true, options: onOpts)
-        assert(pushCommit == " 国")
+        check(pushCommit == " 国")
         let nextBase = iosCompTracker.effectiveBefore(hostBefore: "hello", hostBeforeIsAuthoritative: false)
-        assert(nextBase == "hello 国")
+        check(nextBase == "hello 国")
         let finalCommit = iosCompTracker.prepareCommit("我", hostBefore: "hello", hostBeforeIsAuthoritative: false, overrideBefore: nextBase, splitInternal: true, options: onOpts)
-        assert(finalCommit == "我")
+        check(finalCommit == "我")
         // 123-plane digit after CJK
-        assert(iosCompTracker.prepareCommit("1", hostBefore: "hello 国我", hostBeforeIsAuthoritative: false, splitInternal: false, options: onOpts) == " 1")
+        let digitCommit = iosCompTracker.prepareCommit("1", hostBefore: "hello 国我", hostBeforeIsAuthoritative: false, splitInternal: false, options: onOpts)
+        check(digitCommit == " 1")
 
         // 12. Guard against transient full-screen bounds (e.g. 440x903 while paste alert interrupts layout):
         //     keyH must stay clamped <= 48pt and all 4 rows must remain inside the 220pt visible tray!
         let transientSnap = layout.computeLayout(in: CGSize(width: 440, height: 903))
         let transientQ = transientSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })!
         let transientSpace = transientSnap.keys.first(where: { $0.kind == .space })!
-        assert(transientQ.frame.height <= 48.0, "Row 0 must never stretch on transient full-screen height, got \(transientQ.frame.height)")
-        assert(transientSpace.frame.maxY <= 220.0, "All 4 rows must fit within 220pt visible tray, space.maxY=\(transientSpace.frame.maxY)")
+        check(transientQ.frame.height <= 48.0, "Row 0 must never stretch on transient full-screen height, got \(transientQ.frame.height)")
+        check(transientSpace.frame.maxY <= 220.0, "All 4 rows must fit within 220pt visible tray, space.maxY=\(transientSpace.frame.maxY)")
 
         // 13. Non-blocking 2-step lookup + denied read (`nil`) suppresses repeat paste prompts for same changeCount
         let lookupNeeds = clipStore.lookup(hasFullAccess: true, enabled: true, hasStrings: true, changeCount: 12, prefersOTP: false, now: 1400)
-        assert(lookupNeeds == .needsRead(changeCount: 12))
+        check(lookupNeeds == .needsRead(changeCount: 12))
         let denied = clipStore.recordRead(changeCount: 12, rawText: nil, prefersOTP: false, now: 1401)
-        assert(denied == nil)
+        check(denied == nil)
         let afterDenied = clipStore.lookup(hasFullAccess: true, enabled: true, hasStrings: true, changeCount: 12, prefersOTP: false, now: 1405)
-        assert(afterDenied == .none, "Denied pasteboard read must not re-prompt for same changeCount")
+        check(afterDenied == .none, "Denied pasteboard read must not re-prompt for same changeCount")
 
         // 14. Idle next-word / next-char prediction via WBAUX003 (N-gram + Micro-RWKV-7) FFI
         bridge.setContext("")
         let starters = bridge.predictNextWords(maxCount: 8)
-        assert(starters.count == 8 && starters.first == "我")
+        check(starters.count == 8 && starters.first == "我")
 
         bridge.setContext("小红")
         let xhsPreds = bridge.predictNextWords(maxCount: 8)
-        assert(xhsPreds.first == "书", "Expected '书' after '小红', got \(xhsPreds)")
+        check(xhsPreds.first == "书", "Expected '书' after '小红', got \(xhsPreds)")
 
         bridge.setContext("情绪")
         let moodPreds = bridge.predictNextWords(maxCount: 8)
-        assert(moodPreds.prefix(3).contains("价值"), "Expected '价值' after '情绪', got \(moodPreds)")
+        check(moodPreds.prefix(3).contains("价值"), "Expected '价值' after '情绪', got \(moodPreds)")
 
         // Chained prediction via acceptPrediction + punctuation reset
         bridge.setContext("大模")
-        assert(bridge.predictNextWords(maxCount: 8).first == "型")
+        let preModelPreds = bridge.predictNextWords(maxCount: 8)
+        check(preModelPreds.first == "型")
         bridge.acceptPrediction("型", timestampMs: 3000)
         let afterModel = bridge.predictNextWords(maxCount: 8)
-        assert(afterModel.count == 8 && afterModel.first != "型")
+        check(afterModel.count == 8 && afterModel.first != "型")
 
         bridge.setContext("大模型，")
-        assert(bridge.predictNextWords(maxCount: 8) == starters, "Punctuation must reset idle predictions to starters")
+        let punctResetPreds = bridge.predictNextWords(maxCount: 8)
+        check(punctResetPreds == starters, "Punctuation must reset idle predictions to starters")
 
         // 15. Clipboard visibility gate: show only right after fresh copy or app switch before typing;
         //     hide for the rest of the session once the user types anything.
         var clipGate = IOSClipboardVisibilityGate()
-        assert(clipGate.shouldAllowDisplay(for: 20) == true)
+        let allowInitial20 = clipGate.shouldAllowDisplay(for: 20)
+        check(allowInitial20 == true)
         clipGate.markUserTyped()
-        assert(clipGate.shouldAllowDisplay(for: 20) == false, "Must stay hidden after typing in same session")
+        let allowAfterType20 = clipGate.shouldAllowDisplay(for: 20)
+        check(allowAfterType20 == false, "Must stay hidden after typing in same session")
         // Fresh copy (new changeCount) lifts suppression immediately
-        assert(clipGate.shouldAllowDisplay(for: 21) == true, "Fresh copy must allow display again")
+        let allowFresh21 = clipGate.shouldAllowDisplay(for: 21)
+        check(allowFresh21 == true, "Fresh copy must allow display again")
         clipGate.markUserTyped()
-        assert(clipGate.shouldAllowDisplay(for: 21) == false)
+        let allowAfterType21 = clipGate.shouldAllowDisplay(for: 21)
+        check(allowAfterType21 == false)
         // Switching app / reopening keyboard (`viewWillAppear`) resets typing suppression
         clipGate.resetForKeyboardAppearance()
-        assert(clipGate.shouldAllowDisplay(for: 21) == true, "App switch before typing must allow display again")
+        let allowAfterReopen21 = clipGate.shouldAllowDisplay(for: 21)
+        check(allowAfterReopen21 == true, "App switch before typing must allow display again")
 
         // 16. Verify neural `nextKeyPriors` disambiguates BOTH:
         //     (a) Key #1 predictive gutter taps (`validNextMask == 0x03FF_FFFF`), and
@@ -354,7 +382,7 @@ struct IOSKeyboardTests {
 
         // (a) Key #1: without neural priors, point 0.8pt closer to 'f' hits 'f'; with strong 'g' prior, snaps to 'g'!
         let neutralHit1 = IOSKeyboardLayoutEngine.hitTest(point: fgMidGutter, in: snap220)
-        assert(neutralHit1?.kind == .letter(UInt8(ascii: "f")))
+        check(neutralHit1?.kind == .letter(UInt8(ascii: "f")))
         var priorsKey1 = Array(repeating: UInt8(100), count: 26)
         priorsKey1[Int(UInt8(ascii: "g") - 97)] = 162
         priorsKey1[Int(UInt8(ascii: "f") - 97)] = 74
@@ -364,13 +392,13 @@ struct IOSKeyboardTests {
             validNextMask: 0x03FF_FFFF,
             nextKeyPriors: priorsKey1
         )
-        assert(neuralHit1?.kind == .letter(UInt8(ascii: "g")), "Expected Key #1 neural prior to pull disputed gutter tap to 'g'")
+        check(neuralHit1?.kind == .letter(UInt8(ascii: "g")), "Expected Key #1 neural prior to pull disputed gutter tap to 'g'")
 
         // (b) Keys #2..#4 valid-vs-valid gutter tie (both 'f' and 'g' have mask bit = 1, e.g. `im+g 没理` vs `im+f 油井`)
         let bothFGValidMask: UInt32 = (1 << UInt32(UInt8(ascii: "f") - 97)) | (1 << UInt32(UInt8(ascii: "g") - 97))
         let bevelInsideF = CGPoint(x: f220.frame.maxX - 1.8, y: f220.frame.midY)
         let flatMaskHit = IOSKeyboardLayoutEngine.hitTest(point: bevelInsideF, in: snap220, validNextMask: bothFGValidMask)
-        assert(flatMaskHit?.kind == .letter(UInt8(ascii: "f")), "Flat binary mask cannot break valid-vs-valid tie toward 'g'")
+        check(flatMaskHit?.kind == .letter(UInt8(ascii: "f")), "Flat binary mask cannot break valid-vs-valid tie toward 'g'")
         var priorsValidTie = Array(repeating: UInt8(0), count: 26)
         priorsValidTie[Int(UInt8(ascii: "g") - 97)] = 168
         priorsValidTie[Int(UInt8(ascii: "f") - 97)] = 58
@@ -380,7 +408,7 @@ struct IOSKeyboardTests {
             validNextMask: bothFGValidMask,
             nextKeyPriors: priorsValidTie
         )
-        assert(neuralTieHit?.kind == .letter(UInt8(ascii: "g")), "Expected neural valid-vs-valid prior to snap 'f' bevel slip onto 'g'")
+        check(neuralTieHit?.kind == .letter(UInt8(ascii: "g")), "Expected neural valid-vs-valid prior to snap 'f' bevel slip onto 'g'")
 
         // (c) Sacred Keycap Core (`>= 3.0pt` inside 'f') is STILL protected even under maximum 'g' neural prior!
         let coreInsideF = CGPoint(x: f220.frame.maxX - 3.6, y: f220.frame.midY)
@@ -390,7 +418,7 @@ struct IOSKeyboardTests {
             validNextMask: bothFGValidMask,
             nextKeyPriors: priorsValidTie
         )
-        assert(corePreserved?.kind == .letter(UInt8(ascii: "f")), "Sacred keycap core must never be overridden by neural priors")
+        check(corePreserved?.kind == .letter(UInt8(ascii: "f")), "Sacred keycap core must never be overridden by neural priors")
 
         // (d) Adaptive personal `touchOffsets` shift gutter ownership toward the user's calibrated key center!
         var personalOffsets = Array(repeating: Float(0), count: 52)
@@ -402,75 +430,75 @@ struct IOSKeyboardTests {
             nextKeyPriors: Array(repeating: UInt8(100), count: 26),
             touchOffsets: personalOffsets
         )
-        assert(personalHit?.kind == .letter(UInt8(ascii: "f")), "Personal right-shifted TouchProfile for 'f' should capture f/g gutter tap")
+        check(personalHit?.kind == .letter(UInt8(ascii: "f")), "Personal right-shifted TouchProfile for 'f' should capture f/g gutter tap")
 
         // (e) `compensatedLetterPoint` matches `hitTest` ergonomic Y compensation 1:1
         let row1Comp = IOSKeyboardLayoutEngine.compensatedLetterPoint(CGPoint(x: f220.frame.midX, y: f220.frame.midY), in: snap220)
-        assert(abs((f220.frame.midY - row1Comp.y) - IOSKeyboardLayoutEngine.ergonomicThumbYBias) < 0.01)
+        check(abs((f220.frame.midY - row1Comp.y) - IOSKeyboardLayoutEngine.ergonomicThumbYBias) < 0.01)
 
         // 17. Cangjie radical keycaps option + automatic fallback on ASCII/Shift/disabled
         var cjLayout = IOSKeyboardLayoutEngine()
         cjLayout.schemaId = 35
         cjLayout.cangjieKeycapRadicals = true
         let cjSnap = cjLayout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(cjSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "手")
-        assert(cjSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "a")) })?.primaryLabel == "日")
-        assert(cjSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "z")) })?.primaryLabel == "重")
-        assert(cjSnap.keys.first(where: { $0.kind == .space })?.cornerSubscript == "仓")
+        check(cjSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "手")
+        check(cjSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "a")) })?.primaryLabel == "日")
+        check(cjSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "z")) })?.primaryLabel == "重")
+        check(cjSnap.keys.first(where: { $0.kind == .space })?.cornerSubscript == "仓")
         cjLayout.asciiMode = true
         let cjAsciiSnap = cjLayout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(cjAsciiSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "q")
+        check(cjAsciiSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "q")
         cjLayout.asciiMode = false
         cjLayout.isZLookupActive = true
         let cjZLookupSnap = cjLayout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(cjZLookupSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "q")
+        check(cjZLookupSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "q")
         cjLayout.isZLookupActive = false
         cjLayout.cangjieKeycapRadicals = false
         let cjOffSnap = cjLayout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(cjOffSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "q")
+        check(cjOffSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })?.primaryLabel == "q")
         var cjPrefs = JuxuPreferences()
-        assert(cjPrefs.cangjieKeycapRadicals == true)
+        check(cjPrefs.cangjieKeycapRadicals == true)
         cjPrefs.cangjieKeycapRadicals = false
-        assert(JuxuPreferences.fromTOML(cjPrefs.toTOML()).cangjieKeycapRadicals == false)
+        check(JuxuPreferences.fromTOML(cjPrefs.toTOML()).cangjieKeycapRadicals == false)
 
         // 18. Wubi radical keycaps option (86 / 98 / 06 version-specific tables + ASCII/Shift fallback)
         var wbLayout = IOSKeyboardLayoutEngine()
         wbLayout.schemaId = 86
         wbLayout.wubiKeycapRadicals = true
         let wb86Snap = wbLayout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(wb86Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "g")) })?.keycapRadicals == "王戋\n五一")
-        assert(wb86Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "m")) })?.keycapRadicals?.contains("几") == true)
-        assert(wb86Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "z")) })?.keycapRadicals == "万能")
+        check(wb86Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "g")) })?.keycapRadicals == "王戋\n五一")
+        check(wb86Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "m")) })?.keycapRadicals?.contains("几") == true)
+        check(wb86Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "z")) })?.keycapRadicals == "万能")
         wbLayout.schemaId = 98
         let wb98Snap = wbLayout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(wb98Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "w")) })?.keycapRadicals?.contains("几") == true)
-        assert(wb98Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "b")) })?.keycapRadicals?.contains("皮") == true)
+        check(wb98Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "w")) })?.keycapRadicals?.contains("几") == true)
+        check(wb98Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "b")) })?.keycapRadicals?.contains("皮") == true)
         wbLayout.schemaId = 6
         let wb06Snap = wbLayout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(wb06Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "y")) })?.keycapRadicals?.contains("六") == true)
+        check(wb06Snap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "y")) })?.keycapRadicals?.contains("六") == true)
         wbLayout.asciiMode = true
         let wbAsciiSnap = wbLayout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(wbAsciiSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "g")) })?.keycapRadicals == nil)
+        check(wbAsciiSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "g")) })?.keycapRadicals == nil)
         var wbPrefs = JuxuPreferences()
-        assert(wbPrefs.wubiKeycapRadicals == false)
+        check(wbPrefs.wubiKeycapRadicals == false)
         wbPrefs.wubiKeycapRadicals = true
-        assert(JuxuPreferences.fromTOML(wbPrefs.toTOML()).wubiKeycapRadicals == true)
+        check(JuxuPreferences.fromTOML(wbPrefs.toTOML()).wubiKeycapRadicals == true)
 
         // 19. T9 9-key Pinyin layout geometry, ASCII fallback to 26-key, dynamic neural priors & personal T9 touchOffsets
         var t9Layout = IOSKeyboardLayoutEngine()
         t9Layout.schemaId = 20
         t9Layout.pinyinT9Layout = true
-        assert(t9Layout.isT9PinyinActive)
+        check(t9Layout.isT9PinyinActive)
         let t9Snap = t9Layout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(t9Snap.isT9Layout)
-        assert(t9Snap.t9SidebarFrame.width > 55 && t9Snap.t9SidebarFrame.height > 140)
-        assert(t9Snap.keys.filter { if case .t9Key = $0.kind { return true } else { return false } }.count == 9)
-        assert(t9Snap.keys.first(where: { $0.kind == .space })?.cornerSubscript == "九")
-        assert(t9Snap.keys.contains(where: { $0.kind == .t9Clear }))
+        check(t9Snap.isT9Layout)
+        check(t9Snap.t9SidebarFrame.width > 55 && t9Snap.t9SidebarFrame.height > 140)
+        check(t9Snap.keys.filter { if case .t9Key = $0.kind { return true } else { return false } }.count == 9)
+        check(t9Snap.keys.first(where: { $0.kind == .space })?.cornerSubscript == "九")
+        check(t9Snap.keys.contains(where: { $0.kind == .t9Clear }))
         // Verify no T9 key overlaps the left sidebar or escapes 220pt canvas
         for k in t9Snap.keys {
-            assert(!k.frame.intersects(t9Snap.t9SidebarFrame), "T9 key \(k.id) overlaps sidebar")
-            assert(k.frame.maxY <= 220.0, "T9 key \(k.id) exceeds 220pt canvas height")
+            check(!k.frame.intersects(t9Snap.t9SidebarFrame), "T9 key \(k.id) overlaps sidebar")
+            check(k.frame.maxY <= 220.0, "T9 key \(k.id) exceeds 220pt canvas height")
         }
         // Dynamic neural prior tie-breaker on the gutter between T9 key '5'(JKL) and '6'(MNO)
         let k5 = t9Snap.keys.first(where: { $0.kind == .t9Key(UInt8(ascii: "5")) })!
@@ -485,7 +513,7 @@ struct IOSKeyboardTests {
             t9ValidNextMask: 0xFF,
             t9NextKeyPriors: t9Priors
         )
-        assert(t9Hit6?.kind == .t9Key(UInt8(ascii: "6")), "T9 neural prior should arbitrate 5/6 gutter toward '6'")
+        check(t9Hit6?.kind == .t9Key(UInt8(ascii: "6")), "T9 neural prior should arbitrate 5/6 gutter toward '6'")
         // Personal T9 touchOffset shifts 5/6 gutter toward '5'
         var t9Offsets = Array(repeating: Float(0), count: 16)
         t9Offsets[Int(UInt8(ascii: "5") - UInt8(ascii: "2")) * 2] = 0.16
@@ -496,153 +524,158 @@ struct IOSKeyboardTests {
             t9NextKeyPriors: Array(repeating: UInt8(100), count: 8),
             t9TouchOffsets: t9Offsets
         )
-        assert(t9PersonalHit5?.kind == .t9Key(UInt8(ascii: "5")), "Personal T9 touchOffset should arbitrate 5/6 gutter toward '5'")
+        check(t9PersonalHit5?.kind == .t9Key(UInt8(ascii: "5")), "Personal T9 touchOffset should arbitrate 5/6 gutter toward '5'")
         // Switching to ASCII automatically restores 26-key QWERTY layout
         t9Layout.asciiMode = true
-        assert(!t9Layout.isT9PinyinActive)
+        check(!t9Layout.isT9PinyinActive)
         let t9AsciiSnap = t9Layout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(!t9AsciiSnap.isT9Layout)
-        assert(t9AsciiSnap.keys.filter { if case .letter = $0.kind { return true } else { return false } }.count == 26)
+        check(!t9AsciiSnap.isT9Layout)
+        check(t9AsciiSnap.keys.filter { if case .letter = $0.kind { return true } else { return false } }.count == 26)
         // Preferences TOML roundtrip
         var t9Prefs = JuxuPreferences()
-        assert(t9Prefs.pinyinT9Layout == false)
+        check(t9Prefs.pinyinT9Layout == false)
         t9Prefs.pinyinT9Layout = true
-        assert(JuxuPreferences.fromTOML(t9Prefs.toTOML()).pinyinT9Layout == true)
+        check(JuxuPreferences.fromTOML(t9Prefs.toTOML()).pinyinT9Layout == true)
 
         // Swipe-up secondary input
-        assert(IOSSwipeUp.symbol(for: UInt8(ascii: "q"), asciiMode: false) == "1")
-        assert(IOSSwipeUp.symbol(for: UInt8(ascii: "p"), asciiMode: true) == "0")
-        assert(IOSSwipeUp.symbol(for: UInt8(ascii: "d"), asciiMode: false) == "：")
-        assert(IOSSwipeUp.symbol(for: UInt8(ascii: "d"), asciiMode: true) == ":")
-        assert(IOSSwipeUp.symbol(for: UInt8(ascii: "l"), asciiMode: true) == "\"")
+        check(IOSSwipeUp.symbol(for: UInt8(ascii: "q"), asciiMode: false) == "1")
+        check(IOSSwipeUp.symbol(for: UInt8(ascii: "p"), asciiMode: true) == "0")
+        check(IOSSwipeUp.symbol(for: UInt8(ascii: "d"), asciiMode: false) == "：")
+        check(IOSSwipeUp.symbol(for: UInt8(ascii: "d"), asciiMode: true) == ":")
+        check(IOSSwipeUp.symbol(for: UInt8(ascii: "l"), asciiMode: true) == "\"")
         for b in Array("abcdefghijklmnopqrstuvwxyz".utf8) {
-            assert(IOSSwipeUp.symbol(for: b, asciiMode: false) != nil)
-            assert(IOSSwipeUp.symbol(for: b, asciiMode: true) != nil)
+            check(IOSSwipeUp.symbol(for: b, asciiMode: false) != nil)
+            check(IOSSwipeUp.symbol(for: b, asciiMode: true) != nil)
         }
         var swipeLayout = IOSKeyboardLayoutEngine()
         swipeLayout.swipeUpInputEnabled = true
         let swipeSnap = swipeLayout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(swipeSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "w")) })?.swipeUpSymbol == "2")
-        assert(swipeSnap.keys.first(where: { $0.kind == .backspace })?.swipeUpSymbol == nil)
+        check(swipeSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "w")) })?.swipeUpSymbol == "2")
+        check(swipeSnap.keys.first(where: { $0.kind == .backspace })?.swipeUpSymbol == nil)
         swipeLayout.asciiMode = true
         let swipeAscii = swipeLayout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(swipeAscii.keys.first(where: { $0.kind == .letter(UInt8(ascii: "b")) })?.swipeUpSymbol == "?")
+        check(swipeAscii.keys.first(where: { $0.kind == .letter(UInt8(ascii: "b")) })?.swipeUpSymbol == "?")
         let o = CGPoint(x: 100, y: 100)
-        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 101, y: 80), keyHeight: 45, wasActive: false), "Thumb lift roll must stay a tap")
-        assert(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 103, y: 72), keyHeight: 45, wasActive: false))
-        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 120, y: 70), keyHeight: 45, wasActive: false), "Diagonal slide is not a swipe-up")
-        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 130), keyHeight: 45, wasActive: false))
-        assert(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 82), keyHeight: 45, wasActive: true), "Hysteresis keeps an armed swipe")
-        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 86), keyHeight: 45, wasActive: true), "Sliding back cancels")
+        check(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 101, y: 80), keyHeight: 45, wasActive: false), "Thumb lift roll must stay a tap")
+        check(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 103, y: 72), keyHeight: 45, wasActive: false))
+        check(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 120, y: 70), keyHeight: 45, wasActive: false), "Diagonal slide is not a swipe-up")
+        check(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 130), keyHeight: 45, wasActive: false))
+        check(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 82), keyHeight: 45, wasActive: true), "Hysteresis keeps an armed swipe")
+        check(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 100, y: 86), keyHeight: 45, wasActive: true), "Sliding back cancels")
         // During active Pinyin/Wubi composition (`isComposing: true`), a 28pt thumb flick must NOT break composition,
         // while a deliberate 38pt vertical swipe still arms cleanly.
-        assert(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 103, y: 72), keyHeight: 45, wasActive: false, isComposing: true))
-        assert(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 102, y: 62), keyHeight: 45, wasActive: false, isComposing: true))
+        check(!IOSSwipeUp.isActive(from: o, to: CGPoint(x: 103, y: 72), keyHeight: 45, wasActive: false, isComposing: true))
+        check(IOSSwipeUp.isActive(from: o, to: CGPoint(x: 102, y: 62), keyHeight: 45, wasActive: false, isComposing: true))
 
         // Long-press alternates
         let uAlt = IOSKeyAlternates.options(for: UInt8(ascii: "u"), asciiMode: false)
-        assert(uAlt.items == ["ū", "ú", "ǔ", "ù", "U", "7", "u"])
-        assert(uAlt.items[uAlt.defaultIndex] == "7")
+        check(uAlt.items == ["ū", "ú", "ǔ", "ù", "U", "7", "u"])
+        check(uAlt.items[uAlt.defaultIndex] == "7")
         let vAlt = IOSKeyAlternates.options(for: UInt8(ascii: "v"), asciiMode: true)
-        assert(vAlt.items.contains("ü") && vAlt.items[vAlt.defaultIndex] == "&")
+        check(vAlt.items.contains("ü") && vAlt.items[vAlt.defaultIndex] == "&")
         let bAlt = IOSKeyAlternates.options(for: UInt8(ascii: "b"), asciiMode: false)
-        assert(bAlt.items == ["B", "？", "b"] && bAlt.defaultIndex == 1)
+        check(bAlt.items == ["B", "？", "b"] && bAlt.defaultIndex == 1)
         for key in swipeSnap.keys {
             guard case .letter(let ascii) = key.kind else { continue }
             let o = IOSKeyAlternates.options(for: ascii, asciiMode: false)
             let strip = IOSKeyAlternates.stripFrame(keyFrame: key.frame, count: o.items.count, defaultIndex: o.defaultIndex, containerWidth: 440)
-            assert(strip.minX >= 4.0 && strip.maxX <= 436.0, "Alternates strip must stay inside the keyboard")
-            assert(IOSKeyAlternates.index(atX: strip.minX - 50, in: strip, count: o.items.count) == 0)
-            assert(IOSKeyAlternates.index(atX: strip.maxX + 50, in: strip, count: o.items.count) == o.items.count - 1)
+            check(strip.minX >= 4.0 && strip.maxX <= 436.0, "Alternates strip must stay inside the keyboard")
+            check(IOSKeyAlternates.index(atX: strip.minX - 50, in: strip, count: o.items.count) == 0)
+            check(IOSKeyAlternates.index(atX: strip.maxX + 50, in: strip, count: o.items.count) == o.items.count - 1)
         }
         let narrow = IOSKeyAlternates.stripFrame(keyFrame: CGRect(x: 300, y: 60, width: 30, height: 42), count: 8, defaultIndex: 6, containerWidth: 320)
-        assert(narrow.minX >= 4.0 && narrow.maxX <= 316.0)
+        check(narrow.minX >= 4.0 && narrow.maxX <= 316.0)
         // Symbol key long-press alternates
         let zeroAlt = IOSKeyAlternates.symbolOptions(for: "0", asciiMode: false)
-        assert(zeroAlt?.items == ["0", "°"] && zeroAlt?.defaultIndex == 0)
+        check(zeroAlt?.items == ["0", "°"] && zeroAlt?.defaultIndex == 0)
         let rmbAlt = IOSKeyAlternates.symbolOptions(for: "￥", asciiMode: false)
-        assert(rmbAlt?.items.first == "￥" && (rmbAlt?.items.contains("$") == true) && rmbAlt?.defaultIndex == 0)
+        check(rmbAlt?.items.first == "￥" && (rmbAlt?.items.contains("$") == true) && rmbAlt?.defaultIndex == 0)
         let cnParenAlt = IOSKeyAlternates.symbolOptions(for: "（", asciiMode: false)
-        assert(cnParenAlt?.items.first == "（" && (cnParenAlt?.items.contains("「") == true) && cnParenAlt?.defaultIndex == 0)
-        assert(IOSKeyAlternates.symbolOptions(for: "1", asciiMode: false) == nil)
+        check(cnParenAlt?.items.first == "（" && (cnParenAlt?.items.contains("「") == true) && cnParenAlt?.defaultIndex == 0)
+        check(IOSKeyAlternates.symbolOptions(for: "1", asciiMode: false) == nil)
         var symPlaneLayout = IOSKeyboardLayoutEngine()
         symPlaneLayout.switchPlane(.numbers)
         for key in symPlaneLayout.computeLayout(in: CGSize(width: 440, height: 220)).keys {
             guard case .symbol(let sym) = key.kind,
                   let o = IOSKeyAlternates.symbolOptions(for: sym, asciiMode: false) else { continue }
             let strip = IOSKeyAlternates.stripFrame(keyFrame: key.frame, count: o.items.count, defaultIndex: o.defaultIndex, containerWidth: 440)
-            assert(strip.minX >= 4.0 && strip.maxX <= 436.0, "Symbol alternates strip must stay inside the keyboard")
+            check(strip.minX >= 4.0 && strip.maxX <= 436.0, "Symbol alternates strip must stay inside the keyboard")
         }
         var offLayout = IOSKeyboardLayoutEngine()
         offLayout.swipeUpInputEnabled = false
         let offSnap = offLayout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(offSnap.keys.allSatisfy { $0.swipeUpSymbol == nil }, "Switching swipe-up off must remove letter hints and gesture")
+        check(offSnap.keys.allSatisfy { $0.swipeUpSymbol == nil }, "Switching swipe-up off must remove letter hints and gesture")
         // Backspace swipe-up clears only the current line, left of the cursor
-        assert(IOSLineClear.plan(before: "第一行\n第二行", maxBatch: 128) == .init(deleteCount: 3, reachesLineStart: true))
-        assert(IOSLineClear.plan(before: "第一行\n", maxBatch: 128) == .init(deleteCount: 0, reachesLineStart: true), "Cursor at line start must not join lines")
-        assert(IOSLineClear.plan(before: "没有换行", maxBatch: 128) == .init(deleteCount: 4, reachesLineStart: false))
-        assert(IOSLineClear.plan(before: "a\r\nbc", maxBatch: 128) == .init(deleteCount: 2, reachesLineStart: true))
-        assert(IOSLineClear.plan(before: String(repeating: "字", count: 300), maxBatch: 128) == .init(deleteCount: 128, reachesLineStart: false))
-        assert(IOSLineClear.plan(before: "x\n" + String(repeating: "字", count: 200), maxBatch: 128).deleteCount == 128)
+        check(IOSLineClear.plan(before: "第一行\n第二行", maxBatch: 128) == .init(deleteCount: 3, reachesLineStart: true))
+        check(IOSLineClear.plan(before: "第一行\n", maxBatch: 128) == .init(deleteCount: 0, reachesLineStart: true), "Cursor at line start must not join lines")
+        check(IOSLineClear.plan(before: "没有换行", maxBatch: 128) == .init(deleteCount: 4, reachesLineStart: false))
+        check(IOSLineClear.plan(before: "a\r\nbc", maxBatch: 128) == .init(deleteCount: 2, reachesLineStart: true))
+        check(IOSLineClear.plan(before: String(repeating: "字", count: 300), maxBatch: 128) == .init(deleteCount: 128, reachesLineStart: false))
+        check(IOSLineClear.plan(before: "x\n" + String(repeating: "字", count: 200), maxBatch: 128).deleteCount == 128)
         let partial = IOSLineClear.Expected(previous: "abcdef", removed: 2)
-        assert(partial.isSatisfied(by: "abcd") && partial.isSatisfied(by: "zzabcd"))
-        assert(!partial.isSatisfied(by: "abcdef") && !partial.isSatisfied(by: "abcde"), "Stale context must wait")
-        assert(!partial.isSatisfied(by: "other"), "Another field must not be deleted")
+        check(partial.isSatisfied(by: "abcd") && partial.isSatisfied(by: "zzabcd"))
+        check(!partial.isSatisfied(by: "abcdef") && !partial.isSatisfied(by: "abcde"), "Stale context must wait")
+        check(!partial.isSatisfied(by: "other"), "Another field must not be deleted")
         let whole = IOSLineClear.Expected(previous: "abc", removed: 3)
-        assert(!whole.isSatisfied(by: "abc") && !whole.isSatisfied(by: "ab"))
-        assert(whole.isSatisfied(by: "上一行\n"))
+        check(!whole.isSatisfied(by: "abc") && !whole.isSatisfied(by: "ab"))
+        check(whole.isSatisfied(by: "上一行\n"))
         // Backspace swipe-down restores line clears in reverse order
         let docA = UUID(), docB = UUID()
         var undo = IOSLineClearUndo()
         undo.push(text: "第二行", contextBefore: "第一行\n", documentID: docA)
         undo.push(text: "第三行", contextBefore: "第一行\n第二行\n", documentID: docA)
-        assert(undo.restorableIndex(before: "第一行\n第二行\n", documentID: docB) == nil, "Must not restore into another field")
-        assert(undo.restorableIndex(before: "第一行\n第二行\n", documentID: nil) == nil, "Nil documentID during focus transition must never match")
-        assert(undo.restorableIndex(before: "别的内容", documentID: docA) == nil, "Must not restore after the text changed")
-        assert(undo.take(before: "第一行\n第二行\n", documentID: docA) == "第三行")
-        assert(undo.take(before: "第一行\n", documentID: docA) == "第二行")
-        assert(undo.take(before: "第一行\n", documentID: docA) == nil)
+        check(undo.restorableIndex(before: "第一行\n第二行\n", documentID: docB) == nil, "Must not restore into another field")
+        check(undo.restorableIndex(before: "第一行\n第二行\n", documentID: nil) == nil, "Nil documentID during focus transition must never match")
+        check(undo.restorableIndex(before: "别的内容", documentID: docA) == nil, "Must not restore after the text changed")
+        let takenThird = undo.take(before: "第一行\n第二行\n", documentID: docA)
+        check(takenThird == "第三行")
+        let takenSecond = undo.take(before: "第一行\n", documentID: docA)
+        check(takenSecond == "第二行")
+        let takenEmpty = undo.take(before: "第一行\n", documentID: docA)
+        check(takenEmpty == nil)
         var startUndo = IOSLineClearUndo()
         startUndo.push(text: "整行", contextBefore: "", documentID: docA)
-        assert(startUndo.restorableIndex(before: "有字", documentID: docA) == nil, "Document-start record needs an empty context")
-        assert(startUndo.take(before: "", documentID: docA) == "整行")
+        check(startUndo.restorableIndex(before: "有字", documentID: docA) == nil, "Document-start record needs an empty context")
+        let takenStart = startUndo.take(before: "", documentID: docA)
+        check(takenStart == "整行")
         startUndo.push(text: "", contextBefore: "", documentID: docA)
-        assert(startUndo.records.isEmpty)
+        check(startUndo.records.isEmpty)
         for i in 0..<(IOSLineClearUndo.maxRecords + 3) {
             startUndo.push(text: "\(i)", contextBefore: "x", documentID: docA)
         }
-        assert(startUndo.records.count == IOSLineClearUndo.maxRecords)
-        assert(startUndo.take(before: "x", documentID: docA) == "\(IOSLineClearUndo.maxRecords + 2)")
+        check(startUndo.records.count == IOSLineClearUndo.maxRecords)
+        let takenCapped = startUndo.take(before: "x", documentID: docA)
+        check(takenCapped == "\(IOSLineClearUndo.maxRecords + 2)")
 
         // Chinese punctuation pairing
         for (open, close) in [("“", "”"), ("‘", "’"), ("（", "）"), ("《", "》"), ("【", "】"), ("「", "」")] {
-            assert(IOSPunctuationPairing.closer(for: open) == close)
-            assert(IOSPunctuationPairing.action(for: open, after: nil, openClosers: []) == .insertPair(close: close))
+            check(IOSPunctuationPairing.closer(for: open) == close)
+            check(IOSPunctuationPairing.action(for: open, after: nil, openClosers: []) == .insertPair(close: close))
         }
-        assert(IOSPunctuationPairing.action(for: "（", after: "，后文", openClosers: []) == .insertPair(close: "）"))
-        assert(IOSPunctuationPairing.action(for: "（", after: "\n下一行", openClosers: []) == .insertPair(close: "）"))
-        assert(IOSPunctuationPairing.action(for: "“", after: "已有文字", openClosers: []) == .plain, "No auto-close directly before text")
-        assert(IOSPunctuationPairing.action(for: "”", after: "”", openClosers: ["”"]) == .skipClose)
-        assert(IOSPunctuationPairing.action(for: "”", after: "”", openClosers: []) == .plain, "Only auto-inserted closers are skipped")
-        assert(IOSPunctuationPairing.action(for: "）", after: "”", openClosers: ["”"]) == .plain)
-        assert(IOSPunctuationPairing.action(for: "，", after: nil, openClosers: []) == .plain)
-        assert(IOSPunctuationPairing.shouldDeletePair(before: "你好“", after: "”", openClosers: ["”"]))
-        assert(!IOSPunctuationPairing.shouldDeletePair(before: "你好“字", after: "”", openClosers: ["”"]), "Pair with content inside stays")
-        assert(!IOSPunctuationPairing.shouldDeletePair(before: "“", after: "”", openClosers: []))
-        assert(!IOSPunctuationPairing.shouldDeletePair(before: "（", after: "”", openClosers: ["”"]))
-        assert(IOSPunctuationPairing.pruned(["）", "”"], after: "”）") == ["）", "”"])
-        assert(IOSPunctuationPairing.pruned(["”"], after: "别的") == [])
-        assert(IOSPunctuationPairing.pruned(["”"], after: nil) == [])
-        assert(IOSPunctuationPairing.cursorStaysInPairs(["）", "”"], tail: "，后文", after: "”），后文"))
-        assert(IOSPunctuationPairing.cursorStaysInPairs(["”"], tail: "很长的后文", after: "”很长"), "A trimmed window still matches")
-        assert(!IOSPunctuationPairing.cursorStaysInPairs(["”"], tail: "，后文", after: "”别处的文字"), "Tapping before another closer must forget the pair")
+        check(IOSPunctuationPairing.action(for: "（", after: "，后文", openClosers: []) == .insertPair(close: "）"))
+        check(IOSPunctuationPairing.action(for: "（", after: "\n下一行", openClosers: []) == .insertPair(close: "）"))
+        check(IOSPunctuationPairing.action(for: "“", after: "已有文字", openClosers: []) == .plain, "No auto-close directly before text")
+        check(IOSPunctuationPairing.action(for: "”", after: "”", openClosers: ["”"]) == .skipClose)
+        check(IOSPunctuationPairing.action(for: "”", after: "”", openClosers: []) == .plain, "Only auto-inserted closers are skipped")
+        check(IOSPunctuationPairing.action(for: "）", after: "”", openClosers: ["”"]) == .plain)
+        check(IOSPunctuationPairing.action(for: "，", after: nil, openClosers: []) == .plain)
+        check(IOSPunctuationPairing.shouldDeletePair(before: "你好“", after: "”", openClosers: ["”"]))
+        check(!IOSPunctuationPairing.shouldDeletePair(before: "你好“字", after: "”", openClosers: ["”"]), "Pair with content inside stays")
+        check(!IOSPunctuationPairing.shouldDeletePair(before: "“", after: "”", openClosers: []))
+        check(!IOSPunctuationPairing.shouldDeletePair(before: "（", after: "”", openClosers: ["”"]))
+        check(IOSPunctuationPairing.pruned(["）", "”"], after: "”）") == ["）", "”"])
+        check(IOSPunctuationPairing.pruned(["”"], after: "别的") == [])
+        check(IOSPunctuationPairing.pruned(["”"], after: nil) == [])
+        check(IOSPunctuationPairing.cursorStaysInPairs(["）", "”"], tail: "，后文", after: "”），后文"))
+        check(IOSPunctuationPairing.cursorStaysInPairs(["”"], tail: "很长的后文", after: "”很长"), "A trimmed window still matches")
+        check(!IOSPunctuationPairing.cursorStaysInPairs(["”"], tail: "，后文", after: "”别处的文字"), "Tapping before another closer must forget the pair")
         var featurePrefs = JuxuPreferences()
-        assert(!featurePrefs.keySwipeUpInput && !featurePrefs.keyLongPressAlternates && !featurePrefs.backspaceSwipeClear, "Gesture features are opt-in")
+        check(!featurePrefs.keySwipeUpInput && !featurePrefs.keyLongPressAlternates && !featurePrefs.backspaceSwipeClear, "Gesture features are opt-in")
         featurePrefs.keySwipeUpInput = true
         featurePrefs.keyLongPressAlternates = true
         featurePrefs.backspaceSwipeClear = true
         let featureRound = JuxuPreferences.fromTOML(featurePrefs.toTOML())
-        assert(featureRound.keySwipeUpInput && featureRound.keyLongPressAlternates && featureRound.backspaceSwipeClear)
+        check(featureRound.keySwipeUpInput && featureRound.keyLongPressAlternates && featureRound.backspaceSwipeClear)
 
         // 20. Verify `IOSInlineMarkedTextSession` against BOTH custom `YYTextView` (Bilibili/Weibo)
         //     and standard Apple `UITextView` `UITextInput` semantics!
@@ -870,10 +903,23 @@ struct IOSKeyboardTests {
             }
         }
 
-        // 20a. Bilibili comment box exact repro #1: `dbfd` -> "破坏", then prediction "计算", then `sm` -> "机"
+        func hostText(_ h: any IOSMarkedTextDocumentSink) -> String {
+            (h as? YYTextViewDocumentMock)?.text ?? (h as! StandardUITextViewMock).text
+        }
+        func hostMarked(_ h: any IOSMarkedTextDocumentSink) -> NSRange? {
+            if let yy = h as? YYTextViewDocumentMock { return yy.markedRange }
+            return (h as! StandardUITextViewMock).markedRange
+        }
+        func hostSel(_ h: any IOSMarkedTextDocumentSink) -> NSRange {
+            if let yy = h as? YYTextViewDocumentMock { return yy.selectedRange }
+            return (h as! StandardUITextViewMock).selectedRange
+        }
+
+        // 20a. Bilibili comment box exact repro #1 (Wubi 86): `dhfg` -> "破坏", then prediction "计算", then `sm` -> "机"
         bridge.switchSchema(86, persist: false)
         var wb86NormalPrefs = bridge.prefs
         wb86NormalPrefs.spaceless = false
+        wb86NormalPrefs.fourthCodeAutoCommit = false
         bridge.applyAndSavePreferences(wb86NormalPrefs, persist: false)
         bridge.clearComposition()
 
@@ -881,16 +927,17 @@ struct IOSKeyboardTests {
             let proxy = TIKeyboardOutputProxyMock(host: rawHost)
             var session = IOSInlineMarkedTextSession()
             bridge.clearComposition()
-            for ch in "dbfd".unicodeScalars {
+            for ch in "dhfg".unicodeScalars {
                 let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 8000)
                 session.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy)
                 proxy.drainTurn(session: &session)
             }
             let commitPohuai = bridge.handleKey(keyCode: 0x31, scalar: 32, hasCmdOrCtrl: false, timestampMs: 8050)
-            assert(commitPohuai.commitText == "破坏")
+            check(commitPohuai.commitText == "破坏")
             session.applyEngineState(commitText: commitPohuai.commitText, inlinePreedit: commitPohuai.activeInlinePreedit, options: onOpts, in: proxy)
             proxy.drainTurn(session: &session)
             // Idle prediction tap ("计算")
+            bridge.acceptPrediction("计算", timestampMs: 8080)
             session.insertTextWithAutoSpace("计算", splitInternal: true, options: onOpts, in: proxy)
             proxy.drainTurn(session: &session)
             // Follow-up word `sm` -> Space -> "机"
@@ -900,18 +947,18 @@ struct IOSKeyboardTests {
                 proxy.drainTurn(session: &session)
             }
             let commitJi = bridge.handleKey(keyCode: 0x31, scalar: 32, hasCmdOrCtrl: false, timestampMs: 8150)
-            assert(commitJi.commitText == "机")
+            check(commitJi.commitText == "机")
             session.applyEngineState(commitText: commitJi.commitText, inlinePreedit: commitJi.activeInlinePreedit, options: onOpts, in: proxy)
             proxy.drainTurn(session: &session)
 
             if let yy = rawHost as? YYTextViewDocumentMock {
-                assert(yy.text == "破坏计算机", "Expected '破坏计算机' in YYTextView, got '\(yy.text)'")
-                assert(yy.markedRange == nil, "Expected nil markedRange after commit in YYTextView")
-                assert(yy.selectedRange == NSRange(location: 5, length: 0))
+                check(yy.text == "破坏计算机", "Expected '破坏计算机' in YYTextView, got '\(yy.text)'")
+                check(yy.markedRange == nil, "Expected nil markedRange after commit in YYTextView")
+                check(yy.selectedRange == NSRange(location: 5, length: 0))
             } else if let std = rawHost as? StandardUITextViewMock {
-                assert(std.text == "破坏计算机", "Expected '破坏计算机' in UITextView, got '\(std.text)'")
-                assert(std.markedRange == nil)
-                assert(std.selectedRange == NSRange(location: 5, length: 0))
+                check(std.text == "破坏计算机", "Expected '破坏计算机' in UITextView, got '\(std.text)'")
+                check(std.markedRange == nil)
+                check(std.selectedRange == NSRange(location: 5, length: 0))
             }
         }
 
@@ -927,7 +974,7 @@ struct IOSKeyboardTests {
             bridge.setContext("")
             let proxy = TIKeyboardOutputProxyMock(host: rawHost)
             var streamSession = IOSInlineMarkedTextSession()
-            let streamCodes = "dbfdytbhsmtxxylhdaqtf" + "txxylhdaqtf"
+            let streamCodes = "dhfgytsmtxxyldjdaqtf" + "txxyldjdaqtf"
             for ch in streamCodes.unicodeScalars {
                 let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 9000)
                 streamSession.applyEngineState(
@@ -938,13 +985,13 @@ struct IOSKeyboardTests {
                 )
                 proxy.drainTurn(session: &streamSession)
             }
-            assert(!streamSession.markedCode.isEmpty, "Expected active inline tail in spaceless stream")
+            check(!streamSession.markedCode.isEmpty, "Expected active inline tail in spaceless stream")
             let currentText = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
-            assert(currentText.hasPrefix("破坏"), "Committed prefix must stay at start, got '\(currentText)'")
-            assert(currentText.hasSuffix(streamSession.markedCode), "Active marked tail must stay at end, got '\(currentText)'")
+            check(currentText.hasPrefix("破坏"), "Committed prefix must stay at start, got '\(currentText)'")
+            check(currentText.hasSuffix(streamSession.markedCode), "Active marked tail must stay at end, got '\(currentText)'")
             // Ensure NO raw ASCII codes leaked between committed Chinese words!
             let prefixBeforeMarked = String(currentText.dropLast(streamSession.markedCode.count))
-            assert(!prefixBeforeMarked.contains(where: { $0.isASCII && $0.isLetter }), "Leaked raw code in committed prefix: '\(currentText)'")
+            check(!prefixBeforeMarked.contains(where: { $0.isASCII && $0.isLetter }), "Leaked raw code in committed prefix: '\(currentText)'")
 
             let finishStream = bridge.handleKey(keyCode: 0x31, scalar: 32, hasCmdOrCtrl: false, timestampMs: 9100)
             streamSession.applyEngineState(
@@ -954,15 +1001,17 @@ struct IOSKeyboardTests {
                 in: proxy
             )
             proxy.drainTurn(session: &streamSession)
-            let finalText = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
-            let finalMarked = (rawHost as? YYTextViewDocumentMock)?.markedRange ?? (rawHost as! StandardUITextViewMock).markedRange
-            assert(finalMarked == nil && streamSession.markedCode.isEmpty)
-            assert(!finalText.contains(where: { $0.isASCII && $0.isLetter }) && finalText.hasPrefix("破坏计算机"), "Got '\(finalText)'")
+            let finalText = hostText(rawHost)
+            let finalMarked = hostMarked(rawHost)
+            check(finalMarked == nil && streamSession.markedCode.isEmpty)
+            check(!finalText.contains(where: { $0.isASCII && $0.isLetter }) && finalText.hasPrefix("破坏计算机"), "Got '\(finalText)'")
         }
 
         // 20c. Mid-text insertion ("前缀|后缀"), 5th-code push + CJK/EN auto-spacing, AND same-turn
         //      `commitPendingFirst` + `insertPassthrough("，")` (e.g. T9 sidebar punctuation while composing)!
+        wb86StreamPrefs.schemaId = 86
         wb86StreamPrefs.spaceless = false
+        wb86StreamPrefs.fourthCodeAutoCommit = false
         bridge.applyAndSavePreferences(wb86StreamPrefs, persist: false)
         bridge.clearComposition()
 
@@ -972,29 +1021,32 @@ struct IOSKeyboardTests {
             let proxy = TIKeyboardOutputProxyMock(host: rawHost)
             var midSession = IOSInlineMarkedTextSession()
             midSession.reconcileExternalContext(hostBefore: proxy.documentContextBeforeInput)
-            // Type 5 codes `lgdba` ("国" pushed on 5th key 'a' -> "工") after "hello" before "后缀"!
-            for ch in "lgdba".unicodeScalars {
+            // Type 5 codes `lgyia` ("国" pushed on 5th key 'a' -> "工") after "hello" before "后缀"!
+            for ch in "lgyia".unicodeScalars {
                 let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 9200)
                 midSession.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy)
                 proxy.drainTurn(session: &midSession)
             }
             let midText = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
-            assert(midText == "hello 国a后缀", "Expected 5th-code push with auto-space in middle of text, got '\(midText)'")
+            check(midText == "hello 国a后缀", "Expected 5th-code push with auto-space in middle of text, got '\(midText)'")
             // Same-turn `commitPendingFirst("工")` + `insertPassthrough("，")` WITHOUT intermediate runloop tick!
             midSession.commitPendingFirst(bridge.state.candidates.first!.text, options: onOpts, in: proxy)
             midSession.insertPassthrough("，", in: proxy)
             bridge.clearComposition()
             proxy.drainTurn(session: &midSession)
 
-            // Simulate intermediate stale XPC `textDidChange` where host still reports `"hello"` before catching up!
-            midSession.reconcileExternalContext(hostBefore: "hello")
-            assert(midSession.autoSpaceTracker.effectiveBefore(hostBefore: "hello", hostBeforeIsAuthoritative: false) == "hello 国工，")
-            let afterPunct = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
-            let afterMarked = (rawHost as? YYTextViewDocumentMock)?.markedRange ?? (rawHost as! StandardUITextViewMock).markedRange
-            let afterSel = (rawHost as? YYTextViewDocumentMock)?.selectedRange ?? (rawHost as! StandardUITextViewMock).selectedRange
-            assert(afterPunct == "hello 国工，后缀" && afterMarked == nil, "Got '\(afterPunct)'")
-            assert(afterSel == NSRange(location: 9, length: 0))
+            // Simulate intermediate stale XPC `textDidChange` where host still reports `"hello 国"` before `"工，"` catches up!
+            midSession.reconcileExternalContext(hostBefore: "hello 国")
+            check(midSession.autoSpaceTracker.effectiveBefore(hostBefore: "hello 国", hostBeforeIsAuthoritative: false) == "hello 国工，")
+            let afterPunct = hostText(rawHost)
+            let afterMarked = hostMarked(rawHost)
+            let afterSel = hostSel(rawHost)
+            check(afterPunct == "hello 国工，后缀" && afterMarked == nil, "Got '\(afterPunct)'")
+            check(afterSel == NSRange(location: 9, length: 0))
         }
+
+        wb86StreamPrefs.fourthCodeAutoCommit = true
+        bridge.applyAndSavePreferences(wb86StreamPrefs, persist: false)
 
         // Single-letter preedit Backspace must NEVER commit raw ASCII in either StandardUITextView or YYTextView!
         for rawHost in [YYTextViewDocumentMock() as any IOSMarkedTextDocumentSink, StandardUITextViewMock()] {
@@ -1006,9 +1058,9 @@ struct IOSKeyboardTests {
             let stBs = bridge.handleKey(keyCode: 0x33, scalar: 0, hasCmdOrCtrl: false, timestampMs: 9350)
             bsSession.applyEngineState(commitText: stBs.commitText, inlinePreedit: stBs.activeInlinePreedit, options: onOpts, in: proxy)
             proxy.drainTurn(session: &bsSession)
-            let txt = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
-            let mr = (rawHost as? YYTextViewDocumentMock)?.markedRange ?? (rawHost as! StandardUITextViewMock).markedRange
-            assert(txt.isEmpty && mr == nil, "Expected empty text after backspace, got '\(txt)'")
+            let txt = hostText(rawHost)
+            let mr = hostMarked(rawHost)
+            check(txt.isEmpty && mr == nil, "Expected empty text after backspace, got '\(txt)'")
         }
 
         // 21. Focus-out and refocus while preedit is uncommitted (`recordFocusLoss` + `sweepOrphanedMarkedTextIfNeeded`)
@@ -1025,9 +1077,9 @@ struct IOSKeyboardTests {
                 focusSession.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy)
                 proxy.drainTurn(session: &focusSession)
             }
-            let preBlurText = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
-            let preBlurMarked = (rawHost as? YYTextViewDocumentMock)?.markedRange ?? (rawHost as! StandardUITextViewMock).markedRange
-            assert(preBlurText == "我们khk" && preBlurMarked == NSRange(location: 2, length: 3))
+            let preBlurText = hostText(rawHost)
+            let preBlurMarked = hostMarked(rawHost)
+            check(preBlurText == "我们khk" && preBlurMarked == NSRange(location: 2, length: 3))
 
             // Simulate keyboard disappearing (`KeyboardViewController` #1 deallocated -> fresh `IOSInlineMarkedTextSession` #2 on reopen!)
             focusSession.recordKeyboardDisappear()
@@ -1036,18 +1088,18 @@ struct IOSKeyboardTests {
                 std.simulateReactivatedEmptyMarkedCaretJump = true
             }
             var reopenedSession = IOSInlineMarkedTextSession()
-            assert(reopenedSession.needsAppearanceSweep && bridge.state.preedit.isEmpty)
+            check(reopenedSession.needsAppearanceSweep && bridge.state.preedit.isEmpty)
 
             // Refocus same field on new VC instance: sweep clears orphaned "khk" AND restores TextKit 2 caret to {2, 0}!
             let outcome = reopenedSession.sweepOrphanedMarkedText(in: proxy)
-            assert(outcome.needsAsyncFlush && outcome.expectedBeforeTail == "我们")
+            check(outcome.needsAsyncFlush && outcome.expectedBeforeTail == "我们")
             proxy.drainTurn(session: &reopenedSession)
             reopenedSession.restoreCaretAfterOrphanedSweepIfNeeded(expectedBeforeTail: outcome.expectedBeforeTail, in: proxy)
 
-            let afterRefocusText = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
-            let afterRefocusMarked = (rawHost as? YYTextViewDocumentMock)?.markedRange ?? (rawHost as! StandardUITextViewMock).markedRange
-            let afterRefocusSel = (rawHost as? YYTextViewDocumentMock)?.selectedRange ?? (rawHost as! StandardUITextViewMock).selectedRange
-            assert(afterRefocusText == "我们" && afterRefocusMarked == nil && afterRefocusSel == NSRange(location: 2, length: 0),
+            let afterRefocusText = hostText(rawHost)
+            let afterRefocusMarked = hostMarked(rawHost)
+            let afterRefocusSel = hostSel(rawHost)
+            check(afterRefocusText == "我们" && afterRefocusMarked == nil && afterRefocusSel == NSRange(location: 2, length: 0),
                    "Expected orphaned markedText cleared with cursor at {2,0}, got '\(afterRefocusText)' sel=\(afterRefocusSel) marked=\(String(describing: afterRefocusMarked))")
 
             // Follow-up Space + new Wubi word `trwu` ("我们") must insert cleanly in forward order!
@@ -1058,9 +1110,9 @@ struct IOSKeyboardTests {
                 reopenedSession.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy)
                 proxy.drainTurn(session: &reopenedSession)
             }
-            let afterFollowUp = (rawHost as? YYTextViewDocumentMock)?.text ?? (rawHost as! StandardUITextViewMock).text
-            let afterFollowMarked = (rawHost as? YYTextViewDocumentMock)?.markedRange ?? (rawHost as! StandardUITextViewMock).markedRange
-            assert(afterFollowUp == "我们 我们" && afterFollowMarked == nil, "Got '\(afterFollowUp)'")
+            let afterFollowUp = hostText(rawHost)
+            let afterFollowMarked = hostMarked(rawHost)
+            check(afterFollowUp == "我们 我们" && afterFollowMarked == nil, "Got '\(afterFollowUp)'")
         }
 
         // 21b. Multi-field switch (`Field 1` with uncommitted "khk" -> `Field 2` with normal text ->
@@ -1088,16 +1140,17 @@ struct IOSKeyboardTests {
                 proxy1.drainTurn(session: &session)
             }
             // Switch Field 1 -> Field 2 (`Field 2` gets normal non-nil `documentID`, so `Field 2` is NOT swept!)
-            assert(session.recordFocusLoss() == true)
+            let recordedLoss = session.recordFocusLoss()
+            check(recordedLoss == true)
             bridge.abandonComposition(timestampMs: 9620)
             for ch in "trwu".unicodeScalars {
                 let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 9630)
                 session.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy2)
                 proxy2.drainTurn(session: &session)
             }
-            let f2Text = (field2 as? YYTextViewDocumentMock)?.text ?? (field2 as! StandardUITextViewMock).text
-            assert(f2Text == "第二框我们", "Typing in second field must stay clean while preserving orphaned sweep flag, got '\(f2Text)'")
-            assert(session.hasOrphanedMarkedInSession, "Orphaned sweep flag must survive typing in Field 2 until Field 1 is refocused")
+            let f2Text = hostText(field2)
+            check(f2Text == "第二框我们", "Typing in second field must stay clean while preserving orphaned sweep flag, got '\(f2Text)'")
+            check(session.hasOrphanedMarkedInSession, "Orphaned sweep flag must survive typing in Field 2 until Field 1 is refocused")
 
             // If sweep ever runs on Field 3 where "选中" is selected (`selectedText == "选中"`), selection MUST NOT be deleted!
             var selGuardSession = IOSInlineMarkedTextSession()
@@ -1105,9 +1158,9 @@ struct IOSKeyboardTests {
             _ = selGuardSession.recordFocusLoss()
             _ = selGuardSession.sweepOrphanedMarkedText(in: proxy3)
             proxy3.drainTurn(session: &selGuardSession)
-            let f3Text = (field3 as? YYTextViewDocumentMock)?.text ?? (field3 as! StandardUITextViewMock).text
-            let f3Sel = (field3 as? YYTextViewDocumentMock)?.selectedRange ?? (field3 as! StandardUITextViewMock).selectedRange
-            assert(f3Text == "选中文字" && f3Sel == NSRange(location: 0, length: 2), "Active text selection must never be erased by sweep")
+            let f3Text = hostText(field3)
+            let f3Sel = hostSel(field3)
+            check(f3Text == "选中文字" && f3Sel == NSRange(location: 0, length: 2), "Active text selection must never be erased by sweep")
 
             // Re-arm orphaned state from Field 1 ("你好" + "khk") and return to Field 1 + immediately type 't' in SAME turn!
             var rearm = IOSInlineMarkedTextSession()
@@ -1120,40 +1173,40 @@ struct IOSKeyboardTests {
             session.applyEngineState(commitText: stT.commitText, inlinePreedit: stT.activeInlinePreedit, options: onOpts, in: proxy1)
             proxy1.drainTurn(session: &session)
 
-            let f1MidText = (field1 as? YYTextViewDocumentMock)?.text ?? (field1 as! StandardUITextViewMock).text
-            let f1MidMarked = (field1 as? YYTextViewDocumentMock)?.markedRange ?? (field1 as! StandardUITextViewMock).markedRange
-            assert(f1MidText == "你好t" && f1MidMarked == NSRange(location: 2, length: 1), "Same-turn refocus + key 't' must clear 'khk' and keep 't' marked, got '\(f1MidText)' marked=\(String(describing: f1MidMarked))")
+            let f1MidText = hostText(field1)
+            let f1MidMarked = hostMarked(field1)
+            check(f1MidText == "你好t" && f1MidMarked == NSRange(location: 2, length: 1), "Same-turn refocus + key 't' must clear 'khk' and keep 't' marked, got '\(f1MidText)' marked=\(String(describing: f1MidMarked))")
 
             for ch in "rwu".unicodeScalars {
                 let st = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 9680)
                 session.applyEngineState(commitText: st.commitText, inlinePreedit: st.activeInlinePreedit, options: onOpts, in: proxy1)
                 proxy1.drainTurn(session: &session)
             }
-            let f1FinalText = (field1 as? YYTextViewDocumentMock)?.text ?? (field1 as! StandardUITextViewMock).text
-            let f1FinalMarked = (field1 as? YYTextViewDocumentMock)?.markedRange ?? (field1 as! StandardUITextViewMock).markedRange
-            assert(f1FinalText == "你好我们" && f1FinalMarked == nil, "Got '\(f1FinalText)'")
+            let f1FinalText = hostText(field1)
+            let f1FinalMarked = hostMarked(field1)
+            check(f1FinalText == "你好我们" && f1FinalMarked == nil, "Got '\(f1FinalText)'")
         }
 
         // Whole-keyboard long-press trackpad with delayed alternates promotion
-        assert(IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .space, wholeKeyboardEnabled: false))
-        assert(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .letter(UInt8(ascii: "a")), wholeKeyboardEnabled: false))
-        assert(IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .letter(UInt8(ascii: "a")), wholeKeyboardEnabled: true))
-        assert(IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .symbol("，"), wholeKeyboardEnabled: true))
-        assert(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .backspace, wholeKeyboardEnabled: true), "Backspace keeps repeat delete")
-        assert(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .globe, wholeKeyboardEnabled: true), "Globe keeps system switcher")
-        assert(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .planeSwitch(.numbers, label: "123"), wholeKeyboardEnabled: true), "Plane switch keeps hold-and-slide")
-        assert(IOSKeyboardTrackpadHold.trackpadHoldDelay(wholeKeyboardEnabled: true) < IOSKeyboardTrackpadHold.alternatesDelay(wholeKeyboardEnabled: true), "Trackpad activates before alternates popup")
-        assert(IOSKeyboardTrackpadHold.alternatesDelay(wholeKeyboardEnabled: false) == IOSKeyboardTrackpadHold.defaultAlternatesDelay)
+        check(IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .space, wholeKeyboardEnabled: false))
+        check(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .letter(UInt8(ascii: "a")), wholeKeyboardEnabled: false))
+        check(IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .letter(UInt8(ascii: "a")), wholeKeyboardEnabled: true))
+        check(IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .symbol("，"), wholeKeyboardEnabled: true))
+        check(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .backspace, wholeKeyboardEnabled: true), "Backspace keeps repeat delete")
+        check(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .globe, wholeKeyboardEnabled: true), "Globe keeps system switcher")
+        check(!IOSKeyboardTrackpadHold.supportsTrackpadHold(for: .planeSwitch(.numbers, label: "123"), wholeKeyboardEnabled: true), "Plane switch keeps hold-and-slide")
+        check(IOSKeyboardTrackpadHold.trackpadHoldDelay(wholeKeyboardEnabled: true) < IOSKeyboardTrackpadHold.alternatesDelay(wholeKeyboardEnabled: true), "Trackpad activates before alternates popup")
+        check(IOSKeyboardTrackpadHold.alternatesDelay(wholeKeyboardEnabled: false) == IOSKeyboardTrackpadHold.defaultAlternatesDelay)
         let holdStart = CGPoint(x: 200, y: 180)
-        assert(!IOSKeyboardTrackpadHold.shouldCancelAlternatesOnMove(from: holdStart, to: CGPoint(x: 208, y: 184)), "Small jitter keeps alternates timer armed")
-        assert(IOSKeyboardTrackpadHold.shouldCancelAlternatesOnMove(from: holdStart, to: CGPoint(x: 215, y: 180)), "Cursor drag cancels pending alternates popup")
-        assert(!IOSKeyboardTrackpadHold.shouldCancelAlternatesInTrackpad(from: holdStart, to: CGPoint(x: 208, y: 184), dx: 0, dy: 0), "Stationary trackpad touch keeps alternates timer armed")
-        assert(IOSKeyboardTrackpadHold.shouldCancelAlternatesInTrackpad(from: holdStart, to: CGPoint(x: 210, y: 180), dx: 1, dy: 0), "Single horizontal cursor step (9.5pt < 12pt) must cancel pending alternates popup")
-        assert(IOSKeyboardTrackpadHold.shouldCancelAlternatesInTrackpad(from: holdStart, to: CGPoint(x: 200, y: 185), dx: 0, dy: 1), "Vertical cursor step must cancel pending alternates popup")
+        check(!IOSKeyboardTrackpadHold.shouldCancelAlternatesOnMove(from: holdStart, to: CGPoint(x: 208, y: 184)), "Small jitter keeps alternates timer armed")
+        check(IOSKeyboardTrackpadHold.shouldCancelAlternatesOnMove(from: holdStart, to: CGPoint(x: 215, y: 180)), "Cursor drag cancels pending alternates popup")
+        check(!IOSKeyboardTrackpadHold.shouldCancelAlternatesInTrackpad(from: holdStart, to: CGPoint(x: 208, y: 184), dx: 0, dy: 0), "Stationary trackpad touch keeps alternates timer armed")
+        check(IOSKeyboardTrackpadHold.shouldCancelAlternatesInTrackpad(from: holdStart, to: CGPoint(x: 210, y: 180), dx: 1, dy: 0), "Single horizontal cursor step (9.5pt < 12pt) must cancel pending alternates popup")
+        check(IOSKeyboardTrackpadHold.shouldCancelAlternatesInTrackpad(from: holdStart, to: CGPoint(x: 200, y: 185), dx: 0, dy: 1), "Vertical cursor step must cancel pending alternates popup")
         var holdCursorPrefs = JuxuPreferences()
-        assert(!holdCursorPrefs.keyboardHoldCursor, "Whole-keyboard hold cursor is opt-in")
+        check(!holdCursorPrefs.keyboardHoldCursor, "Whole-keyboard hold cursor is opt-in")
         holdCursorPrefs.keyboardHoldCursor = true
-        assert(JuxuPreferences.fromTOML(holdCursorPrefs.toTOML()).keyboardHoldCursor)
+        check(JuxuPreferences.fromTOML(holdCursorPrefs.toTOML()).keyboardHoldCursor)
 
         // Bottom-row comma key: tap comma, swipe up period, behind its own toggle
         let commaSize = CGSize(width: 440, height: 220)
@@ -1170,14 +1223,14 @@ struct IOSKeyboardTests {
             engine.swipeUpInputEnabled = swipeToggle
             let commaSnap = engine.computeLayout(in: commaSize)
             let key = commaKey(commaSnap)!
-            assert(key.kind == .symbol(tapSymbol), "Tap must enter \(tapSymbol)")
-            assert(key.swipeUpSymbol == swipeSymbol, "Swipe must enter \(swipeSymbol) with letter swipe toggle \(swipeToggle)")
-            assert(IOSKeyboardLayoutEngine.hitTest(point: CGPoint(x: key.frame.midX, y: key.frame.midY), in: commaSnap)?.id == "B_comma")
+            check(key.kind == .symbol(tapSymbol), "Tap must enter \(tapSymbol)")
+            check(key.swipeUpSymbol == swipeSymbol, "Swipe must enter \(swipeSymbol) with letter swipe toggle \(swipeToggle)")
+            check(IOSKeyboardLayoutEngine.hitTest(point: CGPoint(x: key.frame.midX, y: key.frame.midY), in: commaSnap)?.id == "B_comma")
             let letterHints = commaSnap.keys.contains { key in
                 if case .letter = key.kind { return key.swipeUpSymbol != nil }
                 return false
             }
-            assert(letterHints == swipeToggle, "Letter hints must still follow their own toggle")
+            check(letterHints == swipeToggle, "Letter hints must still follow their own toggle")
         }
         var commaOn = IOSKeyboardLayoutEngine()
         commaOn.spaceCommaKeyEnabled = true
@@ -1192,34 +1245,34 @@ struct IOSKeyboardTests {
         let onPitch = CGFloat(onSnap.pitchX)
         let onGap = onPitch - onLetterQ.frame.width
         let onRow = [onPlane, onComma, onSpace, onMode, onReturn]
-        assert(onSnap.keys.count == 33 && !onSnap.keys.contains(where: { $0.id == "B_period" }))
-        assert(abs(onPlane.frame.minX - onLetterQ.frame.minX) < 0.01 && abs(onReturn.frame.maxX - onLetterP.frame.maxX) < 0.01)
+        check(onSnap.keys.count == 33 && !onSnap.keys.contains(where: { $0.id == "B_period" }))
+        check(abs(onPlane.frame.minX - onLetterQ.frame.minX) < 0.01 && abs(onReturn.frame.maxX - onLetterP.frame.maxX) < 0.01)
         for (left, right) in zip(onRow, onRow.dropFirst()) {
-            assert(abs(right.frame.minX - left.frame.maxX - onGap) < 0.01, "\(left.id) and \(right.id) must be one key gap apart")
+            check(abs(right.frame.minX - left.frame.maxX - onGap) < 0.01, "\(left.id) and \(right.id) must be one key gap apart")
         }
-        assert(abs(onComma.frame.width - onLetterQ.frame.width) < 0.01, "Comma must be one letter key wide")
+        check(abs(onComma.frame.width - onLetterQ.frame.width) < 0.01, "Comma must be one letter key wide")
         for (key, pitches) in [(onPlane, 1.85), (onSpace, 3.6), (onMode, 1.15), (onReturn, 1.85)] as [(IOSKeySpec, CGFloat)] {
-            assert(abs(key.frame.width / onPitch - pitches) < 0.06, "\(key.id) is \(key.frame.width / onPitch) pitches")
+            check(abs(key.frame.width / onPitch - pitches) < 0.06, "\(key.id) is \(key.frame.width / onPitch) pitches")
         }
-        assert(onPlane.usesFunctionFill && onReturn.usesFunctionFill)
-        assert(!onComma.usesFunctionFill && !onSpace.usesFunctionFill && !onMode.usesFunctionFill)
-        assert(onMode.primaryLabel == "中" && onMode.cornerSubscript == "英")
+        check(onPlane.usesFunctionFill && onReturn.usesFunctionFill)
+        check(!onComma.usesFunctionFill && !onSpace.usesFunctionFill && !onMode.usesFunctionFill)
+        check(onMode.primaryLabel == "中" && onMode.cornerSubscript == "英")
         var commaEnglish = IOSKeyboardLayoutEngine()
         commaEnglish.spaceCommaKeyEnabled = true
         commaEnglish.asciiMode = true
         let englishMode = commaEnglish.computeLayout(in: commaSize).keys.first(where: { $0.id == "B_mode" })!
-        assert(englishMode.primaryLabel == "英" && englishMode.cornerSubscript == "中")
+        check(englishMode.primaryLabel == "英" && englishMode.cornerSubscript == "中")
         var commaGlobe = IOSKeyboardLayoutEngine()
         commaGlobe.spaceCommaKeyEnabled = true
         commaGlobe.showInlineGlobeKey = true
         let globeSnap = commaGlobe.computeLayout(in: commaSize)
-        assert(globeSnap.keys.first(where: { $0.id == "B_globe" })?.frame == onMode.frame, "Globe must keep working in the 中/英 slot")
-        assert(!globeSnap.keys.contains(where: { $0.id == "B_mode" }))
+        check(globeSnap.keys.first(where: { $0.id == "B_globe" })?.frame == onMode.frame, "Globe must keep working in the 中/英 slot")
+        check(!globeSnap.keys.contains(where: { $0.id == "B_mode" }))
         for key in onRow {
             let center = CGPoint(x: key.frame.midX, y: key.frame.midY)
-            assert(IOSKeyboardLayoutEngine.hitTest(point: center, in: onSnap)?.id == key.id, "Center tap must hit \(key.id)")
+            check(IOSKeyboardLayoutEngine.hitTest(point: center, in: onSnap)?.id == key.id, "Center tap must hit \(key.id)")
             let topEdge = CGPoint(x: key.frame.midX, y: key.frame.minY - 2.0)
-            assert(IOSKeyboardLayoutEngine.hitTest(point: topEdge, in: onSnap, validNextMask: 1)?.id == key.id, "Top-edge tap must stay on \(key.id)")
+            check(IOSKeyboardLayoutEngine.hitTest(point: topEdge, in: onSnap, validNextMask: 1)?.id == key.id, "Top-edge tap must stay on \(key.id)")
         }
 
         // Toggle off: exactly the original 32-key layout
@@ -1232,29 +1285,29 @@ struct IOSKeyboardTests {
         let plainSpace = plainSnap.keys.first(where: { $0.kind == .space })!
         let plainReturn = plainSnap.keys.first(where: { $0.kind == .returnKey })!
         let plainLeftW = (letter("s").frame.maxX - letter("q").frame.minX - onGap) * 0.5
-        assert(plainSnap.keys.count == 32 && commaKey(plainSnap) == nil)
-        assert(plainSnap.keys.allSatisfy { !$0.usesFunctionFill })
-        assert(plainMode.primaryLabel == "中" && plainMode.secondaryInlineLabel == "/英" && plainMode.cornerSubscript == nil)
-        assert(abs(plainPlane.frame.minX - letter("q").frame.minX) < 0.01 && abs(plainPlane.frame.width - plainLeftW) < 0.01)
-        assert(abs(plainMode.frame.maxX - letter("s").frame.maxX) < 0.01 && abs(plainMode.frame.width - plainLeftW) < 0.01)
-        assert(abs(plainSpace.frame.minX - letter("d").frame.minX) < 0.01 && abs(plainSpace.frame.maxX - letter("j").frame.maxX) < 0.01)
-        assert(abs(plainReturn.frame.minX - letter("k").frame.minX) < 0.01 && abs(plainReturn.frame.maxX - letter("p").frame.maxX) < 0.01)
+        check(plainSnap.keys.count == 32 && commaKey(plainSnap) == nil)
+        check(plainSnap.keys.allSatisfy { !$0.usesFunctionFill })
+        check(plainMode.primaryLabel == "中" && plainMode.secondaryInlineLabel == "/英" && plainMode.cornerSubscript == nil)
+        check(abs(plainPlane.frame.minX - letter("q").frame.minX) < 0.01 && abs(plainPlane.frame.width - plainLeftW) < 0.01)
+        check(abs(plainMode.frame.maxX - letter("s").frame.maxX) < 0.01 && abs(plainMode.frame.width - plainLeftW) < 0.01)
+        check(abs(plainSpace.frame.minX - letter("d").frame.minX) < 0.01 && abs(plainSpace.frame.maxX - letter("j").frame.maxX) < 0.01)
+        check(abs(plainReturn.frame.minX - letter("k").frame.minX) < 0.01 && abs(plainReturn.frame.maxX - letter("p").frame.maxX) < 0.01)
         for key in plainSnap.keys where !key.id.hasPrefix("B_") {
-            assert(onSnap.keys.first(where: { $0.id == key.id })?.frame == key.frame, "\(key.id) must not move")
+            check(onSnap.keys.first(where: { $0.id == key.id })?.frame == key.frame, "\(key.id) must not move")
         }
         let dColumn = CGPoint(x: letter("d").frame.midX, y: plainSpace.frame.midY)
         let kColumn = CGPoint(x: letter("k").frame.midX, y: plainSpace.frame.midY)
-        assert(IOSKeyboardLayoutEngine.hitTest(point: dColumn, in: plainSnap)?.kind == .space)
-        assert(IOSKeyboardLayoutEngine.hitTest(point: kColumn, in: plainSnap)?.kind == .returnKey)
+        check(IOSKeyboardLayoutEngine.hitTest(point: dColumn, in: plainSnap)?.kind == .space)
+        check(IOSKeyboardLayoutEngine.hitTest(point: kColumn, in: plainSnap)?.kind == .returnKey)
 
         // The key stays off other planes and the 9-key layout
         commaOn.switchPlane(.numbers)
-        assert(commaKey(commaOn.computeLayout(in: commaSize)) == nil)
+        check(commaKey(commaOn.computeLayout(in: commaSize)) == nil)
         commaOn.switchPlane(.letters)
         commaOn.schemaId = 20
         commaOn.pinyinT9Layout = true
         let t9CommaSnap = commaOn.computeLayout(in: commaSize)
-        assert(t9CommaSnap.isT9Layout && commaKey(t9CommaSnap) == nil)
+        check(t9CommaSnap.isT9Layout && commaKey(t9CommaSnap) == nil)
 
         // 中/英 on the 123 and symbol pages: content switches in place and the mode carries to letters
         func labels(_ snap: IOSKeyboardLayoutEngine.LayoutSnapshot) -> Set<String> {
@@ -1272,23 +1325,23 @@ struct IOSKeyboardTests {
                 pageEngine.spaceCommaKeyEnabled = commaEnabled
                 pageEngine.switchPlane(page)
                 let zhLabels = labels(pageEngine.computeLayout(in: commaSize))
-                assert(Set(chinese).isSubset(of: zhLabels) && zhLabels.isDisjoint(with: english))
+                check(Set(chinese).isSubset(of: zhLabels) && zhLabels.isDisjoint(with: english))
                 pageEngine.asciiMode = true
-                assert(pageEngine.plane == page, "Mode change must stay on the page")
+                check(pageEngine.plane == page, "Mode change must stay on the page")
                 let enSnap = pageEngine.computeLayout(in: commaSize)
                 let enLabels = labels(enSnap)
-                assert(Set(english).isSubset(of: enLabels) && enLabels.isDisjoint(with: chinese))
-                assert(Set(shared).isSubset(of: zhLabels) && Set(shared).isSubset(of: enLabels), "Keys without a variant stay")
+                check(Set(english).isSubset(of: enLabels) && enLabels.isDisjoint(with: chinese))
+                check(Set(shared).isSubset(of: zhLabels) && Set(shared).isSubset(of: enLabels), "Keys without a variant stay")
                 let enModeKey = enSnap.keys.first(where: { $0.kind == .modeToggle })!
-                assert(enModeKey.primaryLabel == (commaEnabled ? "英" : "EN"))
+                check(enModeKey.primaryLabel == (commaEnabled ? "英" : "EN"))
                 pageEngine.asciiMode = false
-                assert(pageEngine.plane == page && labels(pageEngine.computeLayout(in: commaSize)) == zhLabels, "Switching back restores the Chinese content")
+                check(pageEngine.plane == page && labels(pageEngine.computeLayout(in: commaSize)) == zhLabels, "Switching back restores the Chinese content")
                 pageEngine.asciiMode = true
                 pageEngine.switchPlane(.letters)
                 let backSnap = pageEngine.computeLayout(in: commaSize)
-                assert(backSnap.keys.first(where: { $0.kind == .modeToggle })?.primaryLabel == (commaEnabled ? "英" : "EN"))
+                check(backSnap.keys.first(where: { $0.kind == .modeToggle })?.primaryLabel == (commaEnabled ? "英" : "EN"))
                 if commaEnabled {
-                    assert(commaKey(backSnap)?.kind == .symbol(","), "Letters must use the mode chosen on the page")
+                    check(commaKey(backSnap)?.kind == .symbol(","), "Letters must use the mode chosen on the page")
                 }
             }
 
@@ -1298,22 +1351,22 @@ struct IOSKeyboardTests {
             onPage.switchPlane(page)
             let onPageSnap = onPage.computeLayout(in: commaSize)
             func onKey(_ id: String) -> IOSKeySpec { onPageSnap.keys.first(where: { $0.id == id })! }
-            assert(commaKey(onPageSnap) == nil)
-            assert(onKey("B_mode").frame == onMode.frame && onKey("B_return").frame == onReturn.frame && onKey("B_plane").frame == onPlane.frame)
-            assert(onKey("B_plane").primaryLabel == "ABC" && onKey("B_plane").kind == .planeSwitch(.letters, label: "ABC"))
-            assert(abs(onKey("B_space").frame.minX - onPlane.frame.maxX - onGap) < 0.01)
-            assert(abs(onMode.frame.minX - onKey("B_space").frame.maxX - onGap) < 0.01)
+            check(commaKey(onPageSnap) == nil)
+            check(onKey("B_mode").frame == onMode.frame && onKey("B_return").frame == onReturn.frame && onKey("B_plane").frame == onPlane.frame)
+            check(onKey("B_plane").primaryLabel == "ABC" && onKey("B_plane").kind == .planeSwitch(.letters, label: "ABC"))
+            check(abs(onKey("B_space").frame.minX - onPlane.frame.maxX - onGap) < 0.01)
+            check(abs(onMode.frame.minX - onKey("B_space").frame.maxX - onGap) < 0.01)
             for id in ["B_plane", "B_space", "B_mode", "B_return"] {
                 let key = onKey(id)
-                assert(IOSKeyboardLayoutEngine.hitTest(point: CGPoint(x: key.frame.midX, y: key.frame.midY), in: onPageSnap)?.id == id)
+                check(IOSKeyboardLayoutEngine.hitTest(point: CGPoint(x: key.frame.midX, y: key.frame.midY), in: onPageSnap)?.id == id)
             }
             var globePage = IOSKeyboardLayoutEngine()
             globePage.spaceCommaKeyEnabled = true
             globePage.showInlineGlobeKey = true
             globePage.switchPlane(page)
             let globePageSnap = globePage.computeLayout(in: commaSize)
-            assert(globePageSnap.keys.first(where: { $0.kind == .globe })?.frame == onMode.frame)
-            assert(!globePageSnap.keys.contains(where: { $0.kind == .modeToggle }))
+            check(globePageSnap.keys.first(where: { $0.kind == .globe })?.frame == onMode.frame)
+            check(!globePageSnap.keys.contains(where: { $0.kind == .modeToggle }))
 
             // Toggle off: the original positions on this page
             var offPage = IOSKeyboardLayoutEngine()
@@ -1321,19 +1374,19 @@ struct IOSKeyboardTests {
             offPage.switchPlane(page)
             let offPageSnap = offPage.computeLayout(in: commaSize)
             func offKey(_ id: String) -> IOSKeySpec { offPageSnap.keys.first(where: { $0.id == id })! }
-            assert(offKey("B_plane").frame == plainPlane.frame && offKey("B_mode").frame == plainMode.frame)
-            assert(offKey("B_space").frame == plainSpace.frame && offKey("B_return").frame == plainReturn.frame)
-            assert(offPageSnap.keys.allSatisfy { !$0.usesFunctionFill })
+            check(offKey("B_plane").frame == plainPlane.frame && offKey("B_mode").frame == plainMode.frame)
+            check(offKey("B_space").frame == plainSpace.frame && offKey("B_return").frame == plainReturn.frame)
+            check(offPageSnap.keys.allSatisfy { !$0.usesFunctionFill })
         }
 
         // The setting is opt-in and persists; settings saved before it existed decode to off
         var commaPrefs = JuxuPreferences()
-        assert(!commaPrefs.spaceCommaKey)
+        check(!commaPrefs.spaceCommaKey)
         commaPrefs.spaceCommaKey = true
-        assert(JuxuPreferences.fromTOML(commaPrefs.toTOML()).spaceCommaKey)
+        check(JuxuPreferences.fromTOML(commaPrefs.toTOML()).spaceCommaKey)
         let oldTOML = commaPrefs.toTOML().split(separator: "\n", omittingEmptySubsequences: false)
             .filter { !$0.contains("space_comma_key") }.joined(separator: "\n")
-        assert(oldTOML != commaPrefs.toTOML() && !JuxuPreferences.fromTOML(oldTOML).spaceCommaKey)
+        check(oldTOML != commaPrefs.toTOML() && !JuxuPreferences.fromTOML(oldTOML).spaceCommaKey)
 
         print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi, T9 Pinyin, YYTextView inline commit & focus-loss recovery tests passed!")
     }

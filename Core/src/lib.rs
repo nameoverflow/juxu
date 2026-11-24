@@ -4,13 +4,18 @@ pub mod emoji;
 pub mod engine;
 pub mod english;
 pub mod eval_log;
+pub mod eval_support;
 pub mod ffi;
+mod fixed_decode;
 pub mod format;
+pub mod json;
+mod missed_space;
 pub mod mmap_buf;
 pub mod neural;
 mod personalization;
 pub mod pinyin;
 pub mod pinyin_dict;
+mod predict;
 mod spaceless;
 pub mod typo;
 pub mod user_data;
@@ -492,29 +497,28 @@ mod tests {
     }
 
     #[test]
-    fn wbaux_v1_backward_compat() {
-        // Synthesize a minimal valid legacy WBAUX001 blob (48-byte header + 1 bigram entry)
-        let mut blob = Vec::new();
-        blob.extend_from_slice(WBAUX_MAGIC);
-        blob.extend_from_slice(&0u32.to_le_bytes()); // py_bucket_cnt (8)
-        blob.extend_from_slice(&0u32.to_le_bytes()); // py_item_cnt (12)
-        blob.extend_from_slice(&1u32.to_le_bytes()); // bigram_cnt (16)
-        blob.extend_from_slice(&48u32.to_le_bytes()); // py_buckets_off (20)
-        blob.extend_from_slice(&48u32.to_le_bytes()); // py_items_off (24)
-        blob.extend_from_slice(&48u32.to_le_bytes()); // bg_off (28)
-        blob.extend_from_slice(&58u32.to_le_bytes()); // pool_off (32)
-        blob.extend_from_slice(&0u32.to_le_bytes()); // pool_len (36)
-        blob.extend_from_slice(&[0u8; 8]); // v1 header padding (40..48)
-        assert_eq!(blob.len(), 48);
+    fn wbaux_v3_no_neural_and_export_lm_roundtrip() {
         let pair_key = (('入' as u64) << 32) | ('法' as u64);
-        blob.extend_from_slice(&pair_key.to_le_bytes());
-        blob.extend_from_slice(&(768u16).to_le_bytes()); // 3.0 nats
-
+        let tri_entry = pack_trigram('输', '入', '法', 768).unwrap();
+        let blob = serialize_wbaux(AuxBuildInput {
+            pinyin_items: vec![],
+            unigrams: vec![('法' as u32, 2048)],
+            bigrams: vec![(pair_key, 768)],
+            trigrams: vec![tri_entry],
+            neural_blob: vec![],
+        });
+        assert_eq!(&blob[0..8], WBAUX_MAGIC);
         let aux = AuxView::from_bytes(blob).unwrap();
-        assert!(!aux.has_unigrams());
-        assert_eq!(aux.stats(), (0, 0, 1, 0));
+        assert!(aux.has_unigrams());
+        assert!(!aux.has_neural());
+        assert_eq!(aux.stats(), (0, 1, 1, 1));
         assert!((aux.bigram_boost('入', '法') - 3.0).abs() < 0.01);
-        assert_eq!(aux.trigram_boost('输', '入', '法'), 0.0);
+
+        let (uni, bi, tri, neural) = aux.export_lm_sections();
+        assert_eq!(uni, vec![('法' as u32, 2048)]);
+        assert_eq!(bi, vec![(pair_key, 768)]);
+        assert_eq!(tri, vec![tri_entry]);
+        assert!(neural.is_empty());
     }
 
     #[test]
@@ -589,8 +593,7 @@ mod tests {
         let s = nv.offs.summary;
         assert_eq!((s.vocab_size, s.rank, s.d_model, s.n_heads, s.n_layers, s.ffn_dim), (12288, 192, 320, 10, 7, 1024));
         assert!(nv.offs.has_punct_tokens, "V4 model must expose comma/period tokens");
-        assert!(nv.offs.ascii_trie.is_some(), "V4 WBLM0002 model must embed 4,096-entry ASCII/English subword Trie");
-        assert!(!nv.offs.has_eng_num_token, "V4 WBLM0002 replaces <ENG_NUM> with native ASCII/English subwords");
+        assert_eq!(nv.offs.ascii_trie.ext_count, 4096, "V4 WBLM0002 model must embed 4,096-entry ASCII/English subword Trie");
         assert_eq!(nv.punct_to_token('，'), Some(crate::neural::TOK_COMMA));
         assert_eq!(nv.punct_to_token('。'), Some(crate::neural::TOK_PERIOD));
 
@@ -737,11 +740,6 @@ mod tests {
                 ("an".into(), "安".into(), 8200, 0),
                 ("xian".into(), "先".into(), 9000, 0),
             ],
-            phrases: vec![
-                (vec!["wo".into(), "men".into()], "我们".into(), 50000, 0),
-                (vec!["shu".into(), "ru".into(), "fa".into()], "输入法".into(), 45000, 0),
-                (vec!["xi".into(), "an".into()], "西安".into(), 30000, 0),
-            ],
         });
         let pdict = PinyinDictView::from_bytes(py_bytes).unwrap();
         let mut cfg = JuxuConfig::default();
@@ -807,13 +805,6 @@ mod tests {
                 ("liu".into(), "留".into(), 11000, 0),
                 ("lun".into(), "论".into(), 10000, 0),
                 ("e".into(), "鹅".into(), 6000, 0),
-            ],
-            phrases: vec![
-                (vec!["ce".into(), "lve".into()], "策略".into(), 500000, 0),
-                (vec!["lv".into(), "you".into()], "旅游".into(), 450000, 0),
-                (vec!["nv".into(), "hai".into()], "女孩".into(), 450000, 0),
-                (vec!["nve".into(), "dai".into()], "虐待".into(), 200000, 0),
-                (vec!["ju".into(), "xu".into()], "句序".into(), 300000, 0),
             ],
         });
         let pdict = PinyinDictView::from_bytes(py_bytes).unwrap();
@@ -902,12 +893,6 @@ mod tests {
                 ("xian".into(), "先".into(), 9000, 0),
                 ("zhong".into(), "中".into(), 9800, 0),
                 ("guo".into(), "国".into(), 9700, 0),
-            ],
-            phrases: vec![
-                (vec!["wo".into(), "men".into()], "我们".into(), 50000, 0),
-                (vec!["shu".into(), "ru".into(), "fa".into()], "输入法".into(), 45000, 0),
-                (vec!["xi".into(), "an".into()], "西安".into(), 30000, 0),
-                (vec!["zhong".into(), "guo".into()], "中国".into(), 48000, 0),
             ],
         });
         let pdict = PinyinDictView::from_bytes(py_bytes).unwrap();
@@ -1052,10 +1037,6 @@ mod tests {
                 ("ru".into(), "入".into(), 6_000_000, 0),
                 ("fa".into(), "法".into(), 6_000_000, 0),
             ],
-            phrases: vec![
-                (vec!["wo".into(), "men".into()], "我们".into(), 5_000_000, 0),
-                (vec!["shu".into(), "ru".into(), "fa".into()], "输入法".into(), 4_000_000, 0),
-            ],
         });
         let pdict = PinyinDictView::from_bytes(pblob).unwrap();
 
@@ -1195,12 +1176,6 @@ mod tests {
                 ("an".to_string(), "安".to_string(), 700_000, 0),
                 ("xian".to_string(), "先".to_string(), 800_000, 0),
             ],
-            phrases: vec![
-                (vec!["ni".to_string(), "hao".to_string()], "你好".to_string(), 950_000, 0),
-                (vec!["mi".to_string(), "gao".to_string()], "米糕".to_string(), 300_000, 0),
-                (vec!["zhong".to_string(), "guo".to_string()], "中国".to_string(), 990_000, 0),
-                (vec!["xi".to_string(), "an".to_string()], "西安".to_string(), 850_000, 0),
-            ],
         });
         let pdict = PinyinDictView::from_bytes(pblob).unwrap();
 
@@ -1297,8 +1272,8 @@ mod tests {
         for round in 0..3u64 {
             store.break_single_burst();
             let t = 1000 + round * 1000;
-            let _ = store.record_commit_with_surprisal("", "我们", t, true, 2, Some(&dict), None, Some(2.0));
-            let _ = store.record_commit_with_surprisal("我们", "好", t + 100, true, 2, Some(&dict), None, Some(2.0));
+            let _ = store.record_commit("", "我们", t, true, 2, Some(&dict), None, false, None);
+            let _ = store.record_commit("我们", "好", t + 100, true, 2, Some(&dict), None, false, None);
         }
         assert!(
             !store.phrases.contains_key("们好"),
@@ -1310,15 +1285,15 @@ mod tests {
         // are rejected, whereas modal/function phrases ("傻逼吗", "最好是", "标的", "过拟合", "落地", "我觉得")
         // ARE all valid and learnable!
         store.break_single_burst();
-        let _ = store.record_commit_with_surprisal("", "是", 5300, true, 2, None, None, Some(1.5));
-        let _ = store.record_commit_with_surprisal("是", "是", 5400, true, 2, None, None, Some(1.5));
+        let _ = store.record_commit("", "是", 5300, true, 2, None, None, false, None);
+        let _ = store.record_commit("是", "是", 5400, true, 2, None, None, false, None);
         assert!(!store.phrases.contains_key("是是"), "AA stutter '是是' must not auto-compose");
         // Mid-word slice check for "怎么" + "样": promotes "怎么样", NEVER slices "么样"!
         for r in 0..2u64 {
             store.break_single_burst();
             let t = 5500 + r * 200;
-            let _ = store.record_commit_with_surprisal("", "怎么", t, true, 2, None, None, Some(1.5));
-            let _ = store.record_commit_with_surprisal("怎么", "样", t + 80, true, 2, None, None, Some(1.5));
+            let _ = store.record_commit("", "怎么", t, true, 2, None, None, false, None);
+            let _ = store.record_commit("怎么", "样", t + 80, true, 2, None, None, false, None);
         }
         assert!(store.phrases.contains_key("怎么样"), "'怎么'+'样' must compose full '怎么样'");
         assert!(!store.phrases.contains_key("么样"), "mid-word '么样' must NEVER be sliced out of '怎么'+'样'");
@@ -1334,20 +1309,20 @@ mod tests {
         // Typing "标" + "的" ONCE must NOT 1-shot promote (guards casual '的' suffix),
         // while typing "最" + "好" + "是" or "标" + "的" TWICE DOES promote cleanly!
         store.break_single_burst();
-        let _ = store.record_commit_with_surprisal("", "标", 6000, true, 2, None, None, Some(1.2));
-        let _ = store.record_commit_with_surprisal("标", "的", 6100, true, 2, None, None, Some(1.2));
+        let _ = store.record_commit("", "标", 6000, true, 2, None, None, false, None);
+        let _ = store.record_commit("标", "的", 6100, true, 2, None, None, false, None);
         assert!(!store.phrases.contains_key("标的"), "1st '标'+'的' should wait for repetition");
         store.break_single_burst();
-        let _ = store.record_commit_with_surprisal("", "标", 7000, true, 2, None, None, Some(1.2));
-        let _ = store.record_commit_with_surprisal("标", "的", 7100, true, 2, None, None, Some(1.2));
+        let _ = store.record_commit("", "标", 7000, true, 2, None, None, false, None);
+        let _ = store.record_commit("标", "的", 7100, true, 2, None, None, false, None);
         assert!(store.phrases.contains_key("标的"), "2nd '标'+'的' must auto-compose '标的'");
 
         for r in 0..2u64 {
             store.break_single_burst();
             let t = 8000 + r * 1000;
-            let _ = store.record_commit_with_surprisal("", "最", t, true, 2, None, None, Some(3.0));
-            let _ = store.record_commit_with_surprisal("最", "好", t + 100, true, 2, None, None, Some(2.0));
-            let _ = store.record_commit_with_surprisal("最好", "是", t + 200, true, 2, None, None, Some(2.5));
+            let _ = store.record_commit("", "最", t, true, 2, None, None, false, None);
+            let _ = store.record_commit("最", "好", t + 100, true, 2, None, None, false, None);
+            let _ = store.record_commit("最好", "是", t + 200, true, 2, None, None, false, None);
         }
         assert!(store.phrases.contains_key("最好是"), "expected '最好是' to auto-compose across single-char commits");
 

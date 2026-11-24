@@ -30,22 +30,35 @@
    - 协议：GNU General Public License v3.0 (`GPL-3.0`)，协议原文见 `Resources/RawTables/pinyin_ice/LICENSE`。
    - `Resources/Dicts/emoji.tsv` 取自上游 `opencc/emoji.txt`，仅按词条字节序重新排序。它作为独立资源文件分发，运行时只读映射，不编译进 `Core/` 静态库。
 
-## 纠错语言模型语料来源（`wubi_aux.wbaux` `WBAUX003`）
+## 纠错与整句语言模型语料来源（`wubi_aux.wbaux` `WBAUX003` / `WBLM0003`）
 
-`Resources/Dicts/wubi_aux.wbaux`（`WBAUX003`）中的 `Micro-RWKV7-Small` 量化神经语言模型权重（`WBLM0001`，`INT8` 只读 `mmap`，2.52M 参数）与精简高 PMI N-gram 统计表（8,051 字 Unigram、80,000 条 Bigram、35,000 条 Trigram，不含任何原始语料原文）由 `Scripts/train_rwkv7.py` 基于 **2.80 亿字（279.76M 去重简体汉字）** 多域现代中文语料训练，并经 `build-dicts --corpus-lm` 编译生成：
+### V4 中英混输无方案绑定语言模型训练语料（`WBLM0003`）
+
+当前随附 `Resources/Dicts/wubi_aux.wbaux`（`WBAUX003`）中的 `Micro-RWKV-7` 量化神经语言模型权重（`WBLM0003`，无方案相关头，`INT8` 只读 `mmap`）及高 PMI N-gram 统计表，基于以下开源预训练与指令蒸馏语料离线统计与权重蒸馏生成（**仅提取聚合统计与量化模型参数，仓库与编译产物中零原始语料文本再分发**）：
+
+| 语料名称 | 上游数据集 / 项目 | 用途 | 开源协议声明 | 分发与归属说明 |
+| --- | --- | --- | --- | --- |
+| `MAP-NEO` | [m-a-p/Matrix (MAP-Neo Open Pretraining & SFT Corpus)](https://huggingface.co/m-a-p) | 中英双语及代码切换预训练/指令权重蒸馏 | `Apache-2.0` / `ODC-BY` | 保留归属说明；零原始文本再分发 |
+| `FineWeb-Edu-Chinese` | [opencsg/Fineweb-Edu-Chinese-V2.1](https://huggingface.co/datasets/opencsg/Fineweb-Edu-Chinese-V2.1) | 现代高质量中文网页与科普书面语权重蒸馏 | `ODC-BY` | 保留 OpenCSG 归属说明；零原始文本再分发 |
+| `SmolTalk-Chinese` | [opencsg/smoltalk-chinese](https://huggingface.co/datasets/opencsg/smoltalk-chinese) | 现代自然中文多轮对话与日常表达权重蒸馏 | `Apache-2.0` | 保留归属说明；零原始文本再分发 |
+| `Chinese-DeepSeek-R1-Distill` | [Congliu/Chinese-DeepSeek-R1-Distill-data-110k](https://huggingface.co/datasets/Congliu/Chinese-DeepSeek-R1-Distill-data-110k) | 现代技术/推理表达与中英术语衔接权重蒸馏 | `Apache-2.0` | 保留归属说明；零原始文本再分发 |
+
+### 早期实验语料管线说明（`Scripts/train_rwkv7.py` / `Scripts/corpus_v4.py`）
+
+仓库离线实验脚本 `Scripts/train_rwkv7.py` 与 `Scripts/corpus_v4.py` 另支持按需拉取多域公开语料从头复现 `WBLM0003` 权重与精简高 PMI N-gram 统计表（8,051 字 Unigram、80,000 条 Bigram、35,000 条 Trigram，同样不含任何原始语料原文），并通过 `build-dicts --corpus-lm` 编译生成：
 
 | 语料分组 | 上游数据集 | 采样规模（去重汉字） | 上游协议声明 | 分发/商用合规提示 |
 | --- | --- | --- | --- | --- |
 | 日常社交对话 (Social) | [silver/lccc (`lccc_base_train`)](https://huggingface.co/datasets/silver/lccc) | 95.00M | `MIT` | 需保留署名声明 |
 | 日常社交评论 (Social) | [theblackcat102/bilibili_comments_sharegpt](https://huggingface.co/datasets/theblackcat102/bilibili_comments_sharegpt) | ~2.18M | 公开社区语料 | 原始评论受平台条款约束 |
-| 社交生活笔记 (Social) | [FreshCrawl/rednote-xiaohongshu-notes](https://huggingface.co/datasets/FreshCrawl/rednote-xiaohongshu-notes) | ~1.49M | `Research-only`（非商用研究） | **仅限非商用研究**，公开发布商业版本前需剥离重训 |
+| 社交生活笔记 (Social) | [FreshCrawl/rednote-xiaohongshu-notes](https://huggingface.co/datasets/FreshCrawl/rednote-xiaohongshu-notes) | ~1.49M | `Research-only`（非商用研究） | **仅限非商用研究**，公开发布商业版本请勿启用该分片 |
 | 现代社区问答 (Community) | [KrisTHL181/zhihu-qa](https://huggingface.co/datasets/KrisTHL181/zhihu-qa)（筛 2024.06–2026 分片 `86..93`） | 71.09M | `ODC-BY` | 需署名；原始抓取内容受平台条款约束 |
 | 现代正式文本 (Formal) | [opencsg/Fineweb-Edu-Chinese-V2.1 (`4_5`)](https://huggingface.co/datasets/opencsg/Fineweb-Edu-Chinese-V2.1) | 75.00M | `ODC-BY` | 需保留归属说明 |
 | 百科书面语 (Formal) | [wikimedia/wikipedia (`20231101.zh`)](https://huggingface.co/datasets/wikimedia/wikipedia) | 35.00M（繁转简并过滤自动生成小条目） | `CC-BY-SA-4.0` & `GFDL` | 需署名；统计/模型派生权重建议保留来源说明 |
 
-> 若需构建严格纯宽松协议的独立版 `wubi_aux.wbaux`（不引入任何外部社区/社交语料），可直接运行 `make dicts`（不传 `JUXU_CORPUS_LM`），退回仅由 `Resources/RawTables/` 生成的基础 Bigram 统计。
+> 若需构建不带神经语言模型的最小回退版 `wubi_aux.wbaux`，可在未放置预训练 LM 产物时运行 `make dicts`（不传 `JUXU_CORPUS_LM`），退回仅由 `Resources/RawTables/` 生成的基础 Bigram 统计。
 
 ## 派生二进制产物与协议兼容性提示
 
 - `Resources/Dicts/*.wbdict` 分别是对应原始码表的直接二进制索引编译产物，沿用各自原始码表的开源协议（`LGPL-3.0` / `GPL-3.0` / `Apache-2.0`）。
-- `Resources/Dicts/wubi_aux.wbaux`（`WBAUX003`）汇总了 `mozillazg/pinyin-data` 的拼音反查索引、五笔词表的回退统计，以及多域语料训练的 `Micro-RWKV-7`（`WBLM0001` `INT8` 权重）与高 PMI N-gram 残差表。分发 `Resources/Dicts/` 时需同时遵守 `GPL-3.0` / `LGPL-3.0` / `Apache-2.0` / `MIT` / `ODC-BY` 条款，并留意上表所列少量社交语料的研究用途限制（公开发布商业 App Store 版本前建议移除 `rednote-xiaohongshu-notes` 后重新执行 `Scripts/train_rwkv7.py` + `JUXU_CORPUS_LM=... make dicts`）。
+- `Resources/Dicts/wubi_aux.wbaux`（`WBAUX003`）汇总了 `mozillazg/pinyin-data` 的拼音反查索引、五笔词表的回退统计，以及离线蒸馏的 `Micro-RWKV-7`（`WBLM0003` `INT8` 权重）与高 PMI N-gram 残差表（不含任何原始训练文本）。分发 `Resources/Dicts/` 时需同时遵守 `GPL-3.0` / `LGPL-3.0` / `Apache-2.0` / `MIT` / `ODC-BY` 条款；若自行使用 `Scripts/train_rwkv7.py` 重训商业分发版本，请确保排除 `Research-only` 社交语料分片。

@@ -329,6 +329,10 @@ public final class IOSClipboardSuggestionStore {
         self.ttlSeconds = ttlSeconds
     }
 
+    private func optionalInt(forKey key: String) -> Int? {
+        store.object(forKey: key) != nil ? store.integer(forKey: key) : nil
+    }
+
     /// Non-blocking cache check: returns `.cached` if this `changeCount` was already read and is fresh,
     /// `.none` if disabled/handled/empty/expired, or `.needsRead` when the caller should fetch
     /// `UIPasteboard.general.string` asynchronously off the main thread.
@@ -344,16 +348,11 @@ public final class IOSClipboardSuggestionStore {
             return .none
         }
 
-        let handled: Int? = store.object(forKey: Keys.handledChangeCount) != nil
-            ? store.integer(forKey: Keys.handledChangeCount)
-            : nil
-        if handled == changeCount {
+        if optionalInt(forKey: Keys.handledChangeCount) == changeCount {
             return .none
         }
 
-        let seen: Int? = store.object(forKey: Keys.seenChangeCount) != nil
-            ? store.integer(forKey: Keys.seenChangeCount)
-            : nil
+        let seen = optionalInt(forKey: Keys.seenChangeCount)
 
         guard hasStrings else {
             if seen != changeCount {
@@ -392,10 +391,7 @@ public final class IOSClipboardSuggestionStore {
         prefersOTP: Bool,
         now: TimeInterval
     ) -> IOSClipboardSuggestion? {
-        let handled: Int? = store.object(forKey: Keys.handledChangeCount) != nil
-            ? store.integer(forKey: Keys.handledChangeCount)
-            : nil
-        if handled == changeCount {
+        if optionalInt(forKey: Keys.handledChangeCount) == changeCount {
             return nil
         }
         store.set(changeCount, forKey: Keys.seenChangeCount)

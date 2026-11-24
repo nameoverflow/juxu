@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Juxu (句序) V4 Mixed Chinese-English Multi-Domain Corpus Pipeline (`WBLM0002`)
+Juxu (句序) V4 Mixed Chinese-English Multi-Domain Corpus Pipeline (`WBLM0003`)
 =============================================================================
 Builds a ~1.1B-char bilingual/mixed Chinese-English corpus + 12,288-token
 mini-RWKV-World vocabulary:
@@ -477,8 +477,8 @@ def encode_mixed_line(text: str, cjk_lut: dict[int, int], trie: AsciiTrie) -> li
     return out
 
 
-def pack_wblm0002_ext_vocab_bytes(ext_base_id: int, ext_vocab: list[str]) -> bytes:
-    """Serialize trailing `EXT_VOCAB` section for `WBLM0002` binary export."""
+def pack_wblm0003_ext_vocab_bytes(ext_base_id: int, ext_vocab: list[str]) -> bytes:
+    """Serialize trailing `EXT_VOCAB` section for `WBLM0003` binary export."""
     buf = bytearray(struct.pack("<II", ext_base_id, len(ext_vocab)))
     for s in ext_vocab:
         b = s.encode("ascii")
@@ -486,6 +486,9 @@ def pack_wblm0002_ext_vocab_bytes(ext_base_id: int, ext_vocab: list[str]) -> byt
         buf.append(len(b))
         buf.extend(b)
     return bytes(buf)
+
+
+pack_wblm0002_ext_vocab_bytes = pack_wblm0003_ext_vocab_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -582,28 +585,6 @@ def parse_xhs_csv(fileobj):
         body = (row.get("post_text") or "").strip()
         if title or body:
             yield f"{title}。{body}" if (title and body) else (title or body)
-
-
-def parse_wubi86_char_keys(yaml_path: Path) -> dict[int, int]:
-    char_first_key: dict[int, int] = {}
-    in_body = False
-    for raw in yaml_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not in_body:
-            if line == "...":
-                in_body = True
-            continue
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split("\t")
-        if len(parts) < 2:
-            continue
-        text, code = parts[0].strip(), parts[1].strip()
-        if len(text) == 1 and code and all("a" <= c <= "y" for c in code):
-            cp = ord(text)
-            if cp not in char_first_key:
-                char_first_key[cp] = ord(code[0]) - ord("a")
-    return char_first_key
 
 
 def build_sources_list(api=None) -> list[tuple[str, str, str, str | None, bool]]:
@@ -1025,7 +1006,7 @@ def prepare(directory: Path, seed: Path):
     stats = writer.close()
     result = pack(directory, seed)
     manifest = {
-        "format": "WBLM0002",
+        "format": "WBLM0003",
         "sources": use,
         "groups": {k: dict(v) for k, v in stats.items()},
         "tokens": result["tokens"],

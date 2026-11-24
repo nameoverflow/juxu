@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
+use juxu_core::eval_support::{extract_json_num as extract_num, extract_json_str as extract_str};
 
 #[derive(Default, Debug)]
 struct SchemaStats {
@@ -30,42 +31,6 @@ struct ParsedEvent {
     lm_top1: Option<f32>,
     lm_overruled: bool,
     has_touches: bool,
-}
-
-fn extract_str(line: &str, key: &str) -> String {
-    let pat = format!("\"{}\":\"", key);
-    let Some(start) = line.find(&pat) else {
-        return String::new();
-    };
-    let rest = &line[start + pat.len()..];
-    let mut out = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => break,
-            '\\' => match chars.next() {
-                Some('"') => out.push('"'),
-                Some('\\') => out.push('\\'),
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('t') => out.push('\t'),
-                Some(other) => out.push(other),
-                None => break,
-            },
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-fn extract_num(line: &str, key: &str) -> Option<f64> {
-    let pat = format!("\"{}\":", key);
-    let start = line.find(&pat)? + pat.len();
-    let rest = &line[start..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-' && c != 'e' && c != 'E' && c != '+')
-        .unwrap_or(rest.len());
-    rest[..end].parse::<f64>().ok()
 }
 
 fn parse_line(line: &str) -> Option<ParsedEvent> {

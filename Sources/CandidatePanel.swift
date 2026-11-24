@@ -5,18 +5,28 @@ import SwiftUI
 /// Pure AppKit macOS native candidate view calibrated to Apple InputMethodKit (`16.plist` / `SCIM.app`):
 /// - Strictly single-line CoreText/`NSAttributedString` measurement & drawing: NEVER wraps onto multiple lines.
 /// - No redundant preedit/schema header box (preedit is already marked inline at the cursor like Apple SCIM).
-/// - Clean `32pt` horizontal bar (`24pt` selection rect, `5pt` continuous corner radius, `16pt` PingFang SC Regular,
-///   `11.5pt` guide digits, whisper-light `11.5pt` secondary code annotations without colored pills).
+/// - Clean `30pt` horizontal bar (`24pt` selection rect, `5pt` continuous corner radius, `16pt` PingFang SC Regular,
+///   `12pt` guide digits, whisper-light `11.5pt` secondary code annotations without colored pills).
 public final class NativeCandidateContentView: NSView {
     public var state: JuxuActionState = .empty {
         didSet {
             hoveredCandidateIndex = nil
+            layoutValid = false
             invalidateIntrinsicContentSize()
             needsLayout = true
             needsDisplay = true
         }
     }
-    public var maxAllowedWidth: CGFloat = 1200
+    public var maxAllowedWidth: CGFloat = 1200 {
+        didSet {
+            if maxAllowedWidth != oldValue {
+                layoutValid = false
+                invalidateIntrinsicContentSize()
+                needsLayout = true
+                needsDisplay = true
+            }
+        }
+    }
     public var onSelectCandidate: ((Int) -> Void)?
     public var onTurnPage: ((Int32) -> Void)?
 
@@ -37,6 +47,8 @@ public final class NativeCandidateContentView: NSView {
     private var dividerRect: NSRect = .zero
     private var hoveredCandidateIndex: Int?
     private var trackingAreaRef: NSTrackingArea?
+    private var layoutValid: Bool = false
+    private var cachedFittingSize: NSSize = .zero
 
     public override var isFlipped: Bool { true }
 
@@ -67,11 +79,15 @@ public final class NativeCandidateContentView: NSView {
     // MARK: - Exact Single-Line Layout Computation (Zero Line-Wrapping Guarantee)
 
     public func computeFittingSize() -> NSSize {
-        if state.vertical {
-            return computeVerticalLayout(apply: false)
-        } else {
-            return computeHorizontalLayout(apply: false)
+        if !layoutValid {
+            if state.vertical {
+                cachedFittingSize = computeVerticalLayout(apply: true)
+            } else {
+                cachedFittingSize = computeHorizontalLayout(apply: true)
+            }
+            layoutValid = true
         }
+        return cachedFittingSize
     }
 
     public override var intrinsicContentSize: NSSize {
@@ -80,53 +96,73 @@ public final class NativeCandidateContentView: NSView {
 
     public override func layout() {
         super.layout()
-        if state.vertical {
-            _ = computeVerticalLayout(apply: true)
-        } else {
-            _ = computeHorizontalLayout(apply: true)
+        _ = computeFittingSize()
+    }
+
+    private static let badgeAnnotationMarkers = ["⚡", "⌖", "⟲", "⇄", "⎵"]
+
+    private static func stripBadgeMarkers(_ s: String) -> String {
+        var cleaned = s
+        for marker in badgeAnnotationMarkers {
+            cleaned = cleaned.replacingOccurrences(of: marker, with: "")
         }
+        return cleaned.trimmingCharacters(in: .whitespaces)
     }
 
     private static func cleanAnnotation(for item: JuxuCandidateItem) -> String {
         guard !item.comment.isEmpty else { return "" }
         switch item.badgeKind {
         case .shortcode:
-            // Strip decorative lightning symbol -> crisp native lowercase code (e.g. "k")
-            return item.comment.replacingOccurrences(of: "⚡", with: "").trimmingCharacters(in: .whitespaces)
+            return stripBadgeMarkers(item.comment)
         case .typoCorrected:
-            // Keep only the rescued Wubi code (strip confidence percentage & crosshair symbol -> e.g. "trwu")
+            // Keep only the rescued code (strip confidence percentage & badge symbols -> e.g. "trwu")
             let raw = item.comment.components(separatedBy: " ").first ?? item.comment
-            return raw.replacingOccurrences(of: "⌖", with: "").trimmingCharacters(in: .whitespaces)
+            return stripBadgeMarkers(raw)
         case .pinyinLookup, .wildcard:
-            return item.comment.trimmingCharacters(in: .whitespaces)
+            return stripBadgeMarkers(item.comment)
         case .userPhrase, .emoji, .none:
             return ""
         }
     }
 
-    private func makeSingleLineTruncated(_ text: String, font: NSFont, color: NSColor, maxWidth: CGFloat) -> NSAttributedString {
+    private func makeSingleLineTruncated(
+        _ text: String,
+        font: NSFont,
+        color: NSColor,
+        maxWidth: CGFloat
+    ) -> NSAttributedString {
         let style = NSMutableParagraphStyle()
         style.lineBreakMode = .byTruncatingTail
         style.maximumLineHeight = ceil(font.ascender - font.descender) + 2
-        var str = text.replacingOccurrences(of: "\n", with: " ")
+        let str = text.replacingOccurrences(of: "\n", with: " ")
         let baseAttrs: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: color,
             .paragraphStyle: style,
         ]
-        var attr = NSAttributedString(string: str, attributes: baseAttrs)
-        if attr.size().width <= maxWidth || str.count <= 1 {
-            return attr
+        let fullAttr = NSAttributedString(string: str, attributes: baseAttrs)
+        let chars = Array(str)
+        if fullAttr.size().width <= maxWidth || chars.count <= 1 {
+            return fullAttr
         }
-        while str.count > 1 {
-            str.removeLast()
-            let candidate = NSAttributedString(string: str + "…", attributes: baseAttrs)
+
+        var low = 1
+        var high = chars.count - 1
+        var bestAttr = NSAttributedString(string: String(chars[0]) + "…", attributes: baseAttrs)
+        while low <= high {
+            let mid = (low + high) / 2
+            let candidate = NSAttributedString(
+                string: String(chars[..<mid]) + "…",
+                attributes: baseAttrs
+            )
             if candidate.size().width <= maxWidth {
-                attr = candidate
-                break
+                bestAttr = candidate
+                low = mid + 1
+            } else {
+                high = mid - 1
             }
         }
-        return attr
+        return bestAttr
     }
 
     private func computeHorizontalLayout(apply: Bool) -> NSSize {
@@ -512,7 +548,9 @@ public struct CandidateBarView: NSViewRepresentable {
 
     public func updateNSView(_ effect: NSVisualEffectView, context: Context) {
         guard let content = effect.subviews.first as? NativeCandidateContentView else { return }
-        content.state = state
+        if content.state != state {
+            content.state = state
+        }
         content.onSelectCandidate = onSelectCandidate
         content.onTurnPage = onTurnPage
         content.layout()
@@ -520,7 +558,9 @@ public struct CandidateBarView: NSViewRepresentable {
 
     public func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSVisualEffectView, context: Context) -> CGSize? {
         guard let content = nsView.subviews.first as? NativeCandidateContentView else { return nil }
-        content.state = state
+        if content.state != state {
+            content.state = state
+        }
         return content.computeFittingSize()
     }
 }
@@ -529,7 +569,7 @@ public struct CandidateBarView: NSViewRepresentable {
 public final class CandidatePanelController {
     public static let shared = CandidatePanelController()
 
-    private let panel: NSPanel
+    private let panel: FloatingHUDPanel
     private let effectView: NSVisualEffectView
     private let candidateView: NativeCandidateContentView
 
@@ -541,35 +581,14 @@ public final class CandidatePanelController {
     }
 
     private init() {
-        let effect = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 200, height: 32))
-        effect.material = .popover
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = 8.0
-        effect.layer?.cornerCurve = .continuous
-        effect.layer?.masksToBounds = true
+        let initialRect = NSRect(x: 0, y: 0, width: 200, height: 32)
+        let effect = FloatingHUDPanel.makePopoverEffectView(frame: initialRect, cornerRadius: 8.0)
 
         let content = NativeCandidateContentView(frame: effect.bounds)
         content.autoresizingMask = [.width, .height]
         effect.addSubview(content)
 
-        let p = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 200, height: 32),
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: true
-        )
-        // CRITICAL: `.none` disables macOS WindowServer's pop-up zoom/bounce entrance and fade-out exit animations!
-        p.animationBehavior = .none
-        p.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.floatingWindow)) + 2)
-        p.isOpaque = false
-        p.backgroundColor = .clear
-        p.hasShadow = true
-        p.isMovable = false
-        p.hidesOnDeactivate = false
-        p.worksWhenModal = true
-        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
+        let p = FloatingHUDPanel(contentRect: initialRect, hasShadow: true, ignoresMouseEvents: false)
         p.contentView = effect
 
         self.effectView = effect
@@ -583,68 +602,31 @@ public final class CandidatePanelController {
             return
         }
 
-        let targetScreen = NSScreen.screens.first(where: { $0.frame.intersects(caretRect) })
-            ?? NSScreen.main
-            ?? NSScreen.screens.first
-        let visible = targetScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-
+        let visible = FloatingHUDPanel.visibleScreenFrame(for: caretRect)
         candidateView.maxAllowedWidth = max(240.0, visible.width - 24.0)
         candidateView.state = state
         let size = candidateView.computeFittingSize()
 
-        var originX = round(caretRect.minX)
-        var originY = round(caretRect.minY - size.height - 5.0)
+        let origin = panel.resolvedOrigin(
+            for: size,
+            caretRect: caretRect,
+            visibleFrame: visible,
+            verticalGap: 5.0,
+            minBottomMargin: 6.0,
+            horizontalMargin: 8.0
+        )
+        panel.updateLevel(for: clientWindowLevel)
 
-        // Flip cleanly above the text line if too close to bottom of screen
-        if originY < visible.minY + 6.0 {
-            originY = round(caretRect.maxY + 5.0)
+        let targetFrame = NSRect(origin: origin, size: size)
+        panel.presentWithoutAnimation(frame: targetFrame) {
+            candidateView.frame = NSRect(origin: .zero, size: size)
+            candidateView.layout()
+            candidateView.displayIfNeeded()
         }
-        if originX + size.width > visible.maxX - 8.0 {
-            originX = max(visible.minX + 8.0, round(visible.maxX - size.width - 8.0))
-        }
-        if originX < visible.minX + 8.0 {
-            originX = round(visible.minX + 8.0)
-        }
-
-        // Match IMKCandidates level rule: sit 1 level above client window (without triggering popUpMenu animation)
-        let baseLevel = Int(CGWindowLevelForKey(.floatingWindow)) + 2
-        let targetLevel = clientWindowLevel.map { max(baseLevel, Int($0) + 1) } ?? baseLevel
-        if panel.level.rawValue != targetLevel {
-            panel.level = NSWindow.Level(rawValue: targetLevel)
-        }
-
-        let targetFrame = NSRect(origin: NSPoint(x: originX, y: originY), size: size)
-
-        // Zero implicit CoreAnimation / AppKit frame animation
-        NSAnimationContext.beginGrouping()
-        NSAnimationContext.current.duration = 0
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-
-        panel.setFrame(targetFrame, display: false, animate: false)
-        candidateView.frame = NSRect(origin: .zero, size: size)
-        _ = candidateView.computeFittingSize()
-        candidateView.layout()
-        candidateView.displayIfNeeded()
-        panel.invalidateShadow()
-
-        if !panel.isVisible {
-            panel.orderFrontRegardless()
-        }
-
-        CATransaction.commit()
-        NSAnimationContext.endGrouping()
     }
 
     public func hide() {
-        guard panel.isVisible else { return }
-        NSAnimationContext.beginGrouping()
-        NSAnimationContext.current.duration = 0
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        panel.orderOut(nil)
-        CATransaction.commit()
-        NSAnimationContext.endGrouping()
+        panel.hideWithoutAnimation()
     }
 }
 
@@ -689,42 +671,20 @@ private final class ModeIndicatorContentView: NSView {
 public final class ModeIndicatorPanelController {
     public static let shared = ModeIndicatorPanelController()
 
-    private let panel: NSPanel
+    private let panel: FloatingHUDPanel
     private let contentView: ModeIndicatorContentView
     private var hideWorkItem: DispatchWorkItem?
     private let panelSize = NSSize(width: 32, height: 28)
 
     private init() {
         let frame = NSRect(origin: .zero, size: panelSize)
-        let effect = NSVisualEffectView(frame: frame)
-        effect.material = .popover
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = 7.0
-        effect.layer?.cornerCurve = .continuous
-        effect.layer?.masksToBounds = true
+        let effect = FloatingHUDPanel.makePopoverEffectView(frame: frame, cornerRadius: 7.0)
 
         let content = ModeIndicatorContentView(frame: frame)
         content.autoresizingMask = [.width, .height]
         effect.addSubview(content)
 
-        let p = NSPanel(
-            contentRect: frame,
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: true
-        )
-        p.animationBehavior = .none
-        p.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.floatingWindow)) + 2)
-        p.isOpaque = false
-        p.backgroundColor = .clear
-        p.hasShadow = true
-        p.isMovable = false
-        p.ignoresMouseEvents = true
-        p.hidesOnDeactivate = false
-        p.worksWhenModal = true
-        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
+        let p = FloatingHUDPanel(contentRect: frame, hasShadow: true, ignoresMouseEvents: true)
         p.contentView = effect
 
         self.contentView = content
@@ -734,48 +694,20 @@ public final class ModeIndicatorPanelController {
     public func show(asciiMode: Bool, caretRect: NSRect, clientWindowLevel: CGWindowLevel? = nil) {
         hideWorkItem?.cancel()
 
-        let targetScreen = NSScreen.screens.first(where: { $0.frame.intersects(caretRect) })
-            ?? NSScreen.main
-            ?? NSScreen.screens.first
-        let visible = targetScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-
-        var originX = round(caretRect.minX)
-        var originY = round(caretRect.minY - panelSize.height - 6.0)
-
-        if originY < visible.minY + 6.0 {
-            originY = round(caretRect.maxY + 6.0)
-        }
-        if originX + panelSize.width > visible.maxX - 8.0 {
-            originX = max(visible.minX + 8.0, round(visible.maxX - panelSize.width - 8.0))
-        }
-        if originX < visible.minX + 8.0 {
-            originX = round(visible.minX + 8.0)
-        }
-
-        let baseLevel = Int(CGWindowLevelForKey(.floatingWindow)) + 2
-        let targetLevel = clientWindowLevel.map { max(baseLevel, Int($0) + 1) } ?? baseLevel
-        if panel.level.rawValue != targetLevel {
-            panel.level = NSWindow.Level(rawValue: targetLevel)
-        }
+        let origin = panel.resolvedOrigin(
+            for: panelSize,
+            caretRect: caretRect,
+            verticalGap: 6.0,
+            minBottomMargin: 6.0,
+            horizontalMargin: 8.0
+        )
+        panel.updateLevel(for: clientWindowLevel)
 
         contentView.label = asciiMode ? "英" : "中"
-        let targetFrame = NSRect(origin: NSPoint(x: originX, y: originY), size: panelSize)
-
-        NSAnimationContext.beginGrouping()
-        NSAnimationContext.current.duration = 0
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-
-        panel.setFrame(targetFrame, display: false, animate: false)
-        contentView.displayIfNeeded()
-        panel.invalidateShadow()
-
-        if !panel.isVisible {
-            panel.orderFrontRegardless()
+        let targetFrame = NSRect(origin: origin, size: panelSize)
+        panel.presentWithoutAnimation(frame: targetFrame) {
+            contentView.displayIfNeeded()
         }
-
-        CATransaction.commit()
-        NSAnimationContext.endGrouping()
 
         let item = DispatchWorkItem { [weak self] in
             self?.hide()
@@ -787,13 +719,6 @@ public final class ModeIndicatorPanelController {
     public func hide() {
         hideWorkItem?.cancel()
         hideWorkItem = nil
-        guard panel.isVisible else { return }
-        NSAnimationContext.beginGrouping()
-        NSAnimationContext.current.duration = 0
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        panel.orderOut(nil)
-        CATransaction.commit()
-        NSAnimationContext.endGrouping()
+        panel.hideWithoutAnimation()
     }
 }

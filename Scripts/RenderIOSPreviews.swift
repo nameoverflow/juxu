@@ -19,9 +19,9 @@ struct RenderIOSPreviews {
             .appendingPathComponent("Resources/Dicts", isDirectory: true)
         let bridge = JuxuBridge(customDictsDir: dictsURL, inMemoryOnly: true)
 
-        // Exact 440pt iPhone Pro Max iOS 26 keyboard dimensions (`440 x 225` key area + `52pt` candidate bar + `69pt` bottom safe bar)
+        // Exact 440pt iPhone Pro Max keyboard dimensions (`440 x 220` key area + `53pt` candidate bar + `69pt` bottom safe bar)
         let kbEngine = IOSKeyboardLayoutEngine()
-        let snap = kbEngine.computeLayout(in: CGSize(width: 440, height: 225))
+        let snap = kbEngine.computeLayout(in: CGSize(width: 440, height: 220))
         bridge.setKeyLayout(
             centers52: snap.centers52,
             originX: snap.originX,
@@ -265,15 +265,15 @@ struct IOS26KeyboardSheetPreview: View {
                             .foregroundStyle(isDark ? Color.white : Color.black)
                             .frame(width: 44)
                     }
-                    .frame(height: 52.5)
+                    .frame(height: 53.0)
 
-                    // 225pt 4-Row Key Area (or Expanded 4-Column Grid)
+                    // 220pt 4-Row Key Area (or Expanded 4-Column Grid)
                     if let expanded = expandedCandidates {
                         IOS26ExpandedGridPreview(candidates: expanded, isDark: isDark)
-                            .frame(width: 440, height: 225)
+                            .frame(width: 440, height: 220)
                     } else {
                         IOS26KeyCanvasPreview(snapshot: snapshot, isDark: isDark, pressedKey: pressedKey)
-                            .frame(width: 440, height: 225)
+                            .frame(width: 440, height: 220)
                     }
 
                     // 69pt System Bottom Safe-Area Bar (`🌐` left, `🎤` right) matching Face ID iOS 26!
@@ -309,7 +309,7 @@ struct IOS26KeyboardSheetPreview: View {
                     let bw: CGFloat = max(61.33, pk.frame.width * 1.67)
                     let bh: CGFloat = max(65.0, pk.frame.height * 1.44)
                     let clampedMidX = min(max(4.0 + bw * 0.5, pk.frame.midX), snapshot.bounds.width - 4.0 - bw * 0.5)
-                    let bubbleMidY = 52.5 + pk.frame.minY - 3.67 - bh * 0.5
+                    let bubbleMidY = 53.0 + pk.frame.minY - 3.67 - bh * 0.5
                     let fgColor = isDark ? Color.white : Color.black
 
                     RoundedRectangle(cornerRadius: 13.5, style: .continuous)
@@ -473,45 +473,6 @@ struct TopRoundedShape: Shape {
         p.addLine(to: CGPoint(x: rect.maxX - r, y: 0))
         p.addQuadCurve(to: CGPoint(x: rect.maxX, y: r), control: CGPoint(x: rect.maxX, y: 0))
         p.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
-        p.closeSubpath()
-        return p
-    }
-}
-
-struct IOS26NeckedCalloutShape: Shape {
-    let baseWidth: CGFloat
-
-    func path(in rect: CGRect) -> Path {
-        let w = rect.width
-        let h = rect.height
-        let baseLeft = (w - baseWidth) * 0.5
-        let baseRight = baseLeft + baseWidth
-        let neckY: CGFloat = 54
-        let rTop: CGFloat = 12.0
-        let rBot: CGFloat = 8.5
-
-        var p = Path()
-        p.move(to: CGPoint(x: rTop + 2, y: 2))
-        p.addLine(to: CGPoint(x: w - rTop - 2, y: 2))
-        p.addQuadCurve(to: CGPoint(x: w - 2, y: rTop + 2), control: CGPoint(x: w - 2, y: 2))
-        p.addLine(to: CGPoint(x: w - 2, y: neckY - 12))
-        p.addCurve(
-            to: CGPoint(x: baseRight, y: neckY + 4),
-            control1: CGPoint(x: w - 2, y: neckY - 3),
-            control2: CGPoint(x: baseRight, y: neckY - 2)
-        )
-        p.addLine(to: CGPoint(x: baseRight, y: h - rBot))
-        p.addQuadCurve(to: CGPoint(x: baseRight - rBot, y: h), control: CGPoint(x: baseRight, y: h))
-        p.addLine(to: CGPoint(x: baseLeft + rBot, y: h))
-        p.addQuadCurve(to: CGPoint(x: baseLeft, y: h - rBot), control: CGPoint(x: baseLeft, y: h))
-        p.addLine(to: CGPoint(x: baseLeft, y: neckY + 4))
-        p.addCurve(
-            to: CGPoint(x: 2, y: neckY - 12),
-            control1: CGPoint(x: baseLeft, y: neckY - 2),
-            control2: CGPoint(x: 2, y: neckY - 3)
-        )
-        p.addLine(to: CGPoint(x: 2, y: rTop + 2))
-        p.addQuadCurve(to: CGPoint(x: rTop + 2, y: 2), control: CGPoint(x: 2, y: 2))
         p.closeSubpath()
         return p
     }

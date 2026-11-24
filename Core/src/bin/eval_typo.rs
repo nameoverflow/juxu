@@ -3,121 +3,16 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use juxu_core::code::PackedCode;
-use juxu_core::config::{JuxuConfig, InputSchema};
-use juxu_core::engine::{LmWeights, JuxuEngine};
+use juxu_core::config::{InputSchema, JuxuConfig};
+use juxu_core::engine::{JuxuEngine, LmWeights};
+use juxu_core::eval_support::{
+    pct, segment_wubi_sentence, wubi_neighbor_keys as neighbor_keys, XorshiftRng as Rng,
+};
 use juxu_core::format::{AuxView, DictView};
 use juxu_core::typo::KeyLayout;
 
-/// Deterministic xorshift64* PRNG (zero external dependencies)
-struct Rng(u64);
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed.max(1))
-    }
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn next_f32(&mut self) -> f32 {
-        ((self.next_u64() >> 40) as f32) / ((1u32 << 24) as f32)
-    }
-    fn range(&mut self, n: usize) -> usize {
-        if n <= 1 {
-            0
-        } else {
-            (self.next_u64() as usize) % n
-        }
-    }
-}
-
-fn neighbor_keys(layout: &KeyLayout, ch: u8) -> Vec<u8> {
-    let (cx0, cy0) = layout.center_of(ch);
-    let mut out = Vec::new();
-    for d in 0..25u8 {
-        let k = b'a' + d;
-        if k == ch {
-            continue;
-        }
-        let (cx, cy) = layout.center_of(k);
-        let dx = (cx - cx0).abs();
-        let dy = (cy - cy0).abs();
-        if (dy < 0.1 && dx <= 1.05) || (dy <= 1.05 && dx <= 0.85) {
-            out.push(k);
-        }
-    }
-    out
-}
-
-/// Segment a Chinese sentence into realistic Wubi tokens `(text, code)` using greedy phrase-first
-/// matching (2..=4 char phrases that are #1 at their 4-letter code, else single chars with 2..=4
-/// or 1-letter code).
 fn segment_sentence(dict: &DictView, sent: &str) -> Vec<(String, String)> {
-    let chars: Vec<char> = sent.chars().collect();
-    let mut tokens = Vec::new();
-    let mut i = 0usize;
-    while i < chars.len() {
-        let mut matched: Option<(usize, String, String)> = None;
-        // Prefer 2..=4 char dictionary phrases when they are primary (#1) at their code
-        for len in (2..=4).rev() {
-            if i + len > chars.len() {
-                continue;
-            }
-            let sub: String = chars[i..i + len].iter().collect();
-            if let Some(code) = dict.encode_phrase(&sub) {
-                let hits = dict.lookup_exact(code, false);
-                if let Some(first) = hits.first() {
-                    if first.text == sub {
-                        matched = Some((len, sub, code.as_string()));
-                        break;
-                    }
-                }
-            }
-        }
-        if let Some((len, text, code)) = matched {
-            tokens.push((text, code));
-            i += len;
-            continue;
-        }
-        // Fallback to single char (use primary short code if available, else full code)
-        let ch = chars[i];
-        let mut pushed = false;
-        if let Some(meta) = dict.char_meta(ch) {
-            let code = if !meta.primary_short_code.is_empty() {
-                meta.primary_short_code
-            } else if !meta.shortest_code.is_empty() {
-                meta.shortest_code
-            } else {
-                meta.full_code
-            };
-            let cs = code.as_string();
-            if !cs.is_empty() && cs.bytes().all(|b| (b'a'..=b'y').contains(&b)) {
-                // Only keep if ch is top-1 at this code (realistic blind typing target)
-                let hits = dict.lookup_exact(code, false);
-                if hits.first().map(|e| e.text == ch.to_string()).unwrap_or(false) {
-                    tokens.push((ch.to_string(), cs));
-                    pushed = true;
-                } else if !meta.full_code.is_empty() {
-                    let fhits = dict.lookup_exact(meta.full_code, false);
-                    let fcs = meta.full_code.as_string();
-                    if fhits.first().map(|e| e.text == ch.to_string()).unwrap_or(false)
-                        && fcs.bytes().all(|b| (b'a'..=b'y').contains(&b))
-                    {
-                        tokens.push((ch.to_string(), fcs));
-                        pushed = true;
-                    }
-                }
-            }
-        }
-        if !pushed {
-            tokens.push((ch.to_string(), String::new()));
-        }
-        i += 1;
-    }
-    tokens
+    segment_wubi_sentence(dict, sent, false)
 }
 
 #[derive(Default, Clone, Debug)]
@@ -544,7 +439,19 @@ fn main() {
         }
     }
 
-    let eval_tsv = eval_tsv.expect("--eval <tsv> required");
+    if schema.is_pinyin() {
+        eprintln!(
+            "Error: eval_typo only supports fixed-code .wbdict schemas (wubi86/wubi98/wubi06/xiaohe/cangjie*), not '{}'. Use eval_pinyin or eval_touch_and_bmk instead.",
+            schema.as_tag()
+        );
+        std::process::exit(1);
+    }
+
+    let Some(eval_tsv) = eval_tsv else {
+        eprintln!("Usage: eval_typo --eval <sentences.tsv> [--schema wubi86|wubi98|wubi06|xiaohe|cangjie5]");
+        std::process::exit(1);
+    };
+    let _ = pct;
     let aux_file = aux_path.unwrap_or_else(|| dicts_dir.join("wubi_aux.wbaux"));
     let dict_file = match schema {
         InputSchema::Wubi86 => dicts_dir.join("wubi86.wbdict"),
@@ -554,8 +461,12 @@ fn main() {
         InputSchema::Cangjie3 => dicts_dir.join("cangjie3.wbdict"),
         InputSchema::Cangjie5 => dicts_dir.join("cangjie5.wbdict"),
         InputSchema::Cangjie6 => dicts_dir.join("cangjie6.wbdict"),
-        InputSchema::Pinyin | InputSchema::XiaoheShuangpin => dicts_dir.join("wubi86.wbdict"),
+        InputSchema::Pinyin | InputSchema::XiaoheShuangpin => unreachable!(),
     };
+    if !dict_file.exists() {
+        eprintln!("Error: dictionary file not found: {}", dict_file.display());
+        std::process::exit(1);
+    }
 
     let dict = DictView::open_mmap(&dict_file).expect("open dict");
     let aux = AuxView::open_mmap(&aux_file).expect("open aux");

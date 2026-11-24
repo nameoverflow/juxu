@@ -1,4 +1,5 @@
 use crate::engine::{Candidate, CandidateBadge};
+use crate::json::push_json_str;
 use crate::typo::{CorrectionKind, KeyObs};
 use std::collections::VecDeque;
 
@@ -108,7 +109,6 @@ pub fn is_sensitive_numeric_text(s: &str) -> bool {
             has_digit = true;
             consec_digits += 1;
             if consec_digits >= 4 {
-                // Skip 4+ consecutive digits (OTP codes, PINs, phone/card fragments)
                 return true;
             }
         } else {
@@ -185,37 +185,19 @@ pub fn candidate_typo_tag(cand: &Candidate) -> &'static str {
     }
 }
 
-fn json_escape(s: &str, out: &mut String) {
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
 impl EvalEvent {
     pub fn to_json_line(&self) -> String {
         let mut j = String::with_capacity(256);
         j.push_str("{\"ts\":");
         j.push_str(&self.ts_ms.to_string());
         j.push_str(",\"schema\":");
-        json_escape(self.schema, &mut j);
+        push_json_str(&mut j, self.schema);
         j.push_str(",\"event\":");
-        json_escape(self.event, &mut j);
+        push_json_str(&mut j, self.event);
         j.push_str(",\"ctx\":");
-        json_escape(&self.ctx, &mut j);
+        push_json_str(&mut j, &self.ctx);
         j.push_str(",\"keys\":");
-        json_escape(&self.keys, &mut j);
+        push_json_str(&mut j, &self.keys);
         if !self.touches.is_empty() {
             j.push_str(",\"touches\":[");
             for (i, pt) in self.touches.iter().enumerate() {
@@ -230,11 +212,11 @@ impl EvalEvent {
             ",\"rank\":{},\"explicit\":{},\"chosen\":",
             self.rank, self.explicit
         ));
-        json_escape(&self.chosen, &mut j);
+        push_json_str(&mut j, &self.chosen);
         j.push_str(",\"top1\":");
-        json_escape(&self.top1, &mut j);
+        push_json_str(&mut j, &self.top1);
         j.push_str(",\"typo\":");
-        json_escape(self.typo, &mut j);
+        push_json_str(&mut j, self.typo);
         if let Some(v) = self.lm_chosen {
             if v.is_finite() {
                 j.push_str(&format!(",\"lm_chosen\":{:.3}", v));
@@ -255,7 +237,7 @@ impl EvalEvent {
                     j.push(',');
                 }
                 j.push_str("{\"t\":");
-                json_escape(&c.text, &mut j);
+                push_json_str(&mut j, &c.text);
                 j.push_str(&format!(
                     ",\"b\":{},\"x\":{},\"c\":{:.2}}}",
                     c.badge,

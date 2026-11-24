@@ -72,13 +72,151 @@ public enum VoiceEngineError: LocalizedError, Sendable {
         case .noSpeechDetected:
             return "没听清"
         case .cliNotFound(let bin):
-            return "未找到本地 Whisper 命令：\(bin)"
+            return "未找到本地语音命令：\(bin)"
         case .cliFailed(let msg):
-            return "本地 Whisper 执行失败：\(msg)"
+            return "本地语音执行失败：\(msg)"
         case .networkError(let msg):
             return "请求失败：\(msg)"
         case .cancelled:
             return "已取消语音输入"
+        }
+    }
+}
+
+// MARK: - Non-Blocking Subprocess Runner (Concurrent Pipe Drain + Cancellation)
+
+public struct VoiceSubprocessResult: Sendable {
+    public let terminationStatus: Int32
+    public let terminationReason: Process.TerminationReason
+    public let stdout: Data
+    public let stderr: Data
+}
+
+/// Runs a `Foundation.Process` without blocking cooperative Swift Concurrency threads:
+/// - Drains `stdout` and `stderr` pipes concurrently while the child runs (preventing 64KB pipe buffer deadlocks).
+/// - Uses `terminationHandler` + `DispatchGroup` with `CheckedContinuation` instead of `waitUntilExit()`.
+/// - Wraps execution in `withTaskCancellationHandler` calling `proc.terminate()` immediately on task cancel.
+public enum VoiceSubprocessRunner {
+    private final class CancellationBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var process: Process?
+        private var cancelled = false
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+
+        func attach(_ proc: Process) -> Bool {
+            lock.lock()
+            if cancelled {
+                lock.unlock()
+                return false
+            }
+            self.process = proc
+            lock.unlock()
+            return true
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            let proc = process
+            lock.unlock()
+            if let proc, proc.isRunning {
+                proc.terminate()
+            }
+        }
+    }
+
+    private final class DataBox: @unchecked Sendable {
+        var data = Data()
+    }
+
+    public static func run(
+        executablePath: String,
+        arguments: [String],
+        environment: [String: String]? = nil
+    ) async throws -> VoiceSubprocessResult {
+        try Task.checkCancellation()
+        let cancelBox = CancellationBox()
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<VoiceSubprocessResult, Error>) in
+                if cancelBox.isCancelled {
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: executablePath)
+                proc.arguments = arguments
+                if let environment {
+                    proc.environment = environment
+                }
+                proc.standardInput = FileHandle.nullDevice
+
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                proc.standardOutput = stdoutPipe
+                proc.standardError = stderrPipe
+
+                let stdoutRead = stdoutPipe.fileHandleForReading
+                let stderrRead = stderrPipe.fileHandleForReading
+                let outBox = DataBox()
+                let errBox = DataBox()
+                let group = DispatchGroup()
+
+                group.enter()
+                proc.terminationHandler = { _ in
+                    group.leave()
+                }
+
+                do {
+                    try proc.run()
+                } catch {
+                    proc.terminationHandler = nil
+                    group.leave()
+                    cont.resume(throwing: VoiceEngineError.cliFailed(error.localizedDescription))
+                    return
+                }
+
+                if !cancelBox.attach(proc) {
+                    if proc.isRunning {
+                        proc.terminate()
+                    }
+                }
+
+                group.enter()
+                DispatchQueue.global(qos: .utility).async {
+                    outBox.data = stdoutRead.readDataToEndOfFile()
+                    group.leave()
+                }
+
+                group.enter()
+                DispatchQueue.global(qos: .utility).async {
+                    errBox.data = stderrRead.readDataToEndOfFile()
+                    group.leave()
+                }
+
+                group.notify(queue: .global(qos: .userInitiated)) {
+                    if cancelBox.isCancelled || proc.terminationReason == .uncaughtSignal {
+                        cont.resume(throwing: CancellationError())
+                        return
+                    }
+                    cont.resume(
+                        returning: VoiceSubprocessResult(
+                            terminationStatus: proc.terminationStatus,
+                            terminationReason: proc.terminationReason,
+                            stdout: outBox.data,
+                            stderr: errBox.data
+                        )
+                    )
+                }
+            }
+        } onCancel: {
+            cancelBox.cancel()
         }
     }
 }
@@ -280,28 +418,6 @@ public enum VoiceMultipartBuilder {
     }
 }
 
-// MARK: - Local CLI Discovery (On-Demand)
-
-public enum VoiceLocalCLIDiscovery {
-    private static let candidatePaths = [
-        "/opt/homebrew/bin/whisper-cli",
-        "/usr/local/bin/whisper-cli",
-        "/opt/homebrew/bin/whisper-cpp",
-        "/usr/local/bin/whisper-cpp",
-        "/opt/homebrew/bin/whisper",
-        "/usr/local/bin/whisper",
-    ]
-
-    public static func detectInstalledBinary() -> String? {
-        for path in candidatePaths {
-            if FileManager.default.isExecutableFile(atPath: path) {
-                return path
-            }
-        }
-        return nil
-    }
-}
-
 // MARK: - On-Demand Audio Recorder & Apple Speech Live Streamer
 
 public final class VoiceAudioRecorder: @unchecked Sendable {
@@ -379,9 +495,7 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
             }
             let req = SFSpeechAudioBufferRecognitionRequest()
             req.shouldReportPartialResults = true
-            if #available(macOS 13.0, *) {
-                req.addsPunctuation = true
-            }
+            req.addsPunctuation = true
             if requireOnDevice {
                 if recognizer.supportsOnDeviceRecognition {
                     req.requiresOnDeviceRecognition = true
@@ -853,93 +967,73 @@ public final class VoicePipelineClient: Sendable {
         return cleaned.isEmpty ? rawTranscript : cleaned
     }
 
+    /// Runs `whisper-cli` (`whisper.cpp`) or `mlx_whisper` without blocking cooperative threads or 64KB pipe deadlocks.
     public func transcribeLocalCLI(
         binaryPath: String,
         modelPath: String,
         language: String,
         wavData: Data
     ) async throws -> String {
-        let resolvedBin = binaryPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? (VoiceLocalCLIDiscovery.detectInstalledBinary() ?? "")
-            : binaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !resolvedBin.isEmpty, FileManager.default.isExecutableFile(atPath: resolvedBin) else {
-            throw VoiceEngineError.cliNotFound(resolvedBin.isEmpty ? "whisper-cli / whisper" : resolvedBin)
+        let trimmedBin = binaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBin.isEmpty, FileManager.default.isExecutableFile(atPath: trimmedBin) else {
+            throw VoiceEngineError.cliNotFound(trimmedBin.isEmpty ? "whisper-cli / mlx_whisper" : trimmedBin)
         }
 
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("juxu-voice-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
         let wavURL = tempDir.appendingPathComponent("input.wav")
         try wavData.write(to: wavURL)
 
-        return try await withCheckedThrowingContinuation { cont in
-            DispatchQueue.global(qos: .userInitiated).async {
-                defer { try? FileManager.default.removeItem(at: tempDir) }
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: resolvedBin)
-                let binName = URL(fileURLWithPath: resolvedBin).lastPathComponent.lowercased()
-                let trimmedModel = modelPath.trimmingCharacters(in: .whitespacesAndNewlines)
-
-                if binName.contains("whisper-cli") || binName.contains("whisper-cpp") {
-                    var args = ["-f", wavURL.path, "--no-timestamps", "-nt"]
-                    if !trimmedModel.isEmpty {
-                        args.append(contentsOf: ["-m", trimmedModel])
-                    }
-                    if !language.isEmpty && language != "auto" {
-                        args.append(contentsOf: ["-l", language])
-                    }
-                    proc.arguments = args
-                } else {
-                    // Python openai-whisper CLI
-                    var args = [
-                        wavURL.path,
-                        "--output_format", "txt",
-                        "--output_dir", tempDir.path,
-                        "--fp16", "False",
-                    ]
-                    if !trimmedModel.isEmpty {
-                        args.append(contentsOf: ["--model", trimmedModel])
-                    }
-                    if !language.isEmpty && language != "auto" {
-                        args.append(contentsOf: ["--language", language])
-                    }
-                    proc.arguments = args
-                }
-
-                let stdoutPipe = Pipe()
-                let stderrPipe = Pipe()
-                proc.standardOutput = stdoutPipe
-                proc.standardError = stderrPipe
-
-                do {
-                    try proc.run()
-                    proc.waitUntilExit()
-                    let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                    let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-
-                    if proc.terminationStatus != 0 {
-                        let errMsg = String(data: errData, encoding: .utf8)?
-                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "退出码 \(proc.terminationStatus)"
-                        cont.resume(throwing: VoiceEngineError.cliFailed(String(errMsg.prefix(160))))
-                        return
-                    }
-
-                    let txtFile = tempDir.appendingPathComponent("input.txt")
-                    if FileManager.default.fileExists(atPath: txtFile.path),
-                       let fileText = try? String(contentsOf: txtFile, encoding: .utf8) {
-                        let trimmed = fileText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        cont.resume(returning: trimmed)
-                        return
-                    }
-
-                    let outText = String(data: outData, encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    cont.resume(returning: outText)
-                } catch {
-                    cont.resume(throwing: VoiceEngineError.cliFailed(error.localizedDescription))
-                }
+        let binName = URL(fileURLWithPath: trimmedBin).lastPathComponent.lowercased()
+        let trimmedModel = modelPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let args: [String]
+        if binName.contains("mlx_whisper") || binName.contains("mlx-whisper") {
+            var mlxArgs = [
+                wavURL.path,
+                "--output-format", "txt",
+                "--output-dir", tempDir.path,
+            ]
+            if !trimmedModel.isEmpty {
+                mlxArgs.append(contentsOf: ["--model", trimmedModel])
             }
+            if !language.isEmpty && language != "auto" {
+                mlxArgs.append(contentsOf: ["--language", language])
+            }
+            args = mlxArgs
+        } else {
+            // `whisper.cpp` (`whisper-cli` / `whisper-cpp`)
+            var cppArgs = ["-f", wavURL.path, "--no-timestamps", "-nt"]
+            if !trimmedModel.isEmpty {
+                cppArgs.append(contentsOf: ["-m", trimmedModel])
+            }
+            if !language.isEmpty && language != "auto" {
+                cppArgs.append(contentsOf: ["-l", language])
+            }
+            args = cppArgs
         }
+
+        let result = try await VoiceSubprocessRunner.run(
+            executablePath: trimmedBin,
+            arguments: args
+        )
+
+        if result.terminationStatus != 0 {
+            let errMsg = String(data: result.stderr, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "退出码 \(result.terminationStatus)"
+            throw VoiceEngineError.cliFailed(String(errMsg.prefix(160)))
+        }
+
+        let txtFile = tempDir.appendingPathComponent("input.txt")
+        if FileManager.default.fileExists(atPath: txtFile.path),
+           let fileText = try? String(contentsOf: txtFile, encoding: .utf8) {
+            return fileText.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return String(data: result.stdout, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     public func polishLocalLlamaCLI(
@@ -965,47 +1059,32 @@ public final class VoicePipelineClient: Sendable {
         let userPrompt = messages.last?["content"] ?? rawTranscript
         let chatML = "<|im_start|>system\n\(systemPrompt)<|im_end|>\n<|im_start|>user\n\(userPrompt)<|im_end|>\n<|im_start|>assistant\n"
 
-        return try await withCheckedThrowingContinuation { cont in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: binaryPath)
-                proc.arguments = [
-                    "-m", modelPath,
-                    "-ngl", "99",
-                    "-c", "2048",
-                    "-n", "512",
-                    "--temp", "0.1",
-                    "--no-display-prompt",
-                    "-no-cnv",
-                    "-p", chatML,
-                ]
-                let stdoutPipe = Pipe()
-                let stderrPipe = Pipe()
-                proc.standardOutput = stdoutPipe
-                proc.standardError = stderrPipe
+        let result = try await VoiceSubprocessRunner.run(
+            executablePath: binaryPath,
+            arguments: [
+                "-m", modelPath,
+                "-ngl", "99",
+                "-c", "2048",
+                "-n", "512",
+                "--temp", "0.1",
+                "--no-display-prompt",
+                "-no-cnv",
+                "-p", chatML,
+            ]
+        )
 
-                do {
-                    try proc.run()
-                    proc.waitUntilExit()
-                    let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                    let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                    if proc.terminationStatus != 0 {
-                        let errMsg = String(data: errData, encoding: .utf8)?
-                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "退出码 \(proc.terminationStatus)"
-                        cont.resume(throwing: VoiceEngineError.cliFailed(String(errMsg.suffix(160))))
-                        return
-                    }
-                    var outText = String(data: outData, encoding: .utf8) ?? ""
-                    for marker in ["<|im_end|>", "[end of text]", "<|endoftext|>"] {
-                        outText = outText.replacingOccurrences(of: marker, with: "")
-                    }
-                    let cleaned = outText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    cont.resume(returning: cleaned.isEmpty ? rawTranscript : cleaned)
-                } catch {
-                    cont.resume(throwing: VoiceEngineError.cliFailed(error.localizedDescription))
-                }
-            }
+        if result.terminationStatus != 0 {
+            let errMsg = String(data: result.stderr, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "退出码 \(result.terminationStatus)"
+            throw VoiceEngineError.cliFailed(String(errMsg.suffix(160)))
         }
+
+        var outText = String(data: result.stdout, encoding: .utf8) ?? ""
+        for marker in ["<|im_end|>", "[end of text]", "<|endoftext|>"] {
+            outText = outText.replacingOccurrences(of: marker, with: "")
+        }
+        let cleaned = outText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? rawTranscript : cleaned
     }
 
     private func validateHTTP(response: URLResponse, data: Data) throws {

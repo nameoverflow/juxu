@@ -1,6 +1,25 @@
 #if os(iOS)
 import UIKit
 
+/// Strips duplicated typo/spatial badge glyphs (`⌖`, `⟲`, `⇄`, `⎵`) from candidate comment strings.
+private func cleanIOSCandidateAnnotation(for item: JuxuCandidateItem) -> String {
+    guard !item.comment.isEmpty else { return "" }
+    let raw: String
+    switch item.badgeKind {
+    case .typoCorrected:
+        raw = item.comment.components(separatedBy: " ").first ?? item.comment
+    case .pinyinLookup, .shortcode, .wildcard:
+        raw = item.comment
+    default:
+        return ""
+    }
+    var cleaned = raw
+    for sym in ["⌖", "⟲", "⇄", "⎵"] {
+        cleaned = cleaned.replacingOccurrences(of: sym, with: "")
+    }
+    return cleaned.trimmingCharacters(in: .whitespaces)
+}
+
 /// Direct `UIControl` + `UILabel` candidate slot (zero `UIButton.Configuration` deferred layout pass).
 @MainActor
 private final class IOSRibbonSlotControl: UIControl {
@@ -324,11 +343,11 @@ private final class IOSRibbonChevronButton: UIControl {
     }
 }
 
-/// iOS 26 Native Airy Unboxed Candidate Bar (`44pt` height):
+/// iOS 26 Native Airy Unboxed Candidate Bar (`53pt` portrait / `40pt` landscape):
 /// - Pure `UIView` horizontal track (`clipContainer` + `contentTrack` + horizontal `UIPanGestureRecognizer`)
-///   with ZERO `UIScrollView`, completely eliminating iOS 26's `_UIScrollPocket` / `UIScrollEdgeEffect`
-///   variable blur across the 44pt bar on physical devices and removing `UIScrollView` touch delay.
-/// - Passes touches in the bottom `6pt` empty strip (`y = 38..44`) directly through to Row 0 (`q..p`).
+///   with ZERO `UIScrollView` and ZERO `UIButton.Configuration`, eliminating `_UIScrollPocket` /
+///   `UIScrollEdgeEffect` variable blur and scroll-view touch delay.
+/// - Passes touches in the bottom `8pt` empty strip directly through to Row 0 (`q..p`).
 final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
     var onSelectCandidate: ((Int) -> Void)?
     var onSelectStarterWord: ((String) -> Void)?
@@ -835,14 +854,7 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
                             let item = items[i]
                             ctrl.slotIndex = i
                             ctrl.starterWord = nil
-                            let secondary: String
-                            if !item.comment.isEmpty && (item.badgeKind == .typoCorrected || item.badgeKind == .pinyinLookup || item.badgeKind == .shortcode) {
-                                secondary = item.badgeKind == .typoCorrected
-                                    ? item.comment.components(separatedBy: " ").first ?? item.comment
-                                    : item.comment
-                            } else {
-                                secondary = ""
-                            }
+                            let secondary = cleanIOSCandidateAnnotation(for: item)
                             ctrl.setSlotContent(
                                 primary: item.text,
                                 secondary: secondary,
@@ -902,9 +914,12 @@ private final class IOSExpandedScrollView: UIScrollView {
     }
 }
 
-/// Tactile button for expanded candidate cells & right rail with instant keycap-style press highlight.
+/// Reusable tactile button for expanded candidate cells & right rail with instant keycap-style press highlight
+/// and manual `CGRect` subview layout (zero Auto Layout constraint churn inside `UIScrollView`).
 @MainActor
 private final class IOSExpandedCellButton: UIButton {
+    var candidateIndex: Int = 0
+
     var normalSurfaceColor: UIColor = .white {
         didSet { updateSurface() }
     }
@@ -916,12 +931,134 @@ private final class IOSExpandedCellButton: UIButton {
         didSet { updateSurface() }
     }
 
+    private let candidateLabel = UILabel()
+    private let hintLabel = UILabel()
+    private var isCandidateCell = false
+    private var hasHint = false
+    private var measuredTextHeight: CGFloat = 22.0
+    private var measuredHintHeight: CGFloat = 12.0
+    private var currentTextInset: CGFloat = 10.0
+
+    func setupAsCandidateCell() {
+        guard !isCandidateCell else { return }
+        isCandidateCell = true
+        translatesAutoresizingMaskIntoConstraints = true
+        layer.cornerRadius = IOSKeyboardLayoutEngine.keyCornerRadius
+        layer.cornerCurve = .continuous
+        isAccessibilityElement = true
+
+        candidateLabel.translatesAutoresizingMaskIntoConstraints = true
+        candidateLabel.lineBreakMode = .byCharWrapping
+        candidateLabel.numberOfLines = 0
+        candidateLabel.isUserInteractionEnabled = false
+        candidateLabel.isAccessibilityElement = false
+        addSubview(candidateLabel)
+
+        hintLabel.translatesAutoresizingMaskIntoConstraints = true
+        hintLabel.font = .systemFont(ofSize: 10.0, weight: .regular)
+        hintLabel.lineBreakMode = .byTruncatingMiddle
+        hintLabel.adjustsFontSizeToFitWidth = true
+        hintLabel.minimumScaleFactor = 0.72
+        hintLabel.numberOfLines = 1
+        hintLabel.isUserInteractionEnabled = false
+        hintLabel.isAccessibilityElement = false
+        hintLabel.isHidden = true
+        addSubview(hintLabel)
+    }
+
+    func configureCandidate(
+        text: String,
+        hint: String?,
+        index: Int,
+        font: UIFont,
+        dark: Bool
+    ) {
+        candidateIndex = index
+        normalSurfaceColor = dark ? UIColor(white: 1.0, alpha: 0.175) : .white
+        pressedSurfaceColor = dark
+            ? UIColor(white: 1.0, alpha: 0.30)
+            : UIColor(red: 214.0 / 255.0, green: 216.0 / 255.0, blue: 222.0 / 255.0, alpha: 1.0)
+        accessibilityLabel = text
+        accessibilityIdentifier = "JuxuExpandedCandidate\(index)"
+
+        candidateLabel.text = text
+        candidateLabel.font = font
+        candidateLabel.textColor = dark ? .white : .black
+
+        if let hint, !hint.isEmpty {
+            hasHint = true
+            hintLabel.text = hint
+            hintLabel.textColor = dark ? UIColor(white: 0.72, alpha: 1.0) : UIColor(white: 0.42, alpha: 1.0)
+            hintLabel.isHidden = false
+            measuredHintHeight = ceil(hintLabel.font.lineHeight)
+        } else {
+            hasHint = false
+            hintLabel.text = nil
+            hintLabel.isHidden = true
+            measuredHintHeight = 0
+        }
+    }
+
+    func measureHeight(forWidth width: CGFloat, fullWidth: Bool, textInset: CGFloat) -> CGFloat {
+        currentTextInset = textInset
+        let alignment: NSTextAlignment = fullWidth ? .natural : .center
+        candidateLabel.textAlignment = alignment
+        hintLabel.textAlignment = alignment
+
+        let availableWidth = max(1.0, width - 2.0 * textInset)
+        let textHeight = ceil(candidateLabel.sizeThatFits(CGSize(width: availableWidth, height: .greatestFiniteMagnitude)).height)
+        measuredTextHeight = textHeight
+
+        if hasHint {
+            let spacing: CGFloat = 1.0
+            let totalContentH = textHeight + spacing + measuredHintHeight
+            return max(48.0, totalContentH + 12.0)
+        } else {
+            return max(45.0, textHeight + 16.0)
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard isCandidateCell else { return }
+        let w = bounds.width
+        let h = bounds.height
+        let textW = max(1.0, w - 2.0 * currentTextInset)
+        if hasHint {
+            let spacing: CGFloat = 1.0
+            let totalH = measuredTextHeight + spacing + measuredHintHeight
+            let textY = floor((h - totalH) * 0.5)
+            candidateLabel.frame = CGRect(
+                x: currentTextInset,
+                y: textY,
+                width: textW,
+                height: measuredTextHeight
+            )
+            hintLabel.frame = CGRect(
+                x: 4.0,
+                y: textY + measuredTextHeight + spacing,
+                width: max(1.0, w - 8.0),
+                height: measuredHintHeight
+            )
+        } else {
+            candidateLabel.frame = CGRect(
+                x: currentTextInset,
+                y: floor((h - measuredTextHeight) * 0.5),
+                width: textW,
+                height: measuredTextHeight
+            )
+        }
+    }
+
     private func updateSurface() {
         backgroundColor = isHighlighted ? pressedSurfaceColor : normalSurfaceColor
     }
 }
 
-/// Compact choices share a row. Longer candidates take the full width and wrap.
+/// Pooled manual-frame expanded candidate grid:
+/// - Compact choices share a 4-column row; longer candidates take full width and wrap.
+/// - Reuses `cellPool` (`translatesAutoresizingMaskIntoConstraints = true`) with deterministic `CGRect` layout,
+///   doing zero Auto Layout constraint churn and zero view allocation on scroll or repeated reloads.
 final class IOSExpandedCandidateView: UIView {
     var onSelectAbsCandidate: ((Int) -> Void)?
     var onCollapse: (() -> Void)?
@@ -930,14 +1067,19 @@ final class IOSExpandedCandidateView: UIView {
     var onOpenSettings: (() -> Void)?
 
     private let scrollView = IOSExpandedScrollView()
-    private let gridStack = UIStackView()
     private let railStack = UIStackView()
     private let candidateFont = UIFont.systemFont(ofSize: 17.5, weight: .regular)
+    private let firstCandidateFont = UIFont.systemFont(ofSize: 17.5, weight: .medium)
+    private let columns = 4
     private let columnSpacing: CGFloat = 6
+    private let rowSpacing: CGFloat = 8
     private let textInset: CGFloat = 10
+
+    private var cellPool: [IOSExpandedCellButton] = []
     private var candidates: [JuxuCandidateItem] = []
     private var dark = false
-    private var renderedWidth: CGFloat = 0
+    private var lastLaidOutWidth: CGFloat = 0
+    private var needsRelayout = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -955,16 +1097,11 @@ final class IOSExpandedCandidateView: UIView {
         }
         #endif
 
-        gridStack.translatesAutoresizingMaskIntoConstraints = false
-        gridStack.axis = .vertical
-        gridStack.spacing = 8
-
         railStack.translatesAutoresizingMaskIntoConstraints = false
         railStack.axis = .vertical
         railStack.distribution = .fillEqually
         railStack.spacing = 8
 
-        scrollView.addSubview(gridStack)
         addSubview(scrollView)
         addSubview(railStack)
 
@@ -973,12 +1110,6 @@ final class IOSExpandedCandidateView: UIView {
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
             scrollView.trailingAnchor.constraint(equalTo: railStack.leadingAnchor, constant: -8),
-
-            gridStack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
-            gridStack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
-            gridStack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
-            gridStack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
-            gridStack.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
 
             railStack.topAnchor.constraint(equalTo: topAnchor, constant: 5),
             railStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
@@ -1005,7 +1136,6 @@ final class IOSExpandedCandidateView: UIView {
     func reload(candidates: [JuxuCandidateItem], dark: Bool) {
         self.candidates = candidates
         self.dark = dark
-        renderedWidth = 0
         let cellBg = dark ? UIColor(white: 1.0, alpha: 0.175) : UIColor.white
         let pressedBg = dark
             ? UIColor(white: 1.0, alpha: 0.30)
@@ -1019,127 +1149,118 @@ final class IOSExpandedCandidateView: UIView {
             btn.setTitleColor(textCol, for: .normal)
             btn.layer.shadowOpacity = 0
         }
+
+        ensureCellPoolCapacity(candidates.count)
+        UIView.performWithoutAnimation {
+            for (index, item) in candidates.enumerated() {
+                let cell = cellPool[index]
+                let hint = Self.displayHint(for: item)
+                cell.configureCandidate(
+                    text: item.text,
+                    hint: hint,
+                    index: index,
+                    font: index == 0 ? firstCandidateFont : candidateFont,
+                    dark: dark
+                )
+                cell.isHidden = false
+            }
+            if candidates.count < cellPool.count {
+                for index in candidates.count..<cellPool.count {
+                    cellPool[index].isHidden = true
+                }
+            }
+        }
+
+        needsRelayout = true
         scrollView.setContentOffset(.zero, animated: false)
         setNeedsLayout()
+    }
+
+    private func ensureCellPoolCapacity(_ count: Int) {
+        while cellPool.count < count {
+            let cell = IOSExpandedCellButton(type: .custom)
+            cell.setupAsCandidateCell()
+            cell.isHidden = true
+            cell.addTarget(self, action: #selector(handleCandidateCellTap(_:)), for: .touchUpInside)
+            scrollView.addSubview(cell)
+            cellPool.append(cell)
+        }
+    }
+
+    @objc private func handleCandidateCellTap(_ sender: IOSExpandedCellButton) {
+        onSelectAbsCandidate?(sender.candidateIndex)
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
         let width = scrollView.bounds.width
-        guard width > columnSpacing * 3, width != renderedWidth else { return }
-        renderedWidth = width
-        gridStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        let columns = 4
+        guard width > columnSpacing * 3 else { return }
+        guard needsRelayout || abs(width - lastLaidOutWidth) > 0.5 else { return }
+        lastLaidOutWidth = width
+        needsRelayout = false
+
         let cellWidth = (width - CGFloat(columns - 1) * columnSpacing) / CGFloat(columns)
-        var compact: [UIView] = []
+        var y: CGFloat = 0
+        var compactIndices: [Int] = []
+        compactIndices.reserveCapacity(columns)
+        var compactRowHeight: CGFloat = 0
+
         func flushCompactRow() {
-            guard !compact.isEmpty else { return }
-            let row = UIStackView()
-            row.axis = .horizontal
-            row.distribution = .fillEqually
-            row.spacing = columnSpacing
-            compact.forEach(row.addArrangedSubview)
-            for _ in compact.count..<columns {
-                row.addArrangedSubview(UIView())
+            guard !compactIndices.isEmpty else { return }
+            if y > 0 {
+                y += rowSpacing
             }
-            gridStack.addArrangedSubview(row)
-            compact.removeAll(keepingCapacity: true)
+            for (col, idx) in compactIndices.enumerated() {
+                let x = CGFloat(col) * (cellWidth + columnSpacing)
+                let cell = cellPool[idx]
+                cell.frame = CGRect(x: x, y: y, width: cellWidth, height: compactRowHeight)
+                cell.setNeedsLayout()
+                cell.layoutIfNeeded()
+            }
+            y += compactRowHeight
+            compactIndices.removeAll(keepingCapacity: true)
+            compactRowHeight = 0
         }
-        for (index, item) in candidates.enumerated() {
-            let hint = Self.displayHint(for: item)
-            let textWidth = (item.text as NSString).size(withAttributes: [.font: candidateFont]).width
-            let fullWidth = textWidth > cellWidth - 2 * textInset || item.text.contains("\n")
-            let button = makeCandidateButton(
-                text: item.text, hint: hint, index: index, width: fullWidth ? width : cellWidth, fullWidth: fullWidth
-            )
-            if fullWidth {
-                flushCompactRow()
-                gridStack.addArrangedSubview(button)
-            } else {
-                compact.append(button)
-                if compact.count == columns {
+
+        UIView.performWithoutAnimation {
+            for (index, item) in candidates.enumerated() {
+                let cell = cellPool[index]
+                let font = index == 0 ? firstCandidateFont : candidateFont
+                let textWidth = (item.text as NSString).size(withAttributes: [.font: font]).width
+                let fullWidth = textWidth > cellWidth - 2.0 * textInset || item.text.contains("\n")
+                let targetWidth = fullWidth ? width : cellWidth
+                let height = cell.measureHeight(forWidth: targetWidth, fullWidth: fullWidth, textInset: textInset)
+
+                if fullWidth {
                     flushCompactRow()
+                    if y > 0 {
+                        y += rowSpacing
+                    }
+                    cell.frame = CGRect(x: 0, y: y, width: width, height: height)
+                    cell.setNeedsLayout()
+                    cell.layoutIfNeeded()
+                    y += height
+                } else {
+                    compactIndices.append(index)
+                    compactRowHeight = max(compactRowHeight, height)
+                    if compactIndices.count == columns {
+                        flushCompactRow()
+                    }
                 }
             }
+            flushCompactRow()
+            scrollView.contentSize = CGSize(width: width, height: y)
         }
-        flushCompactRow()
     }
 
     private static func displayHint(for item: JuxuCandidateItem) -> String? {
-        guard !item.comment.isEmpty else { return nil }
         switch item.badgeKind {
-        case .pinyinLookup, .shortcode:
-            return item.comment
-        case .typoCorrected:
-            return item.comment.components(separatedBy: " ").first ?? item.comment
+        case .pinyinLookup, .shortcode, .typoCorrected:
+            let cleaned = cleanIOSCandidateAnnotation(for: item)
+            return cleaned.isEmpty ? nil : cleaned
         default:
             return nil
         }
-    }
-
-    private func makeCandidateButton(text: String, hint: String?, index: Int, width: CGFloat, fullWidth: Bool) -> UIButton {
-        let button = IOSExpandedCellButton(type: .custom)
-        button.normalSurfaceColor = dark ? UIColor(white: 1.0, alpha: 0.175) : .white
-        button.pressedSurfaceColor = dark
-            ? UIColor(white: 1.0, alpha: 0.30)
-            : UIColor(red: 214.0 / 255.0, green: 216.0 / 255.0, blue: 222.0 / 255.0, alpha: 1.0)
-        button.layer.cornerRadius = IOSKeyboardLayoutEngine.keyCornerRadius
-        button.layer.cornerCurve = .continuous
-        button.isAccessibilityElement = true
-        button.accessibilityLabel = text
-        button.accessibilityIdentifier = "JuxuExpandedCandidate\(index)"
-        button.addAction(UIAction { [weak self] _ in self?.onSelectAbsCandidate?(index) }, for: .touchUpInside)
-
-        let label = UILabel()
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.text = text
-        label.textColor = dark ? .white : .black
-        label.font = index == 0 ? UIFont.systemFont(ofSize: 17.5, weight: .medium) : candidateFont
-        label.textAlignment = fullWidth ? .natural : .center
-        label.lineBreakMode = .byCharWrapping
-        label.numberOfLines = 0
-        label.isAccessibilityElement = false
-        let availableWidth = max(1, width - 2 * textInset)
-        let textHeight = ceil(label.sizeThatFits(CGSize(width: availableWidth, height: .greatestFiniteMagnitude)).height)
-        button.addSubview(label)
-
-        if let hint {
-            let hintLabel = UILabel()
-            hintLabel.translatesAutoresizingMaskIntoConstraints = false
-            hintLabel.text = hint
-            hintLabel.textColor = dark ? UIColor(white: 0.72, alpha: 1.0) : UIColor(white: 0.42, alpha: 1.0)
-            hintLabel.font = .systemFont(ofSize: 10.0, weight: .regular)
-            hintLabel.textAlignment = fullWidth ? .natural : .center
-            hintLabel.lineBreakMode = .byTruncatingMiddle
-            hintLabel.adjustsFontSizeToFitWidth = true
-            hintLabel.minimumScaleFactor = 0.72
-            hintLabel.numberOfLines = 1
-            hintLabel.isAccessibilityElement = false
-            let hintHeight = ceil(hintLabel.font.lineHeight)
-            let spacing: CGFloat = 1.0
-            let totalContentH = textHeight + spacing + hintHeight
-            button.addSubview(hintLabel)
-            NSLayoutConstraint.activate([
-                label.leadingAnchor.constraint(equalTo: button.leadingAnchor, constant: textInset),
-                label.trailingAnchor.constraint(equalTo: button.trailingAnchor, constant: -textInset),
-                label.centerYAnchor.constraint(equalTo: button.centerYAnchor, constant: -(hintHeight + spacing) * 0.5),
-                label.heightAnchor.constraint(equalToConstant: textHeight),
-                hintLabel.leadingAnchor.constraint(equalTo: button.leadingAnchor, constant: 4),
-                hintLabel.trailingAnchor.constraint(equalTo: button.trailingAnchor, constant: -4),
-                hintLabel.topAnchor.constraint(equalTo: label.bottomAnchor, constant: spacing),
-                hintLabel.heightAnchor.constraint(equalToConstant: hintHeight),
-                button.heightAnchor.constraint(equalToConstant: max(48, totalContentH + 12)),
-            ])
-        } else {
-            NSLayoutConstraint.activate([
-                label.leadingAnchor.constraint(equalTo: button.leadingAnchor, constant: textInset),
-                label.trailingAnchor.constraint(equalTo: button.trailingAnchor, constant: -textInset),
-                label.centerYAnchor.constraint(equalTo: button.centerYAnchor),
-                label.heightAnchor.constraint(equalToConstant: textHeight),
-                button.heightAnchor.constraint(equalToConstant: max(45, textHeight + 16)),
-            ])
-        }
-        return button
     }
 
     private func makeRailButton(title: String?, symbol: String?, action: @escaping () -> Void) -> UIButton {

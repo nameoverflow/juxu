@@ -8,18 +8,19 @@
 //!   plus automatic error attribution (`lm_rank_miss` vs `beam_or_dict_miss`).
 //! - L3 (Latency & size budget): `step_token` µs, full-sentence `p50/p95/p99` ms, `.wbaux` size.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 use juxu_core::config::JuxuConfig;
+use juxu_core::english::EnDictView;
+use juxu_core::eval_support::{build_char_to_pinyin, char_accuracy, make_obs, percentile_ms};
 use juxu_core::format::AuxView;
 use juxu_core::neural::{NeuralContextTracker, NeuralView};
-use juxu_core::english::EnDictView;
 use juxu_core::pinyin::{decode_pinyin, PinyinDecoder, PinyinStream};
 use juxu_core::pinyin_dict::PinyinDictView;
-use juxu_core::typo::{KeyLayout, KeyObs};
+use juxu_core::typo::KeyLayout;
 use juxu_core::user_data::UserStore;
 
 /// (domain, expected_chinese, exact_pinyin_keys)
@@ -28,7 +29,7 @@ const FULL_SENTENCES: &[(&str, &str, &str)] = &[
     ("im_chat", "今天天气真好我们一起去吃饭吧", "jintiantianqizhenhaowomenyiqiquchifanba"),
     ("im_chat", "你现在在哪里我马上就过去找你", "nixianzaizainaliwomashangjiuguoquzhaoni"),
     ("im_chat", "明天早上九点开会别忘记带电脑", "mingtianzaoshangjiudiankaihuibiewangjidaidiannao"),
-    ("im_chat", "不好意思刚才在忙没来得及回你消息", "buhaoyisigangcaizaimangmeilaidejihuiniXiaoxi"),
+    ("im_chat", "不好意思刚才在忙没来得及回你消息", "buhaoyisigangcaizaimangmeilaidejihuinixiaoxi"),
     ("im_chat", "我已经到了就在地铁口旁边等你", "woyijingdaolejiuzaiditiekoupangbiandengni"),
     ("im_chat", "昨天晚上睡得太晚今天早上起不来", "zuotianwanshangshuidetaiwanjintianzaoshangqibulai"),
     ("im_chat", "能不能帮我把那份文件发到我邮箱里", "nengbunengbangwobanafenwenjianfadaowoyouxiangli"),
@@ -185,48 +186,6 @@ const TYPO_CASES: &[(&str, &str, &str)] = &[
     ("neighbor", "明天早上", "mingtianzsoshang"),
 ];
 
-fn make_obs(keys: &str, layout: &KeyLayout) -> Vec<KeyObs> {
-    keys.bytes()
-        .enumerate()
-        .map(|(i, b)| {
-            let ch = b.to_ascii_lowercase();
-            let (cx, cy) = if ch.is_ascii_lowercase() {
-                layout.center_of(ch)
-            } else {
-                (0.0, 0.0)
-            };
-            KeyObs {
-                ch,
-                is_upper: b.is_ascii_uppercase(),
-                norm_x: cx,
-                norm_y: cy,
-                has_touch: false,
-                timestamp_ms: 1000 + (i as u64) * 65,
-            }
-        })
-        .collect()
-}
-
-fn char_accuracy(expected: &str, predicted: &str) -> (usize, usize) {
-    let e: Vec<char> = expected.chars().collect();
-    let p: Vec<char> = predicted.chars().collect();
-    let mut hits = 0usize;
-    for (i, &ec) in e.iter().enumerate() {
-        if p.get(i).copied() == Some(ec) {
-            hits += 1;
-        }
-    }
-    (hits, e.len())
-}
-
-fn percentile_ms(sorted_us: &[u128], p: f64) -> f64 {
-    if sorted_us.is_empty() {
-        return 0.0;
-    }
-    let idx = (((sorted_us.len() - 1) as f64) * p).round() as usize;
-    sorted_us[idx.min(sorted_us.len() - 1)] as f64 / 1000.0
-}
-
 fn eval_exact_nll_and_calibration(
     nv: &NeuralView<'_>,
     context: &str,
@@ -254,24 +213,6 @@ fn eval_exact_nll_and_calibration(
         }
     }
     (nll_sum, count, abs_logz)
-}
-
-/// Build reverse char -> highest-weight syllable map from `PinyinDictView` for external TSV evaluation.
-fn build_char_to_pinyin(dict: &PinyinDictView) -> HashMap<char, String> {
-    let mut best: HashMap<char, (u32, String)> = HashMap::new();
-    for sid in 0..dict.syllable_count() {
-        let syl = dict.syllable_str(sid as u16);
-        for e in dict.lookup_chars(sid as u16, false) {
-            let mut cs = e.text.chars();
-            if let (Some(ch), None) = (cs.next(), cs.next()) {
-                let entry = best.entry(ch).or_insert_with(|| (0, String::new()));
-                if e.weight > entry.0 {
-                    *entry = (e.weight, syl.to_owned());
-                }
-            }
-        }
-    }
-    best.into_iter().map(|(c, (_, s))| (c, s)).collect()
 }
 
 fn main() {
@@ -355,7 +296,6 @@ fn main() {
         let decoder = PinyinDecoder {
             dict: &dict,
             english: &english_dict,
-            aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
             user: &user,
@@ -485,7 +425,6 @@ fn main() {
         let dec0 = PinyinDecoder {
             dict: &dict,
             english: &english_dict,
-            aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
             user: &user,
@@ -510,7 +449,6 @@ fn main() {
         let dec1 = PinyinDecoder {
             dict: &dict,
             english: &english_dict,
-            aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
             user: &user,
@@ -560,7 +498,6 @@ fn main() {
         let dec = PinyinDecoder {
             dict: &dict,
             english: &english_dict,
-            aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
             user: &user,
@@ -611,7 +548,6 @@ fn main() {
         let dec = PinyinDecoder {
             dict: &dict,
             english: &english_dict,
-            aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
             user: &user,
@@ -692,7 +628,6 @@ fn main() {
             let dec = PinyinDecoder {
                 dict: &dict,
                 english: &english_dict,
-                aux: Some(&aux),
                 model: Some(aux.neural_view().unwrap()),
                 config: &config,
                 user: &user,
@@ -750,7 +685,6 @@ fn main() {
         let dec = PinyinDecoder {
             dict: &dict,
             english: &english_dict,
-            aux: Some(&aux),
             model: Some(aux.neural_view().unwrap()),
             config: &config,
             user: &user,

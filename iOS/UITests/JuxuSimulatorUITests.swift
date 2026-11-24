@@ -54,6 +54,47 @@ final class JuxuSimulatorUITests: XCTestCase {
             XCTAssertEqual(swiped, [swipeSymbol])
             XCTAssertEqual(previews, [swipeSymbol], "Swipe must show the same preview as letter keys")
         }
+
+        // Verify swipe-up while composing (`isComposing == true`) honors the composing threshold & hysteresis on lift:
+        var compLayout = IOSKeyboardLayoutEngine()
+        compLayout.swipeUpInputEnabled = true
+        compLayout.isComposing = true
+        let compSnap = compLayout.computeLayout(in: CGSize(width: 440, height: 220))
+        let qKey = compSnap.keys.first { $0.primaryLabel == "q" }!
+        let compCanvas = IOSKeyCanvasView()
+        compCanvas.isComposing = true
+        compCanvas.updateSnapshot(compSnap)
+        var compTapped: [String] = []
+        var compSwiped: [String] = []
+        compCanvas.onKeyTouchUp = { spec, _ in compTapped.append(spec.primaryLabel) }
+        compCanvas.onKeySwipeUp = { compSwiped.append($0) }
+
+        // 1) Light 30pt upward roll while composing (< 36pt composing arm distance) stays on 'q' even at lift-off:
+        let roll = SyntheticFingerTouch()
+        roll.mockPoint = CGPoint(x: qKey.frame.midX, y: qKey.frame.midY)
+        roll.mockTimestamp = 30.0
+        compCanvas.touchesBegan([roll], with: nil)
+        roll.mockPoint.y -= 30.0
+        roll.mockTimestamp = 30.07
+        compCanvas.touchesMoved([roll], with: nil)
+        compCanvas.touchesEnded([roll], with: nil)
+        XCTAssertEqual(compTapped, ["q"])
+        XCTAssertEqual(compSwiped, [])
+
+        // 2) Deliberate 40pt swipe-up while composing (including slight relaxation within hysteresis on lift) enters "1":
+        compTapped = []
+        let compSwipe = SyntheticFingerTouch()
+        compSwipe.mockPoint = CGPoint(x: qKey.frame.midX, y: qKey.frame.midY)
+        compSwipe.mockTimestamp = 40.0
+        compCanvas.touchesBegan([compSwipe], with: nil)
+        compSwipe.mockPoint.y -= 40.0
+        compSwipe.mockTimestamp = 40.09
+        compCanvas.touchesMoved([compSwipe], with: nil)
+        compSwipe.mockPoint.y += 14.0 // 26pt net up >= 36 * 0.6 (21.6pt) armed hysteresis
+        compSwipe.mockTimestamp = 40.15
+        compCanvas.touchesEnded([compSwipe], with: nil)
+        XCTAssertEqual(compTapped, [])
+        XCTAssertEqual(compSwiped, ["1"])
     }
 
     /// Drives real touches through the canvas. The handler mirrors the controller's `.modeToggle` case.
@@ -827,7 +868,7 @@ final class JuxuSimulatorUITests: XCTestCase {
         dismissBtn.tap()
         Thread.sleep(forTimeInterval: 0.3)
         XCTAssertFalse(pillInApp.exists || pillInInput.exists, "Dismiss button must hide clipboard pill")
-        XCTAssertEqual((app.textFields.firstMatch.value as? String) ?? "", "点此弹出键盘试打五笔、长按空格滑动移光标…")
+        XCTAssertEqual((app.textFields.firstMatch.value as? String) ?? "", "点此弹出键盘试打汉字、长按空格滑动移光标…")
     }
 
     @MainActor

@@ -1,12 +1,11 @@
 use crate::code::{compose_phrase_code, PackedCode, PackedPinyin, Stem2};
-use crate::mmap_buf::ByteSource;
+use crate::config::InputSchema;
+use crate::mmap_buf::{read_u16, read_u32, read_u64, ByteSource};
 use std::io;
 use std::path::Path;
 
 pub const WBDICT_MAGIC: &[u8; 8] = b"WBDICT02";
-pub const WBAUX_MAGIC: &[u8; 8] = b"WBAUX001";
-pub const WBAUX_MAGIC_V2: &[u8; 8] = b"WBAUX002";
-pub const WBAUX_MAGIC_V3: &[u8; 8] = b"WBAUX003";
+pub const WBAUX_MAGIC: &[u8; 8] = b"WBAUX003";
 
 pub const ENTRY_FLAG_SINGLE_CHAR: u16 = 1 << 0;
 pub const ENTRY_FLAG_EXT_RARE: u16 = 1 << 1;
@@ -14,8 +13,8 @@ pub const ENTRY_FLAG_SYMBOL: u16 = 1 << 2;
 
 const HEADER_LEN: usize = 64;
 const BUCKET_STRIDE: usize = 12; // packed_code: u32, start: u32, count: u16, reserved: u16
-const ENTRY_STRIDE: usize = 12;  // str_off: u32, weight: u32, str_len: u16, flags: u16
-const CHAR_STRIDE: usize = 20;   // cp: u32, stem2: u16, flags: u16, shortest: u32, primary_short: u32, full: u32
+const ENTRY_STRIDE: usize = 12; // str_off: u32, weight: u32, str_len: u16, flags: u16
+const CHAR_STRIDE: usize = 20; // cp: u32, stem2: u16, flags: u16, shortest: u32, primary_short: u32, full: u32
 
 #[derive(Clone, Copy, Debug)]
 pub struct DictEntryRef<'a> {
@@ -53,30 +52,6 @@ pub struct DictBuildInput {
     pub char_metas: Vec<CharMeta>,
 }
 
-#[inline]
-fn read_u16(b: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([b[off], b[off + 1]])
-}
-
-#[inline]
-fn read_u32(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-}
-
-#[inline]
-fn read_u64(b: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes([
-        b[off],
-        b[off + 1],
-        b[off + 2],
-        b[off + 3],
-        b[off + 4],
-        b[off + 5],
-        b[off + 6],
-        b[off + 7],
-    ])
-}
-
 pub fn serialize_wbdict(mut input: DictBuildInput) -> Vec<u8> {
     // Sort entries by (packed_code ASC, is_ext_rare ASC, weight DESC, text_char_len ASC, text ASC)
     input.entries.sort_by(|a, b| {
@@ -105,7 +80,7 @@ pub fn serialize_wbdict(mut input: DictBuildInput) -> Vec<u8> {
     input.char_metas.dedup_by_key(|m| m.codepoint);
 
     // Compute primary_short_code accurately from sorted buckets!
-    let max_code_len = if matches!(input.schema_id, 33 | 35 | 36) { 5 } else { 4 };
+    let max_code_len = InputSchema::from_id(input.schema_id).max_code_len();
     let mut primary_short_by_cp = std::collections::HashMap::<u32, PackedCode>::new();
     {
         let mut i = 0;
@@ -384,14 +359,15 @@ impl DictView {
     /// Return a 26-bit mask (`bit i` = `'a' + i`) of letters that yield at least one valid code
     /// starting with `[prefix_bytes..., letter]` (`1 <= prefix_bytes.len() <= 4`).
     pub fn valid_next_letters_mask(&self, prefix_bytes: &[u8], include_rare: bool) -> u32 {
-        let max_len = if matches!(self.schema_id, 33 | 35 | 36) { 5 } else { 4 };
+        let schema = InputSchema::from_id(self.schema_id);
+        let max_len = schema.max_code_len();
         if prefix_bytes.is_empty() || prefix_bytes.len() >= max_len {
             return 0x03FF_FFFF;
         }
         let mut buf = [0u8; 5];
         let n = prefix_bytes.len();
         buf[..n].copy_from_slice(prefix_bytes);
-        let letter_limit = if matches!(self.schema_id, 86 | 98 | 6) { 25u8 } else { 26u8 };
+        let letter_limit = if !schema.allows_z_code() { 25u8 } else { 26u8 };
         let mut mask = 0u32;
         for idx in 0..letter_limit {
             buf[n] = b'a' + idx;
@@ -439,7 +415,7 @@ impl DictView {
         include_rare: bool,
     ) -> [Option<DictEntryRef<'_>>; 26] {
         let mut out: [Option<DictEntryRef<'_>>; 26] = [None; 26];
-        let max_len = if matches!(self.schema_id, 33 | 35 | 36) { 5 } else { 4 };
+        let max_len = InputSchema::from_id(self.schema_id).max_code_len();
         if prefix_bytes.is_empty() || prefix_bytes.len() >= max_len {
             return out;
         }
@@ -470,7 +446,6 @@ impl DictView {
                         let replace = match best_e {
                             None => true,
                             Some(prev) => {
-                                // Prefer exact match at `ext` if shortcode primary, else highest weight
                                 if c == ext && prev.code != ext {
                                     true
                                 } else if c != ext && prev.code == ext {
@@ -486,7 +461,7 @@ impl DictView {
                         break;
                     }
                 }
-                if best_e.map(|x| x.code == ext).unwrap_or(false) && n == 3 {
+                if best_e.is_some_and(|x| x.code == ext) && n == 3 {
                     break;
                 }
                 b_idx += 1;
@@ -518,7 +493,6 @@ impl DictView {
                             continue;
                         }
                         collected.push(e);
-                        // Gather enough high-weight entries then sort
                         if collected.len() >= limit * 8 {
                             break;
                         }
@@ -672,16 +646,15 @@ impl DictView {
 }
 
 // ============================================================================
-// Shared Auxiliary Index (.wbaux): Pinyin Reverse Lookup + Quantized N-gram LM
+// Shared Auxiliary Index (.wbaux `WBAUX003`): Pinyin Reverse Lookup + LM + Neural
 // ============================================================================
 
-const AUX_HEADER_LEN_V1: usize = 48;
-const AUX_HEADER_LEN_V2: usize = 64;
+const AUX_HEADER_LEN: usize = 64;
 const PY_BUCKET_STRIDE: usize = 12; // py_packed: u32, start: u32, count: u16, pad: u16
-const PY_ITEM_STRIDE: usize = 12;   // cp: u32, weight: u32, py_str_off: u16, py_str_len: u16
-const BIGRAM_STRIDE: usize = 10;    // pair_key: u64, log_boost_q8: u16
-const UNIGRAM_STRIDE: usize = 6;    // cp: u32, log_prior_q8: u16
-const TRIGRAM_STRIDE: usize = 8;    // packed u64: (c0<<48)|(c1<<32)|(c2<<16)|boost_q8
+const PY_ITEM_STRIDE: usize = 12; // cp: u32, weight: u32, py_str_off: u16, py_str_len: u16
+const BIGRAM_STRIDE: usize = 10; // pair_key: u64, log_boost_q8: u16
+const UNIGRAM_STRIDE: usize = 6; // cp: u32, log_prior_q8: u16
+const TRIGRAM_STRIDE: usize = 8; // packed u64: (c0<<48)|(c1<<32)|(c2<<16)|boost_q8
 
 /// Pack a BMP character trigram + Q8 boost into a single 64-bit integer.
 /// Returns `None` if any character is outside the Basic Multilingual Plane (`> 0xFFFF`).
@@ -706,7 +679,7 @@ pub struct AuxBuildInput {
     pub unigrams: Vec<(u32, u16)>,
     /// Packed BMP trigrams from `pack_trigram(c0, c1, c2, residual_boost_q8)`
     pub trigrams: Vec<u64>,
-    /// Optional embedded `WBLM0001` (`Micro-RWKV-7` INT8 weights) zero-copy section (`WBAUX003`).
+    /// Optional embedded `WBLM0002` / `WBLM0003` (`Micro-RWKV-7` INT8 weights) zero-copy section.
     pub neural_blob: Vec<u8>,
 }
 
@@ -791,7 +764,7 @@ pub fn serialize_wbaux(mut input: AuxBuildInput) -> Vec<u8> {
         tri_buf.extend_from_slice(&packed.to_le_bytes());
     }
 
-    let py_buckets_off = AUX_HEADER_LEN_V2 as u32;
+    let py_buckets_off = AUX_HEADER_LEN as u32;
     let py_items_off = py_buckets_off + py_buckets.len() as u32;
     let bg_off = py_items_off + py_items.len() as u32;
     let pool_off = bg_off + bg_buf.len() as u32;
@@ -813,7 +786,7 @@ pub fn serialize_wbaux(mut input: AuxBuildInput) -> Vec<u8> {
     };
 
     let mut out = Vec::<u8>::with_capacity(total_cap);
-    out.extend_from_slice(if has_neural { WBAUX_MAGIC_V3 } else { WBAUX_MAGIC_V2 });
+    out.extend_from_slice(WBAUX_MAGIC);
     out.extend_from_slice(&py_bucket_count.to_le_bytes());
     out.extend_from_slice(&(input.pinyin_items.len() as u32).to_le_bytes());
     out.extend_from_slice(&(input.bigrams.len() as u32).to_le_bytes());
@@ -828,9 +801,7 @@ pub fn serialize_wbaux(mut input: AuxBuildInput) -> Vec<u8> {
     out.extend_from_slice(&trigram_off.to_le_bytes());
     out.extend_from_slice(&neural_off.to_le_bytes());
     out.extend_from_slice(&neural_len.to_le_bytes());
-    while out.len() < AUX_HEADER_LEN_V2 {
-        out.push(0);
-    }
+    debug_assert_eq!(out.len(), AUX_HEADER_LEN);
     out.extend_from_slice(&py_buckets);
     out.extend_from_slice(&py_items);
     out.extend_from_slice(&bg_buf);
@@ -870,30 +841,21 @@ impl AuxView {
         Self::from_source(ByteSource::mmap_file(path)?)
     }
 
+    #[inline]
+    pub fn from_mmap<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        Self::open_mmap(path)
+    }
+
     pub fn from_bytes(bytes: Vec<u8>) -> io::Result<Self> {
         Self::from_source(ByteSource::from_vec(bytes))
     }
 
     pub fn from_source(buf: ByteSource) -> io::Result<Self> {
         let b = buf.as_slice();
-        if b.len() < AUX_HEADER_LEN_V1 {
+        if b.len() < AUX_HEADER_LEN || &b[0..8] != WBAUX_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid WBAUX header",
-            ));
-        }
-        let is_v3 = &b[0..8] == WBAUX_MAGIC_V3;
-        let is_v2 = is_v3 || &b[0..8] == WBAUX_MAGIC_V2;
-        if !is_v2 && &b[0..8] != WBAUX_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid WBAUX header",
-            ));
-        }
-        if is_v2 && b.len() < AUX_HEADER_LEN_V2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated WBAUX002/003 header",
+                "invalid WBAUX003 header",
             ));
         }
         let py_bucket_count = read_u32(b, 8) as usize;
@@ -904,23 +866,12 @@ impl AuxView {
         let bg_off = read_u32(b, 28) as usize;
         let pool_off = read_u32(b, 32) as usize;
         let pool_len = read_u32(b, 36) as usize;
-
-        let (unigram_count, unigram_off, trigram_count, trigram_off) = if is_v2 {
-            (
-                read_u32(b, 40) as usize,
-                read_u32(b, 44) as usize,
-                read_u32(b, 48) as usize,
-                read_u32(b, 52) as usize,
-            )
-        } else {
-            (0, 0, 0, 0)
-        };
-
-        let (neural_off, neural_len) = if is_v3 {
-            (read_u32(b, 56) as usize, read_u32(b, 60) as usize)
-        } else {
-            (0, 0)
-        };
+        let unigram_count = read_u32(b, 40) as usize;
+        let unigram_off = read_u32(b, 44) as usize;
+        let trigram_count = read_u32(b, 48) as usize;
+        let trigram_off = read_u32(b, 52) as usize;
+        let neural_off = read_u32(b, 56) as usize;
+        let neural_len = read_u32(b, 60) as usize;
 
         if py_buckets_off + py_bucket_count * PY_BUCKET_STRIDE > b.len()
             || py_items_off + py_item_count * PY_ITEM_STRIDE > b.len()
@@ -932,7 +883,7 @@ impl AuxView {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "truncated WBAUX section",
+                "truncated WBAUX003 section",
             ));
         }
 
@@ -962,6 +913,33 @@ impl AuxView {
             neural_len,
             neural_offs,
         })
+    }
+
+    /// Export `(unigrams, bigrams, trigrams, raw_neural_blob)` so `build-dicts` can rebuild
+    /// reverse-Pinyin tables without wiping an already embedded corpus N-gram & `WBLM` neural LM.
+    pub fn export_lm_sections(&self) -> (Vec<(u32, u16)>, Vec<(u64, u16)>, Vec<u64>, Vec<u8>) {
+        let b = self.buf.as_slice();
+        let mut unigrams = Vec::with_capacity(self.unigram_count);
+        for i in 0..self.unigram_count {
+            let off = self.unigram_off + i * UNIGRAM_STRIDE;
+            unigrams.push((read_u32(b, off), read_u16(b, off + 4)));
+        }
+        let mut bigrams = Vec::with_capacity(self.bigram_count);
+        for i in 0..self.bigram_count {
+            let off = self.bg_off + i * BIGRAM_STRIDE;
+            bigrams.push((read_u64(b, off), read_u16(b, off + 8)));
+        }
+        let mut trigrams = Vec::with_capacity(self.trigram_count);
+        for i in 0..self.trigram_count {
+            let off = self.trigram_off + i * TRIGRAM_STRIDE;
+            trigrams.push(read_u64(b, off));
+        }
+        let neural_blob = if self.neural_len > 0 {
+            b[self.neural_off..self.neural_off + self.neural_len].to_vec()
+        } else {
+            Vec::new()
+        };
+        (unigrams, bigrams, trigrams, neural_blob)
     }
 
     #[inline]

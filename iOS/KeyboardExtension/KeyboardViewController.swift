@@ -43,8 +43,10 @@ public final class KeyboardViewController: UIInputViewController {
     private var lastVisualKeySignature: VisualLayoutSignature?
     private var planeBeforePress: IOSKeyPlane = .letters
     private var inlineSession = IOSInlineMarkedTextSession()
+    private var pairingTracker = PunctuationPairingTracker()
     private var turnFlushScheduled = false
     private var composingDocumentID: UUID?
+    private var lastKnownDocumentID: UUID?
     private var lastKeyboardEditUptime: TimeInterval = 0
     private var nilDocSweepWorkItem: DispatchWorkItem?
     private var appearanceSweepWorkItem: DispatchWorkItem?
@@ -57,6 +59,14 @@ public final class KeyboardViewController: UIInputViewController {
     private var inFlightClipboardChangeCount: Int?
     private var expandedIdleWords: [String]?
     private var hasAppeared = false
+
+    private var lineClearUndo = IOSLineClearUndo()
+    /// Text removed so far by the backspace press in progress.
+    private var backspaceSessionDeleted = ""
+    /// A tap's deletion waits for release while a swipe-down undo is possible.
+    private var backspaceTapDeferred = false
+    /// Bumped to abandon an in-flight line clear as soon as anything else happens.
+    private var clearLineGeneration: UInt64 = 0
 
     private lazy var feedback = IOSKeyboardFeedbackController(attachingTo: keyCanvas)
 
@@ -102,11 +112,24 @@ public final class KeyboardViewController: UIInputViewController {
     /// `_UITextDocumentInterface` returns Objective-C `nil` during focus transitions or when
     /// refocusing a responder that still carries an orphaned `markedTextRange`.
     private var currentDocumentIdentifier: UUID? {
-        (textDocumentProxy as AnyObject).value(forKey: "documentIdentifier") as? UUID
+        (textDocumentProxy as? NSObject)?.value(forKey: "documentIdentifier") as? UUID
     }
 
     private func noteKeyboardProxyMutation() {
         lastKeyboardEditUptime = ProcessInfo.processInfo.systemUptime
+    }
+
+    private func setExpandedGridVisible(_ visible: Bool) {
+        if !visible {
+            expandedIdleWords = nil
+        }
+        expandedGrid.isHidden = !visible
+        keyCanvas.isHidden = visible
+        ribbonView.setExpanded(visible)
+        updateT9SidebarVisibility()
+        if visible {
+            reloadExpandedGrid()
+        }
     }
 
     private func abandonCompositionForExternalFocusOrEdit(clearHostMarked: Bool, isDisappearing: Bool = false) {
@@ -128,16 +151,13 @@ public final class KeyboardViewController: UIInputViewController {
             _ = inlineSession.recordFocusLoss()
         }
         composingDocumentID = nil
-        autoPairClosers.removeAll()
+        pairingTracker.reset()
+        bridge.resetQuoteState()
         if !bridge.state.preedit.isEmpty {
             bridge.abandonComposition(timestampMs: Self.nowMs())
         }
         if !expandedGrid.isHidden {
-            expandedIdleWords = nil
-            expandedGrid.isHidden = true
-            keyCanvas.isHidden = false
-            updateT9SidebarVisibility()
-            ribbonView.setExpanded(false)
+            setExpandedGridVisible(false)
         }
         calloutView.hideImmediately()
         keyCanvas.coveredCalloutKeyId = nil
@@ -148,6 +168,8 @@ public final class KeyboardViewController: UIInputViewController {
     private func sweepOrphanedMarkedTextNow() {
         guard inlineSession.hasOrphanedMarkedInSession else { return }
         noteKeyboardProxyMutation()
+        pairingTracker.reset()
+        bridge.resetQuoteState()
         let outcome = inlineSession.sweepOrphanedMarkedText(in: proxySink)
         scheduleTurnBoundaryFlushIfNeeded(outcome.needsAsyncFlush)
         let expectedTail = outcome.expectedBeforeTail
@@ -214,7 +236,9 @@ public final class KeyboardViewController: UIInputViewController {
         bridge.reloadConfigAndUserOnAppear { [weak self] in
             self?.syncEngineToUI()
         }
-        autoPairClosers.removeAll()
+        pairingTracker.reset()
+        bridge.resetQuoteState()
+        lastKnownDocumentID = currentDocumentIdentifier
         inlineSession.resetForAppearance()
         scheduleAppearanceOrphanedSweepIfNeeded()
         clipboardGate.resetForKeyboardAppearance()
@@ -293,17 +317,30 @@ public final class KeyboardViewController: UIInputViewController {
         }
     }
 
+    public override func textWillChange(_ textInput: UITextInput?) {
+        super.textWillChange(textInput)
+        let elapsed = ProcessInfo.processInfo.systemUptime - lastKeyboardEditUptime
+        if elapsed > 0.08 {
+            pairingTracker.reset()
+            bridge.resetQuoteState()
+        }
+    }
+
     public override func selectionDidChange(_ textInput: UITextInput?) {
         super.selectionDidChange(textInput)
         let isComposing = !bridge.state.preedit.isEmpty || !inlineSession.markedCode.isEmpty
+        let elapsed = ProcessInfo.processInfo.systemUptime - lastKeyboardEditUptime
         guard isComposing else {
-            autoPairClosers.removeAll()
+            pairingTracker.pruneOnCursorChange(after: textDocumentProxy.documentContextAfterInput)
+            if elapsed > 0.08 {
+                pairingTracker.reset()
+                bridge.resetQuoteState()
+            }
             inlineSession.reconcileExternalContext(hostBefore: textDocumentProxy.documentContextBeforeInput)
             syncContextFromProxyIfIdle()
             syncEngineToUI()
             return
         }
-        let elapsed = ProcessInfo.processInfo.systemUptime - lastKeyboardEditUptime
         guard elapsed > 0.08 else { return }
         abandonCompositionForExternalFocusOrEdit(clearHostMarked: true)
         syncContextFromProxyIfIdle()
@@ -314,6 +351,12 @@ public final class KeyboardViewController: UIInputViewController {
         super.textDidChange(textInput)
         let docID = currentDocumentIdentifier
         let isComposing = !bridge.state.preedit.isEmpty || !inlineSession.markedCode.isEmpty
+
+        if docID != lastKnownDocumentID {
+            lastKnownDocumentID = docID
+            pairingTracker.reset()
+            bridge.resetQuoteState()
+        }
 
         if isComposing {
             if docID == nil {
@@ -480,19 +523,6 @@ public final class KeyboardViewController: UIInputViewController {
         wireCallbacks()
         syncProxyTraits()
     }
-
-    private var lineClearUndo = IOSLineClearUndo()
-    /// Text removed so far by the backspace press in progress.
-    private var backspaceSessionDeleted = ""
-    /// A tap's deletion waits for release while a swipe-down undo is possible.
-    private var backspaceTapDeferred = false
-    /// Closers auto-inserted by punctuation pairing that still sit right of the cursor, innermost last.
-    private var autoPairClosers: [String] = []
-    /// Text right of the cursor when the outermost tracked pair was inserted.
-    private var autoPairTail = ""
-
-    /// Bumped to abandon an in-flight line clear as soon as anything else happens.
-    private var clearLineGeneration: UInt64 = 0
 
     private func presentCalloutIfAppropriate(for spec: IOSKeySpec) {
         guard !layoutEngine.isTrackpadActive else {
@@ -731,6 +761,7 @@ public final class KeyboardViewController: UIInputViewController {
             guard let self, self.bridge.state.preedit.isEmpty else { return }
             var moved = false
             if dxSteps != 0 {
+                self.noteKeyboardProxyMutation()
                 self.textDocumentProxy.adjustTextPosition(byCharacterOffset: dxSteps)
                 moved = true
             }
@@ -740,7 +771,8 @@ public final class KeyboardViewController: UIInputViewController {
                 }
             }
             if moved {
-                self.autoPairClosers.removeAll()
+                self.pairingTracker.reset()
+                self.bridge.resetQuoteState()
                 self.inlineSession.reset()
                 self.feedback.fireSoftStep(playClick: false)
                 self.syncContextFromProxyIfIdle()
@@ -791,16 +823,7 @@ public final class KeyboardViewController: UIInputViewController {
             guard let self else { return }
             self.keyCanvas.flushPendingTouches()
             self.feedback.fireSoftStep(playClick: true)
-            self.expandedGrid.isHidden.toggle()
-            let isExp = !self.expandedGrid.isHidden
-            self.keyCanvas.isHidden = isExp
-            self.updateT9SidebarVisibility()
-            if isExp {
-                self.reloadExpandedGrid()
-            } else {
-                self.expandedIdleWords = nil
-            }
-            self.ribbonView.setExpanded(isExp)
+            self.setExpandedGridVisible(self.expandedGrid.isHidden)
         }
 
         t9SidebarView.onSelectPunctuation = { [weak self] sym in
@@ -825,11 +848,7 @@ public final class KeyboardViewController: UIInputViewController {
             self.feedback.fireSoftStep(playClick: true)
             self.markUserTypedForClipboard()
             let idleWords = self.expandedIdleWords
-            self.expandedIdleWords = nil
-            self.expandedGrid.isHidden = true
-            self.keyCanvas.isHidden = false
-            self.updateT9SidebarVisibility()
-            self.ribbonView.setExpanded(false)
+            self.setExpandedGridVisible(false)
             if let idleWords, absIdx < idleWords.count {
                 let word = idleWords[absIdx]
                 self.insertTextWithAutoSpace(word, splitInternal: true)
@@ -843,12 +862,9 @@ public final class KeyboardViewController: UIInputViewController {
         }
 
         expandedGrid.onCollapse = { [weak self] in
-            self?.feedback.fireSoftStep(playClick: true)
-            self?.expandedIdleWords = nil
-            self?.expandedGrid.isHidden = true
-            self?.keyCanvas.isHidden = false
-            self?.updateT9SidebarVisibility()
-            self?.ribbonView.setExpanded(false)
+            guard let self else { return }
+            self.feedback.fireSoftStep(playClick: true)
+            self.setExpandedGridVisible(false)
         }
 
         expandedGrid.onBackspace = { [weak self] in
@@ -858,10 +874,7 @@ public final class KeyboardViewController: UIInputViewController {
             self.performBackspace()
             if !self.expandedGrid.isHidden {
                 if wasComposing && self.bridge.state.preedit.isEmpty {
-                    self.expandedIdleWords = nil
-                    self.expandedGrid.isHidden = true
-                    self.keyCanvas.isHidden = false
-                    self.ribbonView.setExpanded(false)
+                    self.setExpandedGridVisible(false)
                 } else {
                     self.reloadExpandedGrid()
                 }
@@ -869,25 +882,18 @@ public final class KeyboardViewController: UIInputViewController {
         }
 
         expandedGrid.onClear = { [weak self] in
-            self?.feedback.fireSoftStep(playClick: true)
-            self?.cancelMarkedCode()
-            self?.bridge.abandonComposition(timestampMs: Self.nowMs())
-            self?.expandedIdleWords = nil
-            self?.expandedGrid.isHidden = true
-            self?.keyCanvas.isHidden = false
-            self?.updateT9SidebarVisibility()
-            self?.ribbonView.setExpanded(false)
-            self?.syncEngineToUI()
+            guard let self else { return }
+            self.feedback.fireSoftStep(playClick: true)
+            self.cancelMarkedCode()
+            self.bridge.abandonComposition(timestampMs: Self.nowMs())
+            self.setExpandedGridVisible(false)
+            self.syncEngineToUI()
         }
 
         expandedGrid.onOpenSettings = { [weak self] in
             guard let self else { return }
             self.feedback.fireSoftStep(playClick: true)
-            self.expandedIdleWords = nil
-            self.expandedGrid.isHidden = true
-            self.keyCanvas.isHidden = false
-            self.updateT9SidebarVisibility()
-            self.ribbonView.setExpanded(false)
+            self.setExpandedGridVisible(false)
             self.openHostAppSettings()
         }
     }
@@ -1021,7 +1027,7 @@ public final class KeyboardViewController: UIInputViewController {
         case .planeSwitch(let targetPlane, _):
             commitPendingFirstIfComposing()
             layoutEngine.switchPlane(targetPlane)
-            refreshKeyboardLayout()
+            syncEngineToUI()
 
         case .globe:
             commitPendingFirstIfComposing()
@@ -1073,24 +1079,19 @@ public final class KeyboardViewController: UIInputViewController {
         var pairCloser: String?
         if isPunctuationPairingActive {
             let after = textDocumentProxy.documentContextAfterInput
-            refreshAutoPairs(after: after)
-            switch IOSPunctuationPairing.action(for: sym, after: after, openClosers: autoPairClosers) {
+            switch pairingTracker.handleSymbol(sym, after: after) {
             case .skipClose:
                 textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
-                autoPairClosers.removeLast()
                 inlineSession.autoSpaceTracker.invalidate()
                 bridge.setContext("")
                 return
             case .insertPair(let close):
                 pairCloser = close
-                if autoPairClosers.isEmpty {
-                    autoPairTail = after ?? ""
-                }
             case .plain:
                 break
             }
         } else {
-            autoPairClosers.removeAll()
+            pairingTracker.reset()
         }
         if AutoSpaceFormatter.isAutoSpaceRightTrigger(sym, options: AutoSpaceOptions(prefs: bridge.prefs)) {
             insertTextWithAutoSpace(sym, splitInternal: false)
@@ -1101,19 +1102,10 @@ public final class KeyboardViewController: UIInputViewController {
         if let pairCloser {
             textDocumentProxy.insertText(pairCloser)
             textDocumentProxy.adjustTextPosition(byCharacterOffset: -1)
-            autoPairClosers.append(pairCloser)
             inlineSession.autoSpaceTracker.invalidate()
             bridge.setContext("")
         } else {
             syncContextFromProxyIfIdle()
-        }
-    }
-
-    /// Forgets tracked pairs once the cursor has been moved away from them.
-    private func refreshAutoPairs(after: String?) {
-        autoPairClosers = IOSPunctuationPairing.pruned(autoPairClosers, after: after)
-        if !IOSPunctuationPairing.cursorStaysInPairs(autoPairClosers, tail: autoPairTail, after: after) {
-            autoPairClosers.removeAll()
         }
     }
 
@@ -1131,7 +1123,8 @@ public final class KeyboardViewController: UIInputViewController {
               ) else { return }
         noteKeyboardProxyMutation()
         clearLineGeneration &+= 1
-        autoPairClosers.removeAll()
+        pairingTracker.reset()
+        bridge.resetQuoteState()
         inlineSession.autoSpaceTracker.invalidate()
         textDocumentProxy.insertText(text)
         bridge.setContext(String(text.suffix(16)))
@@ -1143,12 +1136,15 @@ public final class KeyboardViewController: UIInputViewController {
     private func clearCurrentLineBeforeCursor() {
         markUserTypedForClipboard()
         if !bridge.state.preedit.isEmpty {
+            noteKeyboardProxyMutation()
             cancelMarkedCode()
             bridge.clearComposition()
             syncEngineToUI()
             return
         }
-        autoPairClosers.removeAll()
+        noteKeyboardProxyMutation()
+        pairingTracker.reset()
+        bridge.resetQuoteState()
         inlineSession.autoSpaceTracker.invalidate()
         // Touch-down at a line start removed only the line break: put it back instead of joining lines.
         // After a longer hold-delete, the text already removed stays removed.
@@ -1213,6 +1209,7 @@ public final class KeyboardViewController: UIInputViewController {
             }
             return
         }
+        noteKeyboardProxyMutation()
         let plan = IOSLineClear.plan(before: before, maxBatch: 128)
         let nowCollected = String(before.suffix(plan.deleteCount)) + collected
         let nowRemaining = String(before.dropLast(plan.deleteCount))
@@ -1240,14 +1237,19 @@ public final class KeyboardViewController: UIInputViewController {
         guard !bridge.state.preedit.isEmpty else { return }
         noteKeyboardProxyMutation()
         composingDocumentID = nil
-        let rawText = bridge.state.candidates.first?.text ?? bridge.state.preedit
+        let out = bridge.commitPending(timestampMs: Self.nowMs())
         let needsFlush = inlineSession.commitPendingFirst(
-            rawText,
+            out.commitText,
             options: currentAutoSpaceOptions(),
             in: proxySink
         )
         scheduleTurnBoundaryFlushIfNeeded(needsFlush)
-        bridge.clearComposition()
+        if !out.commitText.isEmpty {
+            bridge.flushUserDataAsync()
+        }
+        if !expandedGrid.isHidden {
+            setExpandedGridVisible(false)
+        }
     }
 
     private func performBackspace(acceleratedChunk: Bool = false) {
@@ -1259,16 +1261,15 @@ public final class KeyboardViewController: UIInputViewController {
             applyEngineState(out)
             return
         }
-        if isPunctuationPairingActive, !autoPairClosers.isEmpty {
+        if isPunctuationPairingActive, !pairingTracker.openClosers.isEmpty {
             let hostBefore = textDocumentProxy.documentContextBeforeInput
             let hostAfter = textDocumentProxy.documentContextAfterInput
-            refreshAutoPairs(after: hostAfter)
-            if IOSPunctuationPairing.shouldDeletePair(before: hostBefore, after: hostAfter, openClosers: autoPairClosers) {
-                noteBackspaceDeleted(String((hostBefore ?? "").suffix(1)) + (autoPairClosers.last ?? ""))
+            let closer = pairingTracker.openClosers.last ?? ""
+            if pairingTracker.consumeBackspacePairIfNeeded(before: hostBefore, after: hostAfter) {
+                noteBackspaceDeleted(String((hostBefore ?? "").suffix(1)) + closer)
                 textDocumentProxy.adjustTextPosition(byCharacterOffset: 1)
                 textDocumentProxy.deleteBackward()
                 textDocumentProxy.deleteBackward()
-                autoPairClosers.removeLast()
                 inlineSession.autoSpaceTracker.invalidate()
                 bridge.setContext(String((hostBefore ?? "").dropLast().suffix(16)))
                 syncEngineToUI()
@@ -1292,24 +1293,7 @@ public final class KeyboardViewController: UIInputViewController {
             return
         }
         inlineSession.autoSpaceTracker.invalidate()
-        // Native-style accelerated hold-delete: erase up to 3 characters without crossing a newline in one jump
-        if before.last == "\n" {
-            noteBackspaceDeleted("\n")
-            textDocumentProxy.deleteBackward()
-            let afterDel = String(before.dropLast())
-            bridge.setContext(String(afterDel.suffix(32)))
-            syncEngineToUI()
-            return
-        }
-        var count = 0
-        for ch in before.reversed() {
-            if ch == "\n" || count >= 3 { break }
-            count += 1
-            if count >= 2 && (ch == " " || ch == "，" || ch == "。" || ch == "," || ch == ".") {
-                break
-            }
-        }
-        let nDel = max(1, count)
+        let nDel = IOSBackspaceChunkDelete.acceleratedDeleteCount(before: before)
         noteBackspaceDeleted(String(before.suffix(nDel)))
         for _ in 0..<nDel {
             textDocumentProxy.deleteBackward()
@@ -1343,50 +1327,14 @@ public final class KeyboardViewController: UIInputViewController {
 
     /// Move cursor vertically across lines in multi-line text views using `UITextDocumentProxy` context.
     private func moveCursorVertically(lines: Int) -> Bool {
-        guard lines != 0 else { return false }
         let before = textDocumentProxy.documentContextBeforeInput ?? ""
         let after = textDocumentProxy.documentContextAfterInput ?? ""
-
-        // Current column from most recent newline in `before`
-        let currentCol: Int
-        if let lastNL = before.lastIndex(of: "\n") {
-            currentCol = before.distance(from: before.index(after: lastNL), to: before.endIndex)
-        } else {
-            currentCol = before.count
+        guard let delta = IOSTextCursorNavigation.verticalMoveOffset(before: before, after: after, lines: lines) else {
+            return false
         }
-
-        if lines < 0 {
-            guard let lastNL = before.lastIndex(of: "\n") else {
-                if !before.isEmpty {
-                    textDocumentProxy.adjustTextPosition(byCharacterOffset: -before.count)
-                    return true
-                }
-                return false
-            }
-            let prevPrefix = before[..<lastNL]
-            let prevLineStart = prevPrefix.lastIndex(of: "\n").map { prevPrefix.index(after: $0) } ?? prevPrefix.startIndex
-            let prevLineLen = prevPrefix.distance(from: prevLineStart, to: prevPrefix.endIndex)
-            let targetCol = min(currentCol, prevLineLen)
-            let delta = -(currentCol + 1 + (prevLineLen - targetCol))
-            textDocumentProxy.adjustTextPosition(byCharacterOffset: delta)
-            return true
-        } else {
-            guard let nextNL = after.firstIndex(of: "\n") else {
-                if !after.isEmpty {
-                    textDocumentProxy.adjustTextPosition(byCharacterOffset: after.count)
-                    return true
-                }
-                return false
-            }
-            let toEndOfCurLine = after.distance(from: after.startIndex, to: nextNL)
-            let rem = after[after.index(after: nextNL)...]
-            let nextLineEnd = rem.firstIndex(of: "\n") ?? rem.endIndex
-            let nextLineLen = rem.distance(from: rem.startIndex, to: nextLineEnd)
-            let targetCol = min(currentCol, nextLineLen)
-            let delta = toEndOfCurLine + 1 + targetCol
-            textDocumentProxy.adjustTextPosition(byCharacterOffset: delta)
-            return true
-        }
+        noteKeyboardProxyMutation()
+        textDocumentProxy.adjustTextPosition(byCharacterOffset: delta)
+        return true
     }
 
     private func cancelMarkedCode() {
@@ -1497,10 +1445,7 @@ public final class KeyboardViewController: UIInputViewController {
             scheduleUserDataFlush()
         }
         if out.preedit.isEmpty && !expandedGrid.isHidden {
-            expandedGrid.isHidden = true
-            keyCanvas.isHidden = false
-            updateT9SidebarVisibility()
-            ribbonView.setExpanded(false)
+            setExpandedGridVisible(false)
         }
         syncEngineToUI()
     }
@@ -1568,6 +1513,9 @@ public final class KeyboardViewController: UIInputViewController {
             clipboardSuggestion: activeClipboardSuggestion,
             idleWords: currentIdlePredictions(for: st)
         )
+        if !expandedGrid.isHidden {
+            reloadExpandedGrid()
+        }
         refreshKeyboardLayout()
     }
 

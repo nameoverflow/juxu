@@ -18,6 +18,16 @@ private struct SandboxWebView: UIViewRepresentable {
 }
 #endif
 
+private extension View {
+    func iosSettingsCard() -> some View {
+        padding(14)
+            .background(
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(Color.primary.opacity(0.055))
+            )
+    }
+}
+
 public enum IOSHostTab: Int, CaseIterable, Identifiable {
     case home = 0
     case typing = 1
@@ -205,7 +215,7 @@ public struct IOSHostRootView: View {
                                 .font(.system(size: 13))
                                 .foregroundStyle(.secondary)
                             }
-                            if sandboxFocused || ProcessInfo.processInfo.arguments.contains("--dual-sandbox") {
+                            if sandboxFocused || sandboxSecondFocused || ProcessInfo.processInfo.arguments.contains("--dual-sandbox") {
                                 Button("完成") {
                                     dismissKeyboard()
                                 }
@@ -228,6 +238,9 @@ public struct IOSHostRootView: View {
                                 .focused($sandboxSecondFocused)
                                 .accessibilityIdentifier("JuxuSandboxSecondary")
                                 .submitLabel(.done)
+                                .onSubmit {
+                                    dismissKeyboard()
+                                }
                             TextEditor(text: $sandboxEditorText)
                                 .frame(height: 54)
                                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
@@ -239,8 +252,7 @@ public struct IOSHostRootView: View {
                             #endif
                         }
                     }
-                    .padding(14)
-                    .background(iosCardBackground)
+                    .iosSettingsCard()
 
                     // Enable Keyboard Steps
                     VStack(alignment: .leading, spacing: 11) {
@@ -277,15 +289,14 @@ public struct IOSHostRootView: View {
                         .buttonStyle(.plain)
                         .padding(.top, 2)
                     }
-                    .padding(14)
-                    .background(iosCardBackground)
+                    .iosSettingsCard()
                 }
                 .padding(16)
             }
             #if os(iOS)
             .scrollDismissesKeyboard(.interactively)
             .onTapGesture {
-                if sandboxFocused {
+                if sandboxFocused || sandboxSecondFocused {
                     dismissKeyboard()
                 }
             }
@@ -305,8 +316,10 @@ public struct IOSHostRootView: View {
     private var typingTab: some View {
         let activeCategory = bridge.prefs.schemaCategory
         let isCangjie = bridge.prefs.isCangjieFamily
-        let maxCodeLabel = isCangjie ? "五" : "四"
-        let pushCodeLabel = isCangjie ? "六" : "五"
+        let maxCodeLabel = SharedSchemaDisplayHelpers.maxCodeChineseNumeral(isCangjie: isCangjie)
+        let pushCodeLabel = SharedSchemaDisplayHelpers.pushCodeChineseNumeral(isCangjie: isCangjie)
+        let maxCodeDigit = "\(SharedSchemaDisplayHelpers.maxCodeDigits(isCangjie: isCangjie))"
+        let pushCodeDigit = "\(SharedSchemaDisplayHelpers.pushCodeDigits(isCangjie: isCangjie))"
         return iosScreenContainer(title: "输入设置") {
             ScrollView {
                 VStack(spacing: 14) {
@@ -349,8 +362,7 @@ public struct IOSHostRootView: View {
                             }
                         }
                     }
-                    .padding(14)
-                    .background(iosCardBackground)
+                    .iosSettingsCard()
 
                     if !bridge.prefs.isPinyinFamily {
                         VStack(spacing: 12) {
@@ -371,7 +383,7 @@ public struct IOSHostRootView: View {
                             }
                             iosToggleRow("\(maxCodeLabel)码唯一自动上屏", sub: "精确\(maxCodeLabel)码唯一匹配时直接上屏", isOn: binding(\.fourthCodeAutoCommit))
                             Divider()
-                            iosToggleRow("第\(pushCodeLabel)码自动顶字", sub: "\(maxCodeLabel)码重码时敲第 \(isCangjie ? "6" : "5") 码将首选词顶上屏", isOn: binding(\.fifthCodePushCommit))
+                            iosToggleRow("第\(pushCodeLabel)码自动顶字", sub: "\(maxCodeLabel)码重码时敲第 \(pushCodeDigit) 码将首选词顶上屏", isOn: binding(\.fifthCodePushCommit))
                             Divider()
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -383,14 +395,13 @@ public struct IOSHostRootView: View {
                                 }
                                 Spacer()
                                 Picker("", selection: binding(\.fourthEmptyBehavior)) {
-                                    Text("阻断第\(isCangjie ? "5" : "4")码").tag("block")
+                                    Text("阻断第\(maxCodeDigit)码").tag("block")
                                     Text("清空重输").tag("clear")
                                 }
                                 .labelsHidden()
                             }
                         }
-                        .padding(14)
-                        .background(iosCardBackground)
+                        .iosSettingsCard()
                     }
 
                     VStack(spacing: 12) {
@@ -463,8 +474,7 @@ public struct IOSHostRootView: View {
                         Divider()
                         iosToggleRow("全键盘长按移动光标", sub: "在键盘任意键上长按即可滑动光标；继续按住不放则会弹出按键的特殊字符", isOn: binding(\.keyboardHoldCursor))
                     }
-                    .padding(14)
-                    .background(iosCardBackground)
+                    .iosSettingsCard()
                 }
                 .padding(16)
             }
@@ -491,32 +501,23 @@ public struct IOSHostRootView: View {
                         Divider()
                         iosToggleRow("个人拇指热区 EMA 自适应", sub: "确认选词后微调每键判定中心（限幅 ±0.20 键宽）", isOn: binding(\.touchHitboxAdapt))
                         Divider()
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text("空码 / 边缘滑偏直推首选阈值")
-                                    .font(.system(size: 14, weight: .medium))
-                                Spacer()
-                                Text("\(Int(bridge.prefs.promoteThreshold * 100))%")
-                                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                                    .foregroundStyle(Color.accentColor)
-                            }
-                            Slider(value: binding(\.promoteThreshold), in: 0.60...0.96, step: 0.02)
-                        }
+                        sliderRow(
+                            title: "空码 / 边缘滑偏直推首选阈值",
+                            valueText: "\(Int(bridge.prefs.promoteThreshold * 100))%",
+                            value: binding(\.promoteThreshold),
+                            range: 0.60...0.96,
+                            step: 0.02
+                        )
                         Divider()
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text("次选纠错候选提示阈值")
-                                    .font(.system(size: 14, weight: .medium))
-                                Spacer()
-                                Text("\(Int(bridge.prefs.suggestThreshold * 100))%")
-                                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                                    .foregroundStyle(Color.accentColor)
-                            }
-                            Slider(value: binding(\.suggestThreshold), in: 0.15...0.70, step: 0.05)
-                        }
+                        sliderRow(
+                            title: "次选纠错候选提示阈值",
+                            valueText: "\(Int(bridge.prefs.suggestThreshold * 100))%",
+                            value: binding(\.suggestThreshold),
+                            range: 0.15...0.70,
+                            step: 0.05
+                        )
                     }
-                    .padding(14)
-                    .background(iosCardBackground)
+                    .iosSettingsCard()
 
                     // Local Input Eval Log Card (for building real-world eval sets)
                     VStack(alignment: .leading, spacing: 11) {
@@ -527,15 +528,16 @@ public struct IOSHostRootView: View {
                         )
                         Divider()
                         let s = bridge.evalLogSummary
+                        let metrics = EvalLogMetricItem.metrics(from: s, compactTop1Title: true)
                         HStack(spacing: 10) {
-                            evalStatPill(title: "总上屏", value: "\(s.commits)")
-                            evalStatPill(title: "Top-1 率", value: s.commits > 0 ? String(format: "%.1f%%", s.top1RatePercent) : "—")
-                            evalStatPill(title: "手选非首选", value: "\(s.manualSelects)")
+                            ForEach(metrics.prefix(3)) { metric in
+                                SharedEvalMetricCell(item: metric, valueFontSize: 15, cornerRadius: 8)
+                            }
                         }
                         HStack(spacing: 10) {
-                            evalStatPill(title: "策略压制模型", value: "\(s.lmOverruled)")
-                            evalStatPill(title: "退格重打", value: "\(s.backspaceAfterCommit)")
-                            evalStatPill(title: "纠错触发", value: "\(s.typoTriggered)")
+                            ForEach(metrics.dropFirst(3)) { metric in
+                                SharedEvalMetricCell(item: metric, valueFontSize: 15, cornerRadius: 8)
+                            }
                         }
                         HStack(spacing: 10) {
                             Button("刷新统计") {
@@ -564,29 +566,31 @@ public struct IOSHostRootView: View {
                             .disabled(s.totalEvents == 0)
                         }
                     }
-                    .padding(14)
-                    .background(iosCardBackground)
+                    .iosSettingsCard()
                 }
                 .padding(16)
             }
         }
     }
 
-    private func evalStatPill(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title)
-                .font(.system(size: 10.5))
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.system(size: 15, weight: .semibold, design: .monospaced))
+    private func sliderRow(
+        title: String,
+        valueText: String,
+        value: Binding<Double>,
+        range: ClosedRange<Double>,
+        step: Double
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 14, weight: .medium))
+                Spacer()
+                Text(valueText)
+                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Color.accentColor)
+            }
+            Slider(value: value, in: range, step: step)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.primary.opacity(0.05))
-        )
     }
 
     // MARK: - Tab 4: Personal Lexicon & Auto-Phrase
@@ -602,8 +606,7 @@ public struct IOSHostRootView: View {
                         Divider()
                         iosToggleRow("单字动态调频", sub: "建议关闭以保持单字重码顺序稳定", isOn: binding(\.dynamicCharFreq))
                     }
-                    .padding(14)
-                    .background(iosCardBackground)
+                    .iosSettingsCard()
 
                     VStack(alignment: .leading, spacing: 10) {
                         Text("跨版本个人词条（切 86/98/新世纪自动重算编码）")
@@ -640,12 +643,7 @@ public struct IOSHostRootView: View {
                             HStack {
                                 Text(item.text)
                                     .font(.system(size: 15, weight: .medium))
-                                Text(item.code)
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color.primary.opacity(0.07), in: Capsule())
+                                SharedUserPhraseCodePill(code: item.code, isAutoPhrase: item.auto)
                                 Spacer()
                                 Text("\(item.count) 次")
                                     .font(.system(size: 12))
@@ -653,8 +651,7 @@ public struct IOSHostRootView: View {
                             }
                         }
                     }
-                    .padding(14)
-                    .background(iosCardBackground)
+                    .iosSettingsCard()
                 }
                 .padding(16)
             }
@@ -695,11 +692,6 @@ public struct IOSHostRootView: View {
             content()
         }
         #endif
-    }
-
-    private var iosCardBackground: some View {
-        RoundedRectangle(cornerRadius: 13, style: .continuous)
-            .fill(Color.primary.opacity(0.055))
     }
 
     private func compactCategoryButton(_ category: InputSchemaCategory) -> some View {
@@ -810,6 +802,7 @@ public struct IOSHostRootView: View {
 
     private func dismissKeyboard() {
         sandboxFocused = false
+        sandboxSecondFocused = false
         newWordFocused = false
         #if os(iOS)
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
@@ -902,11 +895,7 @@ public struct IOSTouchHitboxMapCard: View {
             }
             .frame(height: 124)
         }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .fill(Color.primary.opacity(0.055))
-        )
+        .iosSettingsCard()
     }
 
     @ViewBuilder
