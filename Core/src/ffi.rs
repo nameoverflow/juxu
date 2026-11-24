@@ -620,18 +620,7 @@ pub extern "C" fn juxu_engine_add_user_phrase(
     let Some(text) = cstr_to_str(phrase) else {
         return into_c_string(String::new());
     };
-    let slot = h.inner.config.schema.slot_index();
-    let encoded = h.inner.dicts[slot]
-        .as_ref()
-        .and_then(|d| d.encode_phrase(text));
-    if let Some(code) = encoded {
-        h.inner
-            .user
-            .add_phrase(text, false, h.inner.dicts[slot].as_ref());
-        into_c_string(code.as_string())
-    } else {
-        into_c_string(String::new())
-    }
+    into_c_string(h.inner.add_user_phrase(text))
 }
 
 #[no_mangle]

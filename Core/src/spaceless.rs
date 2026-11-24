@@ -1,6 +1,6 @@
 use crate::code::PackedCode;
 use crate::config::JuxuConfig;
-use crate::english::{format_english_display, EnDictView};
+use crate::english::{resolve_english_display, EnDictView};
 use crate::format::{AuxView, DictView};
 use crate::neural::{NeuralView, RwkvState};
 use crate::personalization::Context as PersonalContext;
@@ -586,51 +586,63 @@ impl Stream {
                     } else {
                         None
                     }
-                } else if len >= 4 && (user_hit.is_some() || dict_hit.is_some()) {
-                    let (canonical, weight, flags, is_user) = if let Some((disp, cnt)) = user_hit {
-                        (
-                            disp.to_owned(),
-                            (54_000u32 + cnt.min(10) * 1000).min(65_535) as u16,
-                            0u16,
-                            true,
-                        )
+                } else if len >= 2 && (user_hit.is_some() || dict_hit.is_some()) {
+                    let is_user = user_hit.is_some();
+                    let weight = if let Some((_, cnt)) = user_hit {
+                        let dict_w = dict_hit.as_ref().map_or(46_000u32, |x| x.1 as u32);
+                        (dict_w.max(52_000) + cnt.min(10) * 1_200).min(65_535) as u16
                     } else {
-                        let (disp, w, f) = dict_hit.unwrap();
-                        (disp, w, f, false)
+                        dict_hit.as_ref().unwrap().1
                     };
-                    // In spaceless Wubi/shape mode, every 1..4-letter sequence can be a real Wubi code
-                    // or a cross-word Wubi seam (e.g. `ivq[diet]khlf` = `当然` + `不` + `用` + `跳转`).
-                    // Avoid hijacking normal Wubi typing with unanchored lowercase English:
-                    // - require `len >= 4` (2..3-letter English in spaceless uses uppercase anchor like `PR`/`Go`/`iOS`)
-                    // - for 4-letter lowercase non-user words: block when Wubi has an exact match, and when
-                    //   appearing mid-sentence (`parent_pos > 0`) without uppercase, require explicit tech vocabulary
-                    //   (`EN_FLAG_TECH`, e.g. `rust`/`cuda`/`mmap`) or high-frequency top tier (`weight >= 54_000`).
+                    // Zero-hardcode probabilistic + code-space boundary rule:
+                    // - Cold-start (`!is_user && !has_upper`):
+                    //   * Never hijack valid Wubi `#1` blind typing on `<= max_code_len` codes!
+                    //     When `len <= max_code_len` (`2..=4`), only enter the `#1`-competing beam if
+                    //     `parent_pos == 0` AND the Wubi dictionary has NO exact entry for `lower`
+                    //     (truly empty Wubi code; colliding short English words surface in `#2/#3` of
+                    //     `show_spaceless_candidates`, and promote into `user_hit` after 1 selection!).
+                    //   * For `len > max_code_len` (`>= 5` letters, impossible single Wubi code), any
+                    //     sufficiently common corpus word (`weight >= 36_000`) competes directly via RWKV + prior.
+                    // - User-learned (`is_user == true`, 1-shot learned across any schema):
+                    //   * Competes directly in the beam for `len >= 2` via unified RWKV logp + personal prior!
                     let wubi_has_exact = len <= max_code_len
                         && PackedCode::from_ascii(&lower)
                             .is_some_and(|c| !decoder.dict.lookup_exact(c, false).is_empty());
-                    let is_tech = (flags & crate::english::EN_FLAG_TECH) != 0;
-                    let mid_sentence_short_hijack =
-                        parent_pos > 0 && len == 4 && !has_upper && !is_user && !is_tech && weight < 55_000;
-                    if !has_upper
-                        && !is_user
-                        && (weight < 40_000 || (len == 4 && wubi_has_exact) || mid_sentence_short_hijack)
-                    {
+                    let cold_allowed = if len > max_code_len {
+                        weight >= 36_000
+                    } else {
+                        len >= 3 && parent_pos == 0 && !wubi_has_exact && weight >= 42_000
+                    };
+                    if !has_upper && !is_user && !cold_allowed {
                         None
                     } else {
-                        let display = format_english_display(raw_slice, &canonical);
-                        let w_bonus =
-                            ((weight as f32) / 65535.0) * 1.1 + if is_user { 1.8 } else { 0.0 };
-                        let len_bonus = if is_user || is_tech || len >= 5 {
-                            0.45 * (len as f32)
+                        let display = resolve_english_display(
+                            raw_slice,
+                            user_hit.map(|x| x.0),
+                            dict_hit.as_ref().map(|x| x.0.as_str()),
+                        );
+                        let user_cnt = user_hit.map_or(0, |x| x.1);
+                        let w_prior = ((weight as f32) / 65535.0) * 1.2
+                            + if is_user {
+                                1.35 + 0.45 * ((user_cnt as f32) + 1.0).ln()
+                            } else {
+                                0.0
+                            };
+                        let len_prior = if len > max_code_len {
+                            0.55 * (len as f32)
                         } else {
-                            0.15 * (len as f32)
+                            0.25 * (len as f32)
                         };
-                        let switch_cost = if parent_pos > 0 && !has_upper && !is_user && len == 4 {
-                            3.4
+                        let switch_cost = if has_upper {
+                            0.0
+                        } else if is_user && len <= max_code_len && wubi_has_exact {
+                            2.55
+                        } else if parent_pos > 0 && !is_user {
+                            2.25
                         } else {
-                            2.4
+                            1.85
                         };
-                        Some((display, len_bonus + w_bonus - switch_cost))
+                        Some((display, len_prior + w_prior - switch_cost))
                     }
                 } else {
                     None

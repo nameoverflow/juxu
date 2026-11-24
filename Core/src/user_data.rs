@@ -343,6 +343,87 @@ impl UserStore {
         }
     }
 
+    #[inline]
+    pub fn has_pinyin_phrases(&self) -> bool {
+        !self.pinyin_index.is_empty()
+    }
+
+    /// Look up confirmed user phrases (`!auto_composed || count >= 2`) matching Pinyin `constraints`,
+    /// returning `(text, count, auto_composed)` sorted by `(manual_first, count DESC, last_seq DESC)`.
+    pub fn lookup_pinyin_phrases_confirmed(
+        &self,
+        constraints: &[SylConstraint<'_>],
+        pdict: &PinyinDictView,
+        limit: usize,
+    ) -> Vec<(&str, u32, bool)> {
+        let len = constraints.len();
+        if !(2..=6).contains(&len) || self.pinyin_index.is_empty() {
+            return Vec::new();
+        }
+        let mut inits = [0u8; 6];
+        for (i, c) in constraints.iter().enumerate() {
+            inits[i] = match c {
+                SylConstraint::Full(sid) => pdict.syllable_init(*sid).0,
+                SylConstraint::Initial(init_id, _) => *init_id,
+                SylConstraint::Prefix(p) => crate::pinyin_dict::base_initial_id(p),
+            };
+        }
+        let Some(init_key) = pack_init_key(&inits[..len]) else {
+            return Vec::new();
+        };
+        let Some(bucket) = self.pinyin_index.get(&(len as u8, init_key)) else {
+            return Vec::new();
+        };
+        let mut hits: Vec<(&str, u32, u64, bool)> = Vec::new();
+        for (syl_ids, text) in bucket {
+            if syl_ids.len() != len {
+                continue;
+            }
+            let mut matched = true;
+            for j in 0..len {
+                let sid = syl_ids[j];
+                match constraints[j] {
+                    SylConstraint::Full(req_sid) => {
+                        if sid != req_sid {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    SylConstraint::Initial(_, req_digraph) => {
+                        if req_digraph && !pdict.syllable_init(sid).1 {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    SylConstraint::Prefix(pref) => {
+                        if !pdict.syllable_str(sid).starts_with(pref) {
+                            matched = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !matched {
+                continue;
+            }
+            if let Some(up) = self.phrases.get(text) {
+                if up.auto_composed && up.count < 2 {
+                    continue;
+                }
+                if !hits.iter().any(|h| h.0 == up.text.as_str()) {
+                    hits.push((up.text.as_str(), up.count, up.last_seq, up.auto_composed));
+                }
+            }
+        }
+        hits.sort_by(|a, b| {
+            a.3.cmp(&b.3)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.2.cmp(&a.2))
+        });
+        hits.truncate(limit);
+        hits.into_iter().map(|(t, c, _, auto_c)| (t, c, auto_c)).collect()
+    }
+
     /// Look up user phrases matching Full Pinyin `constraints`, sorted by `(count DESC, last_seq DESC)`.
     pub fn lookup_pinyin_phrases(
         &self,
@@ -1138,6 +1219,28 @@ impl UserStore {
         });
         hits.truncate(limit);
         hits.into_iter().map(|(d, c, _, _)| (d, c)).collect()
+    }
+
+    /// Look up personal learned English words (`ENWORD`, including 1-shot newly coined terms like `uv`, `agy`, `sglang`)
+    /// matching a T9 digit sequence (`'2'..='9'`, `len 2..=12`).
+    pub fn lookup_english_t9(&self, digits: &[u8], limit: usize) -> Vec<(&str, u32)> {
+        if limit == 0 || self.english_words.is_empty() {
+            return Vec::new();
+        }
+        let Some(target) = crate::english::pack_t9_digits_slice(digits) else {
+            return Vec::new();
+        };
+        let mut hits: Vec<(&str, u32, u64)> = self
+            .english_words
+            .iter()
+            .filter_map(|(k, (disp, cnt, seq))| {
+                let wk = crate::english::pack_word_to_t9_key(k)?;
+                (wk == target).then_some((disp.as_str(), *cnt, *seq))
+            })
+            .collect();
+        hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+        hits.truncate(limit);
+        hits.into_iter().map(|(d, c, _)| (d, c)).collect()
     }
 
     /// Personal language model log-boost given `prev_committed` context (in nats).

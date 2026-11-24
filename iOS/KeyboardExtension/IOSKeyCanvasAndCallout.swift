@@ -271,6 +271,7 @@ private final class IOSKeycapNodeView: UIView {
             subscriptLabel.frame = CGRect(x: b.width - 30.0, y: b.height - 20.0, width: 24.0, height: 15.0)
             return
         }
+        var xNudge: CGFloat = 0.0
         let yNudge: CGFloat
         switch spec.kind {
         case .letter:
@@ -279,14 +280,19 @@ private final class IOSKeycapNodeView: UIView {
             let isUpper = first?.isUppercase ?? false
             let hintShift: CGFloat = spec.swipeUpSymbol == nil ? 0.0 : 2.0
             yNudge = (isNonASCII ? -0.5 : (isUpper ? -0.3 : -2.2)) + hintShift
-        case .symbol, .planeSwitch:
+        case .symbol:
+            yNudge = spec.swipeUpSymbol == nil ? -0.8 : 1.2
+        case .planeSwitch:
             yNudge = -0.8
         case .modeToggle:
-            yNudge = -0.5
+            // WeChat-style cap: the active language sits upper-left, the other one small at lower-right.
+            let hasCornerLabel = spec.cornerSubscript != nil
+            xNudge = hasCornerLabel ? -6.0 : 0.0
+            yNudge = hasCornerLabel ? -3.0 : -0.5
         default:
             yNudge = 0.0
         }
-        primaryLabel.frame = b.offsetBy(dx: 0, dy: yNudge)
+        primaryLabel.frame = b.offsetBy(dx: xNudge, dy: yNudge)
         radicalLabel.frame = .zero
         symbolView.frame = b
         subscriptLabel.frame = CGRect(x: b.width - 30.0, y: b.height - 20.0, width: 24.0, height: 15.0)
@@ -414,7 +420,7 @@ private final class IOSKeycapNodeView: UIView {
         if let sub = spec.cornerSubscript, !sub.isEmpty {
             subscriptLabel.isHidden = false
             subscriptLabel.text = sub
-            subscriptLabel.textColor = subColor
+            subscriptLabel.textColor = (spec.kind == .modeToggle) ? modeSecondaryColor : subColor
         } else {
             subscriptLabel.isHidden = true
         }
@@ -429,7 +435,9 @@ private final class IOSKeycapNodeView: UIView {
     ) {
         let normalBg: UIColor = spec.isBlueAccent
             ? .systemBlue
-            : (dark ? UIColor(white: 1.0, alpha: 0.175) : .white)
+            : spec.usesFunctionFill
+                ? (dark ? UIColor(white: 1.0, alpha: 0.09) : UIColor(red: 184.0 / 255.0, green: 188.0 / 255.0, blue: 198.0 / 255.0, alpha: 1.0))
+                : (dark ? UIColor(white: 1.0, alpha: 0.175) : .white)
         let pressedBg: UIColor = spec.isBlueAccent
             ? UIColor.systemBlue.withAlphaComponent(0.80)
             : (dark
@@ -517,6 +525,7 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     }
 
     private(set) var snapshot: IOSKeyboardLayoutEngine.LayoutSnapshot?
+    var isComposing: Bool = false
     var validNextMask: UInt32 = 0x03FF_FFFF
     var nextKeyPriors: [UInt8] = Array(repeating: 100, count: 26)
     var touchOffsets: [Float] = Array(repeating: 0, count: 52)
@@ -631,7 +640,10 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
             } else {
                 onKeyTouchUp?(state.initialKey, state.initialPoint)
             }
-        } else if state.swipeUpActive, let symbol = state.initialKey.swipeUpSymbol {
+        } else if state.swipeUpActive,
+                  let symbol = state.initialKey.swipeUpSymbol,
+                  !(isComposing && state.prevTimestamp - state.beganTimestamp < 0.085)
+        {
             onKeySwipeUp?(symbol)
         } else {
             let cleanPt = (state.currentKey.id == state.initialKey.id)
@@ -1000,7 +1012,8 @@ final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
                     from: state.initialPoint,
                     to: pt,
                     keyHeight: state.initialKey.frame.height,
-                    wasActive: state.swipeUpActive
+                    wasActive: state.swipeUpActive,
+                    isComposing: isComposing
                 )
                 if active != state.swipeUpActive {
                     state.swipeUpActive = active
