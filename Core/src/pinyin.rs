@@ -1497,10 +1497,10 @@ fn edge_parent_limit(edge: &LatticeEdge) -> usize {
     match &edge.syl {
         SylMatch::Full(_) => match edge.correction {
             CorrectionKind::Exact => {
-                if edge.start <= 3 {
+                if edge.start <= 6 {
                     16
                 } else {
-                    8
+                    12
                 }
             }
             CorrectionKind::TouchBoundary => 4,
@@ -2059,7 +2059,7 @@ fn extend_pinyin_layer(
                     })
                     .take(3)
                 {
-                    add_req(e1.start, 4);
+                    add_req(e1.start, 8);
                     if decoder.user.has_pinyin_phrases() && e1.start > 0 {
                         for e0 in lattice[e1.start]
                             .iter()
@@ -2578,7 +2578,7 @@ fn extend_pinyin_layer(
                 let syl_score1 = 1.8 * e1.spatial_logp + e1.kind_cost;
                 let c1_keep = if e1_is_init { 40 } else { 28 };
 
-                for gp in gps.iter().take(4) {
+                for gp in gps.iter().take(8) {
                     let Some(gp_rc) = gp.ready_rc() else {
                         continue;
                     };
@@ -3283,7 +3283,14 @@ fn build_pinyin_candidates(
         let insert_at = out.len().min(3);
         let mut inserted = 0usize;
         for disp in t9_en.into_iter().take(2) {
-            if seen.insert(disp.clone()) {
+            if let Some(existing_idx) = out.iter().position(|c| c.candidate.text == disp) {
+                let target = insert_at + inserted;
+                if existing_idx > target {
+                    let item = out.remove(existing_idx);
+                    out.insert(target.min(out.len()), item);
+                    inserted += 1;
+                }
+            } else if seen.insert(disp.clone()) {
                 let pos = (insert_at + inserted).min(out.len());
                 out.insert(
                     pos,

@@ -1118,8 +1118,10 @@ fn real_dicts_log_driven_strategy_regressions_pinyin_and_spaceless_wubi98() {
         haoshi_top3
     );
     assert!(
-        !haoshi_top3[..2].contains(&"好是".to_string()) && !haoshi_top3.contains(&"号是".to_string()),
-        "function-char glue '好是'/'号是' must not pollute top-2 for 'haoshi': {:?}",
+        haoshi_top3[0] != "好是"
+            && !haoshi_top3.contains(&"号是".to_string())
+            && !haoshi_top3.contains(&"好似".to_string()),
+        "inflated UNI '是' or mispronounced '好似'(sì) must not take #1 or pollute top-3 for 'haoshi': {:?}",
         haoshi_top3
     );
 

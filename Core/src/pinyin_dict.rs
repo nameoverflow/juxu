@@ -305,8 +305,8 @@ pub struct PinyinDictView {
     string_pool_off: usize,
     /// Compact sorted reverse index `(unicode_cp, syl_id)` for O(log N) char -> syllables lookup.
     char_syl_index: Vec<(u32, u16)>,
-    /// Per-character total reading weight across all syllables for Bayesian emission `P(syl | char)`.
-    char_total_weights: HashMap<char, f32>,
+    /// Per-character primary (max) reading weight across syllables to suppress rare literary readings without penalizing major polyphone readings.
+    char_max_weights: HashMap<char, f32>,
     /// Prebuilt T9 digit sequence -> `syl_id` list (built once on dictionary load, zero per-keystroke alloc).
     t9_index: HashMap<String, Vec<u16>>,
 }
@@ -343,7 +343,7 @@ impl PinyinDictView {
         }
 
         let mut char_syl_index = Vec::<(u32, u16)>::with_capacity(char_entry_count);
-        let mut char_total_weights = HashMap::<char, f32>::with_capacity(char_entry_count.min(16_384));
+        let mut char_max_weights = HashMap::<char, f32>::with_capacity(char_entry_count.min(16_384));
         for sid in 0..syl_count {
             let boff = char_buckets_off + sid * CHAR_BUCKET_STRIDE;
             if boff + CHAR_BUCKET_STRIDE > b.len() {
@@ -366,9 +366,12 @@ impl PinyinDictView {
                     if let Ok(text) = std::str::from_utf8(&b[text_start..text_start + str_len]) {
                         let mut chars = text.chars();
                         if let (Some(ch), None) = (chars.next(), chars.next()) {
-                            let w = read_u32(b, eoff + 8) as f32;
+                            let w = (read_u32(b, eoff + 4) as f32).max(1.0);
                             char_syl_index.push((ch as u32, sid as u16));
-                            *char_total_weights.entry(ch).or_insert(0.0) += w.max(1.0);
+                            let entry = char_max_weights.entry(ch).or_insert(w);
+                            if w > *entry {
+                                *entry = w;
+                            }
                         }
                     }
                 }
@@ -407,7 +410,7 @@ impl PinyinDictView {
             syl_seq_pool_off,
             string_pool_off,
             char_syl_index,
-            char_total_weights,
+            char_max_weights,
             t9_index,
         })
     }
@@ -420,8 +423,8 @@ impl PinyinDictView {
     #[inline]
     pub fn char_emission_logp(&self, ch: char, syl_weight: u32) -> f32 {
         let w = (syl_weight as f32).max(1.0);
-        let tot = self.char_total_weights.get(&ch).copied().unwrap_or(w).max(w);
-        (w / tot).clamp(1e-4, 1.0).ln()
+        let max_w = self.char_max_weights.get(&ch).copied().unwrap_or(w).max(w);
+        0.38 * (w / max_w).clamp(0.002, 1.0).ln()
     }
 
     #[inline]
