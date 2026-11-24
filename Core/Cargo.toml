@@ -33,6 +33,14 @@ path = "src/bin/eval_typo.rs"
 name = "eval_english_mix"
 path = "src/bin/eval_english_mix.rs"
 
+[[bin]]
+name = "eval_pure_neural"
+path = "src/bin/eval_pure_neural.rs"
+
+[[bin]]
+name = "eval_from_log"
+path = "src/bin/eval_from_log.rs"
+
 [dependencies]
 
 [profile.release]

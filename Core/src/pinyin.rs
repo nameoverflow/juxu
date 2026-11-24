@@ -594,6 +594,13 @@ fn build_lattice(
                     }
                     // Adjacent transposition within syllable (`len >= 2`)
                     if len >= 2 {
+                        let lower_exact = exact_str.to_ascii_lowercase();
+                        let is_common_exact_en = len >= 3
+                            && (decoder.user.lookup_english_exact(&lower_exact).is_some()
+                                || decoder
+                                    .english
+                                    .lookup_exact(&lower_exact)
+                                    .is_some_and(|e| e.weight >= 48_000));
                         for pos in 0..(len - 1) {
                             if exact_bytes[pos] == exact_bytes[pos + 1] {
                                 continue;
@@ -604,12 +611,15 @@ fn build_lattice(
                             let dt = observations[start + pos + 1]
                                 .timestamp_ms
                                 .saturating_sub(observations[start + pos].timestamp_ms);
-                            let trans_lp =
-                                if observations[start + pos + 1].timestamp_ms > 0 && dt <= 65 {
-                                    -2.45
-                                } else {
-                                    -3.45
-                                };
+                            let trans_lp = if !is_exact_or_ortho_syl
+                                && !is_common_exact_en
+                                && observations[start + pos + 1].timestamp_ms > 0
+                                && dt <= 65
+                            {
+                                -2.45
+                            } else {
+                                -3.45
+                            };
                             hyps.push((s, trans_lp, CorrectionKind::Transposition, 0.0));
                         }
                     }
@@ -1250,11 +1260,13 @@ fn add_latin_lattice_edges(
                     .unwrap_or(28_000);
                 // Emit if known word, or at end of buffer, or `len >= 2` (so OOV `Juxu` + Chinese `xie` works)
                 if is_known || actual_end == n || len >= 2 {
-                    let kind_cost = if is_known {
-                        1.42 * (len as f32) + 4.2
+                    let w_norm = ((weight as f32 - 36_000.0) / 24_000.0).clamp(0.0, 1.0);
+                    let apos_bonus = if end < n && observations[end].ch == b'\'' {
+                        1.2
                     } else {
-                        1.18 * (len as f32) + 2.0
+                        0.0
                     };
+                    let kind_cost = 1.38 * (len as f32) + 2.4 + 1.8 * w_norm + apos_bonus;
                     edges_by_end[actual_end].push(LatticeEdge {
                         start,
                         end: actual_end,
@@ -1332,7 +1344,7 @@ fn add_latin_lattice_edges(
                     } else if !is_user && len == 3 && !has_vowel {
                         // Consonant-only 3-letter acronym (e.g. `sql`, `ssh`, `pdf`, `cbd`): keep gentle so
                         // Chinese 3-letter initial abbreviations (`srf`, `jsj`, `cbd`) still win cleanly
-                        0.90 * (len as f32) - 6.2 + w_bonus * 0.5
+                        0.90 * (len as f32) - 8.4 + w_bonus * 0.5
                     } else if !is_user && !is_shuangpin && prefix_is_exact_py {
                         // Continuous frequency-calibrated prior for unanchored lowercase words whose spelling
                         // also parses as `exact Mandarin syllable + trailing consonant initial`:
@@ -1460,7 +1472,7 @@ fn add_latin_lattice_edges(
                         && !can_parse_initials_plus_exact
                         && !swallows_outer_mandarin
                     {
-                        let kind_cost = 0.55 * (len as f32) + 0.6;
+                        let kind_cost = 0.78 * (len as f32) + 0.8;
                         edges_by_end[actual_end].push(LatticeEdge {
                             start,
                             end: actual_end,
@@ -1506,9 +1518,9 @@ fn edge_parent_limit(edge: &LatticeEdge) -> usize {
         },
         SylMatch::Initial(_, _) => {
             if edge.correction == CorrectionKind::Exact && edge.start <= 4 {
-                8
+                14
             } else if edge.correction == CorrectionKind::Exact {
-                6
+                8
             } else {
                 2
             }
@@ -2250,17 +2262,19 @@ fn extend_pinyin_layer(
                             .dict
                             .lookup_chars(sid, decoder.config.enable_rare_charset)
                             .into_iter()
-                            .take(10)
+                            .take(14)
                         {
                             if let Some(ch) = e.text.chars().next() {
-                                if seen_ch.insert(ch) {
+                                if decoder.dict.is_viable_initial_reading(ch, e.weight)
+                                    && seen_ch.insert(ch)
+                                {
                                     cand_chars.push((ch, e.weight));
                                 }
                             }
                         }
                     }
                 }
-                let per_parent_keep = 12usize;
+                let per_parent_keep = if edge.start == 0 { 24usize } else { 12usize };
                 for parent in parents_slice {
                     let Some(parent_rc) = parent.ready_rc() else {
                         continue;
@@ -2468,8 +2482,8 @@ fn extend_pinyin_layer(
                 SylMatch::Initial(init_id, is_digraph) => {
                     let sids = decoder.dict.syllables_with_prefix(&edge.display_syl);
                     let mut head_per_syl = Vec::with_capacity(64);
-                    let mut rest_pool = Vec::with_capacity(128);
-                    let mut seen_c = HashSet::with_capacity(192);
+                    let mut rest_pool = Vec::with_capacity(160);
+                    let mut seen_c = HashSet::with_capacity(224);
                     for sid in sids {
                         let (sid_init, sid_dg) = decoder.dict.syllable_init(sid);
                         if sid_init == *init_id && (!*is_digraph || sid_dg) {
@@ -2477,11 +2491,13 @@ fn extend_pinyin_layer(
                                 .dict
                                 .lookup_chars(sid, decoder.config.enable_rare_charset)
                                 .into_iter()
-                                .take(8)
+                                .take(14)
                                 .enumerate()
                             {
                                 if let Some(ch) = e.text.chars().next() {
-                                    if seen_c.insert(ch) {
+                                    if decoder.dict.is_viable_initial_reading(ch, e.weight)
+                                        && seen_c.insert(ch)
+                                    {
                                         if rank_in_syl < 2 {
                                             head_per_syl.push((ch, e.weight));
                                         } else {
@@ -2569,12 +2585,25 @@ fn extend_pinyin_layer(
                     continue;
                 }
                 let e1_is_init = matches!(e1.syl, SylMatch::Initial(_, _));
-                let c1_raw = collect_edge_chars(e1, if e1_is_init { 128 } else { 80 });
+                let c1_raw = collect_edge_chars(e1, if e1_is_init { 160 } else { 80 });
                 if c1_raw.is_empty() {
                     continue;
                 }
                 let syl_score1 = 1.8 * e1.spatial_logp + e1.kind_cost;
-                let c1_keep = if e1_is_init { 40 } else { 28 };
+                let c1_keep = if e1_is_init && e1.start == 0 {
+                    128
+                } else if e1_is_init {
+                    64
+                } else {
+                    28
+                };
+                let rescue_cap = if e1_is_init && e2_is_init && e1.start == 0 {
+                    12usize
+                } else if e1_is_init || e2_is_init {
+                    8usize
+                } else {
+                    4usize
+                };
 
                 for gp in gps.iter().take(8) {
                     let Some(gp_rc) = gp.ready_rc() else {
@@ -2639,9 +2668,9 @@ fn extend_pinyin_layer(
                             if seen_texts.contains(&cand_text) {
                                 continue;
                             }
-                            if rescues.len() < 4 || est > rescues.last().unwrap().est {
+                            if rescues.len() < rescue_cap || est > rescues.last().unwrap().est {
                                 let pos = rescues.partition_point(|r| r.est > est);
-                                if pos < 4 {
+                                if pos < rescue_cap {
                                     rescues.insert(
                                         pos,
                                         RescueCand {
@@ -2656,7 +2685,7 @@ fn extend_pinyin_layer(
                                             est,
                                         },
                                     );
-                                    if rescues.len() > 4 {
+                                    if rescues.len() > rescue_cap {
                                         rescues.pop();
                                     }
                                 }

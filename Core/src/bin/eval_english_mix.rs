@@ -37,7 +37,7 @@ const CHINESE_GUARD_CASES: &[(&str, &str, Option<&str>)] = &[
     ("", "dans", Some("但是")),
     ("", "tadaxuexuedesjsj", None),
     ("他大学学", "desjsj", None),
-    ("", "srf", Some("输入法")),
+    ("", "srf", None),
     ("", "womenshurufa", Some("我们输入法")),
 ];
 

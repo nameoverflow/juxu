@@ -186,7 +186,6 @@ fn main() {
             let dec_c = PinyinDecoder {
                 dict: &dict,
                 english: &english,
-                aux: Some(&aux),
                 model: Some(aux.neural_view().unwrap()),
                 config: &config,
                 user: &cold_user,
@@ -203,7 +202,6 @@ fn main() {
             let dec_l = PinyinDecoder {
                 dict: &dict,
                 english: &english,
-                aux: Some(&aux),
                 model: Some(aux.neural_view().unwrap()),
                 config: &config,
                 user: &live_user,

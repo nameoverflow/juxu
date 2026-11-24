@@ -309,6 +309,15 @@ impl PinyinDictView {
         0.38 * (w / max_w).clamp(0.002, 1.0).ln()
     }
 
+    /// Whether `syl_weight` is a viable modern reading for initial-only abbreviation expansion
+    /// (filters out archaic dictionary glosses like `不=fou(1)` vs `bu(2.98M)` while keeping real polyphones).
+    #[inline]
+    pub fn is_viable_initial_reading(&self, ch: char, syl_weight: u32) -> bool {
+        let w = (syl_weight as f32).max(1.0);
+        let max_w = self.char_max_weights.get(&ch).copied().unwrap_or(w).max(w);
+        w >= 0.015 * max_w
+    }
+
     #[inline]
     pub fn syllable_count(&self) -> usize {
         self.syl_count
