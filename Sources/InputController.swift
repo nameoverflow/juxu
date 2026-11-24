@@ -6,8 +6,7 @@ import InputMethodKit
 @MainActor
 public final class JuxuInputController: IMKInputController {
     private weak var activeClient: (any IMKTextInput & NSObjectProtocol)?
-    private var shiftKeyDownAlone: Bool = false
-    private var shiftDownTimestamp: TimeInterval = 0
+    private var shiftTapDetector = ShiftTapDetector()
     private var autoSpaceTracker = AutoSpaceContextTracker()
     private var lastExpectedAnchor: Int? = nil
     private var sawClientSupportForRanges: Bool = false
@@ -45,6 +44,7 @@ public final class JuxuInputController: IMKInputController {
     public override func activateServer(_ sender: Any!) {
         super.activateServer(sender)
         self.activeClient = sender as? (any IMKTextInput & NSObjectProtocol)
+        shiftTapDetector.reset()
         autoSpaceTracker.invalidate()
         lastExpectedAnchor = nil
         sawClientSupportForRanges = false
@@ -59,6 +59,7 @@ public final class JuxuInputController: IMKInputController {
         commitPendingAndHide(sender)
         JuxuBridge.shared.flushUserDataAsync()
         JuxuBridge.shared.flushPendingPersistence()
+        shiftTapDetector.reset()
         autoSpaceTracker.invalidate()
         lastExpectedAnchor = nil
         sawClientSupportForRanges = false
@@ -113,40 +114,39 @@ public final class JuxuInputController: IMKInputController {
                 }
             )
             if consumedByVoice {
-                shiftKeyDownAlone = false
+                shiftTapDetector.cancelPendingTap()
                 return true
             }
         }
 
         // Bare Shift tap detection for seamless Chinese / English toggle
         if event.type == .flagsChanged {
-            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            if flags == .shift {
-                shiftKeyDownAlone = true
-                shiftDownTimestamp = event.timestamp
-            } else if flags.isEmpty && shiftKeyDownAlone {
-                shiftKeyDownAlone = false
-                if event.timestamp - shiftDownTimestamp < 0.35 {
-                    let out = JuxuBridge.shared.toggleAsciiMode()
-                    applyEngineOutput(out, client: clientObj)
-                    if out.preedit.isEmpty {
-                        let caret = queryCaretRect(client: clientObj)
-                        ModeIndicatorPanelController.shared.show(
-                            asciiMode: out.asciiMode,
-                            caretRect: caret,
-                            clientWindowLevel: clientObj?.windowLevel()
-                        )
-                    }
-                    return true
+            let now = ProcessInfo.processInfo.systemUptime
+            let eventTs = (event.timestamp > 0 && abs(now - event.timestamp) < 5.0) ? event.timestamp : now
+            let triggered = shiftTapDetector.handleFlagsChanged(
+                keyCode: event.keyCode,
+                modifiers: Self.shiftTapModifiers(from: event.modifierFlags),
+                timestamp: eventTs,
+                hadInterveningHIDEvent: Self.hasInterveningHIDInput(since:)
+            )
+            if triggered {
+                let out = JuxuBridge.shared.toggleAsciiMode()
+                applyEngineOutput(out, client: clientObj)
+                if out.preedit.isEmpty {
+                    let caret = queryCaretRect(client: clientObj)
+                    ModeIndicatorPanelController.shared.show(
+                        asciiMode: out.asciiMode,
+                        caretRect: caret,
+                        clientWindowLevel: clientObj?.windowLevel()
+                    )
                 }
-            } else {
-                shiftKeyDownAlone = false
+                return true
             }
             return false
         }
 
         guard event.type == .keyDown else { return false }
-        shiftKeyDownAlone = false
+        shiftTapDetector.handleKeyDown()
 
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let hasCmdOrOption = mods.contains(.command) || mods.contains(.option)
@@ -682,6 +682,37 @@ public final class JuxuInputController: IMKInputController {
                 JuxuBridge.shared.flushUserDataAsync()
             }
         }
+    }
+
+    private static func shiftTapModifiers(from flags: NSEvent.ModifierFlags) -> ShiftTapModifiers {
+        var result: ShiftTapModifiers = []
+        if flags.contains(.shift) { result.insert(.shift) }
+        if flags.contains(.control) { result.insert(.control) }
+        if flags.contains(.option) { result.insert(.option) }
+        if flags.contains(.command) { result.insert(.command) }
+        if flags.contains(.function) { result.insert(.function) }
+        if flags.contains(.capsLock) { result.insert(.capsLock) }
+        return result
+    }
+
+    private static func hasInterveningHIDInput(since downTimestamp: TimeInterval) -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        let elapsedSinceDown = now - downTimestamp
+        guard elapsedSinceDown > 0 else { return false }
+        let monitoredTypes: [CGEventType] = [
+            .keyDown,
+            .leftMouseDown,
+            .rightMouseDown,
+            .otherMouseDown,
+            .scrollWheel,
+        ]
+        for evType in monitoredTypes {
+            let sinceLast = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: evType)
+            if sinceLast <= elapsedSinceDown {
+                return true
+            }
+        }
+        return false
     }
 
     private static func nowMs() -> UInt64 {

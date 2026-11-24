@@ -371,6 +371,75 @@ struct SwiftBridgeTests {
         let cj5Out = bridge.handleKey(keyCode: 0, scalar: UnicodeScalar("c").value, hasCmdOrCtrl: false, timestampMs: 720)
         assert(cj5Out.commitText == "頡", "Expected Cangjie 5-code auto-commit 頡, got \(cj5Out.commitText)")
 
+        // 8. Verify ShiftTapDetector only triggers on bare Shift taps, never on Shift key combinations
+        do {
+            let lShift = ShiftTapDetector.leftShiftKeyCode
+            let rShift = ShiftTapDetector.rightShiftKeyCode
+            let lCmd: UInt16 = 0x37
+            let lCtrl: UInt16 = 0x3B
+            let lOpt: UInt16 = 0x3A
+            let fnKey: UInt16 = 0x3F
+
+            // (a) Bare Left/Right Shift taps within threshold toggle
+            var d = ShiftTapDetector()
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 10.0))
+            assert(d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 10.12))
+            assert(!d.handleFlagsChanged(keyCode: rShift, modifiers: .shift, timestamp: 11.0))
+            assert(d.handleFlagsChanged(keyCode: rShift, modifiers: [], timestamp: 11.20))
+
+            // (b) Slow Shift hold (>= 0.35s) does not toggle
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 12.0))
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 12.40))
+
+            // (c) Cmd+Shift+S releasing Cmd before Shift must NOT toggle
+            assert(!d.handleFlagsChanged(keyCode: lCmd, modifiers: .command, timestamp: 13.0))
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [.command, .shift], timestamp: 13.05))
+            d.handleKeyDown()
+            assert(!d.handleFlagsChanged(keyCode: lCmd, modifiers: .shift, timestamp: 13.15))
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 13.20))
+
+            // (d) Shift+Cmd releasing Cmd before Shift (even without IMK keyDown) must NOT toggle
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 14.0))
+            assert(!d.handleFlagsChanged(keyCode: lCmd, modifiers: [.shift, .command], timestamp: 14.03))
+            assert(!d.handleFlagsChanged(keyCode: lCmd, modifiers: .shift, timestamp: 14.10))
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 14.15))
+
+            // (e) Ctrl+Shift, Opt+Shift, Fn+Shift releasing other modifier first must NOT toggle
+            for (code, mod) in [(lCtrl, ShiftTapModifiers.control), (lOpt, .option), (fnKey, .function)] {
+                assert(!d.handleFlagsChanged(keyCode: code, modifiers: mod, timestamp: 15.0))
+                assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [mod, .shift], timestamp: 15.02))
+                assert(!d.handleFlagsChanged(keyCode: code, modifiers: .shift, timestamp: 15.08))
+                assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 15.12))
+            }
+
+            // (f) Focus switch while holding Cmd+Shift (reset detector, then Cmd up -> Shift up) must NOT toggle
+            d.reset()
+            assert(!d.handleFlagsChanged(keyCode: lCmd, modifiers: .shift, timestamp: 16.0))
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 16.05))
+
+            // (g) Shift + regular keyDown (e.g. Shift+A) must NOT toggle
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 17.0))
+            d.handleKeyDown()
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 17.10))
+
+            // (h) Shift + intercepted key/mouse (e.g. Shift+Tab, Shift+Click) caught via HID callback must NOT toggle
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 18.0))
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 18.10, hadInterveningHIDEvent: { downTs in
+                assert(downTs == 18.0)
+                return true
+            }))
+
+            // (i) Left Shift + Right Shift chord must NOT toggle
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 19.0))
+            assert(!d.handleFlagsChanged(keyCode: rShift, modifiers: .shift, timestamp: 19.05))
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 19.10))
+            assert(!d.handleFlagsChanged(keyCode: rShift, modifiers: [], timestamp: 19.15))
+
+            // (j) Subsequent bare Shift tap after combinations still works normally
+            assert(!d.handleFlagsChanged(keyCode: lShift, modifiers: .shift, timestamp: 20.0))
+            assert(d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 20.08))
+        }
+
         print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Cangjie, Bayesian typo & macOS Voice MVP tests passed!")
     }
 }
