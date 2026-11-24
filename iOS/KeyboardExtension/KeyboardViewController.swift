@@ -69,6 +69,7 @@ public final class KeyboardViewController: UIInputViewController {
         let cangjieKeycapRadicals: Bool
         let wubiKeycapRadicals: Bool
         let swipeUpInputEnabled: Bool
+        let spaceCommaKeyEnabled: Bool
         let isZLookupActive: Bool
         let showInlineGlobeKey: Bool
         let returnRole: IOSReturnKeyRole
@@ -1027,10 +1028,11 @@ public final class KeyboardViewController: UIInputViewController {
             advanceToNextInputMode()
 
         case .modeToggle:
-            let out = bridge.toggleAsciiMode()
-            if layoutEngine.plane != .letters {
+            // With the comma-key row, stay on the current page: 123 and symbol keys switch content in place.
+            if !bridge.prefs.spaceCommaKey, layoutEngine.plane != .letters {
                 layoutEngine.switchPlane(.letters)
             }
+            let out = bridge.toggleAsciiMode()
             applyEngineState(out)
 
         case .space:
@@ -1514,6 +1516,7 @@ public final class KeyboardViewController: UIInputViewController {
         layoutEngine.cangjieKeycapRadicals = bridge.prefs.cangjieKeycapRadicals
         layoutEngine.wubiKeycapRadicals = bridge.prefs.wubiKeycapRadicals
         layoutEngine.swipeUpInputEnabled = bridge.prefs.keySwipeUpInput
+        layoutEngine.spaceCommaKeyEnabled = bridge.prefs.spaceCommaKey
         keyCanvas.longPressAlternatesEnabled = bridge.prefs.keyLongPressAlternates
         keyCanvas.asciiMode = st.asciiMode
         keyCanvas.backspaceSwipeClearEnabled = bridge.prefs.backspaceSwipeClear
@@ -1592,6 +1595,7 @@ public final class KeyboardViewController: UIInputViewController {
             cangjieKeycapRadicals: layoutEngine.cangjieKeycapRadicals,
             wubiKeycapRadicals: layoutEngine.wubiKeycapRadicals,
             swipeUpInputEnabled: layoutEngine.swipeUpInputEnabled,
+            spaceCommaKeyEnabled: layoutEngine.spaceCommaKeyEnabled,
             isZLookupActive: layoutEngine.isZLookupActive,
             showInlineGlobeKey: layoutEngine.showInlineGlobeKey,
             returnRole: layoutEngine.returnRole,

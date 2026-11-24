@@ -362,6 +362,7 @@ public struct JuxuPreferences: Equatable, Sendable {
     public var cangjieKeycapRadicals: Bool = true
     public var wubiKeycapRadicals: Bool = false
     public var keySwipeUpInput: Bool = false
+    public var spaceCommaKey: Bool = false
     public var keyLongPressAlternates: Bool = false
     public var backspaceSwipeClear: Bool = false
     public var evalLogging: Bool = true
@@ -438,6 +439,7 @@ public struct JuxuPreferences: Equatable, Sendable {
         cangjie_keycap_radicals = \(cangjieKeycapRadicals)
         wubi_keycap_radicals = \(wubiKeycapRadicals)
         key_swipe_up_input = \(keySwipeUpInput)
+        space_comma_key = \(spaceCommaKey)
         key_long_press_alternates = \(keyLongPressAlternates)
         backspace_swipe_clear = \(backspaceSwipeClear)
         emoji_candidates = \(emojiCandidates)
@@ -522,6 +524,8 @@ public struct JuxuPreferences: Equatable, Sendable {
                 p.wubiKeycapRadicals = boolVal
             case (_, "key_swipe_up_input"):
                 p.keySwipeUpInput = boolVal
+            case (_, "space_comma_key"):
+                p.spaceCommaKey = boolVal
             case (_, "key_long_press_alternates"):
                 p.keyLongPressAlternates = boolVal
             case (_, "backspace_swipe_clear"):
@@ -1121,6 +1125,7 @@ public final class JuxuBridge: ObservableObject {
             loaded.cangjieKeycapRadicals = uiPrefs.cangjieKeycapRadicals
             loaded.wubiKeycapRadicals = uiPrefs.wubiKeycapRadicals
             loaded.keySwipeUpInput = uiPrefs.keySwipeUpInput
+            loaded.spaceCommaKey = uiPrefs.spaceCommaKey
             loaded.keyLongPressAlternates = uiPrefs.keyLongPressAlternates
             loaded.backspaceSwipeClear = uiPrefs.backspaceSwipeClear
         }
@@ -1323,6 +1328,7 @@ public final class JuxuBridge: ObservableObject {
                         loaded.cangjieKeycapRadicals = uiPrefs.cangjieKeycapRadicals
                         loaded.wubiKeycapRadicals = uiPrefs.wubiKeycapRadicals
                         loaded.keySwipeUpInput = uiPrefs.keySwipeUpInput
+                        loaded.spaceCommaKey = uiPrefs.spaceCommaKey
                         loaded.keyLongPressAlternates = uiPrefs.keyLongPressAlternates
                         loaded.backspaceSwipeClear = uiPrefs.backspaceSwipeClear
                         self.prefs = loaded

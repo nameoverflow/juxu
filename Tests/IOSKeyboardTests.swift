@@ -576,7 +576,7 @@ struct IOSKeyboardTests {
         var offLayout = IOSKeyboardLayoutEngine()
         offLayout.swipeUpInputEnabled = false
         let offSnap = offLayout.computeLayout(in: CGSize(width: 440, height: 220))
-        assert(offSnap.keys.allSatisfy { $0.swipeUpSymbol == nil }, "Switching swipe-up off must remove hints and gesture")
+        assert(offSnap.keys.allSatisfy { $0.swipeUpSymbol == nil }, "Switching swipe-up off must remove letter hints and gesture")
         // Backspace swipe-up clears only the current line, left of the cursor
         assert(IOSLineClear.plan(before: "第一行\n第二行", maxBatch: 128) == .init(deleteCount: 3, reachesLineStart: true))
         assert(IOSLineClear.plan(before: "第一行\n", maxBatch: 128) == .init(deleteCount: 0, reachesLineStart: true), "Cursor at line start must not join lines")
@@ -1133,6 +1133,186 @@ struct IOSKeyboardTests {
             let f1FinalMarked = (field1 as? YYTextViewDocumentMock)?.markedRange ?? (field1 as! StandardUITextViewMock).markedRange
             assert(f1FinalText == "你好我们" && f1FinalMarked == nil, "Got '\(f1FinalText)'")
         }
+
+        // Bottom-row comma key: tap comma, swipe up period, behind its own toggle
+        let commaSize = CGSize(width: 440, height: 220)
+        func commaKey(_ snap: IOSKeyboardLayoutEngine.LayoutSnapshot) -> IOSKeySpec? {
+            snap.keys.first(where: { $0.id == "B_comma" })
+        }
+        for (ascii, swipeToggle, tapSymbol, swipeSymbol) in [
+            (false, true, "，", "。"), (true, true, ",", "."),
+            (false, false, "，", "。"), (true, false, ",", "."),
+        ] {
+            var engine = IOSKeyboardLayoutEngine()
+            engine.spaceCommaKeyEnabled = true
+            engine.asciiMode = ascii
+            engine.swipeUpInputEnabled = swipeToggle
+            let commaSnap = engine.computeLayout(in: commaSize)
+            let key = commaKey(commaSnap)!
+            assert(key.kind == .symbol(tapSymbol), "Tap must enter \(tapSymbol)")
+            assert(key.swipeUpSymbol == swipeSymbol, "Swipe must enter \(swipeSymbol) with letter swipe toggle \(swipeToggle)")
+            assert(IOSKeyboardLayoutEngine.hitTest(point: CGPoint(x: key.frame.midX, y: key.frame.midY), in: commaSnap)?.id == "B_comma")
+            let letterHints = commaSnap.keys.contains { key in
+                if case .letter = key.kind { return key.swipeUpSymbol != nil }
+                return false
+            }
+            assert(letterHints == swipeToggle, "Letter hints must still follow their own toggle")
+        }
+        var commaOn = IOSKeyboardLayoutEngine()
+        commaOn.spaceCommaKeyEnabled = true
+        let onSnap = commaOn.computeLayout(in: commaSize)
+        let onPlane = onSnap.keys.first(where: { $0.id == "B_plane" })!
+        let onComma = commaKey(onSnap)!
+        let onSpace = onSnap.keys.first(where: { $0.kind == .space })!
+        let onMode = onSnap.keys.first(where: { $0.id == "B_mode" })!
+        let onReturn = onSnap.keys.first(where: { $0.kind == .returnKey })!
+        let onLetterQ = onSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "q")) })!
+        let onLetterP = onSnap.keys.first(where: { $0.kind == .letter(UInt8(ascii: "p")) })!
+        let onPitch = CGFloat(onSnap.pitchX)
+        let onGap = onPitch - onLetterQ.frame.width
+        let onRow = [onPlane, onComma, onSpace, onMode, onReturn]
+        assert(onSnap.keys.count == 33 && !onSnap.keys.contains(where: { $0.id == "B_period" }))
+        assert(abs(onPlane.frame.minX - onLetterQ.frame.minX) < 0.01 && abs(onReturn.frame.maxX - onLetterP.frame.maxX) < 0.01)
+        for (left, right) in zip(onRow, onRow.dropFirst()) {
+            assert(abs(right.frame.minX - left.frame.maxX - onGap) < 0.01, "\(left.id) and \(right.id) must be one key gap apart")
+        }
+        assert(abs(onComma.frame.width - onLetterQ.frame.width) < 0.01, "Comma must be one letter key wide")
+        for (key, pitches) in [(onPlane, 1.85), (onSpace, 3.6), (onMode, 1.15), (onReturn, 1.85)] as [(IOSKeySpec, CGFloat)] {
+            assert(abs(key.frame.width / onPitch - pitches) < 0.06, "\(key.id) is \(key.frame.width / onPitch) pitches")
+        }
+        assert(onPlane.usesFunctionFill && onReturn.usesFunctionFill)
+        assert(!onComma.usesFunctionFill && !onSpace.usesFunctionFill && !onMode.usesFunctionFill)
+        assert(onMode.primaryLabel == "中" && onMode.cornerSubscript == "英")
+        var commaEnglish = IOSKeyboardLayoutEngine()
+        commaEnglish.spaceCommaKeyEnabled = true
+        commaEnglish.asciiMode = true
+        let englishMode = commaEnglish.computeLayout(in: commaSize).keys.first(where: { $0.id == "B_mode" })!
+        assert(englishMode.primaryLabel == "英" && englishMode.cornerSubscript == "中")
+        var commaGlobe = IOSKeyboardLayoutEngine()
+        commaGlobe.spaceCommaKeyEnabled = true
+        commaGlobe.showInlineGlobeKey = true
+        let globeSnap = commaGlobe.computeLayout(in: commaSize)
+        assert(globeSnap.keys.first(where: { $0.id == "B_globe" })?.frame == onMode.frame, "Globe must keep working in the 中/英 slot")
+        assert(!globeSnap.keys.contains(where: { $0.id == "B_mode" }))
+        for key in onRow {
+            let center = CGPoint(x: key.frame.midX, y: key.frame.midY)
+            assert(IOSKeyboardLayoutEngine.hitTest(point: center, in: onSnap)?.id == key.id, "Center tap must hit \(key.id)")
+            let topEdge = CGPoint(x: key.frame.midX, y: key.frame.minY - 2.0)
+            assert(IOSKeyboardLayoutEngine.hitTest(point: topEdge, in: onSnap, validNextMask: 1)?.id == key.id, "Top-edge tap must stay on \(key.id)")
+        }
+
+        // Toggle off: exactly the original 32-key layout
+        var commaOff = IOSKeyboardLayoutEngine()
+        commaOff.spaceCommaKeyEnabled = false
+        let plainSnap = commaOff.computeLayout(in: commaSize)
+        func letter(_ c: Character) -> IOSKeySpec { plainSnap.keys.first(where: { $0.kind == .letter(c.asciiValue!) })! }
+        let plainPlane = plainSnap.keys.first(where: { $0.id == "B_plane" })!
+        let plainMode = plainSnap.keys.first(where: { $0.id == "B_mode" })!
+        let plainSpace = plainSnap.keys.first(where: { $0.kind == .space })!
+        let plainReturn = plainSnap.keys.first(where: { $0.kind == .returnKey })!
+        let plainLeftW = (letter("s").frame.maxX - letter("q").frame.minX - onGap) * 0.5
+        assert(plainSnap.keys.count == 32 && commaKey(plainSnap) == nil)
+        assert(plainSnap.keys.allSatisfy { !$0.usesFunctionFill })
+        assert(plainMode.primaryLabel == "中" && plainMode.secondaryInlineLabel == "/英" && plainMode.cornerSubscript == nil)
+        assert(abs(plainPlane.frame.minX - letter("q").frame.minX) < 0.01 && abs(plainPlane.frame.width - plainLeftW) < 0.01)
+        assert(abs(plainMode.frame.maxX - letter("s").frame.maxX) < 0.01 && abs(plainMode.frame.width - plainLeftW) < 0.01)
+        assert(abs(plainSpace.frame.minX - letter("d").frame.minX) < 0.01 && abs(plainSpace.frame.maxX - letter("j").frame.maxX) < 0.01)
+        assert(abs(plainReturn.frame.minX - letter("k").frame.minX) < 0.01 && abs(plainReturn.frame.maxX - letter("p").frame.maxX) < 0.01)
+        for key in plainSnap.keys where !key.id.hasPrefix("B_") {
+            assert(onSnap.keys.first(where: { $0.id == key.id })?.frame == key.frame, "\(key.id) must not move")
+        }
+        let dColumn = CGPoint(x: letter("d").frame.midX, y: plainSpace.frame.midY)
+        let kColumn = CGPoint(x: letter("k").frame.midX, y: plainSpace.frame.midY)
+        assert(IOSKeyboardLayoutEngine.hitTest(point: dColumn, in: plainSnap)?.kind == .space)
+        assert(IOSKeyboardLayoutEngine.hitTest(point: kColumn, in: plainSnap)?.kind == .returnKey)
+
+        // The key stays off other planes and the 9-key layout
+        commaOn.switchPlane(.numbers)
+        assert(commaKey(commaOn.computeLayout(in: commaSize)) == nil)
+        commaOn.switchPlane(.letters)
+        commaOn.schemaId = 20
+        commaOn.pinyinT9Layout = true
+        let t9CommaSnap = commaOn.computeLayout(in: commaSize)
+        assert(t9CommaSnap.isT9Layout && commaKey(t9CommaSnap) == nil)
+
+        // 中/英 on the 123 and symbol pages: content switches in place and the mode carries to letters
+        func labels(_ snap: IOSKeyboardLayoutEngine.LayoutSnapshot) -> Set<String> {
+            Set(snap.keys.compactMap { key in
+                if case .symbol(let symbol) = key.kind { return symbol }
+                return nil
+            })
+        }
+        for (page, chinese, english, shared) in [
+            (IOSKeyPlane.numbers, ["，", "。", "？", "！", "：", "；", "（", "）", "“", "”", "￥"], [",", "?", "!", ":", ";", "(", ")", "\"", "$"], ["1", "0", "-", "/", "@", "."]),
+            (IOSKeyPlane.symbols, ["——", "～", "《", "》", "【", "】", "·"], ["_", "~", "<", ">", "€", "£", "•"], ["[", "]", "#", "\\", "|", "…", "‘", "’", "〈", "〉"]),
+        ] {
+            for commaEnabled in [true, false] {
+                var pageEngine = IOSKeyboardLayoutEngine()
+                pageEngine.spaceCommaKeyEnabled = commaEnabled
+                pageEngine.switchPlane(page)
+                let zhLabels = labels(pageEngine.computeLayout(in: commaSize))
+                assert(Set(chinese).isSubset(of: zhLabels) && zhLabels.isDisjoint(with: english))
+                pageEngine.asciiMode = true
+                assert(pageEngine.plane == page, "Mode change must stay on the page")
+                let enSnap = pageEngine.computeLayout(in: commaSize)
+                let enLabels = labels(enSnap)
+                assert(Set(english).isSubset(of: enLabels) && enLabels.isDisjoint(with: chinese))
+                assert(Set(shared).isSubset(of: zhLabels) && Set(shared).isSubset(of: enLabels), "Keys without a variant stay")
+                let enModeKey = enSnap.keys.first(where: { $0.kind == .modeToggle })!
+                assert(enModeKey.primaryLabel == (commaEnabled ? "英" : "EN"))
+                pageEngine.asciiMode = false
+                assert(pageEngine.plane == page && labels(pageEngine.computeLayout(in: commaSize)) == zhLabels, "Switching back restores the Chinese content")
+                pageEngine.asciiMode = true
+                pageEngine.switchPlane(.letters)
+                let backSnap = pageEngine.computeLayout(in: commaSize)
+                assert(backSnap.keys.first(where: { $0.kind == .modeToggle })?.primaryLabel == (commaEnabled ? "英" : "EN"))
+                if commaEnabled {
+                    assert(commaKey(backSnap)?.kind == .symbol(","), "Letters must use the mode chosen on the page")
+                }
+            }
+
+            // Toggle on: 123/ABC, 中/英 and Return keep the letter page's frames, with no comma key added
+            var onPage = IOSKeyboardLayoutEngine()
+            onPage.spaceCommaKeyEnabled = true
+            onPage.switchPlane(page)
+            let onPageSnap = onPage.computeLayout(in: commaSize)
+            func onKey(_ id: String) -> IOSKeySpec { onPageSnap.keys.first(where: { $0.id == id })! }
+            assert(commaKey(onPageSnap) == nil)
+            assert(onKey("B_mode").frame == onMode.frame && onKey("B_return").frame == onReturn.frame && onKey("B_plane").frame == onPlane.frame)
+            assert(onKey("B_plane").primaryLabel == "ABC" && onKey("B_plane").kind == .planeSwitch(.letters, label: "ABC"))
+            assert(abs(onKey("B_space").frame.minX - onPlane.frame.maxX - onGap) < 0.01)
+            assert(abs(onMode.frame.minX - onKey("B_space").frame.maxX - onGap) < 0.01)
+            for id in ["B_plane", "B_space", "B_mode", "B_return"] {
+                let key = onKey(id)
+                assert(IOSKeyboardLayoutEngine.hitTest(point: CGPoint(x: key.frame.midX, y: key.frame.midY), in: onPageSnap)?.id == id)
+            }
+            var globePage = IOSKeyboardLayoutEngine()
+            globePage.spaceCommaKeyEnabled = true
+            globePage.showInlineGlobeKey = true
+            globePage.switchPlane(page)
+            let globePageSnap = globePage.computeLayout(in: commaSize)
+            assert(globePageSnap.keys.first(where: { $0.kind == .globe })?.frame == onMode.frame)
+            assert(!globePageSnap.keys.contains(where: { $0.kind == .modeToggle }))
+
+            // Toggle off: the original positions on this page
+            var offPage = IOSKeyboardLayoutEngine()
+            offPage.spaceCommaKeyEnabled = false
+            offPage.switchPlane(page)
+            let offPageSnap = offPage.computeLayout(in: commaSize)
+            func offKey(_ id: String) -> IOSKeySpec { offPageSnap.keys.first(where: { $0.id == id })! }
+            assert(offKey("B_plane").frame == plainPlane.frame && offKey("B_mode").frame == plainMode.frame)
+            assert(offKey("B_space").frame == plainSpace.frame && offKey("B_return").frame == plainReturn.frame)
+            assert(offPageSnap.keys.allSatisfy { !$0.usesFunctionFill })
+        }
+
+        // The setting is opt-in and persists; settings saved before it existed decode to off
+        var commaPrefs = JuxuPreferences()
+        assert(!commaPrefs.spaceCommaKey)
+        commaPrefs.spaceCommaKey = true
+        assert(JuxuPreferences.fromTOML(commaPrefs.toTOML()).spaceCommaKey)
+        let oldTOML = commaPrefs.toTOML().split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.contains("space_comma_key") }.joined(separator: "\n")
+        assert(oldTOML != commaPrefs.toTOML() && !JuxuPreferences.fromTOML(oldTOML).spaceCommaKey)
 
         print("✓ All iOS 26 native grid, lowercase/shift, trackpad, ergonomic Y-bias, dynamic neural next-key, personal touchOffsets, clipboard, Cangjie, Wubi, T9 Pinyin, YYTextView inline commit & focus-loss recovery tests passed!")
     }
