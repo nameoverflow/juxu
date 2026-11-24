@@ -69,12 +69,22 @@ pub(crate) fn state_signature(state: &RwkvState) -> u128 {
         .fold(0, |bits, (i, &q)| bits | (u128::from(q > 0) << i))
 }
 
-#[derive(Default)]
-struct Counts {
+#[derive(Clone, Default)]
+pub(crate) struct Counts {
     tick: u64,
     total: f32,
     options: [Continuation; OPTIONS_PER_CONTEXT],
     states: [StateSample; STATE_SAMPLES_PER_CONTEXT],
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ContinuationUndo {
+    prev_tick: u64,
+    prev_uni_tick: u64,
+    prev_uni_total: f32,
+    prev_state_model: Option<u64>,
+    rows: Vec<(u64, Option<Counts>)>,
+    unigrams: Vec<(u16, Option<(u64, f32)>)>,
 }
 
 impl Counts {
@@ -186,13 +196,13 @@ impl Counts {
     }
 
     /// Estimate `(p_cache, lambda)` from suffix n-gram counts at this context row.
-    fn cache_suffix_prob(&self, ch: u16, max_lambda: f32, now: u64) -> (f32, f32) {
+    fn cache_suffix_prob(&self, ch: u16, max_lambda: f32, support_k: f32, now: u64) -> (f32, f32) {
         let decay = self.decay(now);
         let total = self.total * decay;
         if total < 0.25 {
             return (0.0, 0.0);
         }
-        let support = total / (total + 1.5);
+        let support = total / (total + support_k);
         let lambda = max_lambda * support;
         let w = self
             .options
@@ -276,6 +286,57 @@ impl PersonalContinuations {
 
     pub fn matches_model(&self, view: &NeuralView<'_>) -> bool {
         self.state_model == Some(view.offs.profile_id)
+    }
+
+    /// Capture a compact undo record (`< 1 KB`) of all context rows and unigram slots that would
+    /// be touched when observing `(prefix, text)`, enabling instant exact rollback on Backspace.
+    pub fn capture_undo_before(&self, prefix: &[char], text: &str) -> ContinuationUndo {
+        let mut rows = Vec::new();
+        let mut unigrams = Vec::new();
+        let mut context = Context::with_chars(prefix.iter().copied());
+        for ch in text.chars() {
+            if han(ch) {
+                let ch_u16 = ch as u16;
+                if !unigrams.iter().any(|&(k, _)| k == ch_u16) {
+                    unigrams.push((ch_u16, self.unigrams.get(&ch_u16).copied()));
+                }
+                for (key, _) in context.suffixes() {
+                    if !rows.iter().any(|&(k, _)| k == key) {
+                        rows.push((key, self.rows.get(&key).cloned()));
+                    }
+                }
+            }
+            context = context.push(ch);
+        }
+        ContinuationUndo {
+            prev_tick: self.tick,
+            prev_uni_tick: self.uni_tick,
+            prev_uni_total: self.uni_total,
+            prev_state_model: self.state_model,
+            rows,
+            unigrams,
+        }
+    }
+
+    pub fn apply_undo(&mut self, undo: ContinuationUndo) {
+        self.tick = undo.prev_tick;
+        self.uni_tick = undo.prev_uni_tick;
+        self.uni_total = undo.prev_uni_total;
+        self.state_model = undo.prev_state_model;
+        for (key, prev_row) in undo.rows {
+            if let Some(row) = prev_row {
+                self.rows.insert(key, row);
+            } else {
+                self.rows.remove(&key);
+            }
+        }
+        for (ch, prev_uni) in undo.unigrams {
+            if let Some(val) = prev_uni {
+                self.unigrams.insert(ch, val);
+            } else {
+                self.unigrams.remove(&ch);
+            }
+        }
     }
 
     fn observe_unigram(&mut self, ch: u16, weight: f32) {
@@ -520,13 +581,18 @@ impl PersonalContinuations {
             }
         }
 
-        // 2. Fall back to 1..=3 char suffix continuations when RWKV state kNN did not match
+        // 2. Fall back to 1..=3 char suffix continuations when RWKV state kNN did not match.
+        //    Keep 1-char suffix interpolation conservative (`max_lambda = 0.22`, `support_k = 2.5`) so
+        //    a single incidental 1-char continuation never dethrones high-probability common words
+        //    (e.g. `这种`), while still lifting rare 1-shot personal words (`卓威`).
         if best_lambda < 0.04 {
-            let max_lambdas = [0.38f32, 0.58, 0.75];
+            let max_lambdas = [0.22f32, 0.58, 0.75];
+            let support_ks = [2.5f32, 1.5, 1.5];
             for (idx, (key, _)) in context.suffixes().enumerate() {
                 if let Some(row) = self.rows.get(&key) {
+                    let i = idx.min(2);
                     let (p_suf, l_suf) =
-                        row.cache_suffix_prob(ch_u16, max_lambdas[idx.min(2)], self.tick);
+                        row.cache_suffix_prob(ch_u16, max_lambdas[i], support_ks[i], self.tick);
                     if l_suf * p_suf > best_lambda * best_p || (best_lambda < 0.04 && l_suf > best_lambda) {
                         best_p = p_suf;
                         best_lambda = l_suf;

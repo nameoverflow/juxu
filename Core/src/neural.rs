@@ -12,6 +12,7 @@ use std::io;
 
 pub const WBLM_MAGIC: &[u8; 8] = b"WBLM0001";
 pub const WBLM_MAGIC_V2: &[u8; 8] = b"WBLM0002";
+pub const WBLM_MAGIC_V3: &[u8; 8] = b"WBLM0003";
 pub const TOK_BOS: usize = 0;
 pub const TOK_UNK: usize = 1;
 pub const TOK_COMMA: usize = 2;
@@ -619,17 +620,21 @@ pub struct NeuralOffsets {
     w_dn: QuantMatOff,     // [rank, D] + bias [rank]
     w_mtp_h: QuantMatOff,  // [rank, D] + bias [rank]
     w_mtp_c1: QuantMatOff, // [rank, rank] (no bias)
-    w_key1: QuantMatOff,   // [25, D] + bias [25]
 }
 
 impl NeuralOffsets {
     pub fn parse(blob: &[u8]) -> io::Result<Self> {
-        let is_v2 = if blob.len() >= HEADER_LEN && &blob[0..8] == WBLM_MAGIC_V2 {
-            true
+        let (has_ext_vocab, has_legacy_key1) = if blob.len() >= HEADER_LEN && &blob[0..8] == WBLM_MAGIC_V3 {
+            (true, false)
+        } else if blob.len() >= HEADER_LEN && &blob[0..8] == WBLM_MAGIC_V2 {
+            (true, true)
         } else if blob.len() >= HEADER_LEN && &blob[0..8] == WBLM_MAGIC {
-            false
+            (false, true)
         } else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid WBLM0001/WBLM0002 magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid WBLM0001/WBLM0002/WBLM0003 magic",
+            ));
         };
         let vocab_size = read_u32(blob, 8) as usize;
         let rank = read_u32(blob, 12) as usize;
@@ -719,7 +724,11 @@ impl NeuralOffsets {
         let w_dn = take_qmat(&mut cur, total, rank, d_model, true)?;
         let w_mtp_h = take_qmat(&mut cur, total, rank, d_model, true)?;
         let w_mtp_c1 = take_qmat(&mut cur, total, rank, rank, false)?;
-        let w_key1 = take_qmat(&mut cur, total, 25, d_model, true)?;
+        if has_legacy_key1 {
+            // Legacy WBLM0001/WBLM0002 carried an 86-Wubi key1 head; skip over its bytes cleanly.
+            // WBLM0003+ is 100% scheme-free and omits it altogether.
+            let _ = take_qmat(&mut cur, total, 25, d_model, true)?;
+        }
 
         let mut tok_to_char = vec!['\0'; vocab_size];
         for idx in 0..CJK_LUT_LEN {
@@ -735,27 +744,27 @@ impl NeuralOffsets {
             && tok_to_char[TOK_COMMA] == '\0'
             && tok_to_char[TOK_PERIOD] == '\0';
 
-        // Optional trailing EXT_VOCAB table in WBLM0002:
+        // Trailing EXT_VOCAB table in WBLM0002 / WBLM0003:
         // [u32 ext_base_id][u32 ext_count] followed by ext_count records of [u8 len][len bytes].
-        let ascii_trie = if is_v2 {
+        let ascii_trie = if has_ext_vocab {
             let hdr_off = take(&mut cur, total, 8)?;
             let ext_base_id = read_u32(blob, hdr_off) as usize;
             let ext_count = read_u32(blob, hdr_off + 4) as usize;
             if ext_base_id + ext_count > vocab_size {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "WBLM0002 ext_vocab exceeds vocab_size",
+                    "WBLM ext_vocab exceeds vocab_size",
                 ));
             }
             let mut entries: Vec<&[u8]> = Vec::with_capacity(ext_count);
             for _ in 0..ext_count {
                 if cur >= total {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated WBLM0002 ext_vocab"));
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated WBLM ext_vocab"));
                 }
                 let blen = blob[cur] as usize;
                 cur += 1;
                 if cur + blen > total {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated WBLM0002 ext_vocab entry"));
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated WBLM ext_vocab entry"));
                 }
                 entries.push(&blob[cur..cur + blen]);
                 cur += blen;
@@ -765,7 +774,7 @@ impl NeuralOffsets {
             None
         };
 
-        let has_eng_num_token = !is_v2
+        let has_eng_num_token = !has_ext_vocab
             && has_punct_tokens
             && vocab_size > TOK_ENG_NUM
             && tok_to_char[TOK_ENG_NUM] == '\0';
@@ -797,7 +806,6 @@ impl NeuralOffsets {
             w_dn,
             w_mtp_h,
             w_mtp_c1,
-            w_key1,
         })
     }
 }
@@ -817,7 +825,6 @@ pub struct RwkvState {
     pub p1_q: Vec<i8>,        // [rank] quantized +1 char query vector
     pub p1_scale: f32,
     pub mtp_h: Vec<f32>,      // [rank] context component of MTP-2
-    pub key1_logp: [f32; 25], // log P(first Wubi letter 'a'..'y' | context)
 }
 
 impl RwkvState {
@@ -829,7 +836,6 @@ impl RwkvState {
             p1_q: vec![0i8; s.rank],
             p1_scale: 0.0,
             mtp_h: vec![0.0f32; s.rank],
-            key1_logp: [-3.22f32; 25],
         }
     }
 }
@@ -856,7 +862,6 @@ impl Default for NeuralContextTracker {
                 p1_q: Vec::new(),
                 p1_scale: 0.0,
                 mtp_h: Vec::new(),
-                key1_logp: [-3.22f32; 25],
             },
             active_tokens: Vec::new(),
             bos_cached: None,
@@ -884,6 +889,11 @@ impl NeuralContextTracker {
         self.bos_cached.is_some()
     }
 
+    #[inline]
+    pub fn bos_state(&self) -> Option<&RwkvState> {
+        self.bos_cached.as_ref()
+    }
+
     fn copy_state_from(dst: &mut RwkvState, src: &RwkvState) {
         if dst.mat_state.len() == src.mat_state.len()
             && dst.prev_tm.len() == src.prev_tm.len()
@@ -895,7 +905,6 @@ impl NeuralContextTracker {
             dst.p1_q.copy_from_slice(&src.p1_q);
             dst.p1_scale = src.p1_scale;
             dst.mtp_h.copy_from_slice(&src.mtp_h);
-            dst.key1_logp = src.key1_logp;
         } else {
             *dst = src.clone();
         }
@@ -1330,14 +1339,14 @@ impl<'a> NeuralView<'a> {
         }
     }
 
-    /// Advance recurrent state by 1 token and update all cached output heads (`p1`, `mtp_h`, `key1_logp`).
+    /// Advance recurrent state by 1 token and update all cached output heads (`p1`, `mtp_h`).
     pub fn step_token(&self, tok: usize, state: &mut RwkvState) {
-        self.step_token_heads(tok, state, true, true);
+        self.step_token_heads(tok, state, true, false);
     }
 
-    /// Advance recurrent state by 1 token, computing only the requested output heads.
-    /// Pinyin beam search skips `key1_logp` (and `mtp_h` on intermediate multi-char steps) for zero-loss speedup.
-    pub fn step_token_heads(&self, tok: usize, state: &mut RwkvState, compute_mtp: bool, compute_key1: bool) {
+    /// Advance recurrent state by 1 token, computing `p1` and optionally `mtp_h`.
+    /// (`_compute_key1` is retained only for API compatibility; first-key priors are projected scheme-freely in the engine.)
+    pub fn step_token_heads(&self, tok: usize, state: &mut RwkvState, compute_mtp: bool, _compute_key1: bool) {
         let s = &self.offs.summary;
         let d = s.d_model;
         let h = s.n_heads;
@@ -1415,20 +1424,6 @@ impl<'a> NeuralView<'a> {
 
         if compute_mtp {
             self.eval_qmat(&self.offs.w_mtp_h, &q_buf[..d], h_sc, r, d, &mut state.mtp_h[..r]);
-        }
-
-        if compute_key1 {
-            let mut k1_raw = [0.0f32; 25];
-            self.eval_qmat(&self.offs.w_key1, &q_buf[..d], h_sc, 25, d, &mut k1_raw);
-            let max_k = k1_raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum_exp = 0.0f32;
-            for &v in &k1_raw {
-                sum_exp += (v - max_k).exp();
-            }
-            let log_z = max_k + sum_exp.ln();
-            for i in 0..25 {
-                state.key1_logp[i] = k1_raw[i] - log_z;
-            }
         }
     }
 
@@ -1592,19 +1587,6 @@ impl<'a> NeuralView<'a> {
                         &mut chunk[b].1.mtp_h[..r],
                     );
                 }
-                if chunk[b].3 {
-                    let mut k1_raw = [0.0f32; 25];
-                    self.eval_qmat(&self.offs.w_key1, &q_batch[b][..d], q_scales[b], 25, d, &mut k1_raw);
-                    let max_k = k1_raw.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum_exp = 0.0f32;
-                    for &v in &k1_raw {
-                        sum_exp += (v - max_k).exp();
-                    }
-                    let log_z = max_k + sum_exp.ln();
-                    for i in 0..25 {
-                        chunk[b].1.key1_logp[i] = k1_raw[i] - log_z;
-                    }
-                }
             }
         }
     }
@@ -1711,24 +1693,28 @@ impl<'a> NeuralView<'a> {
         (scores[tok], log_z)
     }
 
-    /// Retrieve top-K highest-probability next CJK characters `(ch, log_prob)` from cached `p1_q` (`~40 µs`).
+    /// Retrieve top-K highest-probability next CJK characters `(ch, log_prob)` from cached `p1_q` (`~25 µs`).
     pub fn top_next_chars(&self, state: &RwkvState, top_k: usize) -> Vec<(char, f32)> {
         let s = &self.offs.summary;
-        let v = s.vocab_size;
+        let v_cjk = self
+            .offs
+            .ascii_trie
+            .as_ref()
+            .map_or(s.vocab_size, |t| t.ext_base_id.min(s.vocab_size));
         let r = s.rank;
-        if top_k == 0 || v <= 2 {
+        if top_k == 0 || v_cjk <= 2 {
             return Vec::new();
         }
-        let emb_w = &self.blob[self.offs.emb_w_off..self.offs.emb_w_off + v * r];
-        let emb_sc = &self.blob[self.offs.emb_sc_off..self.offs.emb_sc_off + v * 4];
-        let uni_b = &self.blob[self.offs.uni_bias_off..self.offs.uni_bias_off + v * 4];
-        let mut scores = vec![f32::NEG_INFINITY; v];
-        int8_matvec(emb_w, emb_sc, Some(uni_b), &state.p1_q[..r], state.p1_scale, v, r, &mut scores);
+        let emb_w = &self.blob[self.offs.emb_w_off..self.offs.emb_w_off + v_cjk * r];
+        let emb_sc = &self.blob[self.offs.emb_sc_off..self.offs.emb_sc_off + v_cjk * 4];
+        let uni_b = &self.blob[self.offs.uni_bias_off..self.offs.uni_bias_off + v_cjk * 4];
+        let mut scores = vec![f32::NEG_INFINITY; v_cjk];
+        int8_matvec(emb_w, emb_sc, Some(uni_b), &state.p1_q[..r], state.p1_scale, v_cjk, r, &mut scores);
 
-        let k = top_k.min(v.saturating_sub(2));
+        let k = top_k.min(v_cjk.saturating_sub(2));
         let mut best: Vec<(char, f32)> = Vec::with_capacity(k + 1);
         let mut floor = f32::NEG_INFINITY;
-        for tok in 2..v {
+        for tok in 2..v_cjk {
             let lp = scores[tok];
             if best.len() == k && lp <= floor {
                 continue;
@@ -1749,6 +1735,109 @@ impl<'a> NeuralView<'a> {
             }
         }
         best
+    }
+
+    /// Scheme-free runtime projection from universal `P(char | state)` onto any active dictionary's
+    /// precomputed `tok -> 26-bit first-key mask` table (`O(1)` lookup per CJK token, zero `.wbaux` bytes).
+    pub fn project_first_key_priors(
+        &self,
+        state: &RwkvState,
+        tok_key_masks: &[u32],
+    ) -> Option<[u8; 26]> {
+        let s = &self.offs.summary;
+        let v_cjk = self
+            .offs
+            .ascii_trie
+            .as_ref()
+            .map_or(s.vocab_size, |t| t.ext_base_id.min(s.vocab_size))
+            .min(tok_key_masks.len());
+        let r = s.rank;
+        if v_cjk <= 4 {
+            return None;
+        }
+        let emb_w = &self.blob[self.offs.emb_w_off..self.offs.emb_w_off + v_cjk * r];
+        let emb_sc = &self.blob[self.offs.emb_sc_off..self.offs.emb_sc_off + v_cjk * 4];
+        let uni_b = &self.blob[self.offs.uni_bias_off..self.offs.uni_bias_off + v_cjk * 4];
+        let mut scores = vec![f32::NEG_INFINITY; v_cjk];
+        int8_matvec(emb_w, emb_sc, Some(uni_b), &state.p1_q[..r], state.p1_scale, v_cjk, r, &mut scores);
+
+        let k = 48usize.min(v_cjk.saturating_sub(2));
+        let mut best: [(usize, f32); 48] = [(0, f32::NEG_INFINITY); 48];
+        let mut len = 0usize;
+        let mut floor = f32::NEG_INFINITY;
+        for tok in 2..v_cjk {
+            let mask = tok_key_masks[tok];
+            if mask == 0 {
+                continue;
+            }
+            let lp = scores[tok];
+            if len == k && lp <= floor {
+                continue;
+            }
+            let pos = best[..len].partition_point(|x| x.1 > lp);
+            if pos < k {
+                if len < k {
+                    len += 1;
+                }
+                best.copy_within(pos..len - 1, pos + 1);
+                best[pos] = (tok, lp);
+                if len == k {
+                    floor = best[len - 1].1;
+                }
+            }
+        }
+        if len == 0 {
+            return None;
+        }
+        let mut mass = [0.0f32; 26];
+        let mut total = 0.0f32;
+        for &(tok, lp) in &best[..len] {
+            let mask = tok_key_masks[tok];
+            let p = lp.clamp(-13.5, 0.0).exp();
+            let share = p / (mask.count_ones() as f32);
+            for idx in 0..26usize {
+                if (mask & (1u32 << idx)) != 0 {
+                    mass[idx] += share;
+                }
+            }
+            total += p;
+        }
+        if total <= 1e-6 {
+            return None;
+        }
+        let mut out = [100u8; 26];
+        let uniform = 1.0 / 26.0;
+        for idx in 0..26usize {
+            let p = (mass[idx] / total).max(1e-4);
+            let delta = (p / uniform).ln().clamp(-2.5, 3.0);
+            out[idx] = (100.0 + 22.0 * delta).round().clamp(68.0, 172.0) as u8;
+        }
+        Some(out)
+    }
+
+    /// Compute isolated `<BOS>` lexical cohesion `(mean_cond_logp, mean_pmi)` for a `2..=4` CJK candidate
+    /// independent of the preceding sentence context, cleanly separating true words/colloquial phrases
+    /// (including function-word phrases like `来个`, `买的`, `最快的`) from accidental cross-word seams (`洁一`, `点我`).
+    pub fn isolated_phrase_cohesion(&self, bos_state: &RwkvState, phrase: &str) -> Option<(f32, f32)> {
+        let chars: Vec<char> = phrase.chars().collect();
+        if chars.len() < 2 || chars.len() > 4 {
+            return None;
+        }
+        let mut st = bos_state.clone();
+        self.step_token_heads(self.char_to_token(chars[0]), &mut st, false, false);
+        let mut sum_cond = 0.0f32;
+        let mut sum_uncond = 0.0f32;
+        for (idx, &ch) in chars[1..].iter().enumerate() {
+            let lp_cond = self.score_next_char(&st, ch).clamp(-13.5, -0.01);
+            let lp_uncond = self.score_next_char(bos_state, ch).clamp(-13.5, -0.01);
+            sum_cond += lp_cond;
+            sum_uncond += lp_uncond;
+            if idx + 2 < chars.len() {
+                self.step_token_heads(self.char_to_token(ch), &mut st, false, false);
+            }
+        }
+        let n = (chars.len() - 1) as f32;
+        Some((sum_cond / n, (sum_cond - sum_uncond) / n))
     }
 
     /// Precompute quantized `MTP-2` conditional projection `p2_q` for `c1` given `state.mtp_h` (`~0.4 µs`).
@@ -1953,6 +2042,85 @@ mod tests {
         let mut tracker = NeuralContextTracker::default();
         tracker.set_context_str(&nv, "用 Rust 写 v2.1，𠮷好。");
         assert!(tracker.is_ready());
+    }
+
+    #[test]
+    fn wblm0003_scheme_free_without_key1_head() {
+        // Build a WBLM0003 blob omitting the legacy 25xD w_key1 matrix completely
+        let mut v3 = build_tiny_wblm0002(&[]);
+        // Strip trailing ext_vocab (8 bytes) + w_key1 (25*32 + 25*4 + 25*4 = 1000 bytes), rewrite WBLM0003 + ext_vocab
+        let old_ext_off = v3.len() - 8;
+        let w_key1_bytes = 25 * 32 + 25 * 4 + 25 * 4;
+        v3.truncate(old_ext_off - w_key1_bytes);
+        v3[0..8].copy_from_slice(WBLM_MAGIC_V3);
+        while v3.len() % 4 != 0 {
+            v3.push(0);
+        }
+        v3.extend_from_slice(&(32u32).to_le_bytes());
+        v3.extend_from_slice(&(2u32).to_le_bytes());
+        for entry in [&b"review"[..], &b"commit"[..]] {
+            v3.push(entry.len() as u8);
+            v3.extend_from_slice(entry);
+        }
+        // Adjust vocab_size in header to 34
+        v3[8..12].copy_from_slice(&(34u32).to_le_bytes());
+        // Resize emb_w / emb_sc / uni_bias? Easier: build directly from helper logic:
+        let vocab_size: usize = 34;
+        let rank: usize = 16;
+        let d_model: usize = 32;
+        let n_heads: usize = 1;
+        let n_layers: usize = 1;
+        let ffn_dim: usize = 32;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(WBLM_MAGIC_V3);
+        for v in [vocab_size, rank, d_model, n_heads, n_layers, ffn_dim] {
+            blob.extend_from_slice(&(v as u32).to_le_bytes());
+        }
+        blob.resize(HEADER_LEN, 0);
+        let align4 = |b: &mut Vec<u8>| {
+            while b.len() % 4 != 0 {
+                b.push(0);
+            }
+        };
+        let push_zeros = |b: &mut Vec<u8>, n: usize| {
+            align4(b);
+            b.resize(b.len() + n, 0);
+        };
+        let push_qmat = |b: &mut Vec<u8>, rows: usize, cols: usize, has_bias: bool| {
+            push_zeros(b, rows * cols);
+            push_zeros(b, rows * 4);
+            if has_bias {
+                push_zeros(b, rows * 4);
+            }
+        };
+        push_zeros(&mut blob, CJK_LUT_LEN * 2);
+        push_zeros(&mut blob, vocab_size * rank);
+        push_zeros(&mut blob, vocab_size * 4);
+        push_zeros(&mut blob, vocab_size * 4);
+        push_qmat(&mut blob, d_model, rank, false);
+        push_zeros(&mut blob, d_model * 4);
+        push_zeros(&mut blob, d_model * 4);
+        push_qmat(&mut blob, 6 * d_model, d_model, true);
+        push_zeros(&mut blob, d_model * 4);
+        push_qmat(&mut blob, d_model, d_model, false);
+        push_zeros(&mut blob, d_model * 4);
+        push_zeros(&mut blob, d_model * 4);
+        push_qmat(&mut blob, ffn_dim, d_model, true);
+        push_qmat(&mut blob, d_model, ffn_dim, false);
+        push_zeros(&mut blob, d_model * 4);
+        push_qmat(&mut blob, rank, d_model, true);
+        push_qmat(&mut blob, rank, d_model, true);
+        push_qmat(&mut blob, rank, rank, false);
+        // NO w_key1 here!
+        align4(&mut blob);
+        blob.extend_from_slice(&(32u32).to_le_bytes());
+        blob.extend_from_slice(&(2u32).to_le_bytes());
+        for entry in [&b"review"[..], &b"commit"[..]] {
+            blob.push(entry.len() as u8);
+            blob.extend_from_slice(entry);
+        }
+        let offs = NeuralOffsets::parse(&blob).expect("parse WBLM0003 without w_key1");
+        assert_eq!(offs.ascii_trie.as_ref().unwrap().ext_count, 2);
     }
 
     #[test]

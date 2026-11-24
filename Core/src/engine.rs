@@ -122,6 +122,9 @@ impl Default for LmWeights {
 
 pub struct JuxuEngine {
     pub dicts: [Option<DictView>; 9],
+    /// Scheme-free runtime projection tables (`tok -> 26-bit first-key mask`) built in RAM when a
+    /// dictionary and `AuxView` are loaded, eliminating any scheme-specific head inside `.wbaux`.
+    dict_key_masks: [Vec<u32>; 9],
     pub pinyin_dict: Option<PinyinDictView>,
     pub english_dict: EnDictView,
     pub emoji_table: Option<crate::emoji::EmojiTable>,
@@ -175,6 +178,7 @@ impl JuxuEngine {
     pub fn new(config: JuxuConfig) -> Self {
         Self {
             dicts: [None, None, None, None, None, None, None, None, None],
+            dict_key_masks: std::array::from_fn(|_| Vec::new()),
             pinyin_dict: None,
             english_dict: EnDictView::builtin_default(),
             emoji_table: None,
@@ -840,12 +844,51 @@ impl JuxuEngine {
         result
     }
 
+    fn rebuild_slot_key_masks(&mut self, slot: usize) {
+        self.dict_key_masks[slot].clear();
+        let (Some(ref dict), Some(nv)) = (
+            self.dicts[slot].as_ref(),
+            self.aux.as_ref().and_then(|a| a.neural_view()),
+        ) else {
+            return;
+        };
+        let v_cjk = nv
+            .offs
+            .ascii_trie
+            .as_ref()
+            .map_or(nv.offs.summary.vocab_size, |t| {
+                t.ext_base_id.min(nv.offs.summary.vocab_size)
+            });
+        let mut table = vec![0u32; v_cjk];
+        for (tok, &ch) in nv.offs.tok_to_char.iter().enumerate().take(v_cjk).skip(2) {
+            if ch == '\0' {
+                continue;
+            }
+            if let Some(meta) = dict.char_meta(ch) {
+                let mut mask = 0u32;
+                if let Some(&b) = meta.shortest_code.as_string().as_bytes().first() {
+                    if b.is_ascii_lowercase() {
+                        mask |= 1u32 << (b - b'a');
+                    }
+                }
+                if let Some(&b) = meta.full_code.as_string().as_bytes().first() {
+                    if b.is_ascii_lowercase() {
+                        mask |= 1u32 << (b - b'a');
+                    }
+                }
+                table[tok] = mask;
+            }
+        }
+        self.dict_key_masks[slot] = table;
+    }
+
     pub fn load_dict(&mut self, schema: InputSchema, dict: DictView) {
         let slot = schema.slot_index();
         if slot >= self.dicts.len() {
             return;
         }
         self.dicts[slot] = Some(dict);
+        self.rebuild_slot_key_masks(slot);
         if self.config.schema == schema {
             if let Some(ref d) = self.dicts[slot] {
                 self.user.reindex_phrases(d);
@@ -863,6 +906,9 @@ impl JuxuEngine {
             for slot in &mut self.dicts {
                 *slot = None;
             }
+            for mask_vec in &mut self.dict_key_masks {
+                mask_vec.clear();
+            }
         } else {
             self.pinyin_dict = None;
             self.pinyin_stream.clear();
@@ -872,6 +918,7 @@ impl JuxuEngine {
             for (idx, slot) in self.dicts.iter_mut().enumerate() {
                 if idx != keep {
                     *slot = None;
+                    self.dict_key_masks[idx].clear();
                 }
             }
         }
@@ -908,6 +955,13 @@ impl JuxuEngine {
             self.lm_weights = LmWeights::default_ngram();
         }
         self.aux = Some(aux);
+        for slot in 0..self.dicts.len() {
+            if self.dicts[slot].is_some() {
+                self.rebuild_slot_key_masks(slot);
+            } else {
+                self.dict_key_masks[slot].clear();
+            }
+        }
         if !self.raw_code.is_empty() {
             self.rebuild_candidates();
         }
@@ -1228,6 +1282,14 @@ impl JuxuEngine {
             let first_choice = (learn && explicit && abs_idx > 0)
                 .then(|| self.candidates.first().map(|c| c.text.clone()))
                 .flatten();
+            let prev_lc = self.last_committed.clone();
+            let prev_rc = self.recent_context.clone();
+            self.user.begin_commit_undo(
+                timestamp_ms,
+                &prev_lc,
+                &prev_rc,
+                (learn && self.config.dynamic_word_freq).then_some(commit_text.as_str()),
+            );
             // Single-pass RWKV unroll across `commit_text`: computes `eval_lm_chosen` (only if logging),
             // collects `PersonalContinuations` state signatures, and advances `neural_tracker` ONCE instead of 4x!
             let (_, eval_lm_chosen) = self.step_and_learn_commit_single_pass(
@@ -1535,10 +1597,27 @@ impl JuxuEngine {
                 );
             }
             if learn {
+                let prev_lc = self.last_committed.clone();
+                let prev_rc = self.recent_context.clone();
+                self.user
+                    .begin_commit_undo(timestamp_ms, &prev_lc, &prev_rc, Some(&selected));
                 self.learn_continuation(&selected, explicit, first_choice.as_deref());
+            } else {
+                let prev_lc = self.last_committed.clone();
+                let prev_rc = self.recent_context.clone();
+                self.user
+                    .begin_commit_undo(timestamp_ms, &prev_lc, &prev_rc, None);
             }
-            self.finalize_stream_segments(segments, true, timestamp_ms, &mut notice)
+            self.finalize_stream_segments(segments, true, false, timestamp_ms, &mut notice)
         } else {
+            let prev_lc = self.last_committed.clone();
+            let prev_rc = self.recent_context.clone();
+            self.user.begin_commit_undo(
+                timestamp_ms,
+                &prev_lc,
+                &prev_rc,
+                (learn && self.config.dynamic_word_freq).then_some(cand.text.as_str()),
+            );
             let (surp, _) = self.step_and_learn_commit_single_pass(
                 &cand.text,
                 learn,
@@ -1719,12 +1798,17 @@ impl JuxuEngine {
         Some(mass)
     }
 
-    /// Compute 26-key contextual priors (`54..=180`) for any shape/phonetic-shape schema
-    /// (Wubi98/06/Xiaohe/spaceless) from `Micro-RWKV-7`'s `top_next_chars`.
+    /// Compute 26-key contextual priors (`68..=172`) for ANY shape/phonetic-shape schema
+    /// (Wubi 86/98/06, Cangjie 3/5/6, Xiaohe, spaceless) via scheme-free runtime projection from
+    /// `Micro-RWKV-7`'s character distribution onto the active dictionary's precomputed key-mask table.
     fn rwkv_dict_first_key_priors(&self, state: &RwkvState, dict: &DictView) -> Option<[u8; 26]> {
         let nv = self.aux.as_ref()?.neural_view()?;
         if !self.neural_tracker.is_ready() {
             return None;
+        }
+        let slot = self.config.schema.slot_index();
+        if let Some(table) = self.dict_key_masks.get(slot).filter(|t| !t.is_empty()) {
+            return nv.project_first_key_priors(state, table);
         }
         let top = nv.top_next_chars(state, 32);
         if top.is_empty() {
@@ -1816,16 +1900,10 @@ impl JuxuEngine {
             return (ALL_26, out);
         }
 
-        // Case 1: Key #1 (`raw_code` is empty) — use `Micro-RWKV-7` first-key priors for ALL schemas!
+        // Case 1: Key #1 (`raw_code` is empty) — universal scheme-free RWKV projection for ALL schemas!
         if bytes.is_empty() {
             if self.neural_tracker.is_ready() {
-                if self.config.schema == InputSchema::Wubi86 {
-                    for idx in 0..25usize {
-                        let lp = self.neural_tracker.active.key1_logp[idx];
-                        let delta = lp - (-3.2189f32);
-                        out[idx] = (100.0 + 20.0 * delta).round().clamp(72.0, 168.0) as u8;
-                    }
-                } else if let Some(dict) = self.active_dict() {
+                if let Some(dict) = self.active_dict() {
                     if let Some(priors) =
                         self.rwkv_dict_first_key_priors(&self.neural_tracker.active, dict)
                     {
@@ -2019,11 +2097,7 @@ impl JuxuEngine {
         match keycode {
             KEY_BACKSPACE => {
                 if self.raw_code.is_empty() {
-                    self.log_backspace_after_commit_if_recent(timestamp_ms);
-                    self.user.break_single_burst();
-                    self.recent_context.clear();
-                    let nv = self.aux.as_ref().and_then(|a| a.neural_view());
-                    self.neural_tracker.pop_commit_or_reset(nv.as_ref());
+                    self.rollback_recent_commit_on_backspace(timestamp_ms, true);
                     return EngineOutput::default();
                 }
                 self.raw_code.pop();
@@ -2071,7 +2145,14 @@ impl JuxuEngine {
                     }
                 }
                 let raw = self.raw_code.clone();
-                self.user.record_english_word(&raw);
+                let lower = raw.to_ascii_lowercase();
+                let in_en_dict = self.english_dict.lookup_exact(&lower).is_some();
+                let prev_lc = self.last_committed.clone();
+                let prev_rc = self.recent_context.clone();
+                self.user
+                    .begin_commit_undo(timestamp_ms, &prev_lc, &prev_rc, None);
+                self.user
+                    .record_english_word_from_return(&raw, in_en_dict, !self.is_pinyin_mode());
                 self.clear_composition();
                 self.user.break_single_burst();
                 if let Some(nv) = self.aux.as_ref().and_then(|a| a.neural_view()) {
@@ -2862,9 +2943,21 @@ impl JuxuEngine {
             ..Default::default()
         };
         if let Some(prefix) = stable {
+            let full_seg_text: String = prefix.segments.iter().map(|s| s.text.as_str()).collect();
+            let prev_lc = self.last_committed.clone();
+            let prev_rc = self.recent_context.clone();
+            self.user.begin_commit_undo(
+                obs.timestamp_ms,
+                &prev_lc,
+                &prev_rc,
+                self.config
+                    .dynamic_word_freq
+                    .then_some(full_seg_text.as_str()),
+            );
             out.commit_text = self.finalize_stream_segments(
                 prefix.segments,
                 false,
+                true,
                 obs.timestamp_ms,
                 &mut out.notice,
             );
@@ -2899,10 +2992,11 @@ impl JuxuEngine {
         &mut self,
         segments: Vec<Segment>,
         confirmed_by_user: bool,
+        force_passive: bool,
         timestamp_ms: u64,
         notice: &mut String,
     ) -> String {
-        let passive_clause = segments.len() >= 3;
+        let passive_clause = force_passive || segments.len() >= 3;
         let mut text = String::new();
         let mut start = 0;
         for segment in segments {
@@ -3058,9 +3152,18 @@ impl JuxuEngine {
         timestamp_ms: u64,
         notice: &mut String,
     ) {
+        let do_learn = candidate.is_exact && self.config.dynamic_word_freq;
+        let prev_lc = self.last_committed.clone();
+        let prev_rc = self.recent_context.clone();
+        self.user.begin_commit_undo(
+            timestamp_ms,
+            &prev_lc,
+            &prev_rc,
+            do_learn.then_some(candidate.text.as_str()),
+        );
         let (surp, _) = self.step_and_learn_commit_single_pass(
             &candidate.text,
-            candidate.is_exact && self.config.dynamic_word_freq,
+            do_learn,
             false,
             None,
             true,
@@ -3098,6 +3201,22 @@ impl JuxuEngine {
         }
     }
 
+    fn rollback_recent_commit_on_backspace(&mut self, timestamp_ms: u64, clear_ctx_on_miss: bool) {
+        self.log_backspace_after_commit_if_recent(timestamp_ms);
+        self.user.break_single_burst();
+        if let Some((prev_last, prev_ctx)) = self
+            .user
+            .rollback_last_commit_if_within(timestamp_ms, 4_000)
+        {
+            self.last_committed = prev_last;
+            self.recent_context = prev_ctx;
+        } else if clear_ctx_on_miss {
+            self.recent_context.clear();
+        }
+        let nv = self.aux.as_ref().and_then(|a| a.neural_view());
+        self.neural_tracker.pop_commit_or_reset(nv.as_ref());
+    }
+
     /// Explicitly abandon the active composition (e.g. iOS Clear button) and record eval log if `>= 2` keys.
     pub fn abandon_composition(&mut self, timestamp_ms: u64) {
         self.log_abandon_event(timestamp_ms);
@@ -3107,10 +3226,7 @@ impl JuxuEngine {
 
     /// Record a post-commit backspace from a touchscreen host (where empty-preedit Backspace deletes directly via `UITextDocumentProxy`).
     pub fn notify_post_commit_backspace(&mut self, timestamp_ms: u64) {
-        self.log_backspace_after_commit_if_recent(timestamp_ms);
-        self.user.break_single_burst();
-        let nv = self.aux.as_ref().and_then(|a| a.neural_view());
-        self.neural_tracker.pop_commit_or_reset(nv.as_ref());
+        self.rollback_recent_commit_on_backspace(timestamp_ms, false);
     }
 
     /// Compute internal transition surprisal (`-log P_rwkv(c_i | c_<i)`) for auto-phrase cohesion gating.
@@ -3216,12 +3332,15 @@ impl JuxuEngine {
         }
 
         // 2. Compute RWKV surprisal BEFORE advancing neural context, then update personal history
-        //    & surprisal-guided auto-phrase (indexed for both active shape schema AND Full Pinyin!)
+        //    & isolated-PMI-guided auto-phrase (indexed for both active shape schema AND Full Pinyin!)
         let surprisal = precomputed_surprisal.unwrap_or_else(|| self.compute_rwkv_surprisal(text));
         let dict_idx = self.config.schema.slot_index();
         let dict_opt = self.dicts.get(dict_idx).and_then(|d| d.as_ref());
         let prev = self.last_committed.clone();
-        let learned = self.user.record_commit_with_mode(
+        let nv_for_iso = self.aux.as_ref().and_then(|a| a.neural_view());
+        let bos_ref = self.neural_tracker.bos_state();
+        let neural_iso = nv_for_iso.as_ref().zip(bos_ref);
+        let learned = self.user.record_commit_with_neural(
             &prev,
             text,
             timestamp_ms,
@@ -3231,6 +3350,7 @@ impl JuxuEngine {
             self.pinyin_dict.as_ref(),
             surprisal,
             passive_stream,
+            neural_iso,
         );
         if let Some(new_word) = learned {
             if let Some(d) = dict_opt {
@@ -3239,7 +3359,9 @@ impl JuxuEngine {
                 }
             }
         }
-        // Learn any OOV or user-cased English words from committed text (pure English or mixed sentences)
+        // Learn user-cased or dictionary-backed English words from committed text; NEVER record
+        // all-lowercase OOV fallbacks in shape mode (prevents dead Wubi codes like `vv`/`qdrg`/`ghek` from polluting `ENWORD`).
+        let is_py = self.is_pinyin_mode();
         if text.bytes().any(|b| b.is_ascii_alphabetic()) {
             let mut start: Option<usize> = None;
             for (idx, ch) in text.char_indices() {
@@ -3250,9 +3372,10 @@ impl JuxuEngine {
                 } else if let Some(s) = start.take() {
                     let tok = &text[s..idx];
                     if tok.len() >= 2 && tok.bytes().any(|b| b.is_ascii_alphabetic()) {
+                        let has_upper = tok.bytes().any(|b| b.is_ascii_uppercase());
                         let lower = tok.to_ascii_lowercase();
-                        let is_oov = self.english_dict.lookup_exact(&lower).is_none();
-                        if is_oov || tok.bytes().any(|b| b.is_ascii_uppercase()) {
+                        let in_en = self.english_dict.lookup_exact(&lower).is_some();
+                        if has_upper || (is_py && in_en) {
                             self.user.record_english_word(tok);
                         }
                     }
@@ -3261,9 +3384,10 @@ impl JuxuEngine {
             if let Some(s) = start {
                 let tok = &text[s..];
                 if tok.len() >= 2 && tok.bytes().any(|b| b.is_ascii_alphabetic()) {
+                    let has_upper = tok.bytes().any(|b| b.is_ascii_uppercase());
                     let lower = tok.to_ascii_lowercase();
-                    let is_oov = self.english_dict.lookup_exact(&lower).is_none();
-                    if is_oov || tok.bytes().any(|b| b.is_ascii_uppercase()) {
+                    let in_en = self.english_dict.lookup_exact(&lower).is_some();
+                    if has_upper || (is_py && in_en) {
                         self.user.record_english_word(tok);
                     }
                 }
@@ -4364,32 +4488,25 @@ impl JuxuEngine {
 
         if rlen == 1 {
             let key_byte = right_bytes[0];
-            if !(b'a'..=b'y').contains(&key_byte) {
+            if !key_byte.is_ascii_lowercase() {
                 return None;
             }
-            let key_idx = (key_byte - b'a') as usize;
             let c2_lp = exact_c2.as_ref().map(|x| x.1).unwrap_or(-13.5);
             let pref_lp = if let (Some(nv), Some(st)) = (nv, state) {
-                if self.config.schema == InputSchema::Wubi86 {
-                    let k1 = st.key1_logp[key_idx].clamp(-9.0, -0.05);
-                    k1.max(c2_lp).min(-0.05)
-                } else {
-                    // For 98 / 06 schemas, aggregate top-24 neural next chars whose schema code starts with `key_byte`
-                    let mut acc = f32::NEG_INFINITY;
-                    for (ch, lp) in nv.top_next_chars(st, 24) {
-                        if let Some(meta) = dict.char_meta(ch) {
-                            let s0 = meta.shortest_code.as_string();
-                            let f0 = meta.full_code.as_string();
-                            if s0.as_bytes().first() == Some(&key_byte)
-                                || f0.as_bytes().first() == Some(&key_byte)
-                            {
-                                acc = logsumexp_pair(acc, lp.clamp(-13.5, -0.05));
-                            }
+                // Scheme-free aggregation: sum neural mass of top-32 next chars whose active-schema code starts with `key_byte`
+                let mut acc = f32::NEG_INFINITY;
+                for (ch, lp) in nv.top_next_chars(st, 32) {
+                    if let Some(meta) = dict.char_meta(ch) {
+                        let s0 = meta.shortest_code.as_string();
+                        let f0 = meta.full_code.as_string();
+                        if s0.as_bytes().first() == Some(&key_byte)
+                            || f0.as_bytes().first() == Some(&key_byte)
+                        {
+                            acc = logsumexp_pair(acc, lp.clamp(-13.5, -0.05));
                         }
                     }
-                    let fallback = (st.key1_logp[key_idx] - 0.5).clamp(-8.0, -1.8);
-                    acc.max(c2_lp).max(fallback).min(-0.05)
                 }
+                acc.max(c2_lp).max(-4.2).min(-0.05)
             } else {
                 // N-gram fallback: combine exact 1-code char with matching bigrams
                 let mut best = c2_lp;

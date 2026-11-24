@@ -91,7 +91,7 @@ RE_WIKI_STUB = re.compile(
 )
 RE_INTER_CJK_SPACE = re.compile(r"(?<=[\u3400-\u9fff])[ \t]+(?=[\u3400-\u9fff])")
 RE_INLINE_TAG = re.compile(r"<[^<>]+>|\[[^\[\]]+\]")
-RE_ASCII_WORD = re.compile(r" ?[A-Za-z0-9][A-Za-z0-9._+-]{0,23}")
+RE_ASCII_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,23}")
 RE_MULTI_SPACE = re.compile(r"[ \t]+")
 HAN = re.compile(r"[\u3400-\u9fff]+")
 DUP_SOUND = re.compile(r"(.)\1{5,}")
@@ -113,20 +113,20 @@ WIKI_CUTS = ("\n参考文献\n", "\n外部链接\n", "\n参见\n", "\n参考资�
 #   ~22% formal Chinese web & Wikipedia (~250M, wiki <=7%)
 #   ~10% high-quality English tech & news/entertainment prose (~110M)
 GROUP_CAPS = {
-    "lccc": 120_000_000,
-    "duplex": 20_000_000,
-    "tieba_recent": 60_000_000,
-    "weibo_bili_2026": 50_000_000,
-    "bilibili_sharegpt": 25_000_000,
-    "xhs_notes": 15_000_000,
-    "tech_code": 55_000_000,
-    "tech_ai": 45_000_000,
+    "lccc": 55_000_000,
+    "duplex": 25_000_000,
+    "tieba_recent": 85_000_000,
+    "weibo_bili_2026": 75_000_000,
+    "bilibili_sharegpt": 35_000_000,
+    "xhs_notes": 35_000_000,
+    "tech_code": 60_000_000,
+    "tech_ai": 50_000_000,
     "tech_comm": 55_000_000,
-    "tech_blog": 35_000_000,
-    "zhihu": 240_000_000,
-    "fineweb_high": 130_000_000,
-    "fineweb_mid": 45_000_000,
-    "wiki": 75_000_000,
+    "tech_blog": 40_000_000,
+    "zhihu": 245_000_000,
+    "fineweb_high": 140_000_000,
+    "fineweb_mid": 40_000_000,
+    "wiki": 50_000_000,
     # Pure English high-quality prose so all 4,096 English subwords train thoroughly
     "en_tech_code": 35_000_000,
     "en_tech_ai": 25_000_000,
@@ -332,6 +332,21 @@ def build_ascii_subword_vocab(ascii_word_counts: Counter[str], target_size: int 
     base_chars = [chr(c) for c in range(0x20, 0x7F)]
     seen = set(base_chars)
     subwords: list[str] = list(base_chars)
+    # Pin high-frequency mixed CJK+English dev/device words in both lowercase and canonical casing
+    # so stripped bare ASCII spans right after CJK characters ALWAYS hit single whole-word tokens.
+    pinned_bare = [
+        "review", "commit", "commits", "push", "pull", "merge", "rebase", "branch", "diff", "patch",
+        "iphone", "iPhone", "macos", "macOS", "ios", "iOS", "ipad", "iPad", "xcode", "Xcode",
+        "claude", "Claude", "gemini", "Gemini", "qwen", "Qwen", "rwkv", "RWKV", "gpt", "GPT",
+        "github", "GitHub", "docker", "Docker", "python", "Python", "rust", "Rust", "swift", "Swift",
+        "linux", "Linux", "cuda", "CUDA", "vllm", "sglang", "colab", "mmap", "token", "tokens",
+        "model", "models", "config", "debug", "release", "build", "test", "tests", "fix", "feat",
+        "bug", "api", "API", "cli", "CLI", "app", "App", "web", "gpu", "GPU", "cpu", "CPU",
+    ]
+    for w in pinned_bare:
+        if len(subwords) < target_size and w not in seen and all(0x20 <= ord(c) <= 0x7E for c in w):
+            seen.add(w)
+            subwords.append(w)
     need = target_size - len(subwords)
     if need <= 0 or not ascii_word_counts:
         return subwords[:target_size]
@@ -866,10 +881,9 @@ def pack(directory: Path, seed: Path):
             if len(ascii_words) > 400_000:
                 ascii_words = Counter(dict(ascii_words.most_common(120_000)))
 
-    char_keys = parse_wubi86_char_keys(seed / "wubi86.dict.yaml")
     ranked_cjk = sorted(
         range(0x3400, 0xA000),
-        key=lambda cp: (-(int(cjk_counts[cp]) + 50 * (cp in char_keys)), cp),
+        key=lambda cp: (-int(cjk_counts[cp]), cp),
     )[: CJK_VOCAB_LIMIT - FIRST_CJK_ID]
     vocab_cjk = sorted(ranked_cjk)
     cjk_lut_arr = np.ones(0xA000 - 0x3400, dtype="<u2")
@@ -906,12 +920,9 @@ def pack(directory: Path, seed: Path):
 
     np.save(directory / "lut.npy", cjk_lut_arr)
     scale = float(tok_counts.sum())
-    key1 = [255] * vocab_total
-    for idx, cp in enumerate(vocab_cjk):
-        key1[FIRST_CJK_ID + idx] = char_keys.get(cp, 255)
 
     labels = {
-        "format": "WBLM0002",
+        "format": "WBLM0003",
         "vocab": vocab_total,
         "cjk_vocab": len(vocab_cjk),
         "ext_base_id": EXT_BASE_ID,
@@ -919,7 +930,6 @@ def pack(directory: Path, seed: Path):
         "lines": total_lines,
         "tokens": total_tokens,
         "uni_logp": np.log(tok_counts / scale).tolist(),
-        "key1": key1,
     }
     (directory / "vocab.json").write_text(json.dumps(labels, ensure_ascii=False) + "\n", encoding="utf-8")
     return labels

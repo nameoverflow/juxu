@@ -84,6 +84,9 @@ public struct IOSHostRootView: View {
             lexiconTab
                 .tabItem { Label(IOSHostTab.lexicon.title, systemImage: IOSHostTab.lexicon.icon) }
                 .tag(IOSHostTab.lexicon)
+                .onAppear {
+                    bridge.loadConfigAndUser()
+                }
         }
         .onOpenURL { url in
             handleDeepLink(url)

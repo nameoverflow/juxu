@@ -1390,3 +1390,164 @@ fn real_dicts_log_driven_strategy_regressions_pinyin_and_spaceless_wubi98() {
         zhs_code
     );
 }
+
+#[test]
+fn real_dicts_balanced_autophrase_backspace_rollback_and_wubi98_fixes() {
+    use juxu_core::engine::KEY_RETURN;
+    use juxu_core::pinyin_dict::PinyinDictView;
+
+    let base = dicts_dir();
+    let d98 = DictView::open_mmap(base.join("wubi98.wbdict")).expect("open wubi98.wbdict");
+    let pdict = PinyinDictView::from_file(base.join("pinyin.pydict")).expect("open pinyin.pydict");
+    let aux = AuxView::open_mmap(base.join("wubi_aux.wbaux")).expect("open wubi_aux.wbaux");
+
+    let mut cfg = JuxuConfig::default();
+    cfg.schema = InputSchema::Wubi98;
+    cfg.spaceless = true;
+    cfg.auto_phrase = true;
+    cfg.auto_phrase_threshold = 2;
+    let mut engine = JuxuEngine::new(cfg.clone());
+    engine.load_dict(InputSchema::Wubi98, d98);
+    engine.load_pinyin_dict(pdict);
+    engine.set_aux(aux);
+
+    // 1. Supplemented Wubi 98 modern words (`改好`, `微信`, `固件`, `重置`, `触屏`, `丝滑`)
+    {
+        let dict98 = engine.dicts[InputSchema::Wubi98.slot_index()].as_ref().unwrap();
+        for w in ["改好", "微信", "固件", "重置", "触屏", "丝滑", "布洛芬", "过拟合"] {
+            assert!(
+                dict98.contains_exact_word(w).is_some(),
+                "expected '{}' to be present in wubi98.wbdict",
+                w
+            );
+        }
+    }
+
+    // 2. Spaceless mid-sentence lowercase 4-letter English (`diet`) must NOT hijack Wubi `ivqdietkhlf` ("当然不用跳转")!
+    engine.clear_composition();
+    engine.set_recent_context("云端");
+    let mut committed_diet = String::new();
+    for (i, ch) in "ivqdietkhlf".chars().enumerate() {
+        let out = engine.handle_key_event(0, Some(ch), false, 1_000 + i as u64 * 30);
+        committed_diet.push_str(&out.commit_text);
+    }
+    let out_end = engine.handle_key_event(KEY_SPACE, Some(' '), false, 1_500);
+    committed_diet.push_str(&out_end.commit_text);
+    assert_eq!(
+        committed_diet, "当然不用跳转",
+        "expected 'ivqdietkhlf' to decode as '当然不用跳转', got '{}'",
+        committed_diet
+    );
+
+    // 3. Backspace-after-commit (`<= 4s`) must roll back PersonalContinuations so deleted typos NEVER poison retry!
+    //    3a. `焦点` + `tq` ("稳") -> Backspace -> `tqq` => `#1` MUST be `移` (not `稳我`)!
+    engine.clear_composition();
+    engine.set_recent_context("焦点");
+    for (i, ch) in "tq".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 2_000 + i as u64 * 30);
+    }
+    let out_wen = engine.handle_key_event(KEY_SPACE, Some(' '), false, 2_100);
+    assert_eq!(out_wen.commit_text, "稳");
+    engine.notify_post_commit_backspace(2_400);
+    for (i, ch) in "tqq".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 2_600 + i as u64 * 30);
+    }
+    assert_eq!(
+        engine.all_candidates()[0].text,
+        "移",
+        "expected post-backspace retry 'tqq' after '焦点' to rank '移' at #1, got {:?}",
+        engine.all_candidates().iter().take(4).map(|c| &c.text).collect::<Vec<_>>()
+    );
+    let _ = engine.handle_key_event(KEY_SPACE, Some(' '), false, 2_800);
+
+    //    3b. `你` + `jtrpg` ("是我家") -> Backspace -> `jtrpgghphxf` => `#1` MUST be `监控一下这些`!
+    engine.clear_composition();
+    engine.set_recent_context("你");
+    for (i, ch) in "jtrpg".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 3_000 + i as u64 * 30);
+    }
+    let _ = engine.handle_key_event(KEY_SPACE, Some(' '), false, 3_200);
+    engine.notify_post_commit_backspace(3_500);
+    let mut mon_out = String::new();
+    for (i, ch) in "jtrpgghphxf".chars().enumerate() {
+        let out = engine.handle_key_event(0, Some(ch), false, 3_700 + i as u64 * 30);
+        mon_out.push_str(&out.commit_text);
+    }
+    let out_mon_end = engine.handle_key_event(KEY_SPACE, Some(' '), false, 4_200);
+    mon_out.push_str(&out_mon_end.commit_text);
+    assert_eq!(
+        mon_out, "监控一下这些",
+        "expected post-backspace retry 'jtrpgghphxf' to decode as '监控一下这些', got '{}'",
+        mon_out
+    );
+
+    // 4. ENWORD anti-garbage: dead Wubi codes (`vv`, `qdrg`, `ghek`) on Return must NOT pollute `english_words`!
+    engine.clear_composition();
+    for (bi, bad) in ["vv", "qdrg", "ghek"].iter().enumerate() {
+        for (i, ch) in bad.chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 5_000 + bi as u64 * 300 + i as u64 * 30);
+        }
+        let _ = engine.handle_key_event(KEY_RETURN, Some('\r'), false, 5_150 + bi as u64 * 300);
+        assert!(
+            !engine.user.english_words.contains_key(*bad),
+            "dead Wubi code '{}' must NOT be learned into user english_words",
+            bad
+        );
+    }
+
+    // 5. Balanced auto-phrase (zero function-word blocklist):
+    //    - Sliding-window spaceless stream (`再简洁一点我其实游戏`) must NOT 1-shot promote cross-word seams `洁一` / `点我`;
+    //    - Typing existing 3-char word `输`+`入`+`法` or left-bound `经`+`验`+`和` must NOT promote `入法` / `验和`;
+    //    - Deliberate function-word colloquial phrase `来` + `个` (`gu` + `wh`) promotes cleanly in 1 shot!
+    engine.user.phrases.clear();
+    engine.clear_composition();
+    engine.clear_context();
+    for (i, ch) in "gmftujifkghkoqdwpuiyca".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 6_000 + i as u64 * 30);
+    }
+    let _ = engine.handle_key_event(KEY_SPACE, Some(' '), false, 6_900);
+    assert!(!engine.user.phrases.contains_key("洁一"), "must not pollute '洁一'");
+    assert!(!engine.user.phrases.contains_key("点我"), "must not pollute '点我'");
+
+    let mut cfg_std = cfg.clone();
+    cfg_std.spaceless = false;
+    cfg_std.fourth_code_auto_commit = false;
+    engine.set_config(cfg_std);
+    engine.clear_context();
+    for (idx, code) in ["lwg", "ty", "ifc"].iter().enumerate() {
+        for (k, ch) in code.chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 7_000 + idx as u64 * 200 + k as u64 * 25);
+        }
+        let _ = engine.handle_key_event(KEY_SPACE, Some(' '), false, 7_100 + idx as u64 * 200);
+    }
+    assert!(
+        !engine.user.phrases.contains_key("入法"),
+        "built-in 3-char '输入法' must NEVER tail-slice '入法'"
+    );
+
+    engine.clear_context();
+    for (idx, code) in ["x", "cgw", "t"].iter().enumerate() {
+        for (k, ch) in code.chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 8_000 + idx as u64 * 200 + k as u64 * 25);
+        }
+        let _ = engine.handle_key_event(KEY_SPACE, Some(' '), false, 8_100 + idx as u64 * 200);
+    }
+    assert!(
+        !engine.user.phrases.contains_key("验和"),
+        "left-word '经验' + '和' must NEVER seam-glue '验和'"
+    );
+
+    // Function-word colloquial phrase `来` + `个` (`gu` + `wh`, isolated PMI = +4.45) promotes cleanly!
+    engine.clear_context();
+    engine.user.break_single_burst();
+    for (idx, code) in ["gu", "wh"].iter().enumerate() {
+        for (k, ch) in code.chars().enumerate() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 9_000 + idx as u64 * 200 + k as u64 * 25);
+        }
+        let _ = engine.handle_key_event(KEY_SPACE, Some(' '), false, 9_100 + idx as u64 * 200);
+    }
+    assert!(
+        engine.user.phrases.contains_key("来个"),
+        "high-cohesion function-word phrase '来个' must compose cleanly without function-word blocklist"
+    );
+}

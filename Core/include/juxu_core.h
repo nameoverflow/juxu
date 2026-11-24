@@ -29,6 +29,8 @@ char *juxu_engine_get_config_toml(const JuxuEngineHandle *handle);
 
 bool juxu_engine_load_user_data(JuxuEngineHandle *handle, const char *path);
 bool juxu_engine_save_user_data(JuxuEngineHandle *handle, const char *path);
+bool juxu_engine_import_user_data_tsv(JuxuEngineHandle *handle, const char *tsv_str);
+uint64_t juxu_engine_user_data_seq(const JuxuEngineHandle *handle);
 char *juxu_engine_export_user_data_tsv(JuxuEngineHandle *handle);
 bool juxu_engine_is_user_dirty(const JuxuEngineHandle *handle);
 

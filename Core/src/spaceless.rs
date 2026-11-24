@@ -353,7 +353,7 @@ impl Stream {
                         .dict
                         .lookup_exact(key, decoder.config.enable_rare_charset);
                     let top_weight = hits.first().map_or(1, |e| e.weight.max(1));
-                    let users = decoder.user.lookup_exact(key);
+                    let users = decoder.user.lookup_exact_detailed(key);
                     let limit = if exact { [1, 2, 4, 6][len - 1] } else { 2 };
                     hits.into_iter()
                         .enumerate()
@@ -375,17 +375,21 @@ impl Stream {
                                 })
                         })
                         .take(limit + 2)
-                        .map(move |(rank, entry)| (rank, entry.text, entry.weight, top_weight, false))
+                        .map(move |(rank, entry)| {
+                            (rank, entry.text, entry.weight, top_weight, false, 0u32, false)
+                        })
                         .chain(
                             users
                                 .into_iter()
                                 .take(if exact { 4 } else { 2 })
                                 .enumerate()
-                                .map(|(rank, (text, _, _))| (rank, text, 500, 500, true)),
+                                .map(|(rank, (text, cnt, _, auto_comp))| {
+                                    (rank, text, 500, 500, true, cnt, auto_comp)
+                                }),
                         )
                         .map(move |entry| (entry, key, correction, penalty))
                 });
-            for ((rank, text, weight, top_weight, custom), code, correction, penalty) in entries {
+            for ((rank, text, weight, top_weight, custom, user_cnt, user_auto), code, correction, penalty) in entries {
                 let mut chars = text.chars();
                 let Some(first) = chars.next() else { continue };
                 let second = chars.next();
@@ -449,7 +453,13 @@ impl Stream {
                     }
                 }
                 if custom {
-                    bias += 2.5;
+                    bias += if !user_auto || user_cnt >= 3 {
+                        2.5
+                    } else if user_cnt == 2 {
+                        1.6
+                    } else {
+                        0.85
+                    };
                 }
                 for (parent_idx, parent) in parents.iter().enumerate() {
                     let mut preceding = parent
@@ -577,29 +587,50 @@ impl Stream {
                         None
                     }
                 } else if len >= 4 && (user_hit.is_some() || dict_hit.is_some()) {
-                    let (canonical, weight, is_user) = if let Some((disp, cnt)) = user_hit {
+                    let (canonical, weight, flags, is_user) = if let Some((disp, cnt)) = user_hit {
                         (
                             disp.to_owned(),
                             (54_000u32 + cnt.min(10) * 1000).min(65_535) as u16,
+                            0u16,
                             true,
                         )
                     } else {
-                        let (disp, w, _) = dict_hit.unwrap();
-                        (disp, w, false)
+                        let (disp, w, f) = dict_hit.unwrap();
+                        (disp, w, f, false)
                     };
-                    // In spaceless Wubi/shape mode, every 1..4-letter sequence can be a real Wubi code.
-                    // Avoid hijacking normal Wubi typing with lowercase English:
+                    // In spaceless Wubi/shape mode, every 1..4-letter sequence can be a real Wubi code
+                    // or a cross-word Wubi seam (e.g. `ivq[diet]khlf` = `当然` + `不` + `用` + `跳转`).
+                    // Avoid hijacking normal Wubi typing with unanchored lowercase English:
                     // - require `len >= 4` (2..3-letter English in spaceless uses uppercase anchor like `PR`/`Go`/`iOS`)
-                    // - for 4-letter lowercase words, require user-learned OR empty exact Wubi code + high freq
+                    // - for 4-letter lowercase non-user words: block when Wubi has an exact match, and when
+                    //   appearing mid-sentence (`parent_pos > 0`) without uppercase, require explicit tech vocabulary
+                    //   (`EN_FLAG_TECH`, e.g. `rust`/`cuda`/`mmap`) or high-frequency top tier (`weight >= 54_000`).
                     let wubi_has_exact = len <= max_code_len
                         && PackedCode::from_ascii(&lower)
                             .is_some_and(|c| !decoder.dict.lookup_exact(c, false).is_empty());
-                    if !has_upper && !is_user && (weight < 40_000 || (len == 4 && wubi_has_exact)) {
+                    let is_tech = (flags & crate::english::EN_FLAG_TECH) != 0;
+                    let mid_sentence_short_hijack =
+                        parent_pos > 0 && len == 4 && !has_upper && !is_user && !is_tech && weight < 55_000;
+                    if !has_upper
+                        && !is_user
+                        && (weight < 40_000 || (len == 4 && wubi_has_exact) || mid_sentence_short_hijack)
+                    {
                         None
                     } else {
                         let display = format_english_display(raw_slice, &canonical);
-                        let w_bonus = ((weight as f32) / 65535.0) * 1.1 + if is_user { 1.8 } else { 0.0 };
-                        Some((display, 0.55 * (len as f32) + w_bonus - 2.4))
+                        let w_bonus =
+                            ((weight as f32) / 65535.0) * 1.1 + if is_user { 1.8 } else { 0.0 };
+                        let len_bonus = if is_user || is_tech || len >= 5 {
+                            0.45 * (len as f32)
+                        } else {
+                            0.15 * (len as f32)
+                        };
+                        let switch_cost = if parent_pos > 0 && !has_upper && !is_user && len == 4 {
+                            3.4
+                        } else {
+                            2.4
+                        };
+                        Some((display, len_bonus + w_bonus - switch_cost))
                     }
                 } else {
                     None

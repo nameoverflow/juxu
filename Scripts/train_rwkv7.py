@@ -1011,7 +1011,6 @@ class MicroRwkv7Model(nn.Module):
         self.w_dn = nn.Linear(d_model, rank, bias=True)
         self.w_mtp_h = nn.Linear(d_model, rank, bias=True)
         self.w_mtp_c1 = nn.Linear(rank, rank, bias=False)
-        self.w_key1 = nn.Linear(d_model, 25, bias=True)
 
         with torch.no_grad():
             nn.init.orthogonal_(self.w_up.weight, gain=0.8)
@@ -1034,7 +1033,7 @@ class MicroRwkv7Model(nn.Module):
             h_out = ste_quant_act(h_out)
         return h_out
 
-    def forward_train(self, seq: torch.Tensor, tok_first_key_t: torch.Tensor, qat: bool = False):
+    def forward_train(self, seq: torch.Tensor, tok_first_key_t: torch.Tensor | None = None, qat: bool = False):
         # seq: [B, T + 2]
         inp = seq[:, :-2]   # [B, T]
         tgt1 = seq[:, 1:-1] # [B, T] (+1 next char; 0 means end-of-clause <BOS>, ignore!)
@@ -1076,12 +1075,7 @@ class MicroRwkv7Model(nn.Module):
             ce2 = ce1 * 0.0
             lse2 = sn_loss * 0.0
 
-        # Next-Wubi-Key1 head loss (for Key #1 dynamic touch hitbox!)
-        k1_logits = F.linear(h, ste_quant_weight_rows(self.w_key1.weight) if qat else self.w_key1.weight, self.w_key1.bias)
-        k1_tgt = tok_first_key_t[tgt1]  # 0..24, or 255
-        ce_k1 = F.cross_entropy(k1_logits.view(-1, 25), k1_tgt.reshape(-1), ignore_index=255)
-
-        loss = ce1 + 0.35 * ce2 + 0.15 * ce_k1 + 0.06 * (sn_loss + 0.5 * lse2)
+        loss = ce1 + 0.35 * ce2 + 0.06 * (sn_loss + 0.5 * lse2)
         return loss, ce1.detach(), ce2.detach(), lse1.detach().abs().mean(), h, p1, e_table
 
 
@@ -1233,8 +1227,8 @@ def export_model_wblm(model: MicroRwkv7Model, lut: np.ndarray, out_path: Path, p
     wmh_b = model_cpu.w_mtp_h.bias.detach().float().numpy().astype("<f4")
     wmh_q, wmh_sc = put_qm(model_cpu.w_mtp_h.weight, model_cpu.w_mtp_h.bias)
     wmc_q, wmc_sc = put_qm(model_cpu.w_mtp_c1.weight, None)
-    wk1_b = model_cpu.w_key1.bias.detach().float().numpy().astype("<f4")
-    wk1_q, wk1_sc = put_qm(model_cpu.w_key1.weight, model_cpu.w_key1.bias)
+    # WBLM0003 omits the scheme-specific w_key1 head altogether; if exporting WBLM0003 with ext_vocab,
+    # append pack_wblm0002_ext_vocab_bytes(ext_base_id, ext_vocab) directly after w_mtp_c1 (4-byte aligned).
 
     out_path.write_bytes(bytes(buf))
     print(f"[export] Wrote {out_path} ({len(buf)/(1024*1024):.2f} MB)", flush=True)

@@ -127,6 +127,22 @@ pub struct UserPhrase {
     pub auto_composed: bool,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct CommitUndoSnapshot {
+    pub ts_ms: u64,
+    pub prev_seq: u64,
+    pub prev_last_committed: String,
+    pub prev_recent_context: Vec<char>,
+    pub unigram_prev: Option<(String, Option<u32>)>,
+    pub word_bigram_prev: Option<((String, String), Option<u32>)>,
+    pub char_bigram_prev: Option<((char, char), Option<u32>)>,
+    pub phrase_prev: Option<(String, Option<UserPhrase>)>,
+    pub pending_prev: Vec<(String, Option<u8>)>,
+    pub enwords_prev: Vec<(String, Option<(String, u32, u64)>)>,
+    pub prev_recent_singles: Vec<(char, u64, Option<f32>, u64, bool, bool, bool)>,
+    pub cont_undo: Option<crate::personalization::ContinuationUndo>,
+}
+
 pub struct UserStore {
     pub seq: u64,
     pub phrases: HashMap<String, UserPhrase>,
@@ -139,6 +155,8 @@ pub struct UserStore {
     pub char_bigrams: HashMap<(char, char), u32>,
     /// Personal learned English / OOV Latin words: `lower_key -> (preferred_display, count, last_seq)`
     pub english_words: HashMap<String, (String, u32, u64)>,
+    /// Pending all-lowercase Return-committed OOV tokens waiting for a 2nd confirmation
+    pending_enwords: HashMap<String, u8>,
     pub(crate) continuations: PersonalContinuations,
     pub touch_profile: TouchProfile,
     /// Rolling buffer of recent consecutive CJK characters
@@ -148,6 +166,7 @@ pub struct UserStore {
     recent_singles: Vec<(char, u64, Option<f32>, u64, bool, bool, bool)>,
     /// Candidate consecutive n-grams waiting to reach `auto_phrase_threshold`
     pending_ngrams: HashMap<String, u8>,
+    pub(crate) last_undo: Option<CommitUndoSnapshot>,
     pub dirty: bool,
 }
 
@@ -162,10 +181,12 @@ impl Default for UserStore {
             word_bigrams: HashMap::new(),
             char_bigrams: HashMap::new(),
             english_words: HashMap::new(),
+            pending_enwords: HashMap::new(),
             continuations: PersonalContinuations::default(),
             touch_profile: TouchProfile::default(),
             recent_singles: Vec::new(),
             pending_ngrams: HashMap::new(),
+            last_undo: None,
             dirty: false,
         }
     }
@@ -235,6 +256,18 @@ impl UserStore {
             .filter_map(|t| {
                 let p = self.phrases.get(t)?;
                 Some((p.text.as_str(), p.count, p.last_seq))
+            })
+            .collect()
+    }
+
+    pub fn lookup_exact_detailed(&self, code: PackedCode) -> Vec<(&str, u32, u64, bool)> {
+        let Some(list) = self.code_index.get(&code) else {
+            return Vec::new();
+        };
+        list.iter()
+            .filter_map(|t| {
+                let p = self.phrases.get(t)?;
+                Some((p.text.as_str(), p.count, p.last_seq, p.auto_composed))
             })
             .collect()
     }
@@ -394,18 +427,33 @@ impl UserStore {
         dict: Option<&DictView>,
         pdict: Option<&PinyinDictView>,
     ) -> Option<PackedCode> {
+        self.add_phrase_with_pinyin_strength(text, auto_composed, !auto_composed, dict, pdict)
+    }
+
+    pub fn add_phrase_with_pinyin_strength(
+        &mut self,
+        text: &str,
+        auto_composed: bool,
+        strong_explicit: bool,
+        dict: Option<&DictView>,
+        pdict: Option<&PinyinDictView>,
+    ) -> Option<PackedCode> {
         let char_len = text.chars().count();
         if char_len < 2 || char_len > 12 {
             return None;
         }
         self.seq += 1;
         let seq = self.seq;
+        let prev_phrase = self.phrases.get(text).cloned();
         let entry = self
             .phrases
             .entry(text.to_string())
             .and_modify(|e| {
                 e.count = e.count.saturating_add(1);
                 e.last_seq = seq;
+                if !auto_composed {
+                    e.auto_composed = false;
+                }
             })
             .or_insert_with(|| UserPhrase {
                 text: text.to_string(),
@@ -414,10 +462,22 @@ impl UserStore {
                 auto_composed,
             });
         let _ = entry;
+        if let Some(ref mut undo) = self.last_undo {
+            if undo.phrase_prev.is_none() {
+                undo.phrase_prev = Some((text.to_string(), prev_phrase));
+            }
+        }
         self.dirty = true;
-        // Reflect explicit & surprisal-promoted phrases directly into RWKV probability space
-        // so pure-neural Pinyin immediately ranks cross-mode / auto-promoted terms at #1!
-        self.continuations.observe(&[], text, true, Some(""), None);
+        // Reflect learned phrases into RWKV probability space:
+        // - explicit manual/segmented assemblies (`strong_explicit = true`) get 1-shot boost (`Some("")`);
+        // - background `auto_composed` promotions use gentle confirmation (`None`) so they never distort common homophones.
+        self.continuations.observe(
+            &[],
+            text,
+            true,
+            if strong_explicit { Some("") } else { None },
+            None,
+        );
         if let Some(pd) = pdict {
             self.index_phrase_pinyin(text, pd);
         }
@@ -449,6 +509,92 @@ impl UserStore {
 
     pub fn break_single_burst(&mut self) {
         self.recent_singles.clear();
+    }
+
+    /// Start tracking mutations for a new commit so an immediate Backspace (`<= 4s`) can revert
+    /// personal continuations, counts, and any newly promoted auto-phrase cleanly.
+    pub fn begin_commit_undo(
+        &mut self,
+        timestamp_ms: u64,
+        prev_last_committed: &str,
+        prev_recent_context: &[char],
+        cont_text: Option<&str>,
+    ) {
+        let cont_undo = cont_text.map(|t| {
+            self.continuations
+                .capture_undo_before(prev_recent_context, t)
+        });
+        self.last_undo = Some(CommitUndoSnapshot {
+            ts_ms: timestamp_ms,
+            prev_seq: self.seq,
+            prev_last_committed: prev_last_committed.to_owned(),
+            prev_recent_context: prev_recent_context.to_vec(),
+            prev_recent_singles: self.recent_singles.clone(),
+            cont_undo,
+            ..CommitUndoSnapshot::default()
+        });
+    }
+
+    /// Revert all personal memory mutations from the last commit if Backspace occurred within `max_age_ms`.
+    /// Returns `Some((prev_last_committed, prev_recent_context))` when a rollback was applied.
+    pub fn rollback_last_commit_if_within(
+        &mut self,
+        timestamp_ms: u64,
+        max_age_ms: u64,
+    ) -> Option<(String, Vec<char>)> {
+        let undo = self.last_undo.take()?;
+        if timestamp_ms.saturating_sub(undo.ts_ms) > max_age_ms {
+            return None;
+        }
+        self.seq = undo.prev_seq;
+        self.recent_singles = undo.prev_recent_singles;
+        if let Some((k, prev_v)) = undo.unigram_prev {
+            if let Some(v) = prev_v {
+                self.unigram_counts.insert(k, v);
+            } else {
+                self.unigram_counts.remove(&k);
+            }
+        }
+        if let Some((k, prev_v)) = undo.word_bigram_prev {
+            if let Some(v) = prev_v {
+                self.word_bigrams.insert(k, v);
+            } else {
+                self.word_bigrams.remove(&k);
+            }
+        }
+        if let Some((k, prev_v)) = undo.char_bigram_prev {
+            if let Some(v) = prev_v {
+                self.char_bigrams.insert(k, v);
+            } else {
+                self.char_bigrams.remove(&k);
+            }
+        }
+        for (ng, prev_cnt) in undo.pending_prev {
+            if let Some(c) = prev_cnt {
+                self.pending_ngrams.insert(ng, c);
+            } else {
+                self.pending_ngrams.remove(&ng);
+            }
+        }
+        if let Some((phrase, prev_up)) = undo.phrase_prev {
+            if let Some(up) = prev_up {
+                self.phrases.insert(phrase, up);
+            } else {
+                self.remove_phrase(&phrase);
+            }
+        }
+        for (lower, prev_en) in undo.enwords_prev {
+            if let Some(val) = prev_en {
+                self.english_words.insert(lower, val);
+            } else {
+                self.english_words.remove(&lower);
+            }
+        }
+        if let Some(cu) = undo.cont_undo {
+            self.continuations.apply_undo(cu);
+        }
+        self.dirty = true;
+        Some((undo.prev_last_committed, undo.prev_recent_context))
     }
 
     /// Record a committed string, updating personal unigram/bigram frequencies and
@@ -502,10 +648,9 @@ impl UserStore {
         )
     }
 
-    /// Stream-aware commit recorder: `passive_stream = true` marks segments produced by a single
-    /// whole-sentence Space commit (`>= 3` segments in spaceless mode) so casual clause spans require
-    /// higher repetition (`>= 3`), while deliberate character-by-character or word-by-word commits use
-    /// `auto_threshold` (`2`).
+    /// Stream-aware commit recorder: `passive_stream = true` marks segments produced by automatic
+    /// spaceless stream commits so casual clause spans never 1-shot pollute user phrases, while
+    /// isolated `<BOS>` PMI + boundary guards keep zero function-word blocklists.
     #[allow(clippy::too_many_arguments)]
     pub fn record_commit_with_mode(
         &mut self,
@@ -519,6 +664,34 @@ impl UserStore {
         surprisal: Option<f32>,
         passive_stream: bool,
     ) -> Option<String> {
+        self.record_commit_with_neural(
+            prev_committed,
+            committed,
+            timestamp_ms,
+            auto_phrase,
+            auto_threshold,
+            dict,
+            pdict,
+            surprisal,
+            passive_stream,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_commit_with_neural(
+        &mut self,
+        prev_committed: &str,
+        committed: &str,
+        timestamp_ms: u64,
+        auto_phrase: bool,
+        auto_threshold: u8,
+        dict: Option<&DictView>,
+        pdict: Option<&PinyinDictView>,
+        surprisal: Option<f32>,
+        passive_stream: bool,
+        neural: Option<(&crate::neural::NeuralView<'_>, &crate::neural::RwkvState)>,
+    ) -> Option<String> {
         if committed.is_empty() {
             return None;
         }
@@ -526,28 +699,51 @@ impl UserStore {
         let seq = self.seq;
         self.dirty = true;
 
+        let prev_uni = self.unigram_counts.get(committed).copied();
         *self
             .unigram_counts
             .entry(committed.to_string())
             .or_insert(0) += 1;
+        if let Some(ref mut undo) = self.last_undo {
+            if undo.unigram_prev.is_none() {
+                undo.unigram_prev = Some((committed.to_string(), prev_uni));
+            }
+        }
 
-        if let Some(up) = self.phrases.get_mut(committed) {
-            up.count = up.count.saturating_add(1);
-            up.last_seq = seq;
+        if let Some(up_prev) = self.phrases.get(committed).cloned() {
+            if let Some(ref mut undo) = self.last_undo {
+                if undo.phrase_prev.is_none() {
+                    undo.phrase_prev = Some((committed.to_string(), Some(up_prev)));
+                }
+            }
+            if let Some(up) = self.phrases.get_mut(committed) {
+                up.count = up.count.saturating_add(1);
+                up.last_seq = seq;
+            }
         }
 
         if !prev_committed.is_empty() {
             if self.word_bigrams.len() < 8192 {
-                *self
-                    .word_bigrams
-                    .entry((prev_committed.to_string(), committed.to_string()))
-                    .or_insert(0) += 1;
+                let wb_key = (prev_committed.to_string(), committed.to_string());
+                let prev_wb = self.word_bigrams.get(&wb_key).copied();
+                *self.word_bigrams.entry(wb_key.clone()).or_insert(0) += 1;
+                if let Some(ref mut undo) = self.last_undo {
+                    if undo.word_bigram_prev.is_none() {
+                        undo.word_bigram_prev = Some((wb_key, prev_wb));
+                    }
+                }
             }
             if let (Some(c_prev), Some(c_next)) =
                 (prev_committed.chars().last(), committed.chars().next())
             {
                 if self.char_bigrams.len() < 8192 {
+                    let prev_cb = self.char_bigrams.get(&(c_prev, c_next)).copied();
                     *self.char_bigrams.entry((c_prev, c_next)).or_insert(0) += 1;
+                    if let Some(ref mut undo) = self.last_undo {
+                        if undo.char_bigram_prev.is_none() {
+                            undo.char_bigram_prev = Some(((c_prev, c_next), prev_cb));
+                        }
+                    }
                 }
             }
         }
@@ -589,9 +785,8 @@ impl UserStore {
             return None;
         }
 
-        // Check longest suffix FIRST (4 -> 3 -> 2 chars) so a 3-char phrase like "哈基米" or "最好是" is NEVER
-        // short-circuited by its 2-char tail, require spanning >= 2 distinct commits,
-        // and require alignment with commit start & commit end boundaries (never tear a word in half!).
+        // Check longest suffix FIRST (4 -> 3 -> 2 chars) so a 3-char phrase like "哈基米", "布洛芬", "输入法",
+        // or "最好是" is NEVER short-circuited or tail-amputated into its 2-char suffix ("基米", "洛芬", "入法").
         let n = self.recent_singles.len();
         let mut promoted: Option<String> = None;
         for cand_len in [4usize, 3usize, 2usize] {
@@ -613,37 +808,99 @@ impl UserStore {
             if !is_valid_auto_phrase_text(&cand) {
                 continue;
             }
-            let all_single_commits = slice.iter().all(|x| x.4 && x.5);
-            let any_passive = slice.iter().any(|x| x.6);
-            let mut sum_s = 0.0f32;
-            let mut cnt_s = 0usize;
-            for item in &slice[1..] {
-                if let Some(s) = item.2 {
-                    sum_s += s;
-                    cnt_s += 1;
+            if self.phrases.contains_key(&cand) {
+                if cand_len >= 3 {
+                    break;
+                }
+                continue;
+            }
+            if let Some(d) = dict {
+                let Some(code) = d.encode_phrase(&cand) else {
+                    continue;
+                };
+                if d.lookup_exact(code, false).iter().any(|e| e.text == cand) {
+                    // Already a built-in dictionary phrase (e.g. `输入法`): stop so we NEVER slice its 2-char tail (`入法`)!
+                    if cand_len >= 3 {
+                        break;
+                    }
+                    continue;
                 }
             }
-            let mean_surp = (cnt_s > 0).then(|| sum_s / (cnt_s as f32));
-            let last_ch = slice[cand_len - 1].0;
-            let allow_fast_promote = !any_passive
-                && cand_len == 2
-                && all_single_commits
-                && !matches!(last_ch, '的' | '了' | '吗' | '呢' | '吧' | '啊' | '着' | '过');
-            let eff_threshold = if any_passive {
-                auto_threshold.max(3)
+
+            let all_single_commits = slice.iter().all(|x| x.4 && x.5);
+            let any_passive = slice.iter().any(|x| x.6);
+            let cohesion = neural.and_then(|(nv, bos)| nv.isolated_phrase_cohesion(bos, &cand));
+
+            // Left-neighbor word seam guard: if `cand` is `[B, C]` (`cand_len == 2`) and `A + B` immediately
+            // to the left is an established dictionary/user word with much stronger cohesion than `B + C`
+            // (e.g. `简洁 + 一 -> 洁一`, `经验 + 和 -> 验和`, `这么 + 大 -> 么大`), `B` belongs to `AB`, not `BC`!
+            if cand_len == 2 && n >= 3 {
+                let prev_item = self.recent_singles[n - 3];
+                let recent_enough = timestamp_ms == 0
+                    || prev_item.1 == 0
+                    || timestamp_ms.saturating_sub(prev_item.1) <= 5000;
+                if recent_enough {
+                    let left_pair: String = [prev_item.0, slice[0].0].iter().collect();
+                    let left_is_word = self.phrases.contains_key(&left_pair)
+                        || dict.is_some_and(|d| d.contains_exact_word(&left_pair).is_some());
+                    if left_is_word {
+                        if let (Some((_, pmi_bc)), Some((nv, bos))) = (cohesion, neural) {
+                            if let Some((_, pmi_ab)) = nv.isolated_phrase_cohesion(bos, &left_pair) {
+                                if pmi_ab > pmi_bc + 1.8 && pmi_bc < 2.8 {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Intent-tiered promotion WITHOUT any function-word / modal-particle blocklist:
+            // - Passive spaceless stream: never 1-shot; reject non-cohesive cross-word seams (`PMI <= 0.35`);
+            //   cohesive phrases (`PMI >= 2.5`, e.g. `傻狗`, `来个`, `最快的`, `布洛芬`) promote in 2 occurrences,
+            //   mild phrases (`0.35 < PMI < 2.5`, e.g. `句序`, `小鹤`) in 3 occurrences.
+            // - Deliberate single/word commits: 1-shot (`bump = threshold`) ONLY when isolated RWKV confirms strong
+            //   2-char lexical cohesion (`iso_cond > -3.85 && iso_pmi > 4.0`, e.g. `微信`, `丝滑`, `触屏`, `来个`, `买的`);
+            //   all other terms (coined words `星锚`/`句序`, colloquial `标的`/`傻逼吗`/`最好是`) promote cleanly on 2nd repeat!
+            let (bump, eff_threshold): (u8, u8) = if let Some((iso_cond, iso_pmi)) = cohesion {
+                if any_passive {
+                    if iso_pmi <= 0.35 {
+                        continue;
+                    }
+                    let thr = if iso_pmi >= 2.5 {
+                        auto_threshold.max(2)
+                    } else {
+                        auto_threshold.max(3)
+                    };
+                    (1, thr)
+                } else if cand_len == 2
+                    && all_single_commits
+                    && iso_cond > -3.85
+                    && iso_pmi > 4.0
+                {
+                    (auto_threshold.max(2), auto_threshold)
+                } else if iso_pmi < -1.5 {
+                    (1, auto_threshold.max(3))
+                } else {
+                    (1, auto_threshold)
+                }
             } else {
-                auto_threshold
+                // Fallback when no neural LM is loaded (unit tests): pure repetition threshold, no blind 1-shot.
+                let thr = if any_passive {
+                    auto_threshold.max(3)
+                } else {
+                    auto_threshold
+                };
+                (1, thr)
             };
-            if let Some(word) = self.bump_pending_ngram(
-                &cand,
-                eff_threshold,
-                dict,
-                pdict,
-                mean_surp,
-                allow_fast_promote,
-            ) {
+
+            if let Some(word) = self.bump_pending_ngram_exact(&cand, bump, eff_threshold, dict, pdict) {
                 promoted = Some(word);
-                // If a longer 3-4 char phrase just promoted, stop so we don't also pollute with its shorter tail!
+                break;
+            }
+            // If a genuinely cohesive 3-4 char phrase (`布洛芬`, `哈基米`, `最快的`) just accumulated toward threshold,
+            // stop here so its amputated 2-char tail (`洛芬`, `基米`) does not promote ahead of it!
+            if cand_len >= 3 && cohesion.is_some_and(|(_, pmi)| pmi >= 2.8) {
                 break;
             }
         }
@@ -651,8 +908,8 @@ impl UserStore {
     }
 
     /// Immediately promote a `2..=4` CJK phrase explicitly assembled by the user via manual segmented
-    /// selection within a single unbroken Pinyin preedit (e.g. `zhuowei` -> `卓` + `威`, `biaode` -> `标` + `的`,
-    /// `zuihaoshi` -> `最好` + `是`).
+    /// selection within a single unbroken Pinyin preedit (e.g. `zhuowei` -> `卓` + `威`, `biaodi` -> `标` + `的`,
+    /// `zuihaoshi` -> `最好` + `是`, `shabima` -> `傻逼` + `吗`).
     pub fn promote_assembled_immediately(
         &mut self,
         phrase: &str,
@@ -671,7 +928,7 @@ impl UserStore {
             return None;
         }
         self.pending_ngrams.remove(phrase);
-        self.add_phrase_with_pinyin(phrase, true, dict, pdict);
+        self.add_phrase_with_pinyin_strength(phrase, true, true, dict, pdict);
         Some(phrase.to_string())
     }
 
@@ -696,17 +953,21 @@ impl UserStore {
         {
             return None;
         }
-        self.bump_pending_ngram(phrase, auto_threshold, dict, pdict, mean_surprisal, len == 2)
+        let bump = if len == 2 && mean_surprisal.is_some_and(|s| s < 3.5) {
+            auto_threshold.max(2)
+        } else {
+            1
+        };
+        self.bump_pending_ngram_exact(phrase, bump, auto_threshold, dict, pdict)
     }
 
-    fn bump_pending_ngram(
+    fn bump_pending_ngram_exact(
         &mut self,
         phrase: &str,
+        bump: u8,
         threshold: u8,
         dict: Option<&DictView>,
         pdict: Option<&PinyinDictView>,
-        mean_surprisal: Option<f32>,
-        allow_fast_promote: bool,
     ) -> Option<String> {
         if self.phrases.contains_key(phrase) {
             return None;
@@ -715,7 +976,6 @@ impl UserStore {
             let Some(code) = d.encode_phrase(phrase) else {
                 return None;
             };
-            // Already exists in built-in dictionary? No need to duplicate
             if d.lookup_exact(code, false)
                 .iter()
                 .any(|e| e.text == phrase)
@@ -723,23 +983,17 @@ impl UserStore {
                 return None;
             }
         }
-        // Only allow 1-shot promotion (`bump = 2`) for 2-char words formed from two single-char commits
-        // with strong RWKV cohesion (`surp < 3.8`, e.g. "微"+"信" -> "微信" when missing from Wubi86).
-        // Longer 3-4 char spans or multi-word glues always require real repetition (`bump = 1`).
-        let bump: u8 = if allow_fast_promote {
-            if mean_surprisal.is_some_and(|surp| surp < 3.8) {
-                2
-            } else {
-                1
+        let prev_cnt = self.pending_ngrams.get(phrase).copied();
+        if let Some(ref mut undo) = self.last_undo {
+            if !undo.pending_prev.iter().any(|(k, _)| k == phrase) {
+                undo.pending_prev.push((phrase.to_string(), prev_cnt));
             }
-        } else {
-            1
-        };
+        }
         let cnt = self.pending_ngrams.entry(phrase.to_string()).or_insert(0);
         *cnt = cnt.saturating_add(bump);
         if *cnt >= threshold.max(1) {
             self.pending_ngrams.remove(phrase);
-            self.add_phrase_with_pinyin(phrase, true, dict, pdict);
+            self.add_phrase_with_pinyin_strength(phrase, true, false, dict, pdict);
             return Some(phrase.to_string());
         }
         None
@@ -758,19 +1012,16 @@ impl UserStore {
     /// Record a user-committed English / OOV Latin word (preserving user casing) for future mixed decoding.
     pub fn record_english_word(&mut self, word: &str) {
         let trimmed = word.trim();
-        if !(2..=48).contains(&trimmed.len()) {
-            return;
-        }
-        if !trimmed
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+' | b'#'))
-        {
-            return;
-        }
-        if !trimmed.bytes().any(|b| b.is_ascii_alphabetic()) {
+        if !is_plausible_english_token(trimmed) {
             return;
         }
         let lower = trimmed.to_ascii_lowercase();
+        let prev_en = self.english_words.get(&lower).cloned();
+        if let Some(ref mut undo) = self.last_undo {
+            if !undo.enwords_prev.iter().any(|(k, _)| k == &lower) {
+                undo.enwords_prev.push((lower.clone(), prev_en));
+            }
+        }
         let seq = self.seq;
         self.seq = self.seq.saturating_add(1);
         let has_upper = trimmed.bytes().any(|b| b.is_ascii_uppercase());
@@ -785,6 +1036,46 @@ impl UserStore {
             })
             .or_insert_with(|| (trimmed.to_owned(), 1, seq));
         self.dirty = true;
+    }
+
+    /// Guarded Return-key Latin learner: prevents a single accidental Return on an unmatched Wubi/Pinyin
+    /// raw code (`vv`, `qdrg`, `cla`, `ghek`) from polluting `ENWORD`.
+    pub fn record_english_word_from_return(
+        &mut self,
+        raw: &str,
+        in_english_dict: bool,
+        is_shape_schema: bool,
+    ) {
+        let trimmed = raw.trim();
+        if !is_plausible_english_token(trimmed) {
+            return;
+        }
+        let has_anchor = trimmed
+            .bytes()
+            .any(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.' | b'+' | b'#'));
+        if has_anchor || in_english_dict {
+            self.record_english_word(trimmed);
+            return;
+        }
+        // All-lowercase OOV token on Return: require >= 3 letters and at least 2 independent Return commits in shape mode
+        if is_shape_schema {
+            if trimmed.len() < 3 {
+                return;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            if self.english_words.contains_key(&lower) {
+                self.record_english_word(trimmed);
+                return;
+            }
+            let c = self.pending_enwords.entry(lower.clone()).or_insert(0);
+            *c = c.saturating_add(1);
+            if *c >= 2 {
+                self.pending_enwords.remove(&lower);
+                self.record_english_word(trimmed);
+            }
+        } else {
+            self.record_english_word(trimmed);
+        }
     }
 
     /// Extract and record any Latin words (`len >= 2`) from a committed mixed string.
@@ -1002,6 +1293,10 @@ impl UserStore {
 
     pub fn load_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let src = fs::read_to_string(path)?;
+        Ok(Self::from_tsv_str(&src))
+    }
+
+    pub fn from_tsv_str(src: &str) -> Self {
         let mut store = Self::default();
         for line in src.lines() {
             if line.is_empty() || line.starts_with('#') {
@@ -1081,7 +1376,7 @@ impl UserStore {
                     let disp = parts[2].to_string();
                     let count: u32 = parts[3].parse().unwrap_or(1);
                     let last_seq: u64 = parts[4].parse().unwrap_or(1);
-                    if lower.len() >= 2 && lower.len() <= 48 && !disp.is_empty() {
+                    if is_plausible_english_token(&disp) && lower.len() >= 2 && lower.len() <= 48 {
                         store.english_words.insert(lower, (disp, count, last_seq));
                     }
                 }
@@ -1093,8 +1388,32 @@ impl UserStore {
             }
         }
         store.dirty = false;
-        Ok(store)
+        store
     }
+}
+
+fn is_plausible_english_token(trimmed: &str) -> bool {
+    if !(2..=48).contains(&trimmed.len()) {
+        return false;
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+' | b'#'))
+    {
+        return false;
+    }
+    if !trimmed.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    // Reject all-lowercase pure consonant clusters (`vv`, `qq`, `qdrg`, `sl`, `gm`, `yh`) from Wubi dead codes,
+    // while allowing uppercase acronyms (`PR`, `KFR`, `MCP`, `RWKV`), digits/symbols (`v2`, `c++`), or vowel-bearing words.
+    let has_non_lower = trimmed
+        .bytes()
+        .any(|b| !b.is_ascii_lowercase());
+    let has_vowel = trimmed
+        .bytes()
+        .any(|b| matches!(b.to_ascii_lowercase(), b'a' | b'e' | b'i' | b'o' | b'u' | b'y'));
+    has_non_lower || has_vowel
 }
 
 fn escape_tab(s: &str) -> String {
@@ -1118,6 +1437,9 @@ pub fn is_valid_auto_phrase_text(phrase: &str) -> bool {
         return false;
     }
     if n == 2 && chars[0] == chars[1] {
+        return false;
+    }
+    if n == 4 && chars[0] == chars[2] && chars[1] == chars[3] {
         return false;
     }
     true

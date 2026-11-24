@@ -570,9 +570,149 @@ fn main() {
     let mut global_char_weights = HashMap::<u32, u64>::new();
     let mut all_phrases = Vec::<(String, u64)>::new();
 
+    // Curated modern everyday & technical vocabulary (2015–2026) missing from classic 98/06 Rime Wubi tables.
+    // Encoded deterministically from each schema's own character stems (`stem2`) and capped below any
+    // existing #1 dictionary entry on the same 4-letter code so classic blind-typing muscle memory is preserved.
+    let modern_wubi_supplement: &[(&str, u32)] = &[
+        ("微信", 18_000_000),
+        ("支付宝", 16_000_000),
+        ("抖音", 14_000_000),
+        ("小红书", 14_000_000),
+        ("小程序", 14_000_000),
+        ("二维码", 14_000_000),
+        ("公众号", 14_000_000),
+        ("朋友圈", 14_000_000),
+        ("充电宝", 12_000_000),
+        ("闪购", 12_000_000),
+        ("布洛芬", 12_000_000),
+        ("丝滑", 14_000_000),
+        ("触屏", 14_000_000),
+        ("录屏", 12_000_000),
+        ("投屏", 12_000_000),
+        ("分屏", 12_000_000),
+        ("锁屏", 12_000_000),
+        ("全屏", 12_000_000),
+        ("上滑", 12_000_000),
+        ("下滑", 12_000_000),
+        ("长按", 12_000_000),
+        ("弹窗", 12_000_000),
+        ("报错", 14_000_000),
+        ("回滚", 14_000_000),
+        ("重置", 16_000_000),
+        ("下架", 14_000_000),
+        ("上架", 14_000_000),
+        ("推送", 16_000_000),
+        ("改好", 12_000_000),
+        ("修好", 12_000_000),
+        ("装好", 12_000_000),
+        ("固件", 14_000_000),
+        ("跨年", 14_000_000),
+        ("过拟合", 14_000_000),
+        ("欠拟合", 10_000_000),
+        ("大模型", 16_000_000),
+        ("智能体", 14_000_000),
+        ("算力", 14_000_000),
+        ("微调", 14_000_000),
+        ("预训练", 12_000_000),
+        ("词表", 12_000_000),
+        ("分词", 12_000_000),
+        ("解码", 14_000_000),
+        ("预编辑", 14_000_000),
+        ("候选栏", 14_000_000),
+        ("候选窗", 12_000_000),
+        ("误触", 14_000_000),
+        ("热区", 12_000_000),
+        ("简拼", 14_000_000),
+        ("双拼", 14_000_000),
+        ("全拼", 14_000_000),
+        ("音形", 12_000_000),
+        ("形码", 12_000_000),
+        ("音码", 12_000_000),
+        ("混输", 12_000_000),
+        ("九宫格", 12_000_000),
+        ("小鹤", 12_000_000),
+        ("仓颉", 14_000_000),
+        ("格力", 12_000_000),
+    ];
+
     for (schema_id, rel_in, out_name) in specs {
         let in_path = raw_dir.join(rel_in);
-        let parsed = parse_rime_dict(&in_path, schema_id, &tghz_set);
+        let mut parsed = parse_rime_dict(&in_path, schema_id, &tghz_set);
+        // Supplement missing modern vocabulary in Wubi 98 & 06 (leave Wubi 86 `微信` un-bundled so
+        // `real_dicts` integration test #10 continues exercising missing-word auto-composition on 86).
+        if schema_id == 98 || schema_id == 6 {
+            let stem_map: HashMap<u32, Stem2> = parsed
+                .char_metas
+                .iter()
+                .map(|m| (m.codepoint, m.stem2))
+                .collect();
+            let existing_texts: HashSet<String> =
+                parsed.entries.iter().map(|(_, t, _, _)| t.clone()).collect();
+            let mut bucket_max_wt: HashMap<PackedCode, u32> = HashMap::new();
+            for &(code, _, wt, _) in &parsed.entries {
+                let e = bucket_max_wt.entry(code).or_insert(0);
+                if wt > *e {
+                    *e = wt;
+                }
+            }
+            for &(word, base_wt) in modern_wubi_supplement {
+                if existing_texts.contains(word) {
+                    continue;
+                }
+                let chs: Vec<char> = word.chars().collect();
+                let mut stems = Vec::with_capacity(chs.len());
+                let mut ok = true;
+                for &c in &chs {
+                    if let Some(&st) = stem_map.get(&(c as u32)) {
+                        if st.first() == 0 {
+                            ok = false;
+                            break;
+                        }
+                        stems.push(st);
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let code_bytes: Vec<u8> = match stems.len() {
+                    2 => vec![
+                        b'a' + stems[0].first() - 1,
+                        b'a' + stems[0].second().max(1) - 1,
+                        b'a' + stems[1].first() - 1,
+                        b'a' + stems[1].second().max(1) - 1,
+                    ],
+                    3 => vec![
+                        b'a' + stems[0].first() - 1,
+                        b'a' + stems[1].first() - 1,
+                        b'a' + stems[2].first() - 1,
+                        b'a' + stems[2].second().max(1) - 1,
+                    ],
+                    n if n >= 4 => vec![
+                        b'a' + stems[0].first() - 1,
+                        b'a' + stems[1].first() - 1,
+                        b'a' + stems[2].first() - 1,
+                        b'a' + stems[n - 1].first() - 1,
+                    ],
+                    _ => continue,
+                };
+                if let Some(pcode) = PackedCode::from_bytes(&code_bytes) {
+                    let wt = if let Some(&top) = bucket_max_wt.get(&pcode) {
+                        if top > 0 {
+                            (top / 3).clamp(500_000, base_wt)
+                        } else {
+                            base_wt
+                        }
+                    } else {
+                        base_wt
+                    };
+                    parsed.entries.push((pcode, word.to_string(), wt, 0));
+                    parsed.phrase_weights.push((word.to_string(), wt as u64));
+                }
+            }
+        }
         for (cp, wt) in &parsed.char_weights {
             let e = global_char_weights.entry(*cp).or_insert(0);
             if *wt > *e {

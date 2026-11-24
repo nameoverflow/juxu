@@ -6,6 +6,16 @@ private enum IOSSharedSettings {
     static let preferencesAccount = "input-settings"
     static let touchProfileAccount = "touch-profile"
     static let evalLogAccount = "eval-log-ring"
+    static let userDataAccount = "user-data-zlib"
+
+    static func parseUserDataSeq(_ tsv: String) -> UInt64 {
+        for line in tsv.prefix(512).split(separator: "\n", omittingEmptySubsequences: true) {
+            if line.hasPrefix("SEQ\t") {
+                return UInt64(line.dropFirst(4).trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+            }
+        }
+        return 0
+    }
 
     private static func query(account: String, groupKey: String = "JuxuSettingsGroup", service: String = "Juxu") -> [String: Any]? {
         guard let group = Bundle.main.object(forInfoDictionaryKey: groupKey) as? String else { return nil }
@@ -583,6 +593,8 @@ private final class JuxuPersistenceWorker: @unchecked Sendable {
     private var iosEvalRingLines: [String] = []
     private var iosEvalRingDirty = false
     private var pendingRingFlush: DispatchWorkItem?
+    private var pendingUserDataFlush: DispatchWorkItem?
+    private var pendingUserDataTSV: String?
     #endif
 
     init(evalLogURL: URL, userDataURL: URL, inMemoryOnly: Bool) {
@@ -609,6 +621,9 @@ private final class JuxuPersistenceWorker: @unchecked Sendable {
             pendingRingFlush?.cancel()
             pendingRingFlush = nil
             flushIOSEvalRingOnQueue()
+            pendingUserDataFlush?.cancel()
+            pendingUserDataFlush = nil
+            flushIOSUserDataOnQueue()
             #endif
         }
     }
@@ -620,6 +635,9 @@ private final class JuxuPersistenceWorker: @unchecked Sendable {
             pendingRingFlush?.cancel()
             pendingRingFlush = nil
             flushIOSEvalRingOnQueue()
+            pendingUserDataFlush?.cancel()
+            pendingUserDataFlush = nil
+            flushIOSUserDataOnQueue()
         }
         #endif
     }
@@ -632,11 +650,78 @@ private final class JuxuPersistenceWorker: @unchecked Sendable {
         queue.async { [self] in
             try? Data(tsv.utf8).write(to: userDataURL, options: .atomic)
             let mtime = (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
+            #if os(iOS)
+            pendingUserDataTSV = tsv
+            if pendingUserDataFlush == nil {
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    self.pendingUserDataFlush = nil
+                    self.flushIOSUserDataOnQueue()
+                }
+                pendingUserDataFlush = work
+                queue.asyncAfter(deadline: .now() + 1.5, execute: work)
+            }
+            #endif
             onSavedMtime(mtime)
         }
     }
 
     #if os(iOS)
+    private func flushIOSUserDataOnQueue() {
+        guard let tsv = pendingUserDataTSV else { return }
+        pendingUserDataTSV = nil
+        Self.writeSharedUserDataOnQueue(tsv)
+    }
+
+    private static func writeSharedUserDataOnQueue(_ tsv: String) {
+        let newSeq = IOSSharedSettings.parseUserDataSeq(tsv)
+        guard newSeq > 0 else { return }
+        if let existing = decodeSharedUserDataOnQueue(), existing.seq > newSeq {
+            return
+        }
+        if let compressed = try? (Data(tsv.utf8) as NSData).compressed(using: .zlib) as Data {
+            _ = IOSSharedSettings.write(compressed, account: IOSSharedSettings.userDataAccount)
+        }
+    }
+
+    private static func decodeSharedUserDataOnQueue() -> (seq: UInt64, tsv: String)? {
+        guard let compressed = IOSSharedSettings.read(account: IOSSharedSettings.userDataAccount) else {
+            return nil
+        }
+        let rawData: Data
+        if let inflated = try? (compressed as NSData).decompressed(using: .zlib) as Data {
+            rawData = inflated
+        } else {
+            rawData = compressed
+        }
+        guard let tsv = String(data: rawData, encoding: .utf8), !tsv.isEmpty else { return nil }
+        return (IOSSharedSettings.parseUserDataSeq(tsv), tsv)
+    }
+
+    func readSharedUserDataSync() -> (seq: UInt64, tsv: String)? {
+        guard !inMemoryOnly else { return nil }
+        return queue.sync {
+            Self.decodeSharedUserDataOnQueue()
+        }
+    }
+
+    func publishIOSUserDataSync(_ tsv: String) {
+        guard !inMemoryOnly, !tsv.isEmpty else { return }
+        queue.sync {
+            pendingUserDataFlush?.cancel()
+            pendingUserDataFlush = nil
+            pendingUserDataTSV = nil
+            Self.writeSharedUserDataOnQueue(tsv)
+        }
+    }
+
+    func publishIOSUserDataAsync(_ tsv: String) {
+        guard !inMemoryOnly, !tsv.isEmpty else { return }
+        queue.async {
+            Self.writeSharedUserDataOnQueue(tsv)
+        }
+    }
+
     func enqueueIOSTouchProfilePublish(
         profile: [TouchKeyCalibrationItem],
         lastKnown: [TouchKeyCalibrationItem]?,
@@ -661,7 +746,8 @@ private final class JuxuPersistenceWorker: @unchecked Sendable {
     }
 
     func checkIOSAppearanceUpdates(
-        onResult: @escaping @Sendable (Data?, [TouchKeyCalibrationItem]?, Date?) -> Void
+        knownSharedSeq: UInt64,
+        onResult: @escaping @Sendable (Data?, [TouchKeyCalibrationItem]?, Date?, (UInt64, String)?) -> Void
     ) {
         guard !inMemoryOnly else { return }
         queue.async { [self] in
@@ -678,7 +764,11 @@ private final class JuxuPersistenceWorker: @unchecked Sendable {
             } else {
                 mtime = nil
             }
-            onResult(prefsData, sharedTouch, mtime)
+            var newerSharedUser: (UInt64, String)? = nil
+            if let shared = Self.decodeSharedUserDataOnQueue(), shared.seq > knownSharedSeq {
+                newerSharedUser = (shared.seq, shared.tsv)
+            }
+            onResult(prefsData, sharedTouch, mtime, newerSharedUser)
         }
     }
     #endif
@@ -811,6 +901,7 @@ public final class JuxuBridge: ObservableObject {
     private let inMemoryOnly: Bool
     private var lastSharedTouchProfile: [TouchKeyCalibrationItem]?
     private var lastSharedPrefsData: Data?
+    private var lastSharedUserDataSeq: UInt64 = 0
     private var lastAppearanceCheckUptime: TimeInterval = 0
     #endif
 
@@ -1044,6 +1135,30 @@ public final class JuxuBridge: ObservableObject {
                 }
             }
         }
+        #if os(iOS)
+        if !inMemoryOnly && !hasSharedContainerAccess {
+            let localSeq = juxu_engine_user_data_seq(h)
+            if let shared = persistence.readSharedUserDataSync() {
+                if shared.seq > localSeq {
+                    if shared.tsv.withCString({ juxu_engine_import_user_data_tsv(h, $0) }) {
+                        lastSharedUserDataSeq = shared.seq
+                        _ = userDataURL.path.withCString { juxu_engine_save_user_data(h, $0) }
+                        lastLoadedUserDataMtime = (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
+                    }
+                } else {
+                    lastSharedUserDataSeq = max(localSeq, shared.seq)
+                    if localSeq > shared.seq && localSeq > 1 {
+                        let tsv = takeString(juxu_engine_export_user_data_tsv(h))
+                        persistence.publishIOSUserDataAsync(tsv)
+                    }
+                }
+            } else if localSeq > 1 {
+                lastSharedUserDataSeq = localSeq
+                let tsv = takeString(juxu_engine_export_user_data_tsv(h))
+                persistence.publishIOSUserDataAsync(tsv)
+            }
+        }
+        #endif
         refreshState()
         if refreshPublishedLists {
             refreshUserPhrases()
@@ -1116,11 +1231,20 @@ public final class JuxuBridge: ObservableObject {
             userDataSaveGeneration &+= 1
             #if os(iOS)
             publishTouchProfile()
+            let exportedTSV = (!inMemoryOnly && !hasSharedContainerAccess)
+                ? takeString(juxu_engine_export_user_data_tsv(h))
+                : ""
             #endif
             persistence.syncBarrier {
                 _ = userDataURL.path.withCString { juxu_engine_save_user_data(h, $0) }
                 lastLoadedUserDataMtime = (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
             }
+            #if os(iOS)
+            if !exportedTSV.isEmpty {
+                lastSharedUserDataSeq = juxu_engine_user_data_seq(h)
+                persistence.publishIOSUserDataSync(exportedTSV)
+            }
+            #endif
             if refreshPublishedLists {
                 refreshUserPhrases()
                 refreshTouchProfile()
@@ -1161,6 +1285,11 @@ public final class JuxuBridge: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.userDataSaveGeneration == gen else { return }
                 self.lastLoadedUserDataMtime = mtime
+                #if os(iOS)
+                if let h = self.handle {
+                    self.lastSharedUserDataSeq = max(self.lastSharedUserDataSeq, juxu_engine_user_data_seq(h))
+                }
+                #endif
             }
         }
     }
@@ -1178,7 +1307,8 @@ public final class JuxuBridge: ObservableObject {
         let now = ProcessInfo.processInfo.systemUptime
         guard now - lastAppearanceCheckUptime >= 0.8 else { return }
         lastAppearanceCheckUptime = now
-        persistence.checkIOSAppearanceUpdates { [weak self] prefsData, sharedTouch, mtime in
+        let knownSeq = max(lastSharedUserDataSeq, handle.map { juxu_engine_user_data_seq($0) } ?? 0)
+        persistence.checkIOSAppearanceUpdates(knownSharedSeq: knownSeq) { [weak self] prefsData, sharedTouch, mtime, sharedUser in
             Task { @MainActor [weak self] in
                 guard let self, let h = self.handle else { return }
                 var changed = false
@@ -1205,11 +1335,22 @@ public final class JuxuBridge: ObservableObject {
                     self.adoptSharedTouchProfile(sharedTouch)
                     changed = true
                 }
-                if let mtime,
+                if let (sSeq, sTSV) = sharedUser,
+                   !juxu_engine_is_user_dirty(h),
+                   sSeq > juxu_engine_user_data_seq(h) {
+                    if sTSV.withCString({ juxu_engine_import_user_data_tsv(h, $0) }) {
+                        self.lastSharedUserDataSeq = sSeq
+                        _ = self.userDataURL.path.withCString { juxu_engine_save_user_data(h, $0) }
+                        self.lastLoadedUserDataMtime = (try? FileManager.default.attributesOfItem(atPath: self.userDataURL.path)[.modificationDate]) as? Date
+                        self.refreshUserPhrases()
+                        changed = true
+                    }
+                } else if let mtime,
                    !juxu_engine_is_user_dirty(h),
                    self.lastLoadedUserDataMtime != mtime {
                     if self.userDataURL.path.withCString({ juxu_engine_load_user_data(h, $0) }) {
                         self.lastLoadedUserDataMtime = mtime
+                        self.lastSharedUserDataSeq = max(self.lastSharedUserDataSeq, juxu_engine_user_data_seq(h))
                         changed = true
                     }
                 }
@@ -1373,6 +1514,13 @@ public final class JuxuBridge: ObservableObject {
         guard let h = handle else { return "" }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2 else { return "" }
+        #if os(iOS)
+        if persist && !inMemoryOnly && !hasSharedContainerAccess {
+            if let shared = persistence.readSharedUserDataSync(), shared.seq > juxu_engine_user_data_seq(h) {
+                _ = shared.tsv.withCString { juxu_engine_import_user_data_tsv(h, $0) }
+            }
+        }
+        #endif
         let code = trimmed.withCString { takeString(juxu_engine_add_user_phrase(h, $0)) }
         if !code.isEmpty && persist {
             flushUserDataIfNeeded()
@@ -1384,6 +1532,13 @@ public final class JuxuBridge: ObservableObject {
 
     public func removeUserPhrase(_ text: String, persist: Bool = true) {
         guard let h = handle else { return }
+        #if os(iOS)
+        if persist && !inMemoryOnly && !hasSharedContainerAccess {
+            if let shared = persistence.readSharedUserDataSync(), shared.seq > juxu_engine_user_data_seq(h) {
+                _ = shared.tsv.withCString { juxu_engine_import_user_data_tsv(h, $0) }
+            }
+        }
+        #endif
         _ = text.withCString { juxu_engine_remove_user_phrase(h, $0) }
         if persist {
             flushUserDataIfNeeded()

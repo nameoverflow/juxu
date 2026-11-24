@@ -417,6 +417,35 @@ pub extern "C" fn juxu_engine_save_user_data(
 }
 
 #[no_mangle]
+pub extern "C" fn juxu_engine_import_user_data_tsv(
+    handle: *mut JuxuEngineHandle,
+    tsv_str: *const c_char,
+) -> bool {
+    let Some(h) = (unsafe { handle.as_mut() }) else {
+        return false;
+    };
+    let Some(src) = cstr_to_str(tsv_str) else {
+        return false;
+    };
+    let mut store = UserStore::from_tsv_str(src);
+    if let Some(d) = h.inner.active_dict() {
+        store.reindex_phrases(d);
+    }
+    if let Some(ref pd) = h.inner.pinyin_dict {
+        store.reindex_pinyin_phrases(pd);
+    }
+    h.inner.user = store;
+    true
+}
+
+#[no_mangle]
+pub extern "C" fn juxu_engine_user_data_seq(handle: *const JuxuEngineHandle) -> u64 {
+    unsafe { handle.as_ref() }
+        .map(|h| h.inner.user.seq)
+        .unwrap_or(0)
+}
+
+#[no_mangle]
 pub extern "C" fn juxu_engine_export_user_data_tsv(
     handle: *mut JuxuEngineHandle,
 ) -> *mut c_char {

@@ -440,6 +440,41 @@ struct SwiftBridgeTests {
             assert(d.handleFlagsChanged(keyCode: lShift, modifiers: [], timestamp: 20.08))
         }
 
+        // 9. Verify in-memory user_data TSV export/import & zlib round-trip (iOS Keychain sync path)
+        do {
+            let h1 = juxu_engine_new()!
+            let h2 = juxu_engine_new()!
+            defer {
+                juxu_engine_free(h1)
+                juxu_engine_free(h2)
+            }
+            let dict98 = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("Resources/Dicts/wubi98.wbdict").path
+            assert(dict98.withCString { juxu_engine_load_dict_mmap(h1, 98, $0) })
+            assert(dict98.withCString { juxu_engine_load_dict_mmap(h2, 98, $0) })
+            "schema = \"wubi98\"".withCString {
+                juxu_engine_set_config_toml(h1, $0)
+                juxu_engine_set_config_toml(h2, $0)
+            }
+            let seq0 = juxu_engine_user_data_seq(h1)
+            let codePtr = "句序测试".withCString { juxu_engine_add_user_phrase(h1, $0) }
+            if let codePtr { juxu_string_free(codePtr) }
+            let seq1 = juxu_engine_user_data_seq(h1)
+            assert(seq1 > seq0, "Expected user_data seq to increment after adding phrase")
+            let tsvPtr = juxu_engine_export_user_data_tsv(h1)!
+            let tsv = String(cString: tsvPtr)
+            juxu_string_free(tsvPtr)
+            let compressed = try! (Data(tsv.utf8) as NSData).compressed(using: .zlib) as Data
+            let inflated = try! (compressed as NSData).decompressed(using: .zlib) as Data
+            let roundtripTSV = String(data: inflated, encoding: .utf8)!
+            assert(roundtripTSV.withCString { juxu_engine_import_user_data_tsv(h2, $0) })
+            assert(juxu_engine_user_data_seq(h2) == seq1)
+            let listPtr = juxu_engine_list_user_phrases_json(h2)!
+            let listJSON = String(cString: listPtr)
+            juxu_string_free(listPtr)
+            assert(listJSON.contains("句序测试"), "Expected imported user phrase in h2, got \(listJSON)")
+        }
+
         print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Cangjie, Bayesian typo & macOS Voice MVP tests passed!")
     }
 }
