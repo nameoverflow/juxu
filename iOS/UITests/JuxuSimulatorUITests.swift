@@ -12,6 +12,93 @@ final class JuxuSimulatorUITests: XCTestCase {
     @MainActor private static var midPressShot: XCUIScreenshot?
 
     @MainActor
+    func testCommaKeyTapAndSwipeUp() {
+        for (ascii, swipeToggle, tapSymbol, swipeSymbol) in [
+            (false, true, "，", "。"), (true, true, ",", "."),
+            (false, false, "，", "。"), (true, false, ",", "."),
+        ] {
+            var layout = IOSKeyboardLayoutEngine()
+            layout.spaceCommaKeyEnabled = true
+            layout.asciiMode = ascii
+            layout.swipeUpInputEnabled = swipeToggle
+            let snapshot = layout.computeLayout(in: CGSize(width: 440, height: 220))
+            let key = snapshot.keys.first { $0.id == "B_comma" }!
+            let canvas = IOSKeyCanvasView()
+            canvas.updateSnapshot(snapshot)
+            var tapped: [String] = []
+            var swiped: [String] = []
+            var previews: [String] = []
+            canvas.onKeyTouchUp = { spec, _ in tapped.append(spec.primaryLabel) }
+            canvas.onKeySwipeUp = { swiped.append($0) }
+            canvas.onKeySlidePreview = { previews.append($0?.primaryLabel ?? "") }
+
+            let tap = SyntheticFingerTouch()
+            tap.mockPoint = CGPoint(x: key.frame.midX, y: key.frame.midY)
+            tap.mockTimestamp = 10.0
+            canvas.touchesBegan([tap], with: nil)
+            tap.mockTimestamp = 10.06
+            canvas.touchesEnded([tap], with: nil)
+            XCTAssertEqual(tapped, [tapSymbol])
+            XCTAssertEqual(swiped, [])
+
+            tapped = []
+            let swipe = SyntheticFingerTouch()
+            swipe.mockPoint = CGPoint(x: key.frame.midX, y: key.frame.midY)
+            swipe.mockTimestamp = 20.0
+            canvas.touchesBegan([swipe], with: nil)
+            swipe.mockPoint.y -= 30.0
+            swipe.mockTimestamp = 20.08
+            canvas.touchesMoved([swipe], with: nil)
+            canvas.touchesEnded([swipe], with: nil)
+            XCTAssertEqual(tapped, [])
+            XCTAssertEqual(swiped, [swipeSymbol])
+            XCTAssertEqual(previews, [swipeSymbol], "Swipe must show the same preview as letter keys")
+        }
+    }
+
+    /// Drives real touches through the canvas. The handler mirrors the controller's `.modeToggle` case.
+    @MainActor
+    func testModeKeyKeepsNumberPageAndSwitchesContent() {
+        let size = CGSize(width: 440, height: 220)
+        for page in [IOSKeyPlane.numbers, .symbols] {
+            var layout = IOSKeyboardLayoutEngine()
+            layout.spaceCommaKeyEnabled = true
+            layout.switchPlane(page)
+            let modeFrame = layout.computeLayout(in: size).keys.first { $0.kind == .modeToggle }!.frame
+            let canvas = IOSKeyCanvasView()
+            canvas.updateSnapshot(layout.computeLayout(in: size))
+            canvas.onKeyTouchUp = { spec, _ in
+                if spec.kind == .modeToggle {
+                    layout.asciiMode.toggle()
+                    canvas.updateSnapshot(layout.computeLayout(in: size))
+                }
+            }
+            func tapMode(at clock: TimeInterval) {
+                let touch = SyntheticFingerTouch()
+                touch.mockPoint = CGPoint(x: modeFrame.midX, y: modeFrame.midY)
+                touch.mockTimestamp = clock
+                canvas.touchesBegan([touch], with: nil)
+                touch.mockTimestamp = clock + 0.06
+                canvas.touchesEnded([touch], with: nil)
+            }
+            let probe = page == .numbers ? ("，", ",") : ("《", "<")
+            func hasSymbol(_ symbol: String) -> Bool {
+                layout.computeLayout(in: size).keys.contains { $0.kind == .symbol(symbol) }
+            }
+            XCTAssertTrue(hasSymbol(probe.0))
+            tapMode(at: 10.0)
+            XCTAssertTrue(layout.asciiMode)
+            XCTAssertEqual(layout.plane, page)
+            XCTAssertTrue(hasSymbol(probe.1))
+            XCTAssertFalse(hasSymbol(probe.0))
+            tapMode(at: 11.0)
+            XCTAssertFalse(layout.asciiMode)
+            XCTAssertEqual(layout.plane, page)
+            XCTAssertTrue(hasSymbol(probe.0))
+        }
+    }
+
+    @MainActor
     func testMultiTouchRolloverAndLiftFlickHysteresis() {
         let canvas = IOSKeyCanvasView()
         let snapshot = IOSKeyboardLayoutEngine().computeLayout(in: CGSize(width: 440, height: 219))

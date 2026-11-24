@@ -7,11 +7,11 @@
 use crate::code::PackedCode;
 use crate::config::JuxuConfig;
 use crate::engine::{Candidate, CandidateBadge};
-use crate::english::{format_english_display, EnDictView};
+use crate::english::{resolve_english_display, EnDictView};
 use crate::format::AuxView;
 use crate::neural::{NeuralView, RwkvState, TOK_UNK};
 use crate::personalization::Context as PersonalContext;
-use crate::pinyin_dict::{base_initial_id, PinyinDictView};
+use crate::pinyin_dict::{base_initial_id, PinyinDictView, SylConstraint};
 use crate::typo::{
     key_choices_for_obs, letter_to_t9_digit, softmax_confidences, t9_key_choices_for_obs,
     t9_letters_for_digit, CorrectionKind, KeyLayout, KeyObs,
@@ -676,12 +676,28 @@ fn build_lattice(
                         {
                             continue;
                         }
+                        if !is_repeat {
+                            let (cx, cy) = decoder.layout.center_of(exact_bytes[drop_pos]);
+                            let near_neighbor = (drop_pos > 0 && {
+                                let (px, py) = decoder.layout.center_of(exact_bytes[drop_pos - 1]);
+                                (cx - px).powi(2) + (cy - py).powi(2) <= 2.6
+                            }) || (drop_pos + 1 < len && {
+                                let (nx, ny) = decoder.layout.center_of(exact_bytes[drop_pos + 1]);
+                                (cx - nx).powi(2) + (cy - ny).powi(2) <= 2.6
+                            });
+                            if !near_neighbor {
+                                continue;
+                            }
+                        }
                         let mut b = Vec::with_capacity(len - 1);
                         b.extend_from_slice(&exact_bytes[..drop_pos]);
                         b.extend_from_slice(&exact_bytes[drop_pos + 1..]);
                         let s = String::from_utf8_lossy(&b).into_owned();
                         if decoder.dict.lookup_syllable_id(&s).is_some() {
-                            let cost = if is_repeat { -3.6 } else { -5.2 };
+                            // Non-repeat letter drop (`main -> man`) already gains `-1.35` fewer keys of
+                            // syllable length than `end - start`, so charge an explicit `-6.55` total offset
+                            // (`-5.2 - 1.35`) so `1.35 * (end - start) + cost == 1.35 * s.len() - 5.2`!
+                            let cost = if is_repeat { -3.6 } else { -6.55 };
                             hyps.push((s, exact_lp, CorrectionKind::NeighborKey, cost));
                         }
                     }
@@ -766,12 +782,17 @@ fn build_lattice(
 
     add_latin_lattice_edges(observations, raw_code, decoder, &mut edges_by_end, false);
 
-    // Prune and deduplicate edges per `end`
+    // Prune and deduplicate edges per `end` (keep Exact edges ahead of speculative NeighborKey typos
+    // so valid Latin / Initial edges are never evicted by 20+ single-letter substitution hypotheses!)
     for list in &mut edges_by_end {
         list.sort_by(|a, b| {
-            (b.spatial_logp + b.kind_cost)
-                .partial_cmp(&(a.spatial_logp + a.kind_cost))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let a_spec = matches!(a.correction, CorrectionKind::NeighborKey);
+            let b_spec = matches!(b.correction, CorrectionKind::NeighborKey);
+            a_spec.cmp(&b_spec).then_with(|| {
+                (b.spatial_logp + b.kind_cost)
+                    .partial_cmp(&(a.spatial_logp + a.kind_cost))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
         let mut deduped: Vec<LatticeEdge> = Vec::with_capacity(24);
         for edge in list.drain(..) {
@@ -1049,6 +1070,59 @@ fn build_t9_lattice(
                     });
                 }
             }
+
+            // Mixed Chinese-English in T9 (`2..=12` digits): match both 1-shot personal `ENWORD`s
+            // (`uv`, `agy`, `sglang`, `Arbitero`) and corpus-frequency `english.endict` words (`App`, `bug`, `iOS`).
+            if (2..=12).contains(&len) {
+                let mut seen_t9_en: HashSet<String> = HashSet::new();
+                for (udisp, ucnt) in decoder.user.lookup_english_t9(&exact_bytes, 2) {
+                    let lower_u = udisp.to_ascii_lowercase();
+                    let dict_disp = decoder.english.lookup_exact(&lower_u).map(|e| e.display);
+                    let disp = resolve_english_display("", Some(udisp), dict_disp);
+                    if seen_t9_en.insert(disp.to_ascii_lowercase()) {
+                        let w = (54_000u32 + ucnt.min(10) * 1_000).min(65_535) as u16;
+                        let kind_cost = 1.15 * (len as f32)
+                            + if had_exact_full { -3.0 } else { -0.8 }
+                            + 0.35 * ((ucnt as f32) + 1.0).ln();
+                        edges_by_end[actual_end].push(LatticeEdge {
+                            start,
+                            end: actual_end,
+                            syl: SylMatch::Latin {
+                                display: disp.clone(),
+                                weight: w,
+                                is_oov: false,
+                                is_explicit_upper: false,
+                            },
+                            spatial_logp: exact_lp,
+                            kind_cost,
+                            correction: CorrectionKind::Exact,
+                            display_syl: disp,
+                        });
+                    }
+                }
+                for e in decoder.english.lookup_t9(&exact_bytes, 2) {
+                    if seen_t9_en.insert(e.key.to_owned()) {
+                        let w_bonus = (e.weight as f32) / 65535.0;
+                        let kind_cost = 1.05 * (len as f32)
+                            + if had_exact_full { -4.6 } else { -1.6 }
+                            + w_bonus;
+                        edges_by_end[actual_end].push(LatticeEdge {
+                            start,
+                            end: actual_end,
+                            syl: SylMatch::Latin {
+                                display: e.display.to_owned(),
+                                weight: e.weight,
+                                is_oov: false,
+                                is_explicit_upper: false,
+                            },
+                            spatial_logp: exact_lp,
+                            kind_cost,
+                            correction: CorrectionKind::Exact,
+                            display_syl: e.display.to_owned(),
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -1223,17 +1297,18 @@ fn add_latin_lattice_edges(
                 }
             });
             if user_hit.is_some() || dict_hit.is_some() {
-                let (canonical, weight, is_user) = if let Some((disp, cnt)) = user_hit {
-                    (
-                        disp.to_owned(),
-                        (54_000u32 + cnt.min(10) * 1000).min(65_535) as u16,
-                        true,
-                    )
+                let is_user = user_hit.is_some();
+                let weight = if let Some((_, cnt)) = user_hit {
+                    let dict_w = dict_hit.as_ref().map_or(48_000u32, |x| x.1 as u32);
+                    (dict_w.max(54_000) + cnt.min(10) * 1000).min(65_535) as u16
                 } else {
-                    let (disp, w, _) = dict_hit.unwrap();
-                    (disp, w, false)
+                    dict_hit.as_ref().unwrap().1
                 };
-                let display = format_english_display(raw_slice, &canonical);
+                let display = resolve_english_display(
+                    raw_slice,
+                    user_hit.map(|x| x.0),
+                    dict_hit.as_ref().map(|x| x.0.as_str()),
+                );
                 let has_vowel = lower
                     .bytes()
                     .any(|b| matches!(b, b'a' | b'e' | b'i' | b'o' | b'u' | b'y'));
@@ -1251,28 +1326,42 @@ fn add_latin_lattice_edges(
                     // Cuts across valid Chinese full syllables (e.g. `chaos` + `hi` slicing through `chao'shi` = 超时)
                     0.95 * (len as f32) - 6.8 + if is_user { 1.5 } else { 0.0 }
                 } else if !exact_py {
-                    let prefix_is_exact_py = len >= 3 && can_parse_exact_full(start, end - 1);
+                    let prefix_is_exact_py = len >= 3
+                        && can_parse_exact_full(start, end - 1)
+                        && base_initial_id(&lower[len - 1..]) > 0;
                     if !is_user && len == 2 {
                         0.85 * (len as f32) - 5.2 + w_bonus * 0.5
                     } else if !is_user && len == 3 && !has_vowel {
                         // Consonant-only 3-letter acronym (e.g. `sql`, `ssh`, `pdf`, `cbd`): keep gentle so
                         // Chinese 3-letter initial abbreviations (`srf`, `jsj`, `cbd`) still win cleanly
                         0.90 * (len as f32) - 6.2 + w_bonus * 0.5
-                    } else if !is_user && prefix_is_exact_py && weight < 42_000 {
-                        // Low-frequency English word that is a valid Chinese syllable + trailing initial
-                        // (e.g. `tas` = `ta's` 他是, `dans` = `dan's` 但是)
-                        0.90 * (len as f32) - 5.8 + w_bonus * 0.5
+                    } else if !is_user && !is_shuangpin && prefix_is_exact_py {
+                        // Continuous frequency-calibrated prior for unanchored lowercase words whose spelling
+                        // also parses as `exact Mandarin syllable + trailing consonant initial`:
+                        // - rare/mid words (`tas`=18k, `bud`=25k, `dans`=27k, `des`=44k at len=3) stay well below
+                        //   Chinese (`他是`, `我不懂`, `但是`, `的是`);
+                        // - ultra-common 4+ letter words at segment start (`main`=58k after `把这个分支合到`)
+                        //   remain competitive so contextual RWKV promotes `main` to #1!
+                        let freq_norm = ((weight as f32 - 36_000.0) / 24_000.0).clamp(-1.0, 1.0);
+                        if len <= 3 || start > 0 {
+                            0.85 * (len as f32) - 5.0 + 1.4 * freq_norm
+                        } else {
+                            1.10 * (len as f32) - 3.6 + 2.4 * freq_norm
+                        }
+                    } else if !is_user && !is_shuangpin && start > 0 && len <= 3 {
+                        // Mid-sentence 2..3-letter unanchored lowercase slice (`z+his` in `zhis`, `y+on` in `buhuiyon`)
+                        0.85 * (len as f32) - 5.2 + w_bonus * 0.5
                     } else if is_shuangpin {
-                        1.05 * (len as f32) - 2.8 + w_bonus
+                        1.05 * (len as f32) - 2.6 + w_bonus
                     } else {
-                        1.15 * (len as f32) - 2.6 + w_bonus
+                        1.15 * (len as f32) - 2.4 + w_bonus
                     }
                 } else if !is_shuangpin && len <= 3 && decoder.dict.lookup_syllable_id(&lower).is_some() {
                     // Single exact Chinese syllable (e.g. `he`, `me`, `man`, `can`, `you`, `run`) -> keep Chinese strongly preferred
                     0.85 * (len as f32) - 6.5 + if is_user { 1.5 } else { 0.0 }
                 } else if is_shuangpin {
-                    // In Shuangpin almost every 2-letter pair is valid, so require >= 4 letters or user-learned for lowercase English
-                    if len >= 4 || is_user {
+                    // In Shuangpin almost every 2-letter pair is valid: allow `len >= 4`, `is_user`, or high-frequency 3-letter words
+                    if len >= 4 || is_user || (len == 3 && weight >= 48_000) {
                         0.95 * (len as f32) - 4.8 + w_bonus
                     } else {
                         continue;
@@ -1298,32 +1387,82 @@ fn add_latin_lattice_edges(
                 continue;
             }
 
-            // 2c. Open-vocabulary OOV `RawLatin` fallback for impossible-pinyin spans
-            //     (e.g. `worktree`, `stillfail`, `wbdict`, `kqueue`, `tokio`, `serde`, `nomofu`).
-            //     Require `len >= 4`, at least one vowel, and at least one position uncovered even by
-            //     1-edit Pinyin typo syllables so spelling typos like `zhogwen` -> `中文` still rescue cleanly.
-            if !is_shuangpin && !has_upper && len >= 4 {
-                let has_vowel = lower
-                    .bytes()
-                    .any(|b| matches!(b, b'a' | b'e' | b'i' | b'o' | b'u' | b'y'));
-                let has_impossible = has_vowel && (start..end).any(|p| !covered_by_any_full[p]);
-                // Don't treat a valid Chinese full-syllable prefix + 1..2 trailing initials
-                // (e.g. `shangp`, `woguor`, `heyiw`, `shurf`) or a span dominated by valid Chinese
-                // full syllables (e.g. `nshitiganhuihaohend` = 17/19 Chinese) as an OOV English word.
-                let is_chinese_plus_tail_init = (end >= start + 2 && can_parse_exact_full(start, end - 1))
-                    || (end >= start + 3 && can_parse_exact_full(start, end - 2));
-                let exact_covered_cnt = (start..end).filter(|&p| covered_by_exact_full[p]).count();
-                if has_impossible
-                    && !can_parse_exact_full(start, end)
-                    && !is_chinese_plus_tail_init
-                    && !covered_by_exact_full[end - 1]
-                    && exact_covered_cnt * 2 <= len
-                {
-                    // Only start/end on clean boundaries (0, n, or adjacent to exact-full-covered positions)
-                    let left_clean = start == 0 || covered_by_exact_full[start - 1] || !covered_by_exact_full[start];
-                    let right_clean = end == n || covered_by_exact_full[end] || !covered_by_exact_full[end - 1];
-                    if left_clean && right_clean {
-                        let kind_cost = 0.05 * (len as f32) - 3.2;
+            // 2c. Open-vocabulary OOV `RawLatin` fallback for phonologically impossible spans
+            //     (e.g. `worktree`, `stillfail`, `wbdict`, `sglang`, `nixpkgs`, `tokio`, `serde`, `nomofu`).
+            if !has_upper && len >= if is_shuangpin { 5 } else { 4 } {
+                let is_vowel_byte = |b: u8| matches!(b, b'a' | b'e' | b'i' | b'o' | b'u' | b'y');
+                let has_vowel = lower.bytes().any(is_vowel_byte);
+                if is_shuangpin {
+                    let lb = lower.as_bytes();
+                    let has_impossible_sp_pair = lb
+                        .windows(2)
+                        .any(|w| xiaohe_sp_decode_pair(w[0], w[1], decoder.dict).is_empty());
+                    if has_vowel && has_impossible_sp_pair && !can_parse_exact_full(start, end) {
+                        edges_by_end[actual_end].push(LatticeEdge {
+                            start,
+                            end: actual_end,
+                            syl: SylMatch::Latin {
+                                display: raw_slice.to_owned(),
+                                weight: 18_000,
+                                is_oov: true,
+                                is_explicit_upper: false,
+                            },
+                            spatial_logp: 0.0,
+                            kind_cost: 0.15 * (len as f32) - 3.0,
+                            correction: CorrectionKind::Exact,
+                            display_syl: raw_slice.to_owned(),
+                        });
+                    }
+                } else {
+                    let has_impossible = has_vowel && (start..end).any(|p| !covered_by_any_full[p]);
+                    let lb = lower.as_bytes();
+                    let is_mandarin_vowel = |b: u8| matches!(b, b'a' | b'e' | b'i' | b'o' | b'u' | b'v');
+                    // Block `exact Mandarin syllables + trailing consonant initials` (`desjsj`, `tadaxuexuedesjsj`, `zhez`).
+                    let can_parse_exact_plus_initials = (0..=len).any(|k| {
+                        can_parse_exact_full(start, start + k)
+                            && lb[k..].iter().all(|&b| !is_mandarin_vowel(b))
+                    });
+                    // Block `leading Mandarin consonant initials + exact Mandarin syllables`
+                    // (`smen` = 什么, `sjida` = 世纪大, `bjdaxue` = 北京大学, `sjsjde`), while allowing
+                    // valid 2-consonant Latin onset clusters before a single syllable (`sglang`, `clang`, `flang`).
+                    let can_parse_initials_plus_exact = (1..len).any(|k| {
+                        if !lb[..k].iter().all(|&b| !is_mandarin_vowel(b))
+                            || !can_parse_exact_full(start + k, end)
+                        {
+                            return false;
+                        }
+                        if k == 2 && end - (start + k) <= 4 {
+                            let (c1, c2) = (lb[0], lb[1]);
+                            let latin_onset =
+                                c1 == b's' || matches!(c2, b'l' | b'r' | b'w' | b'h' | b'y');
+                            !latin_onset
+                        } else if k == 3 && end - (start + k) <= 4 {
+                            let latin_onset3 = (lb[0] == b's'
+                                && matches!(lb[2], b'l' | b'r' | b'w' | b'y'))
+                                || (lb[1] == b'h' && matches!(lb[2], b'r' | b'l' | b'w'));
+                            !latin_onset3
+                        } else {
+                            true
+                        }
+                    });
+                    // Prevent OOV spans from swallowing an adjacent >=3-letter exact Mandarin syllable
+                    // (`yong` or `xie` in `woyongworktreexie`) when the remaining >=4-letter core already
+                    // holds an impossible non-Pinyin cluster.
+                    let swallows_outer_mandarin = len >= 7
+                        && ((3..=len - 4).any(|k| {
+                            can_parse_exact_full(start, start + k)
+                                && (start + k..end).any(|p| !covered_by_any_full[p])
+                        }) || (4..=len - 3).any(|k| {
+                            (start..start + k).any(|p| !covered_by_any_full[p])
+                                && can_parse_exact_full(start + k, end)
+                        }));
+                    if has_impossible
+                        && !can_parse_exact_full(start, end)
+                        && !can_parse_exact_plus_initials
+                        && !can_parse_initials_plus_exact
+                        && !swallows_outer_mandarin
+                    {
+                        let kind_cost = 0.55 * (len as f32) + 0.6;
                         edges_by_end[actual_end].push(LatticeEdge {
                             start,
                             end: actual_end,
@@ -1371,7 +1510,7 @@ fn edge_parent_limit(edge: &LatticeEdge) -> usize {
             if edge.correction == CorrectionKind::Exact && edge.start <= 4 {
                 8
             } else if edge.correction == CorrectionKind::Exact {
-                4
+                6
             } else {
                 2
             }
@@ -1905,11 +2044,12 @@ fn extend_pinyin_layer(
             for e2 in lattice[end]
                 .iter()
                 .filter(|e| {
-                    (include_prefix_edges || !matches!(e.syl, SylMatch::Prefix(_)))
+                    e.correction == CorrectionKind::Exact
+                        && (include_prefix_edges || !matches!(e.syl, SylMatch::Prefix(_)))
                         && !matches!(e.syl, SylMatch::Latin { .. })
                         && e.start > 0
                 })
-                .take(2)
+                .take(3)
             {
                 for e1 in lattice[e2.start]
                     .iter()
@@ -1917,9 +2057,33 @@ fn extend_pinyin_layer(
                         e.correction == CorrectionKind::Exact
                             && !matches!(e.syl, SylMatch::Latin { .. } | SylMatch::Prefix(_))
                     })
-                    .take(2)
+                    .take(3)
                 {
-                    add_req(e1.start, 2);
+                    add_req(e1.start, 4);
+                    if decoder.user.has_pinyin_phrases() && e1.start > 0 {
+                        for e0 in lattice[e1.start]
+                            .iter()
+                            .filter(|e| {
+                                e.correction == CorrectionKind::Exact
+                                    && !matches!(e.syl, SylMatch::Latin { .. } | SylMatch::Prefix(_))
+                            })
+                            .take(2)
+                        {
+                            add_req(e0.start, 1);
+                            if e0.start > 0 {
+                                for em1 in lattice[e0.start]
+                                    .iter()
+                                    .filter(|e| {
+                                        e.correction == CorrectionKind::Exact
+                                            && !matches!(e.syl, SylMatch::Latin { .. } | SylMatch::Prefix(_))
+                                    })
+                                    .take(1)
+                                {
+                                    add_req(em1.start, 1);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2098,7 +2262,7 @@ fn extend_pinyin_layer(
                         }
                     }
                 }
-                let per_parent_keep = 8usize;
+                let per_parent_keep = 12usize;
                 for parent in parents_slice {
                     let Some(parent_rc) = parent.ready_rc() else {
                         continue;
@@ -2305,28 +2469,36 @@ fn extend_pinyin_layer(
                     .collect(),
                 SylMatch::Initial(init_id, is_digraph) => {
                     let sids = decoder.dict.syllables_with_prefix(&edge.display_syl);
-                    let mut out = Vec::with_capacity(160);
-                    let mut seen_c = HashSet::with_capacity(160);
+                    let mut head_per_syl = Vec::with_capacity(64);
+                    let mut rest_pool = Vec::with_capacity(128);
+                    let mut seen_c = HashSet::with_capacity(192);
                     for sid in sids {
                         let (sid_init, sid_dg) = decoder.dict.syllable_init(sid);
                         if sid_init == *init_id && (!*is_digraph || sid_dg) {
-                            for e in decoder
+                            for (rank_in_syl, e) in decoder
                                 .dict
                                 .lookup_chars(sid, decoder.config.enable_rare_charset)
                                 .into_iter()
-                                .take(6)
+                                .take(8)
+                                .enumerate()
                             {
                                 if let Some(ch) = e.text.chars().next() {
                                     if seen_c.insert(ch) {
-                                        out.push((ch, e.weight));
+                                        if rank_in_syl < 2 {
+                                            head_per_syl.push((ch, e.weight));
+                                        } else {
+                                            rest_pool.push((ch, e.weight));
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                    out.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-                    out.truncate(max_n);
-                    out
+                    head_per_syl.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                    rest_pool.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                    head_per_syl.extend(rest_pool);
+                    head_per_syl.truncate(max_n);
+                    head_per_syl
                 }
                 SylMatch::Prefix(pref) => {
                     let sids = decoder.dict.syllables_with_prefix(pref);
@@ -2372,14 +2544,15 @@ fn extend_pinyin_layer(
         for e2 in lattice[end]
             .iter()
             .filter(|e| {
-                (include_prefix_edges || !matches!(e.syl, SylMatch::Prefix(_)))
+                e.correction == CorrectionKind::Exact
+                    && (include_prefix_edges || !matches!(e.syl, SylMatch::Prefix(_)))
                     && !matches!(e.syl, SylMatch::Latin { .. })
                     && e.start > 0
             })
-            .take(2)
+            .take(3)
         {
             let e2_is_init = matches!(e2.syl, SylMatch::Initial(_, _));
-            let c2_raw = collect_edge_chars(e2, if e2_is_init { 64 } else { 48 });
+            let c2_raw = collect_edge_chars(e2, if e2_is_init { 128 } else { 48 });
             if c2_raw.is_empty() {
                 continue;
             }
@@ -2391,21 +2564,21 @@ fn extend_pinyin_layer(
                     e.correction == CorrectionKind::Exact
                         && !matches!(e.syl, SylMatch::Latin { .. } | SylMatch::Prefix(_))
                 })
-                .take(2)
+                .take(3)
             {
                 let gps = &layers[e1.start];
                 if gps.is_empty() {
                     continue;
                 }
                 let e1_is_init = matches!(e1.syl, SylMatch::Initial(_, _));
-                let c1_raw = collect_edge_chars(e1, if e1_is_init { 120 } else { 80 });
+                let c1_raw = collect_edge_chars(e1, if e1_is_init { 128 } else { 80 });
                 if c1_raw.is_empty() {
                     continue;
                 }
                 let syl_score1 = 1.8 * e1.spatial_logp + e1.kind_cost;
                 let c1_keep = if e1_is_init { 40 } else { 28 };
 
-                for gp in gps.iter().take(2) {
+                for gp in gps.iter().take(4) {
                     let Some(gp_rc) = gp.ready_rc() else {
                         continue;
                     };
@@ -2580,6 +2753,181 @@ fn extend_pinyin_layer(
         }
     }
 
+    // Unified Personal Lexicon (`UserStore`) across Full Pinyin, Xiaohe Shuangpin, and T9:
+    // Surface manual (`auto_composed == false`) and confirmed (`count >= 2`) user phrases
+    // learned in Wubi or Pinyin, scored under exact RWKV + personal log-prior!
+    if decoder.user.has_pinyin_phrases() {
+        let mut edge_chains: Vec<Vec<&LatticeEdge>> = Vec::new();
+        for e_last in lattice[end]
+            .iter()
+            .filter(|e| {
+                (include_prefix_edges || !matches!(e.syl, SylMatch::Prefix(_)))
+                    && !matches!(e.syl, SylMatch::Latin { .. })
+            })
+            .take(3)
+        {
+            if e_last.start > 0 {
+                for e_prev in lattice[e_last.start]
+                    .iter()
+                    .filter(|e| {
+                        e.correction == CorrectionKind::Exact
+                            && !matches!(e.syl, SylMatch::Latin { .. } | SylMatch::Prefix(_))
+                    })
+                    .take(2)
+                {
+                    edge_chains.push(vec![e_prev, e_last]);
+                    if e_prev.start > 0 {
+                        for e_p2 in lattice[e_prev.start]
+                            .iter()
+                            .filter(|e| {
+                                e.correction == CorrectionKind::Exact
+                                    && !matches!(e.syl, SylMatch::Latin { .. } | SylMatch::Prefix(_))
+                            })
+                            .take(2)
+                        {
+                            edge_chains.push(vec![e_p2, e_prev, e_last]);
+                            if e_p2.start > 0 {
+                                for e_p3 in lattice[e_p2.start]
+                                    .iter()
+                                    .filter(|e| {
+                                        e.correction == CorrectionKind::Exact
+                                            && !matches!(e.syl, SylMatch::Latin { .. } | SylMatch::Prefix(_))
+                                    })
+                                    .take(1)
+                                {
+                                    edge_chains.push(vec![e_p3, e_p2, e_prev, e_last]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for chain in edge_chains {
+            let start_pos = chain[0].start;
+            let Some(gp) = layers[start_pos].first() else {
+                continue;
+            };
+            let Some(gp_rc) = gp.ready_rc() else {
+                continue;
+            };
+            let mut constraints: Vec<SylConstraint<'_>> = Vec::with_capacity(chain.len());
+            let mut init_cnt = 0usize;
+            let mut syl_sum = 0.0f32;
+            let mut any_corr = gp.any_corrected;
+            for &ce in &chain {
+                syl_sum += 1.8 * ce.spatial_logp + ce.kind_cost;
+                if ce.correction != CorrectionKind::Exact {
+                    any_corr = true;
+                }
+                match &ce.syl {
+                    SylMatch::Full(sid) => constraints.push(SylConstraint::Full(*sid)),
+                    SylMatch::Initial(id, dg) => {
+                        init_cnt += 1;
+                        constraints.push(SylConstraint::Initial(*id, *dg));
+                    }
+                    SylMatch::Prefix(p) => constraints.push(SylConstraint::Prefix(p.as_str())),
+                    SylMatch::Latin { .. } => break,
+                }
+            }
+            if constraints.len() != chain.len() {
+                continue;
+            }
+            for (phrase_text, ucnt, auto_comp) in
+                decoder.user.lookup_pinyin_phrases_confirmed(&constraints, decoder.dict, 2)
+            {
+                let chars: Vec<char> = phrase_text.chars().collect();
+                if chars.len() != chain.len() {
+                    continue;
+                }
+                let mut full_text = String::with_capacity(gp.text.len() + phrase_text.len());
+                full_text.push_str(&gp.text);
+                full_text.push_str(phrase_text);
+                let user_prior = if !auto_comp {
+                    2.6 + 0.35 * ((ucnt as f32) + 1.0).ln()
+                } else if ucnt >= 3 {
+                    2.0 + 0.30 * ((ucnt as f32) + 1.0).ln()
+                } else {
+                    1.35
+                } + 1.65 * (init_cnt as f32);
+
+                let mut pctx = gp.personal_context;
+                let (lm_sum, path_state) = if let Some(nv) = &decoder.model {
+                    let mut st = (**gp_rc).clone();
+                    let mut acc_lp = 0.0f32;
+                    for (ci, &ch) in chars.iter().enumerate() {
+                        acc_lp += score_char_pure_neural(
+                            nv,
+                            &st,
+                            ch,
+                            50_000,
+                            decoder.dict,
+                            personal,
+                            pctx,
+                            personalize,
+                            use_personal_states,
+                        );
+                        pctx = pctx.push(ch);
+                        if ci + 1 < chars.len() {
+                            nv.step_token(nv.char_to_token(ch), &mut st);
+                        }
+                    }
+                    let last_ch = *chars.last().unwrap();
+                    let ps = if chars.len() == 1 {
+                        PathState::PendingChar {
+                            parent: Rc::clone(gp_rc),
+                            tok: nv.char_to_token(last_ch),
+                        }
+                    } else {
+                        PathState::PendingChar {
+                            parent: Rc::new(st),
+                            tok: nv.char_to_token(last_ch),
+                        }
+                    };
+                    (acc_lp, ps)
+                } else {
+                    for &ch in &chars {
+                        pctx = pctx.push(ch);
+                    }
+                    (-2.0 * (chars.len() as f32), PathState::Ready(Rc::clone(gp_rc)))
+                };
+
+                let total_score = gp.score + syl_sum + lm_sum + user_prior;
+                let mut boundaries = gp.boundaries.clone();
+                let mut cur_bytes = gp.text.len();
+                for (&ce, &ch) in chain.iter().zip(chars.iter()) {
+                    cur_bytes += ch.len_utf8();
+                    boundaries.push(PinyinBoundary {
+                        keys: ce.end,
+                        text_bytes: cur_bytes,
+                        syl_display: ce.display_syl.clone(),
+                        correction: ce.correction,
+                    });
+                }
+                if let Some(existing) = next_paths.iter_mut().find(|p| p.text == full_text) {
+                    if total_score > existing.score {
+                        existing.score = total_score;
+                        existing.boundaries = boundaries;
+                        existing.path_state = path_state;
+                        existing.personal_context = pctx;
+                        existing.any_corrected = any_corr;
+                    }
+                } else {
+                    seen_texts.insert(full_text.clone());
+                    next_paths.push(PinyinPath {
+                        text: full_text,
+                        score: total_score,
+                        boundaries,
+                        path_state,
+                        personal_context: pctx,
+                        any_corrected: any_corr,
+                    });
+                }
+            }
+        }
+    }
+
     next_paths.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
     next_paths.truncate(BEAM_WIDTH);
     next_paths
@@ -2609,14 +2957,22 @@ fn build_pinyin_candidates(
         .first()
         .map_or(0, |p| p.text.chars().count());
     let is_long_sentence = top_char_len >= 4;
-    let max_full_sentences = if is_long_sentence { 3usize } else { BEAM_WIDTH };
+    let is_multi_char = top_char_len >= 2;
+    let head_full_cap = if is_long_sentence {
+        3usize
+    } else if is_multi_char {
+        4usize
+    } else {
+        BEAM_WIDTH
+    };
     let top_score = full_paths.first().map_or(f32::NEG_INFINITY, |p| p.score);
 
     let raw_scores: Vec<f32> = full_paths.iter().map(|p| p.score).collect();
     let confs = softmax_confidences(&raw_scores);
     let mut full_added = 0usize;
+    let mut deferred_full_cands: Vec<PinyinCandidate> = Vec::new();
     for (idx, path) in full_paths.iter().enumerate() {
-        if full_added >= max_full_sentences {
+        if is_long_sentence && full_added >= 3 {
             break;
         }
         if is_long_sentence && full_added >= 1 && path.score < top_score - 4.5 {
@@ -2624,7 +2980,7 @@ fn build_pinyin_candidates(
         }
         if seen.insert(path.text.clone()) {
             let hint = path.correction_hint();
-            out.push(PinyinCandidate {
+            let pc = PinyinCandidate {
                 candidate: Candidate {
                     text: path.text.clone(),
                     matched_code: PackedCode::EMPTY,
@@ -2639,7 +2995,12 @@ fn build_pinyin_candidates(
                 },
                 consumed_keys: best_end,
                 boundaries: path.boundaries.clone(),
-            });
+            };
+            if full_added < head_full_cap {
+                out.push(pc);
+            } else {
+                deferred_full_cands.push(pc);
+            }
             full_added += 1;
         }
     }
@@ -2686,8 +3047,11 @@ fn build_pinyin_candidates(
             })
     });
     let mut prefix_words_added = 0usize;
-    let max_prefix_words = if is_long_sentence { 5usize } else { 8usize };
+    let max_prefix_words = if is_long_sentence { 4usize } else { 6usize };
+    let top_first_char = full_paths.first().and_then(|p| p.text.chars().next());
+    let mut same_head_prefix_cnt = 0usize;
     let mut per_span_counts: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut deferred_prefix_cands: Vec<PinyinCandidate> = Vec::new();
     for pw in prefix_words {
         if prefix_words_added >= max_prefix_words {
             break;
@@ -2696,9 +3060,16 @@ fn build_pinyin_candidates(
         if *span_cnt >= 2 {
             continue;
         }
+        let shares_head = top_first_char.is_some() && pw.text.chars().next() == top_first_char;
+        if shares_head && same_head_prefix_cnt >= 2 {
+            continue;
+        }
         if seen.insert(pw.text.clone()) {
             *span_cnt += 1;
-            out.push(PinyinCandidate {
+            if shares_head {
+                same_head_prefix_cnt += 1;
+            }
+            deferred_prefix_cands.push(PinyinCandidate {
                 candidate: Candidate {
                     text: pw.text,
                     matched_code: PackedCode::EMPTY,
@@ -2718,7 +3089,9 @@ fn build_pinyin_candidates(
         }
     }
 
-    // Tier 3: Single-char candidates at position 0 ranked purely by RWKV + PersonalContinuations
+    // Tier 3: Single-char candidates at position 0 ranked purely by RWKV + PersonalContinuations.
+    // Interleave the top-2 first-syllable single-char candidates onto Page 1 (`#3-#5`) alongside
+    // the top prefix word so segmented selection (`卓`+`威`+`玻璃`, `断`+`言`) never requires multi-page scrolling!
     let init_path = layers[0].first();
     let init_state = init_path.and_then(PinyinPath::ready_state);
     let init_pctx = init_path.map_or_else(PersonalContext::default, |p| p.personal_context);
@@ -2794,9 +3167,25 @@ fn build_pinyin_candidates(
             .then_with(|| b.1.cmp(&a.1))
             .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
     });
+
+    let mut pref_iter = deferred_prefix_cands.into_iter();
+    if is_long_sentence {
+        if let Some(first_pref) = pref_iter.next() {
+            out.push(first_pref);
+        }
+    }
+    let single_promote_cap = if is_long_sentence {
+        2usize
+    } else if is_multi_char {
+        3usize
+    } else {
+        0usize
+    };
+    let mut head_singles_promoted = 0usize;
+    let mut rest_singles: Vec<PinyinCandidate> = Vec::new();
     for (text, consumed, _, corr, hint) in single_items {
         if seen.insert(text.clone()) {
-            out.push(PinyinCandidate {
+            let pc = PinyinCandidate {
                 candidate: Candidate {
                     text,
                     matched_code: PackedCode::EMPTY,
@@ -2811,11 +3200,22 @@ fn build_pinyin_candidates(
                 },
                 consumed_keys: consumed,
                 boundaries: Vec::new(),
-            });
-            if out.len() >= 80 {
-                break;
+            };
+            if !corr && head_singles_promoted < single_promote_cap {
+                out.push(pc);
+                head_singles_promoted += 1;
+            } else {
+                rest_singles.push(pc);
             }
         }
+    }
+    out.extend(deferred_full_cands);
+    out.extend(pref_iter);
+    for pc in rest_singles {
+        if out.len() >= 80 {
+            break;
+        }
+        out.push(pc);
     }
 
     // Tier 4: English prefix completions when typing a single English word prefix (e.g. `pyth` -> `Python`)
@@ -2823,12 +3223,14 @@ fn build_pinyin_candidates(
         let lower = raw_code.to_ascii_lowercase();
         let mut en_cands: Vec<String> = Vec::new();
         for (disp, _) in decoder.user.lookup_english_prefix(&lower, 2) {
-            en_cands.push(format_english_display(raw_code, disp));
+            let u_low = disp.to_ascii_lowercase();
+            let d_disp = decoder.english.lookup_exact(&u_low).map(|e| e.display);
+            en_cands.push(resolve_english_display(raw_code, Some(disp), d_disp));
         }
         for e in decoder.english.lookup_prefix(&lower, 3) {
             if e.weight >= 24_000 || raw_code.bytes().any(|b| b.is_ascii_uppercase()) {
                 let disp = if e.key == lower {
-                    format_english_display(raw_code, e.display)
+                    resolve_english_display(raw_code, None, Some(e.display))
                 } else {
                     e.display.to_owned()
                 };
@@ -2840,6 +3242,47 @@ fn build_pinyin_candidates(
         let insert_at = out.len().min(3);
         let mut inserted = 0usize;
         for disp in en_cands.into_iter().take(3) {
+            if seen.insert(disp.clone()) {
+                let pos = (insert_at + inserted).min(out.len());
+                out.insert(
+                    pos,
+                    PinyinCandidate {
+                        candidate: Candidate {
+                            text: disp,
+                            matched_code: PackedCode::EMPTY,
+                            comment: String::new(),
+                            badge: CandidateBadge::None,
+                            confidence: 0.20,
+                            is_exact: true,
+                        },
+                        consumed_keys: n,
+                        boundaries: Vec::new(),
+                    },
+                );
+                inserted += 1;
+            }
+        }
+    } else if n >= 2 && n <= 12 && raw_code.bytes().all(|b| (b'2'..=b'9').contains(&b)) {
+        let mut t9_en: Vec<String> = Vec::new();
+        for (disp, _) in decoder.user.lookup_english_t9(raw_code.as_bytes(), 2) {
+            let u_low = disp.to_ascii_lowercase();
+            let d_disp = decoder.english.lookup_exact(&u_low).map(|e| e.display);
+            let res = resolve_english_display("", Some(disp), d_disp);
+            if !t9_en.contains(&res) {
+                t9_en.push(res);
+            }
+        }
+        for e in decoder.english.lookup_t9(raw_code.as_bytes(), 2) {
+            if e.weight >= 48_000 {
+                let disp = e.display.to_owned();
+                if !t9_en.contains(&disp) {
+                    t9_en.push(disp);
+                }
+            }
+        }
+        let insert_at = out.len().min(3);
+        let mut inserted = 0usize;
+        for disp in t9_en.into_iter().take(2) {
             if seen.insert(disp.clone()) {
                 let pos = (insert_at + inserted).min(out.len());
                 out.insert(

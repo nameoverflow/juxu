@@ -73,6 +73,19 @@ impl AsciiTrie {
         trie
     }
 
+    /// True only for legacy GPT-2 BPE vocabularies (`WBLM0002`) that contain multi-byte tokens
+    /// starting with `' '` (`0x20`). Always `false` for bare-token `WBLM0003`.
+    #[inline]
+    pub fn has_leading_space_vocab(&self) -> bool {
+        let root_edges = &self.nodes[0].edges;
+        if let Ok(pos0) = root_edges.binary_search_by_key(&b' ', |&(eb, _)| eb) {
+            let cur = root_edges[pos0].1 as usize;
+            !self.nodes[cur].edges.is_empty()
+        } else {
+            false
+        }
+    }
+
     /// Encode a contiguous visible ASCII slice using greedy longest-prefix match.
     pub fn encode_ascii(&self, bytes: &[u8], out: &mut Vec<usize>) {
         let mut i = 0usize;
@@ -1611,7 +1624,9 @@ impl<'a> NeuralView<'a> {
     }
 
     /// Fast zero-unroll estimate of `log P(latin_word | state)` for beam-search ranking.
-    /// Works seamlessly on both `WBLM0002` (native 4,096 ASCII subword Trie) and `WBLM0001` (`<ENG_NUM>`).
+    /// Keeps the contextual language-switch / word-onset `lp0` 100% unscaled (`T == 1` is exact `lp0`),
+    /// and scales intra-word subword/char fallback tokens so multi-char words align on the same nats
+    /// scale as CJK without ever diluting `lp0` on long strings.
     pub fn estimate_latin_logp(&self, state: &RwkvState, word: &str) -> f32 {
         if word.is_empty() {
             return 0.0;
@@ -1620,15 +1635,26 @@ impl<'a> NeuralView<'a> {
             let mut toks = Vec::with_capacity(4);
             trie.encode_ascii(word.as_bytes(), &mut toks);
             if let Some(&first_tok) = toks.first() {
-                let lp1 = self.score_next_token(state, first_tok);
+                let lp0 = self.score_next_token(state, first_tok);
                 if toks.len() == 1 {
-                    return lp1;
+                    return lp0;
                 }
-                let extra: f32 = toks[1..]
-                    .iter()
-                    .map(|&t| self.emb_row(t).2.clamp(-10.0, 0.0))
-                    .sum();
-                return (lp1 + 0.55 * extra) / (toks.len() as f32).powf(0.45);
+                let bare_est = lp0 - 1.05 * ((toks.len() - 1) as f32);
+                if !word.starts_with(' ') && trie.has_leading_space_vocab() {
+                    let mut sp_bytes = Vec::with_capacity(word.len() + 1);
+                    sp_bytes.push(b' ');
+                    sp_bytes.extend_from_slice(word.as_bytes());
+                    let mut sp_toks = Vec::with_capacity(4);
+                    trie.encode_ascii(&sp_bytes, &mut sp_toks);
+                    if let Some(&sp0) = sp_toks.first() {
+                        if sp0 != trie.single_ascii[0] as usize {
+                            let sp_lp0 = self.score_next_token(state, sp0);
+                            let sp_est = sp_lp0 - 1.05 * ((sp_toks.len() - 1) as f32);
+                            return bare_est.max(sp_est);
+                        }
+                    }
+                }
+                return bare_est;
             }
         }
         if self.offs.has_eng_num_token {
@@ -1653,15 +1679,67 @@ impl<'a> NeuralView<'a> {
             let mut toks = Vec::with_capacity(6);
             trie.encode_ascii(word.as_bytes(), &mut toks);
             if !toks.is_empty() {
-                let mut sum_lp = 0.0f32;
+                if toks.len() > 1 && !word.starts_with(' ') && trie.has_leading_space_vocab() {
+                    let mut sp_bytes = Vec::with_capacity(word.len() + 1);
+                    sp_bytes.push(b' ');
+                    sp_bytes.extend_from_slice(word.as_bytes());
+                    let mut sp_toks = Vec::with_capacity(6);
+                    trie.encode_ascii(&sp_bytes, &mut sp_toks);
+                    if !sp_toks.is_empty() && sp_toks[0] != trie.single_ascii[0] as usize {
+                        let eval_seq = |seq: &[usize]| -> (f32, RwkvState) {
+                            let mut s = base_state.clone();
+                            let last = seq.len() - 1;
+                            let mut l0 = 0.0f32;
+                            let mut lrest = 0.0f32;
+                            for (i, &tk) in seq.iter().enumerate() {
+                                let slp = self.score_next_token(&s, tk);
+                                if i == 0 {
+                                    l0 = slp;
+                                } else {
+                                    lrest += slp;
+                                }
+                                let is_last = i == last;
+                                self.step_token_heads(
+                                    tk,
+                                    &mut s,
+                                    compute_mtp && is_last,
+                                    compute_key1 && is_last,
+                                );
+                            }
+                            let tot = if seq.len() == 1 {
+                                l0
+                            } else {
+                                l0 + 0.35 * lrest
+                            };
+                            (tot, s)
+                        };
+                        let (bare_lp, bare_st) = eval_seq(&toks);
+                        let (sp_lp, sp_st) = eval_seq(&sp_toks);
+                        if sp_lp > bare_lp {
+                            return (sp_lp, sp_st);
+                        }
+                        return (bare_lp, bare_st);
+                    }
+                }
                 let last_idx = toks.len() - 1;
+                let mut lp0 = 0.0f32;
+                let mut rest_lp = 0.0f32;
                 for (i, &tok) in toks.iter().enumerate() {
-                    sum_lp += self.score_next_token(&st, tok);
+                    let step_lp = self.score_next_token(&st, tok);
+                    if i == 0 {
+                        lp0 = step_lp;
+                    } else {
+                        rest_lp += step_lp;
+                    }
                     let is_last = i == last_idx;
                     self.step_token_heads(tok, &mut st, compute_mtp && is_last, compute_key1 && is_last);
                 }
-                let norm_lp = sum_lp / (toks.len() as f32).powf(0.45);
-                return (norm_lp, st);
+                let total_lp = if toks.len() == 1 {
+                    lp0
+                } else {
+                    lp0 + 0.35 * rest_lp
+                };
+                return (total_lp, st);
             }
         }
         if self.offs.has_eng_num_token {

@@ -455,9 +455,13 @@ public struct IOSHostRootView: View {
                         Divider()
                         iosToggleRow("上滑输入数字和符号", sub: "在字母键上滑，输入键帽顶部的小字符", isOn: binding(\.keySwipeUpInput))
                         Divider()
+                        iosToggleRow("空格旁逗号键（上滑句号）", sub: "在 26 键空格左侧显示逗号键，点按输入逗号，上滑输入句号；不受上一项开关影响", isOn: binding(\.spaceCommaKey))
+                        Divider()
                         iosToggleRow("长按弹出更多字符", sub: "长按字母键后左右滑动，选择声调字母、大小写、数字或符号", isOn: binding(\.keyLongPressAlternates))
                         Divider()
                         iosToggleRow("退格键上滑清空本行", sub: "上滑删除光标左侧到行首的内容，下滑依次撤回；正在输入拼音时只清空拼音", isOn: binding(\.backspaceSwipeClear))
+                        Divider()
+                        iosToggleRow("全键盘长按移动光标", sub: "在键盘任意键上长按即可滑动光标；继续按住不放则会弹出按键的特殊字符", isOn: binding(\.keyboardHoldCursor))
                     }
                     .padding(14)
                     .background(iosCardBackground)

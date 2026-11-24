@@ -1,6 +1,6 @@
 use crate::code::{cangjie_radicals_str, expand_wildcards, PackedCode};
 use crate::config::{FourthEmptyBehavior, ShiftToggleMode, JuxuConfig, InputSchema};
-use crate::english::{format_english_display, EnDictView};
+use crate::english::{format_english_display, resolve_english_display, EnDictView};
 use crate::format::{AuxView, DictView, ENTRY_FLAG_SYMBOL};
 use crate::neural::{NeuralContextTracker, NeuralView, RwkvState};
 use crate::personalization::Context as PersonalContext;
@@ -939,6 +939,43 @@ impl JuxuEngine {
         }
     }
 
+    /// Manually add a user phrase (`auto_composed = false`), indexing it across both the active
+    /// shape schema dictionary (if any) AND `pinyin_dict` so it works immediately in Wubi, Cangjie,
+    /// Full Pinyin, Xiaohe Shuangpin, and T9!
+    pub fn add_user_phrase(&mut self, text: &str) -> String {
+        let trimmed = text.trim();
+        let char_len = trimmed.chars().count();
+        if !(2..=12).contains(&char_len) {
+            return String::new();
+        }
+        let slot = self.config.schema.slot_index();
+        let dict_ref = self
+            .dicts
+            .get(slot)
+            .and_then(|d| d.as_ref())
+            .or_else(|| self.dicts.iter().find_map(|d| d.as_ref()));
+        let code_opt =
+            self.user
+                .add_phrase_with_pinyin(trimmed, false, dict_ref, self.pinyin_dict.as_ref());
+        if let Some(code) = code_opt {
+            return code.as_string();
+        }
+        if let Some(ref pd) = self.pinyin_dict {
+            let mut syls = Vec::new();
+            for ch in trimmed.chars() {
+                if let Some(&sid) = pd.char_syllables(ch).first() {
+                    syls.push(pd.syllable_str(sid));
+                } else {
+                    return String::new();
+                }
+            }
+            if !syls.is_empty() {
+                return syls.join("'");
+            }
+        }
+        String::new()
+    }
+
     pub fn load_english_dict(&mut self, dict: EnDictView) {
         self.english_dict = dict;
         if !self.raw_code.is_empty() {
@@ -1602,6 +1639,9 @@ impl JuxuEngine {
                 self.user
                     .begin_commit_undo(timestamp_ms, &prev_lc, &prev_rc, Some(&selected));
                 self.learn_continuation(&selected, explicit, first_choice.as_deref());
+                if explicit && selected.bytes().any(|b| b.is_ascii_alphabetic()) {
+                    self.user.record_english_words_in_text(&selected, true);
+                }
             } else {
                 let prev_lc = self.last_committed.clone();
                 let prev_rc = self.recent_context.clone();
@@ -1626,6 +1666,9 @@ impl JuxuEngine {
                 true,
                 false,
             );
+            if learn && explicit && cand.text.bytes().any(|b| b.is_ascii_alphabetic()) {
+                self.user.record_english_words_in_text(&cand.text, true);
+            }
             if self.config.eval_logging {
                 self.log_commit_event(
                     timestamp_ms,
@@ -2618,15 +2661,13 @@ impl JuxuEngine {
         let mut seen = HashSet::<String>::new();
 
         // 1. Exact user-typed or canonical dictionary match goes #1
-        let primary = if has_upper {
-            raw.clone()
-        } else if let Some((disp, _)) = self.user.lookup_english_exact(&lower) {
-            disp.to_owned()
-        } else if let Some((disp, _, _)) = self.english_dict.lookup_with_morphology(&lower) {
-            disp
-        } else {
-            raw.clone()
-        };
+        let user_hit = self.user.lookup_english_exact(&lower);
+        let dict_hit = self.english_dict.lookup_with_morphology(&lower);
+        let primary = resolve_english_display(
+            &raw,
+            user_hit.map(|x| x.0),
+            dict_hit.as_ref().map(|x| x.0.as_str()),
+        );
         if seen.insert(primary.clone()) {
             self.candidates.push(Candidate {
                 text: primary,
@@ -2825,6 +2866,75 @@ impl JuxuEngine {
             entries.extend(singles.drain(..visible));
             entries.extend(alternatives);
             entries.extend(singles);
+        }
+
+        // Surface canonical-cased personal or high-frequency English match in `#2/#3` when a `2..=4`
+        // letter code collides with Wubi `#1`: preserves 100% deterministic Wubi `#1` blind-typing on
+        // cold start while keeping any English word 1 tap away (tapping `#2` promotes it to 1-shot `ENWORD`!).
+        {
+            let schema_max_len = self.config.schema.max_code_len();
+            let mut en_spans: Vec<(usize, &str)> = Vec::with_capacity(2);
+            if (2..=schema_max_len).contains(&self.raw_code.len()) {
+                en_spans.push((0, self.raw_code.as_str()));
+            }
+            if let Some(ts) = paths.first().map(|p| p.tail_start()).filter(|&s| s > 0) {
+                let tail = &self.raw_code[ts..];
+                if (3..=schema_max_len).contains(&tail.len()) {
+                    en_spans.push((ts, tail));
+                }
+            }
+            for (span_start, span_raw) in en_spans {
+                if !span_raw.bytes().all(|b| b.is_ascii_alphabetic()) {
+                    continue;
+                }
+                let lower = span_raw.to_ascii_lowercase();
+                let Some(pcode) = PackedCode::from_ascii(&lower) else {
+                    continue;
+                };
+                let user_hit = self.user.lookup_english_exact(&lower);
+                let dict_hit = self.english_dict.lookup_with_morphology(&lower);
+                let min_dict_w = if lower.len() == 2 { 52_000 } else { 34_000 };
+                let eligible = user_hit.is_some()
+                    || dict_hit.as_ref().is_some_and(|(_, w, _)| *w >= min_dict_w);
+                if !eligible {
+                    continue;
+                }
+                let disp = resolve_english_display(
+                    span_raw,
+                    user_hit.map(|x| x.0),
+                    dict_hit.as_ref().map(|x| x.0.as_str()),
+                );
+                let full_check = if span_start == 0 {
+                    disp.clone()
+                } else if let Some(first_path) = paths.first() {
+                    let prefix_text: String = first_path
+                        .segments(span_start)
+                        .into_iter()
+                        .map(|s| s.text)
+                        .collect();
+                    format!("{prefix_text}{disp}")
+                } else {
+                    disp.clone()
+                };
+                if !entries.iter().any(|(c, _)| c.text == disp || c.text == full_check) {
+                    let insert_idx = entries.len().min(if user_hit.is_some() { 1 } else { 2 }).max(usize::from(!entries.is_empty()));
+                    entries.insert(
+                        insert_idx,
+                        (
+                            Candidate {
+                                text: disp,
+                                matched_code: pcode,
+                                comment: String::new(),
+                                badge: CandidateBadge::None,
+                                confidence: 0.25,
+                                is_exact: true,
+                            },
+                            Some(span_start),
+                        ),
+                    );
+                    break;
+                }
+            }
         }
 
         // Prefix completions for short codes (e.g. typing `q` shows `qe`, `qw`, ... after exact/beam hits),

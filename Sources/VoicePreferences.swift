@@ -93,6 +93,7 @@ public enum VoiceCloudPreset: String, Codable, CaseIterable, Identifiable, Senda
 }
 
 public enum VoiceLocalASRModelPreset: String, Codable, CaseIterable, Identifiable, Sendable {
+    case qwen3ASR = "qwen3_asr"
     case whisperTurbo = "whisper_turbo"
     case whisperBase = "whisper_base"
     case appleSpeech = "apple_speech"
@@ -100,38 +101,10 @@ public enum VoiceLocalASRModelPreset: String, Codable, CaseIterable, Identifiabl
 
     public var id: String { rawValue }
 
-    public var displayName: String {
-        switch self {
-        case .whisperTurbo: return "Whisper v3 Turbo（推荐）"
-        case .whisperBase: return "Whisper Base（轻量极速）"
-        case .appleSpeech: return "Apple 端侧语音（免下载）"
-        case .customHTTP: return "已有本地 HTTP 服务"
-        }
-    }
-
-    public var modelFilename: String? {
-        switch self {
-        case .whisperTurbo: return "ggml-large-v3-turbo-q5_0.bin"
-        case .whisperBase: return "ggml-base.bin"
-        case .appleSpeech, .customHTTP: return nil
-        }
-    }
-
-    public var approximateSizeLabel: String {
-        switch self {
-        case .whisperTurbo: return "547 MB"
-        case .whisperBase: return "142 MB"
-        case .appleSpeech, .customHTTP: return "0 MB"
-        }
-    }
-
-    public var downloadURLs: [URL] {
-        guard let filename = modelFilename else { return [] }
-        return [
-            URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(filename)")!,
-            URL(string: "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/\(filename)")!,
-        ]
-    }
+    public var displayName: String { descriptor.displayName }
+    public var modelFilename: String? { descriptor.modelFilename }
+    public var approximateSizeLabel: String { descriptor.sizeLabel }
+    public var downloadURLs: [URL] { descriptor.downloadURLs }
 }
 
 public enum VoiceLocalLLMPreset: String, Codable, CaseIterable, Identifiable, Sendable {
@@ -169,6 +142,15 @@ public enum VoiceLocalLLMPreset: String, Codable, CaseIterable, Identifiable, Se
             URL(string: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/\(filename)")!,
             URL(string: "https://hf-mirror.com/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/\(filename)")!,
         ]
+    }
+
+    public var expectedSHA256: String? {
+        switch self {
+        case .qwen15B:
+            return "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e"
+        case .ollamaHTTP, .none:
+            return nil
+        }
     }
 
     public init(from decoder: Decoder) throws {
@@ -272,6 +254,14 @@ public struct VoicePreferences: Codable, Equatable, Sendable {
     public var localHTTPLLMBaseURL: String = "http://127.0.0.1:11434/v1"
     public var localHTTPLLMModel: String = "qwen2.5:3b"
 
+    /// Optional so existing voice.json files still decode, and stay unchanged while it is off.
+    public var globalVoiceHotkey: Bool?
+    public var isGlobalHotkeyEnabled: Bool { globalVoiceHotkey ?? false }
+
+    /// Optional so existing voice.json files still decode; nil means the default, on.
+    public var voiceCues: Bool?
+    public var areVoiceCuesEnabled: Bool { voiceCues ?? true }
+
     public init() {}
 
     public var effectiveCloudASRBaseURL: String {
@@ -374,18 +364,25 @@ public enum VoiceKeychainStore {
 
     @discardableResult
     public static func delete(_ account: VoiceKeychainAccount) -> Bool {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account.rawValue,
-        ]
-        let status = SecItemDelete(query as CFDictionary)
-        return status == errSecSuccess || status == errSecItemNotFound
+        var ok = true
+        for svc in [service, legacyService] {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: svc,
+                kSecAttrAccount as String: account.rawValue,
+            ]
+            let status = SecItemDelete(query as CFDictionary)
+            if status != errSecSuccess && status != errSecItemNotFound {
+                ok = false
+            }
+        }
+        return ok
     }
 }
 
 @MainActor
 public final class VoicePreferencesStore: ObservableObject {
+    public static var defaultInMemoryForTesting = false
     public static let shared = VoicePreferencesStore()
 
     @Published public private(set) var prefs: VoicePreferences
@@ -393,7 +390,8 @@ public final class VoicePreferencesStore: ObservableObject {
     private let inMemoryOnly: Bool
 
     public init(fileURL: URL? = nil, inMemoryOnly: Bool = false) {
-        self.inMemoryOnly = inMemoryOnly
+        let effectiveInMemory = inMemoryOnly || (fileURL == nil && Self.defaultInMemoryForTesting)
+        self.inMemoryOnly = effectiveInMemory
         if let fileURL {
             self.fileURL = fileURL
         } else {
@@ -402,7 +400,7 @@ public final class VoicePreferencesStore: ObservableObject {
                 .appendingPathComponent("Library/Application Support/Juxu", isDirectory: true)
                 .appendingPathComponent("voice.json")
         }
-        if !inMemoryOnly,
+        if !effectiveInMemory,
            FileManager.default.fileExists(atPath: self.fileURL.path),
            let data = try? Data(contentsOf: self.fileURL),
            let decoded = try? JSONDecoder().decode(VoicePreferences.self, from: data) {
@@ -421,6 +419,9 @@ public final class VoicePreferencesStore: ObservableObject {
         if wasEnabled && !newPrefs.enabled {
             VoiceSessionController.unload()
             VoiceLocalInstaller.unload()
+        }
+        if self === VoicePreferencesStore.shared {
+            VoiceGlobalHotkeyController.sync(with: newPrefs)
         }
     }
 

@@ -2,6 +2,21 @@ import AVFoundation
 import Foundation
 import Speech
 
+/// Which samples of a captured buffer fall inside the time a cue is audible.
+enum VoiceCueMute {
+    static func sampleRange(
+        bufferStart: TimeInterval,
+        count: Int,
+        sampleRate: Double,
+        muteStart: TimeInterval,
+        muteEnd: TimeInterval
+    ) -> Range<Int> {
+        let first = max(0, min(count, Int(((muteStart - bufferStart) * sampleRate).rounded())))
+        let last = max(first, min(count, Int(((muteEnd - bufferStart) * sampleRate).rounded())))
+        return first..<last
+    }
+}
+
 public struct VoiceContext: Sendable {
     public let bundleIdentifier: String?
     public let selectedText: String?
@@ -30,6 +45,7 @@ public enum VoiceEngineError: LocalizedError, Sendable {
     case invalidEndpoint(String)
     case recordingTooShort
     case emptyTranscript
+    case noSpeechDetected
     case cliNotFound(String)
     case cliFailed(String)
     case networkError(String)
@@ -53,6 +69,8 @@ public enum VoiceEngineError: LocalizedError, Sendable {
             return "录音过短，已忽略"
         case .emptyTranscript:
             return "未识别到有效语音内容"
+        case .noSpeechDetected:
+            return "没听清"
         case .cliNotFound(let bin):
             return "未找到本地 Whisper 命令：\(bin)"
         case .cliFailed(let msg):
@@ -287,9 +305,16 @@ public enum VoiceLocalCLIDiscovery {
 // MARK: - On-Demand Audio Recorder & Apple Speech Live Streamer
 
 public final class VoiceAudioRecorder: @unchecked Sendable {
+    /// Caps buffered PCM16 audio at 5 minutes (16 kHz mono ≈ 9.6 MB WAV), preventing
+    /// unbounded memory growth in hands-free mode and staying well within cloud upload limits.
+    public static let maxRecordingSamples = 16_000 * 300
+
     private let lock = NSLock()
+    private let configQueue = DispatchQueue(label: "im.juxu.voice.audio.config")
     private var engine: AVAudioEngine?
+    private var configChangeObserver: NSObjectProtocol?
     private var pcm16Samples: [Int16] = []
+    private var didReachMaxDuration = false
     private var targetFormat: AVAudioFormat?
     private var converter: AVAudioConverter?
     private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
@@ -298,9 +323,18 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     private var latestAppleTranscript: String = ""
     private var appleFinalContinuation: CheckedContinuation<String, Error>?
     private var appleFinished = false
+    private var levelMeter = VoiceLevelMeter()
+    private let spectrumAnalyzer = VoiceSpectrumAnalyzer()
+    /// Buffers per whole dBFS, for the timing log. Holds no audio.
+    private var levelHistogram = [Int](repeating: 0, count: 91)
+    private var cueMuteStart: TimeInterval = 0
+    private var cueMuteEnd: TimeInterval = 0
 
     public var onAudioLevel: (@Sendable (Float) -> Void)?
+    public var onAudioSpectrum: (@Sendable ([[Float]]) -> Void)?
     public var onPartialTranscript: (@Sendable (String) -> Void)?
+    public var onMaxDurationReached: (@Sendable () -> Void)?
+    public var onAudioInterrupted: (@Sendable (String) -> Void)?
 
     public init() {}
 
@@ -325,10 +359,12 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
             throw VoiceEngineError.networkError("无法初始化 16kHz PCM 音频格式")
         }
 
-        self.targetFormat = outFormat
-        self.converter = AVAudioConverter(from: inputFormat, to: outFormat)
+        let conv = AVAudioConverter(from: inputFormat, to: outFormat)
         lock.lock()
+        self.targetFormat = outFormat
+        self.converter = conv
         pcm16Samples.removeAll(keepingCapacity: true)
+        didReachMaxDuration = false
         latestAppleTranscript = ""
         appleFinished = false
         lock.unlock()
@@ -355,9 +391,11 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
                     )
                 }
             }
+            lock.lock()
             self.speechRecognizer = recognizer
             self.speechRequest = req
-            self.speechTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
+            lock.unlock()
+            let task = recognizer.recognitionTask(with: req) { [weak self] result, error in
                 guard let self else { return }
                 if let result {
                     let text = result.bestTranscription.formattedString
@@ -390,32 +428,133 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
                     }
                 }
             }
+            lock.lock()
+            self.speechTask = task
+            lock.unlock()
         }
 
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            guard let self else { return }
-            self.speechRequest?.append(buffer)
-            self.processBuffer(buffer)
+        installInputTap(on: eng, inputFormat: inputFormat)
+
+        let observer = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: eng,
+            queue: nil
+        ) { [weak self, weak eng] _ in
+            guard let self, let eng else { return }
+            self.handleConfigurationChange(for: eng)
         }
+        lock.lock()
+        self.engine = eng
+        self.configChangeObserver = observer
+        lock.unlock()
 
         eng.prepare()
         try eng.start()
-        self.engine = eng
     }
 
-    private func processBuffer(_ buffer: AVAudioPCMBuffer) {
-        // Compute normalized RMS audio level for HUD bars
+    private func installInputTap(on eng: AVAudioEngine, inputFormat: AVAudioFormat) {
+        eng.inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, when in
+            guard let self else { return }
+            let (req, conv, fmt): (SFSpeechAudioBufferRecognitionRequest?, AVAudioConverter?, AVAudioFormat?) = {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                return (self.speechRequest, self.converter, self.targetFormat)
+            }()
+            req?.append(buffer)
+            self.processBuffer(buffer, when: when, converter: conv, targetFormat: fmt)
+        }
+    }
+
+    private func handleConfigurationChange(for eng: AVAudioEngine) {
+        configQueue.async { [weak self, weak eng] in
+            guard let self, let eng else { return }
+            let outFormat: AVAudioFormat? = {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                guard self.engine === eng else { return nil }
+                return self.targetFormat
+            }()
+            guard let outFormat else { return }
+
+            eng.inputNode.removeTap(onBus: 0)
+            eng.stop()
+            let newInputFormat = eng.inputNode.outputFormat(forBus: 0)
+            guard newInputFormat.sampleRate > 0, newInputFormat.channelCount > 0,
+                  let newConv = AVAudioConverter(from: newInputFormat, to: outFormat) else {
+                self.onAudioInterrupted?("音频输入设备变化，录音已中断")
+                return
+            }
+            self.lock.lock()
+            guard self.engine === eng else {
+                self.lock.unlock()
+                return
+            }
+            self.converter = newConv
+            self.lock.unlock()
+
+            self.installInputTap(on: eng, inputFormat: newInputFormat)
+            eng.prepare()
+            do {
+                try eng.start()
+            } catch {
+                self.onAudioInterrupted?("音频设备切换后无法继续录音")
+            }
+        }
+    }
+
+    /// Blanks what the microphone captures while a cue is audible, so it never reaches the recogniser.
+    func muteInput(forSeconds seconds: TimeInterval) {
+        let now = AVAudioTime.seconds(forHostTime: mach_absolute_time())
+        lock.lock()
+        cueMuteStart = now
+        cueMuteEnd = now + seconds
+        lock.unlock()
+    }
+
+    private func processBuffer(
+        _ buffer: AVAudioPCMBuffer,
+        when: AVAudioTime,
+        converter: AVAudioConverter?,
+        targetFormat: AVAudioFormat?
+    ) {
+        // HUD meter only: the audio sent to the recogniser is converted below, untouched by this.
         if let channelData = buffer.floatChannelData?[0] {
             let count = Int(buffer.frameLength)
             if count > 0 {
-                var sum: Float = 0
-                for i in 0..<count {
-                    let s = channelData[i]
-                    sum += s * s
+                // CoreAudio tap buffers are often ~100 ms; slicing into ~25 ms windows keeps
+                // brief pauses tracking the noise floor while preserving syllable loudness peaks.
+                let sampleRate = buffer.format.sampleRate
+                let step = max(1, Int((sampleRate * 0.025).rounded()))
+                var peakLevel: Float = 0
+                var totalSum: Float = 0
+                var offset = 0
+                while offset < count {
+                    let end = min(count, offset + step)
+                    let chunk = end - offset
+                    var sum: Float = 0
+                    for i in offset..<end {
+                        let s = channelData[i]
+                        sum += s * s
+                    }
+                    totalSum += sum
+                    let rms = sqrt(sum / Float(chunk))
+                    let seconds = Float(Double(chunk) / sampleRate)
+                    let level = levelMeter.process(rms: rms, seconds: seconds)
+                    if level > peakLevel { peakLevel = level }
+                    offset = end
                 }
-                let rms = sqrt(sum / Float(count))
-                let level = min(1.0, max(0.0, rms * 8.5))
-                onAudioLevel?(level)
+                let bufferRMS = sqrt(totalSum / Float(count))
+                let bucket = Int((20 * log10(max(bufferRMS, 1e-6))).rounded()) + 90
+                lock.lock()
+                levelHistogram[max(0, min(90, bucket))] += 1
+                lock.unlock()
+                onAudioLevel?(peakLevel)
+                if let onAudioSpectrum {
+                    let frames = spectrumAnalyzer.process(samples: channelData, count: count, sampleRate: sampleRate)
+                    if !frames.isEmpty {
+                        onAudioSpectrum(frames)
+                    }
+                }
             }
         }
 
@@ -441,26 +580,91 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
 
         if error == nil, outBuffer.frameLength > 0, let int16Ptr = outBuffer.int16ChannelData?[0] {
             let count = Int(outBuffer.frameLength)
-            let chunk = UnsafeBufferPointer(start: int16Ptr, count: count)
+            var hitLimitNow = false
             lock.lock()
-            pcm16Samples.append(contentsOf: chunk)
+            let remaining = Self.maxRecordingSamples - pcm16Samples.count
+            if remaining > 0 {
+                let appendCount = min(count, remaining)
+                let chunk = UnsafeBufferPointer(start: int16Ptr, count: appendCount)
+                let firstNew = pcm16Samples.count
+                pcm16Samples.append(contentsOf: chunk)
+                if when.isHostTimeValid, cueMuteEnd > cueMuteStart {
+                    let muted = VoiceCueMute.sampleRange(
+                        bufferStart: AVAudioTime.seconds(forHostTime: when.hostTime),
+                        count: appendCount,
+                        sampleRate: targetFormat.sampleRate,
+                        muteStart: cueMuteStart,
+                        muteEnd: cueMuteEnd
+                    )
+                    for i in muted { pcm16Samples[firstNew + i] = 0 }
+                }
+                if pcm16Samples.count >= Self.maxRecordingSamples && !didReachMaxDuration {
+                    didReachMaxDuration = true
+                    hitLimitNow = true
+                }
+            } else if !didReachMaxDuration {
+                didReachMaxDuration = true
+                hitLimitNow = true
+            }
             lock.unlock()
+            if hitLimitNow {
+                onMaxDurationReached?()
+            }
         }
     }
 
     public func stopAndCollectSamples() -> [Int16] {
-        engine?.inputNode.removeTap(onBus: 0)
-        engine?.stop()
-        engine = nil
-        converter = nil
-        targetFormat = nil
-        speechRequest?.endAudio()
+        let (eng, observer, req): (AVAudioEngine?, NSObjectProtocol?, SFSpeechAudioBufferRecognitionRequest?) = {
+            lock.lock()
+            defer { lock.unlock() }
+            let e = engine
+            let o = configChangeObserver
+            let r = speechRequest
+            engine = nil
+            configChangeObserver = nil
+            return (e, o, r)
+        }()
+        if let observer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        eng?.inputNode.removeTap(onBus: 0)
+        eng?.stop()
+        req?.endAudio()
 
         lock.lock()
+        converter = nil
+        targetFormat = nil
         let out = pcm16Samples
         pcm16Samples.removeAll(keepingCapacity: false)
         lock.unlock()
         return out
+    }
+
+    /// Copies at most the newest `maxCount` samples while recording continues.
+    /// Input loudness percentiles in dBFS for the timing log.
+    public func levelSummary() -> String {
+        lock.lock()
+        let histogram = levelHistogram
+        lock.unlock()
+        let total = histogram.reduce(0, +)
+        guard total > 0 else { return "" }
+        let percentile = { (p: Int) -> Int in
+            var seen = 0
+            for (i, n) in histogram.enumerated() {
+                seen += n
+                if seen * 100 >= total * p { return i - 90 }
+            }
+            return 0
+        }
+        let top = (histogram.lastIndex { $0 > 0 } ?? 0) - 90
+        return "dbfs_p10=\(percentile(10)) dbfs_p50=\(percentile(50)) dbfs_p90=\(percentile(90)) dbfs_p99=\(percentile(99)) dbfs_max=\(top) buffers=\(total)"
+    }
+
+    public func snapshotRecentSamples(maxCount: Int) -> (samples: [Int16], total: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        let total = pcm16Samples.count
+        return (Array(pcm16Samples.suffix(max(0, maxCount))), total)
     }
 
     public func finishAppleSpeech(timeoutSeconds: Double = 3.5) async throws -> String {
@@ -501,13 +705,24 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     }
 
     public func cancel() {
-        engine?.inputNode.removeTap(onBus: 0)
-        engine?.stop()
-        engine = nil
-        converter = nil
-        targetFormat = nil
+        let (eng, observer): (AVAudioEngine?, NSObjectProtocol?) = {
+            lock.lock()
+            defer { lock.unlock() }
+            let e = engine
+            let o = configChangeObserver
+            engine = nil
+            configChangeObserver = nil
+            return (e, o)
+        }()
+        if let observer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        eng?.inputNode.removeTap(onBus: 0)
+        eng?.stop()
         teardownAppleSpeech()
         lock.lock()
+        converter = nil
+        targetFormat = nil
         pcm16Samples.removeAll(keepingCapacity: false)
         latestAppleTranscript = ""
         let pending = appleFinalContinuation
@@ -518,11 +733,18 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
     }
 
     private func teardownAppleSpeech() {
-        speechRequest?.endAudio()
-        speechTask?.cancel()
-        speechTask = nil
-        speechRequest = nil
-        speechRecognizer = nil
+        let (req, task): (SFSpeechAudioBufferRecognitionRequest?, SFSpeechRecognitionTask?) = {
+            lock.lock()
+            defer { lock.unlock() }
+            let r = speechRequest
+            let t = speechTask
+            speechRequest = nil
+            speechTask = nil
+            speechRecognizer = nil
+            return (r, t)
+        }()
+        req?.endAudio()
+        task?.cancel()
     }
 }
 
