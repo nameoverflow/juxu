@@ -420,7 +420,7 @@ private final class IOSKeycapNodeView: UIView {
         if let sub = spec.cornerSubscript, !sub.isEmpty {
             subscriptLabel.isHidden = false
             subscriptLabel.text = sub
-            subscriptLabel.textColor = subColor
+            subscriptLabel.textColor = (spec.kind == .modeToggle) ? modeSecondaryColor : subColor
         } else {
             subscriptLabel.isHidden = true
         }

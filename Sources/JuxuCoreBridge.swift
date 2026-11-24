@@ -1328,6 +1328,7 @@ public final class JuxuBridge: ObservableObject {
                         loaded.cangjieKeycapRadicals = uiPrefs.cangjieKeycapRadicals
                         loaded.wubiKeycapRadicals = uiPrefs.wubiKeycapRadicals
                         loaded.keySwipeUpInput = uiPrefs.keySwipeUpInput
+                        loaded.spaceCommaKey = uiPrefs.spaceCommaKey
                         loaded.keyLongPressAlternates = uiPrefs.keyLongPressAlternates
                         loaded.backspaceSwipeClear = uiPrefs.backspaceSwipeClear
                         self.prefs = loaded
