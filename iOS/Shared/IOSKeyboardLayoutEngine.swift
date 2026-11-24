@@ -332,6 +332,15 @@ public enum IOSKeyboardTrackpadHold {
     public static func shouldCancelAlternatesOnMove(from start: CGPoint, to current: CGPoint) -> Bool {
         hypot(current.x - start.x, current.y - start.y) > moveCancelDistance
     }
+
+    public static func shouldCancelAlternatesInTrackpad(
+        from start: CGPoint,
+        to current: CGPoint,
+        dx: Int,
+        dy: Int
+    ) -> Bool {
+        dx != 0 || dy != 0 || shouldCancelAlternatesOnMove(from: start, to: current)
+    }
 }
 
 public struct IOSKeySpec: Identifiable, Equatable {

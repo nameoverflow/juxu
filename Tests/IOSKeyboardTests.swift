@@ -1143,6 +1143,9 @@ struct IOSKeyboardTests {
         let holdStart = CGPoint(x: 200, y: 180)
         assert(!IOSKeyboardTrackpadHold.shouldCancelAlternatesOnMove(from: holdStart, to: CGPoint(x: 208, y: 184)), "Small jitter keeps alternates timer armed")
         assert(IOSKeyboardTrackpadHold.shouldCancelAlternatesOnMove(from: holdStart, to: CGPoint(x: 215, y: 180)), "Cursor drag cancels pending alternates popup")
+        assert(!IOSKeyboardTrackpadHold.shouldCancelAlternatesInTrackpad(from: holdStart, to: CGPoint(x: 208, y: 184), dx: 0, dy: 0), "Stationary trackpad touch keeps alternates timer armed")
+        assert(IOSKeyboardTrackpadHold.shouldCancelAlternatesInTrackpad(from: holdStart, to: CGPoint(x: 210, y: 180), dx: 1, dy: 0), "Single horizontal cursor step (9.5pt < 12pt) must cancel pending alternates popup")
+        assert(IOSKeyboardTrackpadHold.shouldCancelAlternatesInTrackpad(from: holdStart, to: CGPoint(x: 200, y: 185), dx: 0, dy: 1), "Vertical cursor step must cancel pending alternates popup")
         var holdCursorPrefs = JuxuPreferences()
         assert(!holdCursorPrefs.keyboardHoldCursor, "Whole-keyboard hold cursor is opt-in")
         holdCursorPrefs.keyboardHoldCursor = true
