@@ -55,7 +55,11 @@ public struct SettingsRootView: View {
     private var sidebarSelection: Binding<SettingsSection?> {
         Binding(
             get: { navigation.selectedSection },
-            set: { newValue in if let newValue { navigation.selectedSection = newValue } }
+            set: { newValue in
+                // The sidebar may try to clear its selection (⌘-click, empty space); re-publish the
+                // current page so the highlight comes back instead of disappearing.
+                navigation.selectedSection = newValue ?? navigation.selectedSection
+            }
         )
     }
 
