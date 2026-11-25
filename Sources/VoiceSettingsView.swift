@@ -104,15 +104,14 @@ public struct VoiceSettingsView: View {
     // MARK: - Provider Mode Selector
 
     private var providerCard: some View {
-        card {
-            Group {
-                Text("运行方案")
-                    .font(.system(size: 13, weight: .medium))
-                HStack(spacing: 10) {
-                    providerOptionCard(.cloudBYOK)
-                    providerOptionCard(.local)
-                }
+        Section {
+            HStack(spacing: 10) {
+                providerOptionCard(.cloudBYOK)
+                providerOptionCard(.local)
             }
+            .fixedSize(horizontal: false, vertical: true)
+        } header: {
+            Text("运行方案")
         }
     }
 
@@ -135,7 +134,7 @@ public struct VoiceSettingsView: View {
                     .lineLimit(2)
             }
             .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(selected ? Color.accentColor.opacity(0.11) : Color.primary.opacity(0.03))
@@ -175,13 +174,14 @@ public struct VoiceSettingsView: View {
                         }
                     }
                     .labelsHidden()
-                    .frame(width: 195)
                 }
 
 
                 fieldRow(title: "API Key") {
                     HStack(spacing: 8) {
-                        SecureField(preset.keyPlaceholder, text: primaryKeyBinding)
+                        SecureField("", text: primaryKeyBinding, prompt: Text(verbatim: preset.keyPlaceholder))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
                             .textFieldStyle(.roundedBorder)
                         Text(hasSavedKey ? "✓ 钥匙串" : "必填")
                             .font(.system(size: 11, weight: .medium))
@@ -192,16 +192,22 @@ public struct VoiceSettingsView: View {
 
                 if preset == .custom {
                     fieldRow(title: "Base URL") {
-                        TextField("https://api.openai.com/v1", text: voiceBinding(\.customBaseURL))
+                        TextField("", text: voiceBinding(\.customBaseURL), prompt: Text(verbatim: "https://api.openai.com/v1"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
                             .textFieldStyle(.roundedBorder)
                     }
                     fieldRow(title: "语音识别模型") {
-                        TextField("whisper-1", text: voiceBinding(\.customASRModel))
+                        TextField("", text: voiceBinding(\.customASRModel), prompt: Text(verbatim: "whisper-1"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
                             .textFieldStyle(.roundedBorder)
                     }
                     if voiceStore.prefs.cloudPolishEnabled {
                         fieldRow(title: "口语整理模型") {
-                            TextField("gpt-4o-mini", text: voiceBinding(\.customLLMModel))
+                            TextField("", text: voiceBinding(\.customLLMModel), prompt: Text(verbatim: "gpt-4o-mini"))
+                                .labelsHidden()
+                                .multilineTextAlignment(.leading)
                                 .textFieldStyle(.roundedBorder)
                         }
                         HStack {
@@ -216,11 +222,15 @@ public struct VoiceSettingsView: View {
                         }
                         if voiceStore.prefs.customSplitLLM {
                             fieldRow(title: "整理 Base URL") {
-                                TextField("https://api.deepseek.com/v1", text: voiceBinding(\.customLLMBaseURL))
+                                TextField("", text: voiceBinding(\.customLLMBaseURL), prompt: Text(verbatim: "https://api.deepseek.com/v1"))
+                                    .labelsHidden()
+                                    .multilineTextAlignment(.leading)
                                     .textFieldStyle(.roundedBorder)
                             }
                             fieldRow(title: "整理 API Key") {
-                                SecureField("sk-...", text: splitLLMKeyBinding)
+                                SecureField("", text: splitLLMKeyBinding, prompt: Text(verbatim: "sk-..."))
+                                    .labelsHidden()
+                                    .multilineTextAlignment(.leading)
                                     .textFieldStyle(.roundedBorder)
                             }
                         }
@@ -349,7 +359,6 @@ public struct VoiceSettingsView: View {
                         }
                     }
                     .labelsHidden()
-                    .frame(width: 205)
                 }
 
 
@@ -390,7 +399,6 @@ public struct VoiceSettingsView: View {
                         }
                     }
                     .labelsHidden()
-                    .frame(width: 165)
                 }
 
                 if voiceStore.prefs.outputMode == .smartPolish {
@@ -405,7 +413,6 @@ public struct VoiceSettingsView: View {
                             }
                         }
                         .labelsHidden()
-                        .frame(width: 195)
                     }
                 }
 
@@ -497,7 +504,9 @@ public struct VoiceSettingsView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("自定义语音热词（逗号或换行分隔）")
                         .font(.system(size: 12.5, weight: .medium))
-                    TextField("例如：句序, Juxu, RWKV-7, Typeless, SwiftUI", text: voiceBinding(\.customVocabulary))
+                    TextField("", text: voiceBinding(\.customVocabulary), prompt: Text(verbatim: "例如：句序, Juxu, RWKV-7, Typeless, SwiftUI"))
+                        .labelsHidden()
+                        .multilineTextAlignment(.leading)
                         .textFieldStyle(.roundedBorder)
                 }
 
@@ -606,104 +615,115 @@ private struct LocalVoiceConfigCard: View {
         let llmStatus = VoiceLocalInstaller.llmStatus(for: llmPreset)
 
         Section {
-            // 1. Local ASR Section
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("本地语音识别模型")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text("选择模型并一键下载；按需运行，闲置自动释放")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Picker("", selection: binding(\.localASRPreset)) {
-                    ForEach(VoiceLocalASRModelPreset.allCases) { item in
-                        Text(item.displayName).tag(item)
+            VStack(alignment: .leading, spacing: 10) {
+                // 1. Local ASR Section
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("本地语音识别模型")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("选择模型并一键下载；按需运行，闲置自动释放")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
                     }
-                }
-                .labelsHidden()
-                .frame(width: 245)
-            }
-
-            switch asrPreset.backend {
-            case .engine:
-                installActionRow(
-                    status: asrStatus,
-                    sizeLabel: asrPreset.approximateSizeLabel,
-                    depName: asrPreset.descriptor.engineLabel,
-                    onInstall: { installer.installASR(preset: asrPreset) },
-                    onDelete: {
-                        if let file = asrPreset.modelFilename {
-                            installer.deleteModel(filename: file)
-                        }
-                    }
-                )
-            case .appleSpeech:
-                HStack(spacing: 10) {
-                    Text("识别语言")
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(.secondary)
-                    TextField("zh-CN", text: binding(\.localAppleLocale))
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 90)
                     Spacer()
-                    Text("仅离线")
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(.secondary)
-                    Toggle("", isOn: binding(\.localAppleRequireOnDevice))
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                        .controlSize(.small)
-                }
-            case .customHTTP:
-                HStack(spacing: 8) {
-                    TextField("http://127.0.0.1:8080/v1", text: binding(\.localHTTPASRBaseURL))
-                        .textFieldStyle(.roundedBorder)
-                    TextField("whisper-1", text: binding(\.localHTTPASRModel))
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 110)
-                }
-            }
-
-
-            // 2. Local Polish Section
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("本地 LLM 整理引擎")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text("一键下载 Qwen2.5-1.5B（llama.cpp Metal 加速），或接入已有本地 LLM 服务")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Picker("", selection: binding(\.localLLMPreset)) {
-                    ForEach(VoiceLocalLLMPreset.allCases) { item in
-                        Text(item.displayName).tag(item)
-                    }
-                }
-                .labelsHidden()
-                .frame(width: 245)
-            }
-
-            if llmPreset == .qwen15B {
-                installActionRow(
-                    status: llmStatus,
-                    sizeLabel: llmPreset.approximateSizeLabel,
-                    depName: "llama.cpp",
-                    onInstall: { installer.installLLM(preset: .qwen15B) },
-                    onDelete: {
-                        if let file = llmPreset.modelFilename {
-                            installer.deleteModel(filename: file)
+                    Picker("", selection: binding(\.localASRPreset)) {
+                        ForEach(VoiceLocalASRModelPreset.allCases) { item in
+                            Text(item.displayName).tag(item)
                         }
                     }
-                )
-            } else if llmPreset == .ollamaHTTP {
-                HStack(spacing: 8) {
-                    TextField("http://127.0.0.1:11434/v1", text: binding(\.localHTTPLLMBaseURL))
-                        .textFieldStyle(.roundedBorder)
-                    TextField("qwen2.5:3b", text: binding(\.localHTTPLLMModel))
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 120)
+                    .labelsHidden()
+                }
+
+                switch asrPreset.backend {
+                case .engine:
+                    installActionRow(
+                        status: asrStatus,
+                        sizeLabel: asrPreset.approximateSizeLabel,
+                        depName: asrPreset.descriptor.engineLabel,
+                        onInstall: { installer.installASR(preset: asrPreset) },
+                        onDelete: {
+                            if let file = asrPreset.modelFilename {
+                                installer.deleteModel(filename: file)
+                            }
+                        }
+                    )
+                case .appleSpeech:
+                    HStack(spacing: 10) {
+                        Text("识别语言")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.secondary)
+                        TextField("", text: binding(\.localAppleLocale), prompt: Text(verbatim: "zh-CN"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 90)
+                        Spacer()
+                        Text("仅离线")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.secondary)
+                        Toggle("", isOn: binding(\.localAppleRequireOnDevice))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                    }
+                case .customHTTP:
+                    HStack(spacing: 8) {
+                        TextField("", text: binding(\.localHTTPASRBaseURL), prompt: Text(verbatim: "http://127.0.0.1:8080/v1"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
+                            .textFieldStyle(.roundedBorder)
+                        TextField("", text: binding(\.localHTTPASRModel), prompt: Text(verbatim: "whisper-1"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 110)
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                // 2. Local Polish Section
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("本地 LLM 整理引擎")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("一键下载 Qwen2.5-1.5B（llama.cpp Metal 加速），或接入已有本地 LLM 服务")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Picker("", selection: binding(\.localLLMPreset)) {
+                        ForEach(VoiceLocalLLMPreset.allCases) { item in
+                            Text(item.displayName).tag(item)
+                        }
+                    }
+                    .labelsHidden()
+                }
+
+                if llmPreset == .qwen15B {
+                    installActionRow(
+                        status: llmStatus,
+                        sizeLabel: llmPreset.approximateSizeLabel,
+                        depName: "llama.cpp",
+                        onInstall: { installer.installLLM(preset: .qwen15B) },
+                        onDelete: {
+                            if let file = llmPreset.modelFilename {
+                                installer.deleteModel(filename: file)
+                            }
+                        }
+                    )
+                } else if llmPreset == .ollamaHTTP {
+                    HStack(spacing: 8) {
+                        TextField("", text: binding(\.localHTTPLLMBaseURL), prompt: Text(verbatim: "http://127.0.0.1:11434/v1"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
+                            .textFieldStyle(.roundedBorder)
+                        TextField("", text: binding(\.localHTTPLLMModel), prompt: Text(verbatim: "qwen2.5:3b"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 120)
+                    }
                 }
             }
 

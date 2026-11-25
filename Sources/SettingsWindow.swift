@@ -68,7 +68,8 @@ public struct SettingsRootView: View {
                 }
             }
             .listStyle(.sidebar)
-            .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 240)
+            .frame(minWidth: 180)
+            .navigationSplitViewColumnWidth(min: 180, ideal: 196, max: 260)
             .toolbar(removing: .sidebarToggle)
         } detail: {
             Form {
@@ -86,7 +87,10 @@ public struct SettingsRootView: View {
                 }
             }
             .formStyle(.grouped)
+            // A fresh Form per page, so switching pages starts at the top instead of keeping the old scroll offset.
+            .id(navigation.selectedSection)
             .navigationTitle(navigation.selectedSection.rawValue)
+            .navigationSubtitle("句序")
         }
         .frame(minWidth: 720, minHeight: 540)
     }
@@ -123,6 +127,7 @@ public struct SettingsRootView: View {
                                 schemaCategoryCard(category)
                             }
                         }
+                        .fixedSize(horizontal: false, vertical: true)
                     }
 
 
@@ -135,6 +140,7 @@ public struct SettingsRootView: View {
                                 schemaOptionCard(id: option.id, title: option.title, desc: option.desc)
                             }
                         }
+                        .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -166,7 +172,6 @@ public struct SettingsRootView: View {
                                 Text("自动清空重输").tag("clear")
                             }
                             .labelsHidden()
-                            .frame(width: 168)
                         }
                     }
                 }
@@ -378,7 +383,6 @@ public struct SettingsRootView: View {
                             Text("连打 3 次成词").tag(3)
                         }
                         .labelsHidden()
-                        .frame(width: 168)
                     }
                     toggleRow(
                         title: "词组动态调频",
@@ -393,13 +397,13 @@ public struct SettingsRootView: View {
                 }
             }
 
-            settingsCard {
+            Section {
                 Group {
-                    Text("添加个人词条（自动按当前 \(bridge.state.schemaName) 推导编码）")
-                        .font(.system(size: 13, weight: .medium))
 
                     HStack(spacing: 8) {
-                        TextField("输入 2–12 字中文词条，如：句序", text: $newPhraseInput)
+                        TextField("", text: $newPhraseInput, prompt: Text(verbatim: "输入 2–12 字中文词条，如：句序"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
                             .textFieldStyle(.roundedBorder)
                         Button("添加词条") {
                             let code = bridge.addUserPhrase(newPhraseInput)
@@ -449,6 +453,8 @@ public struct SettingsRootView: View {
                         }
                     }
                 }
+            } header: {
+                Text("添加个人词条（自动按当前 \(bridge.state.schemaName) 推导编码）")
             }
         }
     }
@@ -502,7 +508,6 @@ public struct SettingsRootView: View {
                             Text("清空未上屏编码").tag("clear")
                         }
                         .labelsHidden()
-                        .frame(width: 168)
                     }
                     toggleRow(
                         title: "中文标点与引号智能配对",
@@ -599,7 +604,7 @@ public struct SettingsRootView: View {
                     .lineLimit(1)
             }
             .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
                     .fill(selected ? Color.accentColor.opacity(0.11) : Color.primary.opacity(0.03))
@@ -632,7 +637,7 @@ public struct SettingsRootView: View {
                     .lineLimit(2)
             }
             .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(selected ? Color.accentColor.opacity(0.11) : Color.primary.opacity(0.03))
@@ -1003,6 +1008,11 @@ public final class SettingsWindowController: NSObject, NSWindowDelegate {
                 defer: false
             )
             win.title = "句序偏好设置"
+            // An explicit toolbar gives the full-height unified title bar; without one the
+            // full-size content would scroll underneath a bare 32pt title bar.
+            let toolbar = NSToolbar(identifier: "JuxuSettingsToolbar")
+            toolbar.displayMode = .iconOnly
+            win.toolbar = toolbar
             win.toolbarStyle = .unified
             win.center()
             win.isReleasedWhenClosed = false
