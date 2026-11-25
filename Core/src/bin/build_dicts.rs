@@ -1196,7 +1196,7 @@ fn build_pinyin_dict(ice_dir: &Path, tghz_set: &HashSet<u32>) -> Vec<u8> {
             let wt = parts
                 .get(2)
                 .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(1)
+                .unwrap_or(0)
                 .min(u32::MAX as u64) as u32;
             let ch = text.chars().next().unwrap();
             let flags = if is_rare_file && !tghz_set.contains(&(ch as u32)) {
