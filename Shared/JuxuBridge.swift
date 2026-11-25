@@ -8,6 +8,7 @@ private enum IOSSharedSettings {
     static let touchProfileAccount = "touch-profile"
     static let evalLogAccount = "eval-log-ring"
     static let userDataAccount = "user-data-zlib"
+    static let userDataSeqAccount = "user-data-seq"
 
     static func parseUserDataSeq(_ tsv: String) -> UInt64 {
         for line in tsv.prefix(512).split(separator: "\n", omittingEmptySubsequences: true) {
@@ -16,6 +17,20 @@ private enum IOSSharedSettings {
             }
         }
         return 0
+    }
+
+    static func readUserDataSeq() -> UInt64? {
+        guard let data = read(account: userDataSeqAccount),
+              let text = String(data: data, encoding: .utf8)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              let seq = UInt64(text) else {
+            return nil
+        }
+        return seq
+    }
+
+    static func writeUserDataSeq(_ seq: UInt64) {
+        _ = write(Data(String(seq).utf8), account: userDataSeqAccount)
     }
 
     private static func query(account: String, groupKey: String = "JuxuSettingsGroup", service: String = "Juxu") -> [String: Any]? {
@@ -66,7 +81,12 @@ private enum IOSSharedSettings {
 /// Serial background persistence worker keeping all file writes, `zlib` compression, and
 /// iOS Keychain (`SecItemCopyMatching` / `SecItemUpdate`) IPC off `@MainActor`.
 private final class JuxuPersistenceWorker: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "im.juxu.persistence", qos: .utility)
+    private static let isAppExtension = Bundle.main.bundlePath.hasSuffix(".appex")
+    private let queue = DispatchQueue(
+        label: "im.juxu.persistence",
+        qos: .utility,
+        autoreleaseFrequency: .workItem
+    )
     private let evalLogURL: URL
     private let userDataURL: URL
     private let inMemoryOnly: Bool
@@ -152,7 +172,8 @@ private final class JuxuPersistenceWorker: @unchecked Sendable {
                         self.flushIOSUserDataOnQueue()
                     }
                     pendingUserDataFlush = work
-                    queue.asyncAfter(deadline: .now() + 1.5, execute: work)
+                    let delay: TimeInterval = Self.isAppExtension ? 4.0 : 1.5
+                    queue.asyncAfter(deadline: .now() + delay, execute: work)
                 }
             }
             #endif
@@ -161,10 +182,12 @@ private final class JuxuPersistenceWorker: @unchecked Sendable {
     }
 
     private func writeUserDataOnQueue(_ tsv: String) -> Date? {
-        let dir = userDataURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try? Data(tsv.utf8).write(to: userDataURL, options: .atomic)
-        return (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
+        autoreleasepool {
+            let dir = userDataURL.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? Data(tsv.utf8).write(to: userDataURL, options: .atomic)
+            return (try? FileManager.default.attributesOfItem(atPath: userDataURL.path)[.modificationDate]) as? Date
+        }
     }
 
     #if os(iOS)
@@ -175,28 +198,40 @@ private final class JuxuPersistenceWorker: @unchecked Sendable {
     }
 
     private static func writeSharedUserDataOnQueue(_ tsv: String) {
-        let newSeq = IOSSharedSettings.parseUserDataSeq(tsv)
-        guard newSeq > 0 else { return }
-        if let existing = decodeSharedUserDataOnQueue(), existing.seq > newSeq {
-            return
-        }
-        if let compressed = try? (Data(tsv.utf8) as NSData).compressed(using: .zlib) as Data {
-            _ = IOSSharedSettings.write(compressed, account: IOSSharedSettings.userDataAccount)
+        autoreleasepool {
+            let newSeq = IOSSharedSettings.parseUserDataSeq(tsv)
+            guard newSeq > 0 else { return }
+            if let existingSeq = IOSSharedSettings.readUserDataSeq() {
+                if existingSeq > newSeq {
+                    return
+                }
+            } else if let existing = decodeSharedUserDataOnQueue() {
+                IOSSharedSettings.writeUserDataSeq(existing.seq)
+                if existing.seq > newSeq {
+                    return
+                }
+            }
+            if let compressed = try? (Data(tsv.utf8) as NSData).compressed(using: .zlib) as Data,
+               IOSSharedSettings.write(compressed, account: IOSSharedSettings.userDataAccount) {
+                IOSSharedSettings.writeUserDataSeq(newSeq)
+            }
         }
     }
 
     private static func decodeSharedUserDataOnQueue() -> (seq: UInt64, tsv: String)? {
-        guard let compressed = IOSSharedSettings.read(account: IOSSharedSettings.userDataAccount) else {
-            return nil
+        autoreleasepool {
+            guard let compressed = IOSSharedSettings.read(account: IOSSharedSettings.userDataAccount) else {
+                return nil
+            }
+            let rawData: Data
+            if let inflated = try? (compressed as NSData).decompressed(using: .zlib) as Data {
+                rawData = inflated
+            } else {
+                rawData = compressed
+            }
+            guard let tsv = String(data: rawData, encoding: .utf8), !tsv.isEmpty else { return nil }
+            return (IOSSharedSettings.parseUserDataSeq(tsv), tsv)
         }
-        let rawData: Data
-        if let inflated = try? (compressed as NSData).decompressed(using: .zlib) as Data {
-            rawData = inflated
-        } else {
-            rawData = compressed
-        }
-        guard let tsv = String(data: rawData, encoding: .utf8), !tsv.isEmpty else { return nil }
-        return (IOSSharedSettings.parseUserDataSeq(tsv), tsv)
     }
 
     func readSharedUserDataSync() -> (seq: UInt64, tsv: String)? {
@@ -266,8 +301,17 @@ private final class JuxuPersistenceWorker: @unchecked Sendable {
                 mtime = nil
             }
             var newerSharedUser: (UInt64, String)? = nil
-            if let shared = Self.decodeSharedUserDataOnQueue(), shared.seq > knownSharedSeq {
-                newerSharedUser = (shared.seq, shared.tsv)
+            if let fastSeq = IOSSharedSettings.readUserDataSeq() {
+                if fastSeq > knownSharedSeq,
+                   let shared = Self.decodeSharedUserDataOnQueue(),
+                   shared.seq > knownSharedSeq {
+                    newerSharedUser = (shared.seq, shared.tsv)
+                }
+            } else if let shared = Self.decodeSharedUserDataOnQueue() {
+                IOSSharedSettings.writeUserDataSeq(shared.seq)
+                if shared.seq > knownSharedSeq {
+                    newerSharedUser = (shared.seq, shared.tsv)
+                }
             }
             onResult(prefsData, sharedTouch, mtime, newerSharedUser)
         }
@@ -313,27 +357,34 @@ private final class JuxuPersistenceWorker: @unchecked Sendable {
     }
 
     private func appendEvalLogOnQueue(_ batch: String) {
-        let payload = Data((batch + "\n").utf8)
-        let fm = FileManager.default
-        let dir = evalLogURL.deletingLastPathComponent()
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        if let attrs = try? fm.attributesOfItem(atPath: evalLogURL.path),
-           let size = attrs[.size] as? UInt64,
-           size > 8 * 1024 * 1024 {
-            let prevURL = dir.appendingPathComponent("eval_log.prev.jsonl")
-            try? fm.removeItem(at: prevURL)
-            try? fm.moveItem(at: evalLogURL, to: prevURL)
-        }
-        if !fm.fileExists(atPath: evalLogURL.path) {
-            fm.createFile(
-                atPath: evalLogURL.path,
-                contents: payload,
-                attributes: [.posixPermissions: NSNumber(value: Int16(0o600))]
-            )
-        } else if let fh = try? FileHandle(forWritingTo: evalLogURL) {
-            defer { try? fh.close() }
-            _ = try? fh.seekToEnd()
-            try? fh.write(contentsOf: payload)
+        autoreleasepool {
+            let payload = Data((batch + "\n").utf8)
+            let fm = FileManager.default
+            let dir = evalLogURL.deletingLastPathComponent()
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            let maxBytes: UInt64 = Self.isAppExtension ? (512 * 1024) : (8 * 1024 * 1024)
+            if let attrs = try? fm.attributesOfItem(atPath: evalLogURL.path),
+               let size = attrs[.size] as? UInt64,
+               size > maxBytes {
+                let prevURL = dir.appendingPathComponent("eval_log.prev.jsonl")
+                try? fm.removeItem(at: prevURL)
+                if Self.isAppExtension {
+                    try? fm.removeItem(at: evalLogURL)
+                } else {
+                    try? fm.moveItem(at: evalLogURL, to: prevURL)
+                }
+            }
+            if !fm.fileExists(atPath: evalLogURL.path) {
+                fm.createFile(
+                    atPath: evalLogURL.path,
+                    contents: payload,
+                    attributes: [.posixPermissions: NSNumber(value: Int16(0o600))]
+                )
+            } else if let fh = try? FileHandle(forWritingTo: evalLogURL) {
+                defer { try? fh.close() }
+                _ = try? fh.seekToEnd()
+                try? fh.write(contentsOf: payload)
+            }
         }
 
         #if os(iOS)
@@ -365,24 +416,28 @@ private final class JuxuPersistenceWorker: @unchecked Sendable {
     private func flushIOSEvalRingOnQueue() {
         guard iosEvalRingDirty else { return }
         iosEvalRingDirty = false
-        let joined = iosEvalRingLines.joined(separator: "\n")
-        if let compressed = try? (Data(joined.utf8) as NSData).compressed(using: .zlib) as Data {
-            _ = IOSSharedSettings.write(compressed, account: IOSSharedSettings.evalLogAccount)
+        autoreleasepool {
+            let joined = iosEvalRingLines.joined(separator: "\n")
+            if let compressed = try? (Data(joined.utf8) as NSData).compressed(using: .zlib) as Data {
+                _ = IOSSharedSettings.write(compressed, account: IOSSharedSettings.evalLogAccount)
+            }
         }
     }
 
     private static func decodeSharedEvalRingOnQueue() -> [String] {
-        guard let compressed = IOSSharedSettings.read(account: IOSSharedSettings.evalLogAccount) else {
-            return []
+        autoreleasepool {
+            guard let compressed = IOSSharedSettings.read(account: IOSSharedSettings.evalLogAccount) else {
+                return []
+            }
+            let rawData: Data
+            if let inflated = try? (compressed as NSData).decompressed(using: .zlib) as Data {
+                rawData = inflated
+            } else {
+                rawData = compressed
+            }
+            guard let text = String(data: rawData, encoding: .utf8) else { return [] }
+            return text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
         }
-        let rawData: Data
-        if let inflated = try? (compressed as NSData).decompressed(using: .zlib) as Data {
-            rawData = inflated
-        } else {
-            rawData = compressed
-        }
-        guard let text = String(data: rawData, encoding: .utf8) else { return [] }
-        return text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
     }
     #endif
 }
@@ -405,6 +460,7 @@ private final class EngineHandleBox {
 @MainActor
 public final class JuxuBridge: ObservableObject {
     public static let shared = JuxuBridge()
+    private static let isAppExtension = Bundle.main.bundlePath.hasSuffix(".appex")
 
     private let handleBox: EngineHandleBox
     private var handle: OpaquePointer? { handleBox.ptr }
@@ -505,11 +561,13 @@ public final class JuxuBridge: ObservableObject {
         self.handleBox = EngineHandleBox(juxu_engine_new())
         loadDictionaries(overrideDir: customDictsDir)
         if !inMemoryOnly {
-            loadConfigAndUser()
+            loadConfigAndUser(refreshPublishedLists: !Self.isAppExtension)
         } else {
             ensureDictionaryLoaded(for: prefs.schemaId)
             refreshState()
-            refreshTouchProfile()
+            if !Self.isAppExtension {
+                refreshTouchProfile()
+            }
         }
     }
 
@@ -624,9 +682,18 @@ public final class JuxuBridge: ObservableObject {
             lastSharedPrefsData = data
             if let data, let shared = String(data: data, encoding: .utf8) {
                 shared.withCString { juxu_engine_set_config_toml(h, $0) }
+                if Self.isAppExtension {
+                    _ = configURL.path.withCString { juxu_engine_save_config(h, $0) }
+                }
             }
-            loadSharedTouchProfile()
-            lastAppearanceCheckUptime = ProcessInfo.processInfo.systemUptime
+            if !Self.isAppExtension {
+                loadSharedTouchProfile()
+                lastAppearanceCheckUptime = ProcessInfo.processInfo.systemUptime
+            } else {
+                // Defer touch-profile and compressed user-data Keychain sync off `viewDidLoad`
+                // onto the async `reloadConfigAndUserOnAppear` worker queue.
+                lastAppearanceCheckUptime = 0
+            }
         }
         #endif
         let configJSON = takeString(juxu_engine_get_config_json(h))
@@ -647,7 +714,9 @@ public final class JuxuBridge: ObservableObject {
         #if os(iOS)
         if !inMemoryOnly && !hasSharedContainerAccess {
             let localSeq = juxu_engine_user_data_seq(h)
-            if let shared = persistence.readSharedUserDataSync() {
+            if Self.isAppExtension {
+                lastSharedUserDataSeq = localSeq
+            } else if let shared = persistence.readSharedUserDataSync() {
                 if shared.seq > localSeq {
                     if shared.tsv.withCString({ juxu_engine_import_user_data_tsv(h, $0) }) {
                         lastSharedUserDataSeq = shared.seq
@@ -832,6 +901,9 @@ public final class JuxuBridge: ObservableObject {
                     self.lastSharedPrefsData = prefsData
                     if let prefsData, let shared = String(data: prefsData, encoding: .utf8) {
                         shared.withCString { juxu_engine_set_config_toml(h, $0) }
+                        if Self.isAppExtension {
+                            _ = self.configURL.path.withCString { juxu_engine_save_config(h, $0) }
+                        }
                         let configJSON = self.takeString(juxu_engine_get_config_json(h))
                         if let jsonData = configJSON.data(using: .utf8),
                            let loaded = try? self.decoder.decode(JuxuPreferences.self, from: jsonData) {
@@ -860,7 +932,9 @@ public final class JuxuBridge: ObservableObject {
                                 self.lastLoadedUserDataMtime = savedMtime
                             }
                         }
-                        self.refreshUserPhrases()
+                        if !Self.isAppExtension {
+                            self.refreshUserPhrases()
+                        }
                         changed = true
                     }
                 } else if let mtime,
@@ -1009,6 +1083,14 @@ public final class JuxuBridge: ObservableObject {
         guard let h = handle else { return }
         juxu_engine_clear(h)
         refreshState()
+    }
+
+    public func handleMemoryWarning() {
+        drainEvalLogIfNeeded()
+        flushUserDataAsync()
+        if let h = handle {
+            juxu_engine_trim_memory(h)
+        }
     }
 
     public func abandonComposition(timestampMs: UInt64) {

@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 use std::time::Instant;
 use juxu_core::config::{JuxuConfig, InputSchema};
-use juxu_core::engine::{CandidateBadge, JuxuEngine, KEY_BACKSPACE, KEY_RETURN, KEY_SPACE};
+use juxu_core::engine::{
+    CandidateBadge, JuxuEngine, KEY_BACKSPACE, KEY_EQUAL, KEY_MINUS, KEY_RETURN, KEY_SPACE,
+};
 use juxu_core::format::{AuxView, DictView};
+use juxu_core::pinyin_dict::PinyinDictView;
 use juxu_core::user_data::UserStore;
 
 fn dicts_dir() -> PathBuf {
@@ -2273,4 +2276,72 @@ fn user_data_cap_prunes_to_6144_without_freezing_learning() {
     assert!(tsv.starts_with("# Juxu User Data v1\n"));
     let reloaded = UserStore::from_tsv_str(&tsv);
     assert_eq!(reloaded.unigram_counts.get(&existing_curr), Some(&4));
+}
+
+#[test]
+fn minus_and_equal_turn_pages_in_spaceless_and_all_modes_without_committing() {
+    let dir = dicts_dir();
+    let d98 = DictView::open_mmap(dir.join("wubi98.wbdict")).expect("open wubi98");
+    let py = PinyinDictView::from_file(dir.join("pinyin.pydict")).expect("open pinyin");
+    let aux = AuxView::open_mmap(dir.join("wubi_aux.wbaux")).expect("open aux");
+
+    let mut cfg = JuxuConfig::default();
+    cfg.schema = InputSchema::Wubi98;
+    cfg.spaceless = true;
+    cfg.page_size = 3;
+
+    let mut engine = JuxuEngine::new(cfg);
+    engine.load_dict(InputSchema::Wubi98, d98);
+    engine.load_pinyin_dict(py);
+    engine.set_aux(aux);
+
+    // 1. Idle `-` and `=` must pass through (`consumed == false`) so plain typing is unaffected.
+    let idle_minus = engine.handle_key_event(KEY_MINUS, Some('-'), false, 100);
+    assert!(!idle_minus.consumed && idle_minus.commit_text.is_empty());
+    let idle_eq = engine.handle_key_event(KEY_EQUAL, Some('='), false, 110);
+    assert!(!idle_eq.consumed && idle_eq.commit_text.is_empty());
+
+    // 2. Spaceless Wubi 98 (`page_size = 3`): `qbh` produces many candidates across multiple pages.
+    for (i, ch) in "qbh".chars().enumerate() {
+        let out = engine.handle_key_event(0, Some(ch), false, 200 + i as u64 * 30);
+        assert!(out.consumed && out.commit_text.is_empty());
+    }
+    assert!(engine.total_pages() >= 3, "expected >= 3 pages for qbh with page_size=3");
+    assert_eq!(engine.current_page(), 0);
+    let page0_first = engine.page_candidates()[0].text.clone();
+
+    // macOS `InputController` sends `(keyCode: KEY_EQUAL, ch: Some('='))` and `(KEY_MINUS, Some('-'))`.
+    let next1 = engine.handle_key_event(KEY_EQUAL, Some('='), false, 300);
+    assert!(next1.consumed && next1.commit_text.is_empty(), "expected `=` to turn page, not commit");
+    assert_eq!(engine.current_page(), 1);
+    let page1_first = engine.page_candidates()[0].text.clone();
+    assert_ne!(page0_first, page1_first);
+
+    // Synthetic keycode-only (`ch = None`) also turns pages in spaceless mode.
+    let next2 = engine.handle_key_event(KEY_EQUAL, None, false, 320);
+    assert!(next2.consumed && next2.commit_text.is_empty());
+    assert_eq!(engine.current_page(), 2);
+
+    let prev1 = engine.handle_key_event(KEY_MINUS, Some('-'), false, 340);
+    assert!(prev1.consumed && prev1.commit_text.is_empty(), "expected `-` to turn page back, not commit");
+    assert_eq!(engine.current_page(), 1);
+    assert_eq!(engine.page_candidates()[0].text, page1_first);
+
+    // Selecting candidate `1` on page 1 commits `page1_first`!
+    let sel = engine.handle_key_event(0, Some('1'), false, 360);
+    assert_eq!(sel.commit_text, page1_first);
+    assert!(!engine.is_composing());
+
+    // 3. `Shift + -` (`_`, `keyCode = KEY_MINUS`, `ch = Some('_')`) in spaceless mode must still
+    //    commit Chinese + `——` rather than being swallowed by `KEY_MINUS` paging!
+    for (i, ch) in "wygd".chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 400 + i as u64 * 30);
+    }
+    let dash = engine.handle_key_event(KEY_MINUS, Some('_'), false, 550);
+    assert!(dash.consumed && dash.commit_text.ends_with("——"), "got commit_text={:?}", dash.commit_text);
+    assert!(!engine.is_composing());
+
+    // 4. `trim_idle_memory` safely reclaims idle buffers without losing context.
+    engine.trim_idle_memory();
+    assert!(!engine.is_composing());
 }

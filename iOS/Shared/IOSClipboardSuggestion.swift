@@ -333,6 +333,14 @@ public final class IOSClipboardSuggestionStore {
         store.object(forKey: key) != nil ? store.integer(forKey: key) : nil
     }
 
+    public var seenChangeCount: Int? {
+        optionalInt(forKey: Keys.seenChangeCount)
+    }
+
+    public var handledChangeCount: Int? {
+        optionalInt(forKey: Keys.handledChangeCount)
+    }
+
     /// Non-blocking cache check: returns `.cached` if this `changeCount` was already read and is fresh,
     /// `.none` if disabled/handled/empty/expired, or `.needsRead` when the caller should fetch
     /// `UIPasteboard.general.string` asynchronously off the main thread.

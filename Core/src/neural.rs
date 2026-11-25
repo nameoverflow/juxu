@@ -1009,6 +1009,16 @@ impl NeuralContextTracker {
         }
     }
 
+    /// Drop older rollback snapshots under OS memory pressure while keeping the newest `keep` entries.
+    pub fn trim_ring(&mut self, keep: usize) {
+        if self.ring.len() > keep {
+            let drain_n = self.ring.len() - keep;
+            self.ring.drain(0..drain_n);
+        }
+        self.ring.shrink_to_fit();
+        self.active_tokens.shrink_to_fit();
+    }
+
     /// Synchronize state with surrounding host text, reusing `active` or `ring` in `O(1)` / `O(delta)`
     /// whenever the host context matches what was already incrementally stepped.
     pub fn set_context_str(&mut self, nv: &NeuralView<'_>, text: &str) {

@@ -852,6 +852,22 @@ impl JuxuEngine {
         self.top_typo_spatial_logp = None;
     }
 
+    /// Reclaim excess transient heap allocations when idle or under iOS extension memory pressure.
+    pub fn trim_idle_memory(&mut self) {
+        self.neural_tracker.trim_ring(2);
+        if !self.is_composing() {
+            self.raw_code.shrink_to(32);
+            self.pinyin_candidates.shrink_to_fit();
+            self.pinyin_paths.shrink_to_fit();
+            self.t9_locked_syls.shrink_to_fit();
+            self.pinyin_partial_acc.shrink_to_fit();
+            self.committed_stream_codes.shrink_to_fit();
+            self.observations.shrink_to(32);
+            self.candidates.shrink_to(16);
+            self.spaceless_candidate_starts.shrink_to(16);
+        }
+    }
+
     /// Flush and commit any in-progress composition (e.g. on focus loss / app switch / Return-commit).
     pub fn commit_pending(&mut self, timestamp_ms: u64) -> EngineOutput {
         if !self.is_composing() {
@@ -1877,7 +1893,7 @@ impl JuxuEngine {
                 return EngineOutput::default();
             }
             KEY_MINUS if ch.is_none() => {
-                if !self.raw_code.is_empty() && !self.uses_spaceless() {
+                if !self.raw_code.is_empty() {
                     self.page_prev();
                     return EngineOutput {
                         consumed: true,
@@ -1887,7 +1903,7 @@ impl JuxuEngine {
                 }
             }
             KEY_EQUAL if ch.is_none() => {
-                if !self.raw_code.is_empty() && !self.uses_spaceless() {
+                if !self.raw_code.is_empty() {
                     self.page_next();
                     return EngineOutput {
                         consumed: true,
@@ -1964,7 +1980,7 @@ impl JuxuEngine {
                     ..Default::default()
                 };
             }
-            if (c == '-' || c == '[') && !self.uses_spaceless() {
+            if c == '-' || (c == '[' && !self.uses_spaceless()) {
                 self.page_prev();
                 return EngineOutput {
                     consumed: true,
@@ -1972,7 +1988,7 @@ impl JuxuEngine {
                     ..Default::default()
                 };
             }
-            if (c == '=' || c == ']') && !self.uses_spaceless() {
+            if c == '=' || (c == ']' && !self.uses_spaceless()) {
                 self.page_next();
                 return EngineOutput {
                     consumed: true,

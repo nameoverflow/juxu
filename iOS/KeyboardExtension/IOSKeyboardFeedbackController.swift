@@ -2,28 +2,19 @@
 import CoreHaptics
 import UIKit
 
-/// Low-latency Taptic feedback controller combining `CoreHaptics` crisp high-sharpness transients
-/// (`playsHapticsOnly = true`, zero audio-session ducking) with a pre-warmed `.rigid` fallback ring
-/// and system keyboard click audio playback.
+/// Shared process-wide `CHHapticEngine` driver so recreating `KeyboardViewController` across
+/// focus changes never spawns duplicate CoreHaptics / `AudioSession` threads or leaks XPC channels.
 @MainActor
-final class IOSKeyboardFeedbackController {
+private final class SharedCoreHapticsDriver {
+    static let shared = SharedCoreHapticsDriver()
+
     private var engine: CHHapticEngine?
     private var keyTapPlayer: CHHapticPatternPlayer?
     private var softTickPlayer: CHHapticPatternPlayer?
     private var engineRunning = false
+    private var activeClientCount = 0
 
-    private var rigidRing: [UIImpactFeedbackGenerator] = []
-    private var ringIndex = 0
-    private let selectionGenerator = UISelectionFeedbackGenerator()
-
-    init(attachingTo view: UIView? = nil) {
-        for _ in 0..<3 {
-            if #available(iOS 17.5, *), let view {
-                rigidRing.append(UIImpactFeedbackGenerator(style: .rigid, view: view))
-            } else {
-                rigidRing.append(UIImpactFeedbackGenerator(style: .rigid))
-            }
-        }
+    private init() {
         setupCoreHapticsIfSupported()
     }
 
@@ -84,46 +75,31 @@ final class IOSKeyboardFeedbackController {
         }
     }
 
-    func prepare() {
-        for gen in rigidRing {
-            gen.prepare()
-        }
-        selectionGenerator.prepare()
-        if let eng = engine, !engineRunning {
-            do {
-                try eng.start()
-                engineRunning = true
-            } catch {
-                engineRunning = false
-            }
+    func acquireClient() {
+        activeClientCount += 1
+        guard let eng = engine, !engineRunning else { return }
+        do {
+            try eng.start()
+            engineRunning = true
+        } catch {
+            engineRunning = false
         }
     }
 
-    func suspend() {
-        engine?.stop(completionHandler: nil)
-        engineRunning = false
+    func releaseClient() {
+        activeClientCount = max(0, activeClientCount - 1)
+        if activeClientCount == 0 {
+            engine?.stop(completionHandler: nil)
+            engineRunning = false
+        }
     }
 
-    func fireKeyDown() {
-        UIDevice.current.playInputClick()
-        if playTransient(keyTapPlayer) {
-            return
-        }
-        let gen = rigidRing[ringIndex % rigidRing.count]
-        ringIndex &+= 1
-        gen.impactOccurred(intensity: 0.42)
-        gen.prepare()
+    func playKeyTap() -> Bool {
+        playTransient(keyTapPlayer)
     }
 
-    func fireSoftStep(playClick: Bool) {
-        if playClick {
-            UIDevice.current.playInputClick()
-        }
-        if playTransient(softTickPlayer) {
-            return
-        }
-        selectionGenerator.selectionChanged()
-        selectionGenerator.prepare()
+    func playSoftTick() -> Bool {
+        playTransient(softTickPlayer)
     }
 
     private func playTransient(_ player: CHHapticPatternPlayer?) -> Bool {
@@ -145,6 +121,67 @@ final class IOSKeyboardFeedbackController {
             engineRunning = false
             return false
         }
+    }
+}
+
+/// Low-latency Taptic feedback controller combining `CoreHaptics` crisp high-sharpness transients
+/// (`playsHapticsOnly = true`, zero audio-session ducking) with a pre-warmed `.rigid` fallback ring
+/// and system keyboard click audio playback.
+@MainActor
+final class IOSKeyboardFeedbackController {
+    private var rigidRing: [UIImpactFeedbackGenerator] = []
+    private var ringIndex = 0
+    private let selectionGenerator = UISelectionFeedbackGenerator()
+    private var isPrepared = false
+
+    init(attachingTo view: UIView? = nil) {
+        for _ in 0..<3 {
+            if #available(iOS 17.5, *), let view {
+                rigidRing.append(UIImpactFeedbackGenerator(style: .rigid, view: view))
+            } else {
+                rigidRing.append(UIImpactFeedbackGenerator(style: .rigid))
+            }
+        }
+        _ = SharedCoreHapticsDriver.shared
+    }
+
+    func prepare() {
+        for gen in rigidRing {
+            gen.prepare()
+        }
+        selectionGenerator.prepare()
+        if !isPrepared {
+            isPrepared = true
+            SharedCoreHapticsDriver.shared.acquireClient()
+        }
+    }
+
+    func suspend() {
+        guard isPrepared else { return }
+        isPrepared = false
+        SharedCoreHapticsDriver.shared.releaseClient()
+    }
+
+    func fireKeyDown() {
+        UIDevice.current.playInputClick()
+        if SharedCoreHapticsDriver.shared.playKeyTap() {
+            return
+        }
+        let gen = rigidRing[ringIndex % rigidRing.count]
+        ringIndex &+= 1
+        gen.impactOccurred(intensity: 0.42)
+        gen.prepare()
+    }
+
+    func fireSoftStep(playClick: Bool) {
+        if playClick {
+            UIDevice.current.playInputClick()
+        }
+        if SharedCoreHapticsDriver.shared.playSoftTick() {
+            return
+        }
+        selectionGenerator.selectionChanged()
+        selectionGenerator.prepare()
     }
 }
 #endif

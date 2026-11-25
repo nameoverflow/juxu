@@ -368,11 +368,6 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
     private var slotControls: [IOSRibbonSlotControl] = []
     private var slotDividers: [UIView] = []
 
-    private var clipTopConstraint: NSLayoutConstraint!
-    private var clipBottomConstraint: NSLayoutConstraint!
-    private var clipTrailingToChevron: NSLayoutConstraint!
-    private var clipTrailingToFull: NSLayoutConstraint!
-
     private var contentWidth: CGFloat = 0
     private var scrollOffsetX: CGFloat = 0
     private var panStartOffsetX: CGFloat = 0
@@ -470,7 +465,6 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func setupViews() {
-        clipContainer.translatesAutoresizingMaskIntoConstraints = false
         clipContainer.clipsToBounds = true
         clipContainer.backgroundColor = .clear
 
@@ -493,7 +487,6 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
 
         chevronDivider.isUserInteractionEnabled = false
 
-        chevronBtn.translatesAutoresizingMaskIntoConstraints = false
         chevronBtn.accessibilityIdentifier = "JuxuCandidateToggle"
         chevronBtn.accessibilityLabel = "展开候选"
         let cfg = UIImage.SymbolConfiguration(pointSize: 15.0, weight: .semibold)
@@ -515,23 +508,6 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
         addSubview(chevronBtn)
         addSubview(clipboardPill)
         addSubview(clipboardDismissBtn)
-
-        clipTrailingToChevron = clipContainer.trailingAnchor.constraint(equalTo: chevronBtn.leadingAnchor)
-        clipTrailingToFull = clipContainer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6)
-        clipTopConstraint = clipContainer.topAnchor.constraint(equalTo: topAnchor, constant: 4.0)
-        clipBottomConstraint = clipContainer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -7.0)
-
-        NSLayoutConstraint.activate([
-            clipContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
-            clipTrailingToFull,
-            clipTopConstraint,
-            clipBottomConstraint,
-
-            chevronBtn.trailingAnchor.constraint(equalTo: trailingAnchor),
-            chevronBtn.topAnchor.constraint(equalTo: topAnchor),
-            chevronBtn.bottomAnchor.constraint(equalTo: bottomAnchor),
-            chevronBtn.widthAnchor.constraint(equalToConstant: Self.chevronWidth),
-        ])
 
         ensureSlotCapacity(10)
     }
@@ -593,20 +569,33 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        layoutRibbonSubviews()
+    }
+
+    private func layoutRibbonSubviews() {
         let topInset = bandTopInset
         let bottomInset = bandBottomInset
-        if clipTopConstraint.constant != topInset {
-            clipTopConstraint.constant = topInset
-        }
-        if clipBottomConstraint.constant != -bottomInset {
-            clipBottomConstraint.constant = -bottomInset
-        }
         chevronBtn.bandTopInset = topInset
         chevronBtn.bandBottomInset = bottomInset
+        chevronBtn.frame = CGRect(
+            x: max(0, bounds.width - Self.chevronWidth),
+            y: 0,
+            width: Self.chevronWidth,
+            height: bounds.height
+        )
+        let barH = max(0, bounds.height - topInset - bottomInset)
+        let clipWidth = chevronBtn.isHidden
+            ? max(0, bounds.width - 6.0)
+            : max(0, chevronBtn.frame.minX)
+        clipContainer.frame = CGRect(
+            x: 0,
+            y: topInset,
+            width: clipWidth,
+            height: barH
+        )
 
         let scale = max(1.0, traitCollection.displayScale)
         let hairline = 1.0 / scale
-        let barH = max(0, bounds.height - topInset - bottomInset)
         let slotH = min(36.0, barH)
         let slotY = floor((barH - slotH) * 0.5)
 
@@ -808,8 +797,6 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
         chevronBtn.isHidden = hideChevron
         chevronDivider.backgroundColor = chevronDividerCol
         chevronDivider.isHidden = hideChevron
-        clipTrailingToChevron.isActive = !hideChevron
-        clipTrailingToFull.isActive = hideChevron
 
         UIView.performWithoutAnimation {
             if let clip = effectiveClipboard {
@@ -876,7 +863,9 @@ final class IOSCandidateRibbonView: UIView, UIGestureRecognizerDelegate {
             }
             scrollOffsetX = 0
             setNeedsLayout()
-            layoutIfNeeded()
+            if bounds.width > 0, bounds.height > 0 {
+                layoutRibbonSubviews()
+            }
         }
     }
 
@@ -1185,6 +1174,24 @@ final class IOSExpandedCandidateView: UIView {
             scrollView.addSubview(cell)
             cellPool.append(cell)
         }
+    }
+
+    func trimCellPool(keep maxKeep: Int = 32) {
+        let target = max(candidates.count, max(0, maxKeep))
+        guard cellPool.count > target else { return }
+        for idx in target..<cellPool.count {
+            cellPool[idx].removeFromSuperview()
+        }
+        cellPool.removeSubrange(target..<cellPool.count)
+    }
+
+    func clearAndTrim(keep maxKeep: Int = 32) {
+        candidates.removeAll()
+        for cell in cellPool {
+            cell.isHidden = true
+        }
+        trimCellPool(keep: maxKeep)
+        scrollView.contentSize = .zero
     }
 
     @objc private func handleCandidateCellTap(_ sender: IOSExpandedCellButton) {

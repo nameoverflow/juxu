@@ -24,7 +24,10 @@ private final class ProxyDocumentSink: IOSMarkedTextDocumentSink {
 
 @objc(KeyboardViewController)
 public final class KeyboardViewController: UIInputViewController {
-    private lazy var bridge = JuxuBridge()
+    /// Share the single process-wide `JuxuBridge` (`JuxuEngine` + `UserStore` + `NeuralContextTracker`
+    /// + `JuxuPersistenceWorker`) across `KeyboardViewController` lifecycles so UIKit's overlapping
+    /// teardown/recreation of `UIInputViewController` never duplicates heap or hits the ~48 MB Jetsam ceiling.
+    private var bridge: JuxuBridge { JuxuBridge.shared }
     private var layoutEngine = IOSKeyboardLayoutEngine()
 
     private let glassBackdrop = UIView()
@@ -54,9 +57,15 @@ public final class KeyboardViewController: UIInputViewController {
     private var proxySink: ProxyDocumentSink { ProxyDocumentSink(proxy: textDocumentProxy) }
     private let clipboardStore = IOSClipboardSuggestionStore()
     private var clipboardGate = IOSClipboardVisibilityGate()
-    private let clipboardReadQueue = DispatchQueue(label: "im.juxu.clipboard", qos: .userInitiated)
+    private let clipboardReadQueue = DispatchQueue(
+        label: "im.juxu.clipboard",
+        qos: .userInitiated,
+        autoreleaseFrequency: .workItem
+    )
     private var activeClipboardSuggestion: IOSClipboardSuggestion?
-    private var inFlightClipboardChangeCount: Int?
+    private var clipboardProbeInFlight = false
+    private var clipboardProbeNeedsRerun = false
+    private var lastClipboardPrefersOTP = false
     private var expandedIdleWords: [String]?
     private var hasAppeared = false
 
@@ -108,6 +117,18 @@ public final class KeyboardViewController: UIInputViewController {
         .all
     }
 
+    public override func didReceiveMemoryWarning() {
+        super.didReceiveMemoryWarning()
+        lineClearUndo.removeAll()
+        if expandedGrid.isHidden {
+            expandedGrid.clearAndTrim(keep: 0)
+        } else {
+            expandedGrid.trimCellPool(keep: 48)
+        }
+        keyCanvas.clearCaches()
+        bridge.handleMemoryWarning()
+    }
+
     /// `UITextDocumentProxy.documentIdentifier` is bridged as non-optional `UUID`, yet UIKit's
     /// `_UITextDocumentInterface` returns Objective-C `nil` during focus transitions or when
     /// refocusing a responder that still carries an orphaned `markedTextRange`.
@@ -122,6 +143,7 @@ public final class KeyboardViewController: UIInputViewController {
     private func setExpandedGridVisible(_ visible: Bool) {
         if !visible {
             expandedIdleWords = nil
+            expandedGrid.clearAndTrim(keep: 32)
         }
         expandedGrid.isHidden = !visible
         keyCanvas.isHidden = visible
@@ -233,18 +255,23 @@ public final class KeyboardViewController: UIInputViewController {
         super.viewWillAppear(animated)
         isKeyboardPresentingOrVisible = true
         feedback.prepare()
+        bridge.suppressEvalLogging = isSensitiveEvalProxy()
+        if !bridge.state.preedit.isEmpty && inlineSession.markedCode.isEmpty {
+            bridge.abandonComposition(timestampMs: Self.nowMs())
+        }
         bridge.reloadConfigAndUserOnAppear { [weak self] in
             self?.syncEngineToUI()
         }
         pairingTracker.reset()
         bridge.resetQuoteState()
         lastKnownDocumentID = currentDocumentIdentifier
+        lastClipboardPrefersOTP = (textDocumentProxy.textContentType == .oneTimeCode)
         inlineSession.resetForAppearance()
         scheduleAppearanceOrphanedSweepIfNeeded()
         clipboardGate.resetForKeyboardAppearance()
+        activeClipboardSuggestion = nil
         applyDesiredTrayDimensions()
         syncContextFromProxyIfIdle()
-        refreshClipboardSuggestion(allowAsyncRead: false)
         syncEngineToUI()
     }
 
@@ -260,12 +287,11 @@ public final class KeyboardViewController: UIInputViewController {
         } else {
             scheduleNilDocOrphanedSweepIfNeeded()
         }
-        // Trigger any uncached pasteboard read AFTER initial 4-row layout is on screen,
-        // so an iOS "Allow Paste" system alert never freezes mid-layout!
+        // Perform pasteboard `changeCount` / `hasStrings` / `string` XPC reads strictly off `@MainActor`
+        // AFTER initial 4-row layout is on screen so Universal Clipboard or system paste alerts never stall UIKit.
         DispatchQueue.main.async { [weak self] in
             guard let self, self.hasAppeared else { return }
-            self.refreshClipboardSuggestion(allowAsyncRead: true)
-            self.syncEngineToUI()
+            self.refreshClipboardSuggestionAsync()
         }
     }
 
@@ -352,10 +378,14 @@ public final class KeyboardViewController: UIInputViewController {
         let docID = currentDocumentIdentifier
         let isComposing = !bridge.state.preedit.isEmpty || !inlineSession.markedCode.isEmpty
 
-        if docID != lastKnownDocumentID {
+        let docChanged = (docID != lastKnownDocumentID)
+        if docChanged {
             lastKnownDocumentID = docID
             pairingTracker.reset()
             bridge.resetQuoteState()
+            if docID != nil {
+                clipboardGate.resetForKeyboardAppearance()
+            }
         }
 
         if isComposing {
@@ -391,13 +421,18 @@ public final class KeyboardViewController: UIInputViewController {
         bridge.suppressEvalLogging = isSensitiveEvalProxy()
         inlineSession.reconcileExternalContext(hostBefore: textDocumentProxy.documentContextBeforeInput)
         syncContextFromProxyIfIdle()
-        refreshClipboardSuggestion(allowAsyncRead: hasAppeared)
+        let prefersOTP = (textDocumentProxy.textContentType == .oneTimeCode)
+        let otpChanged = (prefersOTP != lastClipboardPrefersOTP)
+        lastClipboardPrefersOTP = prefersOTP
+        if hasAppeared && (docChanged || otpChanged) {
+            refreshClipboardSuggestionAsync()
+        }
         syncProxyTraits()
     }
 
     @objc private func handlePasteboardChanged() {
-        refreshClipboardSuggestion(allowAsyncRead: hasAppeared)
-        syncEngineToUI()
+        guard hasAppeared else { return }
+        refreshClipboardSuggestionAsync()
     }
 
     private func markUserTypedForClipboard() {
@@ -405,57 +440,100 @@ public final class KeyboardViewController: UIInputViewController {
         activeClipboardSuggestion = nil
     }
 
-    private func refreshClipboardSuggestion(allowAsyncRead: Bool) {
-        guard self.hasFullAccess, bridge.prefs.clipboardSuggestion else {
-            activeClipboardSuggestion = nil
+    /// Probes `UIPasteboard.general` (`changeCount`, `hasStrings`, `string`) exclusively on
+    /// `clipboardReadQueue` so `pasted` / Universal Clipboard XPC calls can never block `@MainActor`.
+    private func refreshClipboardSuggestionAsync() {
+        guard hasAppeared, isKeyboardPresentingOrVisible, bridge.prefs.clipboardSuggestion, self.hasFullAccess else {
+            if activeClipboardSuggestion != nil {
+                activeClipboardSuggestion = nil
+                syncEngineToUI()
+            }
             return
         }
-        let pb = UIPasteboard.general
-        let changeCount = pb.changeCount
-        guard clipboardGate.shouldAllowDisplay(for: changeCount) else {
-            activeClipboardSuggestion = nil
+        if clipboardProbeInFlight {
+            clipboardProbeNeedsRerun = true
             return
         }
-        let prefersOTP = (textDocumentProxy.textContentType == .oneTimeCode)
-        let now = Date().timeIntervalSince1970
-        let result = clipboardStore.lookup(
-            hasFullAccess: true,
-            enabled: true,
-            hasStrings: pb.hasStrings,
-            changeCount: changeCount,
-            prefersOTP: prefersOTP,
-            now: now
-        )
-        switch result {
-        case .none:
-            activeClipboardSuggestion = nil
-        case .cached(let suggestion):
-            activeClipboardSuggestion = suggestion
-        case .needsRead(let changeCount):
-            activeClipboardSuggestion = nil
-            guard allowAsyncRead, inFlightClipboardChangeCount != changeCount else { return }
-            inFlightClipboardChangeCount = changeCount
-            clipboardReadQueue.async { [weak self] in
-                // Perform blocking XPC pasteboard read off the main thread so an iOS system
-                // "Allow Paste" modal alert never stalls UIKit keyboard layout or rendering.
-                let fetched = UIPasteboard.general.string
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    if self.inFlightClipboardChangeCount == changeCount {
-                        self.inFlightClipboardChangeCount = nil
-                    }
-                    let currentOTP = (self.textDocumentProxy.textContentType == .oneTimeCode)
-                    let suggestion = self.clipboardStore.recordRead(
-                        changeCount: changeCount,
-                        rawText: fetched,
-                        prefersOTP: currentOTP,
-                        now: Date().timeIntervalSince1970
-                    )
-                    if UIPasteboard.general.changeCount == changeCount,
-                       self.clipboardGate.shouldAllowDisplay(for: changeCount) {
-                        self.activeClipboardSuggestion = suggestion
+        clipboardProbeInFlight = true
+        clipboardProbeNeedsRerun = false
+
+        let gateSnapshot = clipboardGate
+        let seenCC = clipboardStore.seenChangeCount
+        let handledCC = clipboardStore.handledChangeCount
+
+        clipboardReadQueue.async { [weak self] in
+            let pb = UIPasteboard.general
+            let cc = pb.changeCount
+            var gateCopy = gateSnapshot
+            let allowed = gateCopy.shouldAllowDisplay(for: cc) && (handledCC != cc)
+            let isUnseen = (seenCC != cc)
+            let hasStrings: Bool
+            let fetchedText: String?
+            if !allowed {
+                hasStrings = false
+                fetchedText = nil
+            } else if !isUnseen {
+                // Already cached in `IOSClipboardSuggestionStore`: avoid `pb.hasStrings` / `pb.string` XPC!
+                hasStrings = true
+                fetchedText = nil
+            } else {
+                let hs = pb.hasStrings
+                hasStrings = hs
+                fetchedText = hs ? pb.string : nil
+            }
+
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.clipboardProbeInFlight = false
+                let shouldRerun = self.clipboardProbeNeedsRerun
+                self.clipboardProbeNeedsRerun = false
+
+                guard self.hasAppeared,
+                      self.isKeyboardPresentingOrVisible,
+                      self.bridge.prefs.clipboardSuggestion,
+                      self.hasFullAccess else {
+                    if self.activeClipboardSuggestion != nil {
+                        self.activeClipboardSuggestion = nil
                         self.syncEngineToUI()
                     }
+                    return
+                }
+
+                let now = Date().timeIntervalSince1970
+                let currentOTP = (self.textDocumentProxy.textContentType == .oneTimeCode)
+                let canShow = self.clipboardGate.shouldAllowDisplay(for: cc)
+                let resolved: IOSClipboardSuggestion?
+                if !canShow {
+                    resolved = nil
+                } else if isUnseen && allowed {
+                    resolved = self.clipboardStore.recordRead(
+                        changeCount: cc,
+                        rawText: hasStrings ? fetchedText : nil,
+                        prefersOTP: currentOTP,
+                        now: now
+                    )
+                } else {
+                    switch self.clipboardStore.lookup(
+                        hasFullAccess: true,
+                        enabled: true,
+                        hasStrings: hasStrings,
+                        changeCount: cc,
+                        prefersOTP: currentOTP,
+                        now: now
+                    ) {
+                    case .cached(let s):
+                        resolved = s
+                    case .none, .needsRead:
+                        resolved = nil
+                    }
+                }
+
+                if self.activeClipboardSuggestion != resolved {
+                    self.activeClipboardSuggestion = resolved
+                    self.syncEngineToUI()
+                }
+                if shouldRerun {
+                    self.refreshClipboardSuggestionAsync()
                 }
             }
         }
@@ -918,7 +996,7 @@ public final class KeyboardViewController: UIInputViewController {
             expandedGrid.reload(candidates: items, dark: isDarkAppearance)
         } else {
             expandedIdleWords = nil
-            expandedGrid.reload(candidates: bridge.allCandidates(maxCount: 300), dark: isDarkAppearance)
+            expandedGrid.reload(candidates: bridge.allCandidates(maxCount: 120), dark: isDarkAppearance)
         }
     }
 
@@ -1452,8 +1530,10 @@ public final class KeyboardViewController: UIInputViewController {
 
     private func syncEngineToUI() {
         let st = bridge.state
-        if st.preedit.isEmpty && activeClipboardSuggestion != nil {
-            refreshClipboardSuggestion(allowAsyncRead: false)
+        if st.preedit.isEmpty, activeClipboardSuggestion != nil {
+            if clipboardGate.isSuppressedByTyping || !bridge.prefs.clipboardSuggestion || !self.hasFullAccess {
+                activeClipboardSuggestion = nil
+            }
         }
         layoutEngine.asciiMode = st.asciiMode
         layoutEngine.schemaId = st.schemaId

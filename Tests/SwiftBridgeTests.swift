@@ -194,9 +194,19 @@ struct SwiftBridgeTests {
         for key in "qbh".unicodeScalars {
             _ = bridge.handleKey(keyCode: 0, scalar: key.value, hasCmdOrCtrl: false, timestampMs: 507)
         }
+        check(bridge.state.page == 0 && bridge.state.totalPages >= 2)
+        let page0Top = bridge.state.candidates.first?.text ?? ""
+        // Verify macOS `-` (`0x1B`, scalar 45) and `=` (`0x18`, scalar 61) turn pages even in `spaceless = true`!
+        let pagedFwd = bridge.handleKey(keyCode: 0x18, scalar: 61, hasCmdOrCtrl: false, timestampMs: 507)
+        check(pagedFwd.consumed && pagedFwd.commitText.isEmpty && pagedFwd.page == 1)
+        check(pagedFwd.candidates.first?.text != page0Top)
+        let pagedBack = bridge.handleKey(keyCode: 0x1B, scalar: 45, hasCmdOrCtrl: false, timestampMs: 507)
+        check(pagedBack.consumed && pagedBack.commitText.isEmpty && pagedBack.page == 0)
+        check(pagedBack.candidates.first?.text == page0Top)
         let singleIndex = bridge.allCandidates(maxCount: 30).firstIndex { $0.text == "邜" }!
         let selectedSingle = bridge.selectAbsCandidate(absIndex: singleIndex, timestampMs: 508)
         check(selectedSingle.commitText == "邜")
+        bridge.handleMemoryWarning()
         bridge.setContext("")
         for key in codes.unicodeScalars {
             _ = bridge.handleKey(keyCode: 0, scalar: key.value, hasCmdOrCtrl: false, timestampMs: 509)

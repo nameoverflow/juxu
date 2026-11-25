@@ -25,7 +25,12 @@ fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 
 #[inline]
 fn into_c_string(s: String) -> *mut c_char {
-    CString::new(s.replace('\0', ""))
+    let clean = if s.as_bytes().contains(&0) {
+        s.replace('\0', "")
+    } else {
+        s
+    };
+    CString::new(clean)
         .unwrap_or_else(|_| CString::new("{}").unwrap())
         .into_raw()
 }
@@ -708,6 +713,15 @@ pub extern "C" fn juxu_engine_clear(handle: *mut JuxuEngineHandle) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if let Some(h) = unsafe { handle.as_mut() } {
             h.inner.clear_composition();
+        }
+    }));
+}
+
+#[no_mangle]
+pub extern "C" fn juxu_engine_trim_memory(handle: *mut JuxuEngineHandle) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(h) = unsafe { handle.as_mut() } {
+            h.inner.trim_idle_memory();
         }
     }));
 }

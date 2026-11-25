@@ -19,6 +19,10 @@ private final class IOSKeycapNodeView: UIView {
 
     private static var symbolCache: [String: UIImage] = [:]
 
+    fileprivate static func clearSymbolCache() {
+        symbolCache.removeAll()
+    }
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = false
@@ -322,6 +326,10 @@ private final class IOSKeycapNodeView: UIView {
 /// and sticky press-lock hysteresis (eliminating lift-off flick drops & cross-key misfires).
 final class IOSKeyCanvasView: UIInputView, UIInputViewAudioFeedback {
     var enableInputClicksWhenVisible: Bool { true }
+
+    func clearCaches() {
+        IOSKeycapNodeView.clearSymbolCache()
+    }
 
     var onKeyTouchDown: ((IOSKeySpec) -> Void)?
     var onKeySlidePreview: ((IOSKeySpec?) -> Void)?
