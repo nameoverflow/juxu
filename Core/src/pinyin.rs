@@ -2987,8 +2987,6 @@ fn build_pinyin_candidates(
     let is_multi_char = top_char_len >= 2;
     let head_full_cap = if is_long_sentence {
         3usize
-    } else if is_multi_char {
-        4usize
     } else {
         BEAM_WIDTH
     };
@@ -3221,13 +3219,7 @@ fn build_pinyin_candidates(
             out.push(first_pref);
         }
     }
-    let single_promote_cap = if is_long_sentence {
-        2usize
-    } else if is_multi_char {
-        3usize
-    } else {
-        0usize
-    };
+    let single_promote_cap = 0usize;
     let mut head_singles_promoted = 0usize;
     let mut rest_singles: Vec<PinyinCandidate> = Vec::new();
     for (text, consumed, _, corr, hint) in single_items {

@@ -1761,21 +1761,26 @@ fn real_dicts_zero_hardcode_mixed_cn_en_and_unified_pinyin() {
     }
     assert_eq!(engine.all_candidates()[0].text, "先做macOS");
 
-    // 3. Page-1 first-syllable single-char interleaving (`duanyan` after `耗时` keeps `断` on Page 1-2, not #27!)
+    // 3. Multi-char words keep full-match candidates ahead of single characters (no single-char interleaving),
+    //    while single-char `断` remains available in the candidate list for segmented selection.
     engine.clear_composition();
     engine.set_recent_context("耗时");
     for (i, ch) in "duanyan".chars().enumerate() {
         let _ = engine.handle_key_event(0, Some(ch), false, 2_500 + i as u64 * 25);
     }
-    let idx_duan = engine
-        .all_candidates()
+    let duanyan_cands = engine.all_candidates();
+    let idx_duan = duanyan_cands
         .iter()
         .position(|c| c.text == "断")
         .expect("expected single-char '断'");
+    let first_single = duanyan_cands
+        .iter()
+        .position(|c| c.text.chars().count() == 1)
+        .expect("expected single-char candidates");
     assert!(
-        idx_duan < 8,
-        "expected '断' surfaced near front for 'duanyan' (was #27), got #{}",
-        idx_duan + 1
+        first_single >= 20 && idx_duan >= first_single,
+        "expected full multi-char candidates before single-char '断', got {:?}",
+        duanyan_cands.iter().take(idx_duan + 1).map(|c| &c.text).collect::<Vec<_>>()
     );
 
     // 4. Unified personal Chinese lexicon across Wubi -> Full Pinyin, Abbr (`jx`), Xiaohe Shuangpin, and T9!
