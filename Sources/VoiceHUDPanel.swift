@@ -28,18 +28,19 @@ enum VoiceHUDMetrics {
     static let cardPadY: CGFloat = 9
     static let noticeMaxTextWidth: CGFloat = 360
     static let fadeDuration: CFTimeInterval = 0.14
+    static let pillResizeDuration: CFTimeInterval = 0.18
     /// New caption characters are placed at once and fade in over this time.
     static let captionFadeDuration: CFTimeInterval = 0.11
     static let captionMaxStagger: CFTimeInterval = 0.05
 }
 
 enum VoiceHUDTextFit {
-    static func attributes(font: NSFont, lineHeight: CGFloat) -> [NSAttributedString.Key: Any] {
+    static func attributes(font: NSFont, lineHeight: CGFloat, color: NSColor = .white) -> [NSAttributedString.Key: Any] {
         let style = NSMutableParagraphStyle()
         style.minimumLineHeight = lineHeight
         style.maximumLineHeight = lineHeight
         style.lineBreakMode = .byCharWrapping
-        return [.font: font, .foregroundColor: NSColor.white, .paragraphStyle: style]
+        return [.font: font, .foregroundColor: color, .paragraphStyle: style]
     }
 
     static func lineCount(_ text: String, attrs: [NSAttributedString.Key: Any], width: CGFloat, lineHeight: CGFloat) -> Int {
@@ -73,6 +74,10 @@ enum VoiceHUDTextFit {
 }
 
 /// Layer-hosting HUD canvas. All drawing is done with Core Animation layers; nothing runs while hidden.
+/// The pill and caption card have no fill of their own: the controller puts system backdrops
+/// (Liquid Glass, or the menu material before macOS 26) behind them at the frames `onBackdropLayout` reports.
+/// The pill's width animation is stepped here on the display link and reported every frame, so the
+/// backdrop and the pill's contents move on one clock.
 final class VoiceHUDContentView: NSView {
     private enum Mode {
         case listening
@@ -115,7 +120,21 @@ final class VoiceHUDContentView: NSView {
     private var cardLinesFloor = 1
     private var currentNotice = ""
     private var currentNoticeIsError = false
+    private var pillWidth: CGFloat = VoiceHUDMetrics.listeningWidth
+    private var pillWidthFrom: CGFloat = VoiceHUDMetrics.listeningWidth
+    private var pillWidthTarget: CGFloat = VoiceHUDMetrics.listeningWidth
+    private var pillResizeElapsed: CFTimeInterval = 0
+    private var isResizingPill: Bool { pillWidth != pillWidthTarget }
     var reduceMotion = false
+
+    /// Pill frame and caption card frame (nil while hidden), in view coordinates.
+    var onBackdropLayout: ((CGRect, CGRect?) -> Void)?
+
+    /// Text and waveform colour for the current light or dark appearance.
+    private var foreground: NSColor {
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        return isDark ? .white : NSColor(white: 0.1, alpha: 1)
+    }
 
     private let cardFont = NSFont.systemFont(ofSize: 14, weight: .regular)
     private let noticeFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
@@ -151,18 +170,19 @@ final class VoiceHUDContentView: NSView {
         groupLayer.frame = CGRect(origin: .zero, size: canvas)
         root.addSublayer(groupLayer)
 
-        cardLayer.backgroundColor = NSColor.black.withAlphaComponent(0.94).cgColor
         cardLayer.cornerRadius = 12
         cardLayer.cornerCurve = .continuous
+        cardLayer.masksToBounds = true
         cardLayer.opacity = 0
         groupLayer.addSublayer(cardLayer)
         cardTextLayer.isWrapped = true
         cardTextLayer.alignmentMode = .left
         cardLayer.addSublayer(cardTextLayer)
 
-        pillLayer.backgroundColor = NSColor.black.cgColor
         pillLayer.cornerRadius = VoiceHUDMetrics.pillHeight / 2
         pillLayer.cornerCurve = .circular
+        // Clip to the pill so a notice is revealed as the pill widens instead of spilling past the glass.
+        pillLayer.masksToBounds = true
         groupLayer.addSublayer(pillLayer)
 
         barsLayer.frame = CGRect(
@@ -174,7 +194,7 @@ final class VoiceHUDContentView: NSView {
         pillLayer.addSublayer(barsLayer)
         for i in 0..<VoiceHUDMetrics.barCount {
             let bar = CALayer()
-            bar.backgroundColor = NSColor.white.cgColor
+            bar.backgroundColor = foreground.cgColor
             bar.cornerRadius = 0.7
             bar.bounds = CGRect(x: 0, y: 0, width: VoiceHUDMetrics.barWidth, height: VoiceHUDMetrics.barWidth)
             bar.position = CGPoint(
@@ -190,7 +210,7 @@ final class VoiceHUDContentView: NSView {
         pillLayer.addSublayer(spinnerLayer)
         for i in 0..<8 {
             let spoke = CALayer()
-            spoke.backgroundColor = NSColor.white.cgColor
+            spoke.backgroundColor = foreground.cgColor
             spoke.bounds = CGRect(x: 0, y: 0, width: 1.8, height: 3.8)
             spoke.cornerRadius = 0.9
             let angle = -CGFloat(i) * .pi / 4
@@ -213,6 +233,10 @@ final class VoiceHUDContentView: NSView {
         layoutPill(animated: false)
     }
 
+    func reportBackdropLayout() {
+        onBackdropLayout?(pillLayer.frame, cardLayer.opacity > 0 ? cardLayer.frame : nil)
+    }
+
     func setContentsScale(_ scale: CGFloat) {
         for textLayer in [cardTextLayer, noticeLayer] {
             textLayer.contentsScale = scale
@@ -222,6 +246,26 @@ final class VoiceHUDContentView: NSView {
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         setContentsScale(window?.backingScaleFactor ?? 2)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        let color = foreground.cgColor
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for layer in barLayers + spokeLayers {
+            layer.backgroundColor = color
+        }
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            errorDotLayer.backgroundColor = NSColor.systemRed.cgColor
+        }
+        if mode == .notice {
+            noticeLayer.string = noticeAttributedString()
+        }
+        CATransaction.commit()
+        if !captionFitted.isEmpty {
+            renderCaption()
+        }
     }
 
     func apply(_ state: VoiceHUDState, animated: Bool) {
@@ -308,6 +352,11 @@ final class VoiceHUDContentView: NSView {
         captionFadeCount = 0
         cardWidthFloor = 0
         cardLinesFloor = 1
+        // A resize cut short by hide() must not carry over into the next presentation.
+        if isResizingPill {
+            pillResizeElapsed = 0
+            setPillWidth(pillWidthTarget)
+        }
         layoutCard()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -319,8 +368,11 @@ final class VoiceHUDContentView: NSView {
         CATransaction.commit()
     }
 
+    private func noticeAttributedString() -> NSAttributedString {
+        NSAttributedString(string: currentNotice, attributes: [.font: noticeFont, .foregroundColor: foreground])
+    }
+
     private func layoutPill(animated: Bool) {
-        let canvas = VoiceHUDMetrics.canvasSize
         var width = VoiceHUDMetrics.listeningWidth
         var noticeAttr: NSAttributedString?
         var noticeTextWidth: CGFloat = 0
@@ -328,24 +380,25 @@ final class VoiceHUDContentView: NSView {
         if mode == .processing {
             width = VoiceHUDMetrics.processingWidth
         } else if mode == .notice {
-            let attrs: [NSAttributedString.Key: Any] = [.font: noticeFont, .foregroundColor: NSColor.white]
-            let attr = NSAttributedString(string: currentNotice, attributes: attrs)
+            let attr = noticeAttributedString()
             noticeTextWidth = min(VoiceHUDMetrics.noticeMaxTextWidth, ceil(attr.size().width) + 1)
             noticeAttr = attr
             width = max(VoiceHUDMetrics.listeningWidth, noticeTextWidth + dotSpace + 28)
         }
 
+        pillWidthTarget = width
+        if animated {
+            // Stepped by advance(dt:); the owner keeps the display link running until it settles.
+            pillWidthFrom = pillWidth
+            pillResizeElapsed = 0
+        } else {
+            setPillWidth(width)
+        }
+
+        // The spinner fades over the resize so it does not sit on the waveform while the pill widens.
         CATransaction.begin()
-        CATransaction.setAnimationDuration(animated ? 0.18 : 0)
-        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
+        CATransaction.setAnimationDuration(animated ? VoiceHUDMetrics.pillResizeDuration : 0)
         CATransaction.setDisableActions(!animated)
-        pillLayer.frame = CGRect(
-            x: round((canvas.width - width) / 2),
-            y: VoiceHUDMetrics.pillBottom,
-            width: width,
-            height: VoiceHUDMetrics.pillHeight
-        )
-        spinnerLayer.position = CGPoint(x: width - 17, y: VoiceHUDMetrics.pillHeight / 2)
         spinnerLayer.opacity = mode == .processing ? 1 : 0
         CATransaction.commit()
 
@@ -362,6 +415,28 @@ final class VoiceHUDContentView: NSView {
         CATransaction.commit()
     }
 
+    /// Places the pill at `width` (centred) and reports it, with the caption card, to the backdrops.
+    private func setPillWidth(_ width: CGFloat) {
+        pillWidth = width
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        pillLayer.frame = CGRect(
+            x: round((VoiceHUDMetrics.canvasSize.width - width) / 2),
+            y: VoiceHUDMetrics.pillBottom,
+            width: width,
+            height: VoiceHUDMetrics.pillHeight
+        )
+        spinnerLayer.position = CGPoint(x: width - 17, y: VoiceHUDMetrics.pillHeight / 2)
+        CATransaction.commit()
+        onBackdropLayout?(pillLayer.frame, cardLayer.opacity > 0 ? cardLayer.frame : nil)
+    }
+
+    /// True while something still needs the display link: the waveform, the spinner, a caption fade
+    /// or the pill's resize. A settled notice needs nothing.
+    private var needsFrames: Bool {
+        mode != .notice || isResizingPill || captionFadeCount > 0
+    }
+
     private func layoutCard() {
         let text = currentPartial
             .replacingOccurrences(of: "\n", with: " ")
@@ -376,6 +451,7 @@ final class VoiceHUDContentView: NSView {
             captionSource = ""
             captionFitted = ""
             captionFadeCount = 0
+            onBackdropLayout?(pillLayer.frame, nil)
             return
         }
 
@@ -424,10 +500,12 @@ final class VoiceHUDContentView: NSView {
         captionFitted = fitted
         renderCaption()
         cardLayer.opacity = 1
+        onBackdropLayout?(pillLayer.frame, cardLayer.frame)
     }
 
     private func renderCaption() {
-        let attrs = VoiceHUDTextFit.attributes(font: cardFont, lineHeight: VoiceHUDMetrics.cardLineHeight)
+        let color = foreground
+        let attrs = VoiceHUDTextFit.attributes(font: cardFont, lineHeight: VoiceHUDMetrics.cardLineHeight, color: color)
         let fitted = captionFitted
         let caption = NSMutableAttributedString(string: fitted, attributes: attrs)
         let total = fitted.count
@@ -436,7 +514,7 @@ final class VoiceHUDContentView: NSView {
             let start = fitted.index(fitted.endIndex, offsetBy: -dimmed)
             caption.addAttribute(
                 .foregroundColor,
-                value: NSColor.white.withAlphaComponent(0.55),
+                value: color.withAlphaComponent(0.55),
                 range: NSRange(start..., in: fitted)
             )
         }
@@ -449,7 +527,7 @@ final class VoiceHUDContentView: NSView {
                 let base: CGFloat = captionFadeCount - k <= dimmed ? 0.55 : 1
                 caption.addAttribute(
                     .foregroundColor,
-                    value: NSColor.white.withAlphaComponent(base * CGFloat(progress)),
+                    value: color.withAlphaComponent(base * CGFloat(progress)),
                     range: NSRange(index..<next, in: fitted)
                 )
                 index = next
@@ -477,7 +555,7 @@ final class VoiceHUDContentView: NSView {
     }
 
     func startAnimating() {
-        guard displayLinkHandle == nil else { return }
+        guard needsFrames, displayLinkHandle == nil else { return }
         lastTimestamp = nil
         let proxy = DisplayLinkWeakProxy(self)
         let link = displayLink(target: proxy, selector: #selector(DisplayLinkWeakProxy.step(_:)))
@@ -497,11 +575,23 @@ final class VoiceHUDContentView: NSView {
         let dt = lastTimestamp.map { min(0.1, max(0.001, now - $0)) } ?? (1.0 / 60)
         lastTimestamp = now
         advance(dt: dt)
+        if !needsFrames {
+            stopAnimating()
+        }
     }
 
     /// Advances the waveform and spinner. Public to the module so previews are deterministic.
     func advance(dt: CFTimeInterval) {
         clock += dt
+        if isResizingPill {
+            pillResizeElapsed += dt
+            let t = min(1, pillResizeElapsed / VoiceHUDMetrics.pillResizeDuration)
+            // Ease in-out (smoothstep), matching the old 0.18s easeInEaseOut.
+            let eased = CGFloat(t * t * (3 - 2 * t))
+            let width = t >= 1 ? pillWidthTarget : round(pillWidthFrom + (pillWidthTarget - pillWidthFrom) * eased)
+            setPillWidth(width)
+            if t >= 1 { pillWidth = pillWidthTarget }
+        }
         let dot = VoiceHUDMetrics.barWidth
         let span = VoiceHUDMetrics.barMaxHeight - dot
 
@@ -835,12 +925,23 @@ public final class VoiceHUDPanelController {
 
     private let panel: NSPanel
     private let contentView: VoiceHUDContentView
+    private let pillBackdrop: HUDBackdropView
+    private let cardBackdrop: HUDBackdropView
     private var hideWorkItem: DispatchWorkItem?
     private var orderOutItem: DispatchWorkItem?
 
     private init() {
         let initialFrame = NSRect(origin: .zero, size: VoiceHUDMetrics.canvasSize)
         let content = VoiceHUDContentView(frame: initialFrame)
+        let pill = HUDBackdropView(frame: .zero, cornerRadius: VoiceHUDMetrics.pillHeight / 2)
+        let card = HUDBackdropView(frame: .zero, cornerRadius: 12)
+        card.isHidden = true
+        pill.showsHairlineBorder = true
+        card.showsHairlineBorder = true
+        let container = NSView(frame: initialFrame)
+        container.addSubview(card)
+        container.addSubview(pill)
+        container.addSubview(content)
 
         let p = NSPanel(
             contentRect: initialFrame,
@@ -858,10 +959,33 @@ public final class VoiceHUDPanelController {
         p.hidesOnDeactivate = false
         p.worksWhenModal = true
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
-        p.contentView = content
+        p.contentView = container
 
         self.contentView = content
+        self.pillBackdrop = pill
+        self.cardBackdrop = card
         self.panel = p
+        content.onBackdropLayout = { [weak self] pillFrame, cardFrame in
+            self?.layoutBackdrops(pill: pillFrame, card: cardFrame)
+        }
+        content.reportBackdropLayout()
+    }
+
+    /// Set directly, never through `animator()`: the content view steps resizes frame by frame,
+    /// so the backdrop and the pill's contents share one clock.
+    private func layoutBackdrops(pill: CGRect, card: CGRect?) {
+        if pillBackdrop.frame != pill {
+            pillBackdrop.frame = pill
+            pillBackdrop.layoutSubtreeIfNeeded()
+        }
+        if let card {
+            if cardBackdrop.frame != card {
+                cardBackdrop.frame = card
+            }
+            cardBackdrop.isHidden = false
+        } else {
+            cardBackdrop.isHidden = true
+        }
     }
 
     public func enqueueSpectrumFrames(_ frames: [[Float]]) {
@@ -919,11 +1043,8 @@ public final class VoiceHUDPanelController {
             animateGroup(visible: true)
         }
 
-        if case .notice = state {
-            contentView.stopAnimating()
-        } else {
-            contentView.startAnimating()
-        }
+        // A notice stops the display link itself once the pill has finished resizing.
+        contentView.startAnimating()
 
         if let autoHideAfter {
             let item = DispatchWorkItem { [weak self] in
@@ -958,34 +1079,40 @@ public final class VoiceHUDPanelController {
         orderOutItem = nil
         contentView.stopAnimating()
         contentView.groupLayer.removeAllAnimations()
+        for backdrop in [pillBackdrop, cardBackdrop] {
+            backdrop.layer?.removeAllAnimations()
+            backdrop.alphaValue = 0
+        }
         panel.orderOut(nil)
     }
 
     private func animateGroup(visible: Bool) {
         let group = contentView.groupLayer
-        let reduce = contentView.reduceMotion
         let fromOpacity = group.presentation()?.opacity ?? group.opacity
-        let hiddenScale = CATransform3DMakeScale(0.94, 0.94, 1)
-        let fromTransform = group.presentation()?.transform ?? group.transform
-        let toTransform = visible || reduce ? CATransform3DIdentity : hiddenScale
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         group.removeAllAnimations()
         group.opacity = visible ? 1 : 0
-        group.transform = toTransform
         CATransaction.commit()
+
+        // The system backdrops are separate views, so they fade with the same timing instead of scaling.
+        let startAlpha: CGFloat = visible && panelJustOrdered(fromOpacity) ? 0 : CGFloat(fromOpacity)
+        for backdrop in [pillBackdrop, cardBackdrop] {
+            backdrop.alphaValue = startAlpha
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = VoiceHUDMetrics.fadeDuration
+            context.timingFunction = CAMediaTimingFunction(name: visible ? .easeOut : .easeIn)
+            for backdrop in [pillBackdrop, cardBackdrop] {
+                backdrop.animator().alphaValue = visible ? 1 : 0
+            }
+        }
 
         let fade = CABasicAnimation(keyPath: "opacity")
         fade.fromValue = visible && panelJustOrdered(fromOpacity) ? 0 : fromOpacity
         fade.toValue = visible ? 1 : 0
-        var animations: [CAAnimation] = [fade]
-        if !reduce {
-            let scale = CABasicAnimation(keyPath: "transform")
-            scale.fromValue = visible && panelJustOrdered(fromOpacity) ? hiddenScale : fromTransform
-            scale.toValue = toTransform
-            animations.append(scale)
-        }
+        let animations: [CAAnimation] = [fade]
         let animation = CAAnimationGroup()
         animation.animations = animations
         animation.duration = VoiceHUDMetrics.fadeDuration

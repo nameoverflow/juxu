@@ -33,21 +33,6 @@ public final class FloatingHUDPanel: NSPanel {
         self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
     }
 
-    public static func makePopoverEffectView(
-        frame: NSRect,
-        cornerRadius: CGFloat
-    ) -> NSVisualEffectView {
-        let effect = NSVisualEffectView(frame: frame)
-        effect.material = .popover
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = cornerRadius
-        effect.layer?.cornerCurve = .continuous
-        effect.layer?.masksToBounds = true
-        return effect
-    }
-
     public static func visibleScreenFrame(for caretRect: NSRect) -> NSRect {
         let targetScreen = NSScreen.screens.first(where: { $0.frame.intersects(caretRect) })
             ?? NSScreen.main
@@ -96,9 +81,13 @@ public final class FloatingHUDPanel: NSPanel {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
 
+        // Recomputing the shadow is a WindowServer round trip; skip it while the size stays the same.
+        let needsShadowRefresh = !isVisible || frame.size != targetFrame.size
         setFrame(targetFrame, display: false, animate: false)
         prepareContent()
-        invalidateShadow()
+        if needsShadowRefresh {
+            invalidateShadow()
+        }
 
         if !isVisible {
             orderFrontRegardless()
@@ -117,5 +106,88 @@ public final class FloatingHUDPanel: NSPanel {
         orderOut(nil)
         CATransaction.commit()
         NSAnimationContext.endGrouping()
+    }
+}
+
+/// System backdrop for the floating input UI: Liquid Glass on macOS 26 and later, the menu
+/// material before. Put the panel's own views in `contentContainer`.
+@MainActor
+public final class HUDBackdropView: NSView {
+    public let contentContainer: NSView
+    private let backdrop: NSView
+
+    /// True when the backdrop is Liquid Glass, which draws its own edge and highlight.
+    public let usesGlass: Bool
+
+    public var cornerRadius: CGFloat {
+        didSet { applyCornerRadius() }
+    }
+
+    /// Draws a 0.5pt appearance-aware rim on the menu material, which has no edge of its own.
+    /// Liquid Glass draws its own edge, so this does nothing there.
+    public var showsHairlineBorder = false {
+        didSet { applyBorder() }
+    }
+
+    public init(
+        frame frameRect: NSRect,
+        cornerRadius: CGFloat,
+        blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
+    ) {
+        self.cornerRadius = cornerRadius
+        let container = NSView(frame: NSRect(origin: .zero, size: frameRect.size))
+        container.autoresizingMask = [.width, .height]
+        self.contentContainer = container
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView(frame: NSRect(origin: .zero, size: frameRect.size))
+            glass.contentView = container
+            self.backdrop = glass
+            self.usesGlass = true
+        } else {
+            let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: frameRect.size))
+            effect.material = .menu
+            effect.blendingMode = blendingMode
+            effect.state = .active
+            effect.wantsLayer = true
+            effect.addSubview(container)
+            self.backdrop = effect
+            self.usesGlass = false
+        }
+        super.init(frame: frameRect)
+        wantsLayer = true
+        backdrop.autoresizingMask = [.width, .height]
+        addSubview(backdrop)
+        applyCornerRadius()
+    }
+
+    override public func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyBorder()
+    }
+
+    private func applyBorder() {
+        guard !usesGlass, let layer = backdrop.layer else { return }
+        guard showsHairlineBorder else {
+            layer.borderWidth = 0
+            return
+        }
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        layer.borderWidth = 0.5
+        layer.borderColor = (isDark
+            ? NSColor.white.withAlphaComponent(0.16)
+            : NSColor.black.withAlphaComponent(0.11)).cgColor
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    private func applyCornerRadius() {
+        if #available(macOS 26.0, *), let glass = backdrop as? NSGlassEffectView {
+            glass.cornerRadius = cornerRadius
+        } else {
+            backdrop.layer?.cornerRadius = cornerRadius
+            backdrop.layer?.cornerCurve = .continuous
+            backdrop.layer?.masksToBounds = true
+        }
     }
 }

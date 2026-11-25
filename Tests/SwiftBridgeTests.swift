@@ -391,7 +391,7 @@ struct SwiftBridgeTests {
         )
         candidateView.state = narrowState
         let sz1 = candidateView.computeFittingSize()
-        check(sz1.height == 30.0, "Expected exact 30pt single-line bar height, got \(sz1.height)")
+        check(sz1.height == CandidatePanelMetrics.barHeight, "Expected exact single-line bar height, got \(sz1.height)")
 
         let wideMultiPhraseState = JuxuActionState(
             consumed: true, bell: false, asciiMode: false, schemaId: 86, page: 0, totalPages: 3, vertical: false,
@@ -406,7 +406,7 @@ struct SwiftBridgeTests {
         )
         candidateView.state = wideMultiPhraseState
         let sz2 = candidateView.computeFittingSize()
-        check(sz2.height == 30.0, "Expected strictly single-line 30pt height without wrapping, got \(sz2.height)")
+        check(sz2.height == CandidatePanelMetrics.barHeight, "Expected strictly single-line bar height without wrapping, got \(sz2.height)")
         check(sz2.width > sz1.width + 200.0, "Expected horizontal candidate bar to expand cleanly on single line")
 
         bridge.setContext("")
@@ -417,7 +417,7 @@ struct SwiftBridgeTests {
         candidateView.frame.size = candidateView.computeFittingSize()
         candidateView.layout()
         check(bridge.state.preedit == "我感觉" && bridge.state.macOSPreedit == "q·dgip")
-        check(candidateView.frame.height == 30 && candidateView.subviews.isEmpty)
+        check(candidateView.frame.height == CandidatePanelMetrics.barHeight && candidateView.subviews.isEmpty)
         candidateView.state = narrowState
         check(narrowState.macOSPreedit == "g")
 
@@ -1164,6 +1164,27 @@ struct SwiftBridgeTests {
             weakHUDView = hudView
         }
         check(weakHUDView == nil, "Expected VoiceHUDContentView to deallocate cleanly even while CADisplayLink was active")
+
+        // 11b. The pill's resize is stepped frame by frame and every step reaches the backdrop,
+        // so the glass never runs on a different clock from the pill's contents.
+        do {
+            let hudView = VoiceHUDContentView(frame: NSRect(origin: .zero, size: VoiceHUDMetrics.canvasSize))
+            var reported: [CGRect] = []
+            hudView.onBackdropLayout = { pill, _ in reported.append(pill) }
+            hudView.reportBackdropLayout()
+            let startWidth = reported.last?.width ?? 0
+            hudView.apply(.notice(text: "已复制到剪贴板，可以直接粘贴", isError: false), animated: true)
+            hudView.advance(dt: VoiceHUDMetrics.pillResizeDuration / 2)
+            let midWidth = reported.last?.width ?? 0
+            hudView.advance(dt: VoiceHUDMetrics.pillResizeDuration)
+            let endWidth = reported.last?.width ?? 0
+            check(startWidth == VoiceHUDMetrics.listeningWidth, "Expected the pill to start at the listening width, got \(startWidth)")
+            check(midWidth > startWidth && midWidth < endWidth, "Expected a mid-resize width between \(startWidth) and \(endWidth), got \(midWidth)")
+            check(abs((reported.last?.midX ?? 0) - VoiceHUDMetrics.canvasSize.width / 2) <= 0.5, "Expected the resized pill to stay centred")
+            let settledCount = reported.count
+            hudView.advance(dt: 0.1)
+            check(reported.count == settledCount, "Expected no backdrop updates once the resize has settled")
+        }
 
         // 12. Verify VoiceAudioNormalizer boosts quiet speech without clipping or amplifying DC silence
         let quietTone = (0..<1600).map { i -> Int16 in

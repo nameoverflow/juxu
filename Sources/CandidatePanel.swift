@@ -5,9 +5,19 @@ import SwiftUI
 /// Pure AppKit macOS native candidate view calibrated to Apple InputMethodKit (`16.plist` / `SCIM.app`):
 /// - Strictly single-line CoreText/`NSAttributedString` measurement & drawing: NEVER wraps onto multiple lines.
 /// - No redundant preedit/schema header box (preedit is already marked inline at the cursor like Apple SCIM).
-/// - Clean `30pt` horizontal bar (`24pt` selection rect, `5pt` continuous corner radius, `16pt` PingFang SC Regular,
+/// - Clean `32pt` horizontal bar (`24pt` selection pill, concentric with the `11pt` outer corner, `16pt` system font,
 ///   `12pt` guide digits, whisper-light `11.5pt` secondary code annotations without colored pills).
+public enum CandidatePanelMetrics {
+    /// Outer corner of the candidate window; the selection pill is inset by `inset` and keeps the same centre.
+    public static let outerCornerRadius: CGFloat = 11.0
+    public static let inset: CGFloat = 4.0
+    public static let pillHeight: CGFloat = 24.0
+    public static var pillCornerRadius: CGFloat { outerCornerRadius - inset }
+    public static var barHeight: CGFloat { pillHeight + inset * 2.0 }
+}
+
 public final class NativeCandidateContentView: NSView {
+
     public var state: JuxuActionState = .empty {
         didSet {
             hoveredCandidateIndex = nil
@@ -166,12 +176,11 @@ public final class NativeCandidateContentView: NSView {
     }
 
     private func computeHorizontalLayout(apply: Bool) -> NSSize {
-        // Apple macOS concentric candidate bar metrics:
-        // Total height: 30pt, concentric outer inset: 3pt X / 3pt Y (outer radius 8pt, inner selection radius 5pt, pill height 24pt)
-        let barHeight: CGFloat = 30.0
-        let outerX: CGFloat = 3.0
-        let pillY: CGFloat = 3.0
-        let pillH: CGFloat = 24.0
+        // Concentric candidate bar: 4pt inset around a 24pt selection pill (outer radius 11pt, pill radius 7pt).
+        let barHeight = CandidatePanelMetrics.barHeight
+        let outerX = CandidatePanelMetrics.inset
+        let pillY = CandidatePanelMetrics.inset
+        let pillH = CandidatePanelMetrics.pillHeight
         let cellPadLeft: CGFloat = 7.5
         let cellPadRight: CGFloat = 8.0
         let cellGap: CGFloat = 1.5
@@ -283,7 +292,7 @@ public final class NativeCandidateContentView: NSView {
 
         if hasPager {
             cursorX += 3.5
-            divR = NSRect(x: cursorX, y: 8.0, width: 0.5, height: 14.0)
+            divR = NSRect(x: cursorX, y: round((barHeight - 14.0) * 0.5), width: 0.5, height: 14.0)
             cursorX += 3.0
             prevR = NSRect(x: cursorX, y: pillY, width: 15.0, height: pillH)
             cursorX += 15.0
@@ -302,9 +311,9 @@ public final class NativeCandidateContentView: NSView {
     }
 
     private func computeVerticalLayout(apply: Bool) -> NSSize {
-        let outerX: CGFloat = 3.5
-        let outerY: CGFloat = 3.5
-        let rowH: CGFloat = 24.0
+        let outerX = CandidatePanelMetrics.inset
+        let outerY = CandidatePanelMetrics.inset
+        let rowH = CandidatePanelMetrics.pillHeight
         let rowGap: CGFloat = 1.0
         let cellPadLeft: CGFloat = 8.0
         let cellPadRight: CGFloat = 10.0
@@ -409,11 +418,19 @@ public final class NativeCandidateContentView: NSView {
 
         for cell in cellLayouts {
             if cell.relIndex == 0 {
-                let path = NSBezierPath(roundedRect: cell.rect, xRadius: 5.0, yRadius: 5.0)
+                let path = NSBezierPath(
+                    roundedRect: cell.rect,
+                    xRadius: CandidatePanelMetrics.pillCornerRadius,
+                    yRadius: CandidatePanelMetrics.pillCornerRadius
+                )
                 NSColor.controlAccentColor.setFill()
                 path.fill()
             } else if cell.relIndex >= 0 && hoveredCandidateIndex == cell.relIndex {
-                let path = NSBezierPath(roundedRect: cell.rect, xRadius: 5.0, yRadius: 5.0)
+                let path = NSBezierPath(
+                    roundedRect: cell.rect,
+                    xRadius: CandidatePanelMetrics.pillCornerRadius,
+                    yRadius: CandidatePanelMetrics.pillCornerRadius
+                )
                 NSColor.labelColor.withAlphaComponent(0.07).setFill()
                 path.fill()
             }
@@ -438,16 +455,6 @@ public final class NativeCandidateContentView: NSView {
         if nextPageRect != .zero {
             drawChevron(up: false, in: nextPageRect, enabled: state.page + 1 < state.totalPages)
         }
-
-        // Hairline native inner border matching macOS NSMenu / SCIM candidate bar
-        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let borderColor = isDark
-            ? NSColor.white.withAlphaComponent(0.16)
-            : NSColor.black.withAlphaComponent(0.11)
-        let borderPath = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.25, dy: 0.25), xRadius: 8.0, yRadius: 8.0)
-        borderPath.lineWidth = 0.5
-        borderColor.setStroke()
-        borderPath.stroke()
     }
 
     private func drawChevron(up: Bool, in rect: NSRect, enabled: Bool) {
@@ -508,7 +515,7 @@ public final class NativeCandidateContentView: NSView {
     }
 }
 
-/// SwiftUI wrapper around `NativeCandidateContentView` + `NSVisualEffectView` solely for Settings / Retina preview rendering.
+/// SwiftUI wrapper around `NativeCandidateContentView` + `HUDBackdropView` solely for Settings / Retina preview rendering.
 public struct CandidateBarView: NSViewRepresentable {
     public let state: JuxuActionState
     public var onSelectCandidate: ((Int) -> Void)?
@@ -524,30 +531,21 @@ public struct CandidateBarView: NSViewRepresentable {
         self.onTurnPage = onTurnPage
     }
 
-    public func makeNSView(context: Context) -> NSVisualEffectView {
-        let effect = NSVisualEffectView()
-        effect.material = .popover
-        effect.blendingMode = .withinWindow
-        effect.state = .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = 8.0
-        effect.layer?.cornerCurve = .continuous
-        effect.layer?.masksToBounds = true
-
-        let content = NativeCandidateContentView()
-        content.translatesAutoresizingMaskIntoConstraints = false
-        effect.addSubview(content)
-        NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
-            content.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
-            content.topAnchor.constraint(equalTo: effect.topAnchor),
-            content.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
-        ])
-        return effect
+    public func makeNSView(context: Context) -> HUDBackdropView {
+        let backdrop = HUDBackdropView(
+            frame: NSRect(x: 0, y: 0, width: 200, height: CandidatePanelMetrics.barHeight),
+            cornerRadius: CandidatePanelMetrics.outerCornerRadius,
+            blendingMode: .withinWindow
+        )
+        let content = NativeCandidateContentView(frame: backdrop.contentContainer.bounds)
+        content.autoresizingMask = [.width, .height]
+        backdrop.showsHairlineBorder = true
+        backdrop.contentContainer.addSubview(content)
+        return backdrop
     }
 
-    public func updateNSView(_ effect: NSVisualEffectView, context: Context) {
-        guard let content = effect.subviews.first as? NativeCandidateContentView else { return }
+    public func updateNSView(_ effect: HUDBackdropView, context: Context) {
+        guard let content = effect.contentContainer.subviews.first as? NativeCandidateContentView else { return }
         if content.state != state {
             content.state = state
         }
@@ -556,8 +554,8 @@ public struct CandidateBarView: NSViewRepresentable {
         content.layout()
     }
 
-    public func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSVisualEffectView, context: Context) -> CGSize? {
-        guard let content = nsView.subviews.first as? NativeCandidateContentView else { return nil }
+    public func sizeThatFits(_ proposal: ProposedViewSize, nsView: HUDBackdropView, context: Context) -> CGSize? {
+        guard let content = nsView.contentContainer.subviews.first as? NativeCandidateContentView else { return nil }
         if content.state != state {
             content.state = state
         }
@@ -570,7 +568,7 @@ public final class CandidatePanelController {
     public static let shared = CandidatePanelController()
 
     private let panel: FloatingHUDPanel
-    private let effectView: NSVisualEffectView
+    private let effectView: HUDBackdropView
     private let candidateView: NativeCandidateContentView
 
     public var onSelect: ((Int) -> Void)? {
@@ -581,12 +579,13 @@ public final class CandidatePanelController {
     }
 
     private init() {
-        let initialRect = NSRect(x: 0, y: 0, width: 200, height: 32)
-        let effect = FloatingHUDPanel.makePopoverEffectView(frame: initialRect, cornerRadius: 8.0)
+        let initialRect = NSRect(x: 0, y: 0, width: 200, height: CandidatePanelMetrics.barHeight)
+        let effect = HUDBackdropView(frame: initialRect, cornerRadius: CandidatePanelMetrics.outerCornerRadius)
 
-        let content = NativeCandidateContentView(frame: effect.bounds)
+        let content = NativeCandidateContentView(frame: effect.contentContainer.bounds)
         content.autoresizingMask = [.width, .height]
-        effect.addSubview(content)
+        effect.showsHairlineBorder = true
+        effect.contentContainer.addSubview(content)
 
         let p = FloatingHUDPanel(contentRect: initialRect, hasShadow: true, ignoresMouseEvents: false)
         p.contentView = effect
@@ -620,6 +619,8 @@ public final class CandidatePanelController {
         let targetFrame = NSRect(origin: origin, size: size)
         panel.presentWithoutAnimation(frame: targetFrame) {
             candidateView.frame = NSRect(origin: .zero, size: size)
+            // Lay the glass out inside the disabled-actions transaction so it never lags the window frame.
+            effectView.layoutSubtreeIfNeeded()
             candidateView.layout()
             candidateView.displayIfNeeded()
         }
@@ -631,6 +632,8 @@ public final class CandidatePanelController {
 }
 
 private final class ModeIndicatorContentView: NSView {
+    static let cornerRadius: CGFloat = 10.0
+
     var label: String = "中" {
         didSet {
             if label != oldValue {
@@ -655,15 +658,6 @@ private final class ModeIndicatorContentView: NSView {
             y: round((bounds.height - textSize.height) * 0.5)
         )
         attr.draw(at: origin)
-
-        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let borderColor = isDark
-            ? NSColor.white.withAlphaComponent(0.16)
-            : NSColor.black.withAlphaComponent(0.11)
-        let borderPath = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.25, dy: 0.25), xRadius: 7.0, yRadius: 7.0)
-        borderPath.lineWidth = 0.5
-        borderColor.setStroke()
-        borderPath.stroke()
     }
 }
 
@@ -674,15 +668,16 @@ public final class ModeIndicatorPanelController {
     private let panel: FloatingHUDPanel
     private let contentView: ModeIndicatorContentView
     private var hideWorkItem: DispatchWorkItem?
-    private let panelSize = NSSize(width: 32, height: 28)
+    private let panelSize = NSSize(width: 34, height: 30)
 
     private init() {
         let frame = NSRect(origin: .zero, size: panelSize)
-        let effect = FloatingHUDPanel.makePopoverEffectView(frame: frame, cornerRadius: 7.0)
+        let effect = HUDBackdropView(frame: frame, cornerRadius: ModeIndicatorContentView.cornerRadius)
 
-        let content = ModeIndicatorContentView(frame: frame)
+        let content = ModeIndicatorContentView(frame: effect.contentContainer.bounds)
         content.autoresizingMask = [.width, .height]
-        effect.addSubview(content)
+        effect.showsHairlineBorder = true
+        effect.contentContainer.addSubview(content)
 
         let p = FloatingHUDPanel(contentRect: frame, hasShadow: true, ignoresMouseEvents: true)
         p.contentView = effect
