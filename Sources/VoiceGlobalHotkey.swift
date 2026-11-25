@@ -216,6 +216,10 @@ final class VoiceGlobalCommitter {
         target = Target(pid: NSWorkspace.shared.frontmostApplication?.processIdentifier, element: Self.focusedElement())
     }
 
+    func clearTarget() {
+        target = Target(pid: nil, element: nil)
+    }
+
     /// A rect on the screen the user is working on, for placing the HUD.
     func anchorRect() -> NSRect {
         let mouse = NSEvent.mouseLocation
@@ -244,6 +248,7 @@ final class VoiceGlobalCommitter {
 
     /// Inserts `text` into the original field, or leaves it on the clipboard. Returns a notice, if any.
     func commit(_ text: String, replaceSelection: Bool = false, completion: @escaping @MainActor (String?) -> Void) {
+        defer { clearTarget() }
         let current = Self.focusedElement()
         let isSecure = IsSecureEventInputEnabled()
             || current.flatMap { Self.string($0, kAXSubroleAttribute) } == kAXSecureTextFieldSubrole
@@ -433,6 +438,7 @@ public final class VoiceGlobalHotkeyController {
     private func teardown() {
         recheck?.invalidate()
         recheck = nil
+        committer.clearTarget()
         stopTap()
     }
 
@@ -458,6 +464,7 @@ public final class VoiceGlobalHotkeyController {
             return
         case .cancelChord:
             session.cancelForChord()
+            if !session.isCapturing { committer.clearTarget() }
         case .forward:
             let committer = self.committer
             _ = session.handleEvent(

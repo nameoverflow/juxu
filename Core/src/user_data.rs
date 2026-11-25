@@ -14,6 +14,14 @@ static USER_DATA_WRITE_ID: AtomicU64 = AtomicU64::new(0);
 
 const MAX_FREQ_MAP_LEN: usize = 8192;
 const PRUNED_FREQ_MAP_LEN: usize = 6144;
+const MAX_PHRASES_LEN: usize = 6000;
+const PRUNED_PHRASES_LEN: usize = 5000;
+const MAX_ENGLISH_WORDS_LEN: usize = 2500;
+const PRUNED_ENGLISH_WORDS_LEN: usize = 2000;
+const MAX_PENDING_NGRAMS_LEN: usize = 2048;
+const PRUNED_PENDING_NGRAMS_LEN: usize = 1024;
+const MAX_PENDING_ENWORDS_LEN: usize = 512;
+const PRUNED_PENDING_ENWORDS_LEN: usize = 256;
 
 fn prune_freq_map_keeping<K: Clone + Eq + std::hash::Hash + Ord>(
     map: &mut HashMap<K, u32>,
@@ -26,6 +34,28 @@ fn prune_freq_map_keeping<K: Clone + Eq + std::hash::Hash + Ord>(
     let mut candidates: Vec<(K, u32)> = map
         .iter()
         .filter(|(k, _)| *k != keep)
+        .map(|(k, &v)| (k.clone(), v))
+        .collect();
+    let remove = remove.min(candidates.len());
+    candidates.select_nth_unstable_by(remove, |a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    for (k, _) in candidates.into_iter().take(remove) {
+        map.remove(&k);
+    }
+}
+
+fn prune_pending_map_keeping(
+    map: &mut HashMap<String, u8>,
+    max_len: usize,
+    pruned_len: usize,
+    keep: &str,
+) {
+    if map.len() <= max_len {
+        return;
+    }
+    let remove = map.len() - pruned_len;
+    let mut candidates: Vec<(String, u8)> = map
+        .iter()
+        .filter(|(k, _)| k.as_str() != keep)
         .map(|(k, &v)| (k.clone(), v))
         .collect();
     let remove = remove.min(candidates.len());
@@ -478,6 +508,7 @@ impl UserStore {
         self.seq += 1;
         let seq = self.seq;
         let prev_phrase = self.phrases.get(text).cloned();
+        let is_new_phrase = prev_phrase.is_none();
         self.phrases
             .entry(text.to_string())
             .and_modify(|e| {
@@ -509,16 +540,69 @@ impl UserStore {
         if let Some(pd) = pdict {
             self.index_phrase_pinyin(text, pd);
         }
-        if let Some(d) = dict {
-            if let Some(code) = d.encode_phrase(text) {
-                let list = self.code_index.entry(code).or_default();
-                if !list.iter().any(|s| s == text) {
-                    list.push(text.to_string());
-                }
-                return Some(code);
+        let encoded_code = dict.and_then(|d| {
+            let code = d.encode_phrase(text)?;
+            let list = self.code_index.entry(code).or_default();
+            if !list.iter().any(|s| s == text) {
+                list.push(text.to_string());
             }
+            Some(code)
+        });
+        if is_new_phrase {
+            self.prune_phrases_keeping(text);
         }
-        None
+        encoded_code
+    }
+
+    fn prune_phrases_keeping(&mut self, keep: &str) {
+        if self.phrases.len() <= MAX_PHRASES_LEN {
+            return;
+        }
+        let remove = self.phrases.len() - PRUNED_PHRASES_LEN;
+        // Evict auto-composed low-count old phrases first; manual phrases sort higher (`!auto_composed`).
+        let mut candidates: Vec<(String, bool, u32, u64)> = self
+            .phrases
+            .iter()
+            .filter(|(k, _)| k.as_str() != keep)
+            .map(|(k, p)| (k.clone(), !p.auto_composed, p.count, p.last_seq))
+            .collect();
+        let remove = remove.min(candidates.len());
+        candidates.select_nth_unstable_by(remove, |a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.3.cmp(&b.3))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut evicted = std::collections::HashSet::<String>::with_capacity(remove);
+        for (k, _, _, _) in candidates.into_iter().take(remove) {
+            self.phrases.remove(&k);
+            evicted.insert(k);
+        }
+        if !evicted.is_empty() {
+            self.code_index.retain(|_, list| {
+                list.retain(|s| !evicted.contains(s));
+                !list.is_empty()
+            });
+            self.pinyin_index.retain(|_, list| {
+                list.retain(|(_, s)| !evicted.contains(s));
+                !list.is_empty()
+            });
+        }
+    }
+
+    pub fn clear_code_index(&mut self) {
+        self.code_index = HashMap::new();
+    }
+
+    pub fn clear_pinyin_index(&mut self) {
+        self.pinyin_index = HashMap::new();
+    }
+
+    pub fn trim_idle_memory(&mut self) {
+        self.last_undo = None;
+        self.recent_singles.shrink_to_fit();
+        self.pending_ngrams.shrink_to_fit();
+        self.pending_enwords.shrink_to_fit();
     }
 
     pub fn remove_phrase(&mut self, text: &str) -> bool {
@@ -913,6 +997,14 @@ impl UserStore {
             self.add_phrase_with_pinyin_strength(phrase, true, false, dict, pdict);
             return Some(phrase.to_string());
         }
+        if prev_cnt.is_none() {
+            prune_pending_map_keeping(
+                &mut self.pending_ngrams,
+                MAX_PENDING_NGRAMS_LEN,
+                PRUNED_PENDING_NGRAMS_LEN,
+                phrase,
+            );
+        }
         None
     }
 
@@ -934,6 +1026,7 @@ impl UserStore {
         }
         let lower = trimmed.to_ascii_lowercase();
         let prev_en = self.english_words.get(&lower).cloned();
+        let is_new_en = prev_en.is_none();
         if let Some(ref mut undo) = self.last_undo {
             if !undo.enwords_prev.iter().any(|(k, _)| k == &lower) {
                 undo.enwords_prev.push((lower.clone(), prev_en));
@@ -943,7 +1036,7 @@ impl UserStore {
         self.seq = self.seq.saturating_add(1);
         let has_upper = trimmed.bytes().any(|b| b.is_ascii_uppercase());
         self.english_words
-            .entry(lower)
+            .entry(lower.clone())
             .and_modify(|e| {
                 e.1 = e.1.saturating_add(1);
                 e.2 = seq;
@@ -952,6 +1045,24 @@ impl UserStore {
                 }
             })
             .or_insert_with(|| (trimmed.to_owned(), 1, seq));
+        if is_new_en && self.english_words.len() > MAX_ENGLISH_WORDS_LEN {
+            let remove = self.english_words.len() - PRUNED_ENGLISH_WORDS_LEN;
+            let mut candidates: Vec<(String, u32, u64)> = self
+                .english_words
+                .iter()
+                .filter(|(k, _)| k.as_str() != lower)
+                .map(|(k, (_, cnt, s))| (k.clone(), *cnt, *s))
+                .collect();
+            let remove = remove.min(candidates.len());
+            candidates.select_nth_unstable_by(remove, |a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| a.2.cmp(&b.2))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            for (k, _, _) in candidates.into_iter().take(remove) {
+                self.english_words.remove(&k);
+            }
+        }
         self.dirty = true;
     }
 
@@ -985,11 +1096,19 @@ impl UserStore {
                 self.record_english_word(trimmed);
                 return;
             }
+            let prev_pending = self.pending_enwords.get(&lower).copied();
             let c = self.pending_enwords.entry(lower.clone()).or_insert(0);
             *c = c.saturating_add(1);
             if *c >= 2 {
                 self.pending_enwords.remove(&lower);
                 self.record_english_word(trimmed);
+            } else if prev_pending.is_none() {
+                prune_pending_map_keeping(
+                    &mut self.pending_enwords,
+                    MAX_PENDING_ENWORDS_LEN,
+                    PRUNED_PENDING_ENWORDS_LEN,
+                    &lower,
+                );
             }
         } else {
             self.record_english_word(trimmed);
@@ -1374,4 +1493,36 @@ pub fn is_valid_auto_phrase_text(phrase: &str) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_store_caps_pending_and_learned_maps() {
+        let mut store = UserStore::default();
+        for i in 0..2500u32 {
+            let c1 = char::from_u32(0x4E00 + (i / 64)).unwrap();
+            let c2 = char::from_u32(0x4E40 + (i % 64)).unwrap();
+            let s1 = c1.to_string();
+            let s2 = c2.to_string();
+            store.record_commit("", &s1, 0, true, 3, None, None, false, None);
+            store.record_commit(&s1, &s2, 0, true, 3, None, None, false, None);
+            store.break_single_burst();
+        }
+        assert!(store.pending_ngrams.len() <= MAX_PENDING_NGRAMS_LEN);
+
+        for i in 0..700usize {
+            let w = format!("wa{:03}e", i);
+            store.record_english_word_from_return(&w, false, true);
+        }
+        assert!(store.pending_enwords.len() <= MAX_PENDING_ENWORDS_LEN);
+
+        for i in 0..2700usize {
+            let w = format!("Token{}", i);
+            store.record_english_word(&w);
+        }
+        assert!(store.english_words.len() <= MAX_ENGLISH_WORDS_LEN);
+    }
 }

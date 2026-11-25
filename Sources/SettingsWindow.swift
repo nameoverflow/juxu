@@ -33,12 +33,9 @@ public final class SettingsNavigationModel: ObservableObject {
 public struct SettingsRootView: View {
     @ObservedObject public var bridge: JuxuBridge
     @ObservedObject private var navigation: SettingsNavigationModel
-    /// Dedicated in-memory bridge so simulator taps never pollute live composition, personal lexicon, or `eval_log.jsonl`.
-    @StateObject private var simBridge = JuxuBridge(inMemoryOnly: true)
     @State private var newPhraseInput: String = ""
     @State private var phraseBanner: String = ""
-    @State private var labCommittedText: String = "输入"
-    @State private var lastTouchInfo: String = "点按下方键帽或两键交界处体验连续高斯热区与 N-gram 置信度纠错"
+    @State private var simCalibrationResetSeq: Int = 0
 
     public var selectedSection: SettingsSection {
         get { navigation.selectedSection }
@@ -154,21 +151,6 @@ public struct SettingsRootView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 680, minHeight: 540)
-        .onAppear {
-            syncSimulatorBridge()
-        }
-        .onChange(of: bridge.prefs) { _, newPrefs in
-            simBridge.applyAndSavePreferences(newPrefs, persist: false)
-        }
-        .onChange(of: bridge.touchCalibrations) { _, newCal in
-            simBridge.applyTouchCalibrations(newCal)
-        }
-    }
-
-    private func syncSimulatorBridge() {
-        simBridge.applyAndSavePreferences(bridge.prefs, persist: false)
-        simBridge.applyTouchCalibrations(bridge.touchCalibrations)
-        simBridge.setContext(String(labCommittedText.suffix(32)))
     }
 
     // MARK: - Section 1: Schema & Core Typing
@@ -386,88 +368,16 @@ public struct SettingsRootView: View {
                         Spacer()
                         Button("重置热区校准") {
                             bridge.resetTouchCalibration()
-                            simBridge.resetTouchCalibration(persist: false)
-                            lastTouchInfo = "已清空全部按键的个人热区偏移校准记录"
+                            simCalibrationResetSeq &+= 1
                         }
                         .controlSize(.small)
                     }
                 }
             }
 
-            // Interactive iOS 26-Key Touch Hitbox Simulator (isolated on in-memory `simBridge`)
+            // Interactive iOS 26-Key Touch Hitbox Simulator (lazily mounted only when `.typo` is visited)
             settingsCard {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Label("触屏热区与误触纠正实时演练台", systemImage: "iphone.gen3")
-                            .font(.system(size: 13, weight: .semibold))
-                        Spacer()
-                        Text("前文语境：\(labCommittedText.isEmpty ? "（无）" : labCommittedText)")
-                            .font(.system(size: 11.5))
-                            .foregroundStyle(.secondary)
-                        Button("清空") {
-                            simBridge.clearComposition()
-                            labCommittedText = ""
-                            simBridge.setContext("")
-                        }
-                        .controlSize(.mini)
-                    }
-
-                    Text(lastTouchInfo)
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .foregroundStyle(.secondary)
-
-                    if !simBridge.state.preedit.isEmpty {
-                        // The bar reports its content width. Scroll it so long candidates cannot widen
-                        // the card and move the keys under the pointer between taps.
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            CandidateBarView(
-                                state: simBridge.state,
-                                onSelectCandidate: { idx in
-                                    let res = simBridge.selectCandidate(pageRelIndex: idx, timestampMs: currentMs())
-                                    if !res.commitText.isEmpty {
-                                        labCommittedText += res.commitText
-                                    }
-                                },
-                                onTurnPage: { d in
-                                    _ = simBridge.turnPage(delta: d)
-                                }
-                            )
-                        }
-                        .frame(minHeight: 34, alignment: .leading)
-                    } else {
-                        HStack {
-                            Text("试着点偏 T/Y 交界输入 y-r-w-u（救回「我们」），或在「输入」后点偏 U/I 交界输入 u-f-c-y（救回「法」）")
-                                .font(.system(size: 11.5))
-                                .foregroundStyle(.tertiary)
-                        }
-                        .frame(height: 34)
-                    }
-
-                    TouchKeyboardSimulatorView { ch, normX, normY in
-                        let out = simBridge.pushTouch(
-                            reportedAscii: ch,
-                            x: normX,
-                            y: normY,
-                            isNormalized: true,
-                            timestampMs: currentMs()
-                        )
-                        if !out.commitText.isEmpty {
-                            labCommittedText += out.commitText
-                        }
-                        let scalar = UnicodeScalar(ch)
-                        lastTouchInfo = String(
-                            format: "触点 (%.2f, %.2f) 落入 [%@] 键区 → 编码 \"%@\"",
-                            normX, normY, String(Character(scalar)), out.preedit
-                        )
-                    } onBackspace: {
-                        _ = simBridge.handleKey(keyCode: 0x33, scalar: 0, hasCmdOrCtrl: false, timestampMs: currentMs())
-                    } onSpace: {
-                        let out = simBridge.handleKey(keyCode: 0x31, scalar: 32, hasCmdOrCtrl: false, timestampMs: currentMs())
-                        if !out.commitText.isEmpty {
-                            labCommittedText += out.commitText
-                        }
-                    }
-                }
+                TypoTouchSimulatorContentView(bridge: bridge, calibrationResetSeq: simCalibrationResetSeq)
             }
 
             settingsCard {
@@ -907,6 +817,112 @@ struct NativeAccentSwitchStyle: ToggleStyle {
     }
 }
 
+/// Isolated in-memory `simBridge` mounted only while the `.typo` tab is visible so opening Preferences
+/// for ordinary settings never spins up a duplicate `JuxuEngine` + `RwkvState` ring.
+private struct TypoTouchSimulatorContentView: View {
+    @ObservedObject var bridge: JuxuBridge
+    let calibrationResetSeq: Int
+    @StateObject private var simBridge = JuxuBridge(inMemoryOnly: true)
+    @State private var labCommittedText: String = "输入"
+    @State private var lastTouchInfo: String = "点按下方键帽或两键交界处体验连续高斯热区与 N-gram 置信度纠错"
+
+    private func currentMs() -> UInt64 {
+        UInt64(Date().timeIntervalSince1970 * 1000.0)
+    }
+
+    private func syncSimulatorBridge() {
+        simBridge.applyAndSavePreferences(bridge.prefs, persist: false)
+        simBridge.applyTouchCalibrations(bridge.touchCalibrations)
+        simBridge.setContext(String(labCommittedText.suffix(32)))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("触屏热区与误触纠正实时演练台", systemImage: "iphone.gen3")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                Text("前文语境：\(labCommittedText.isEmpty ? "（无）" : labCommittedText)")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                Button("清空") {
+                    simBridge.clearComposition()
+                    labCommittedText = ""
+                    simBridge.setContext("")
+                }
+                .controlSize(.mini)
+            }
+
+            Text(lastTouchInfo)
+                .font(.system(size: 11.5, design: .monospaced))
+                .foregroundStyle(.secondary)
+
+            if !simBridge.state.preedit.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    CandidateBarView(
+                        state: simBridge.state,
+                        onSelectCandidate: { idx in
+                            let res = simBridge.selectCandidate(pageRelIndex: idx, timestampMs: currentMs())
+                            if !res.commitText.isEmpty {
+                                labCommittedText += res.commitText
+                            }
+                        },
+                        onTurnPage: { d in
+                            _ = simBridge.turnPage(delta: d)
+                        }
+                    )
+                }
+                .frame(minHeight: 34, alignment: .leading)
+            } else {
+                HStack {
+                    Text("试着点偏 T/Y 交界输入 y-r-w-u（救回「我们」），或在「输入」后点偏 U/I 交界输入 u-f-c-y（救回「法」）")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(height: 34)
+            }
+
+            TouchKeyboardSimulatorView { ch, normX, normY in
+                let out = simBridge.pushTouch(
+                    reportedAscii: ch,
+                    x: normX,
+                    y: normY,
+                    isNormalized: true,
+                    timestampMs: currentMs()
+                )
+                if !out.commitText.isEmpty {
+                    labCommittedText += out.commitText
+                }
+                let scalar = UnicodeScalar(ch)
+                lastTouchInfo = String(
+                    format: "触点 (%.2f, %.2f) 落入 [%@] 键区 → 编码 \"%@\"",
+                    normX, normY, String(Character(scalar)), out.preedit
+                )
+            } onBackspace: {
+                _ = simBridge.handleKey(keyCode: 0x33, scalar: 0, hasCmdOrCtrl: false, timestampMs: currentMs())
+            } onSpace: {
+                let out = simBridge.handleKey(keyCode: 0x31, scalar: 32, hasCmdOrCtrl: false, timestampMs: currentMs())
+                if !out.commitText.isEmpty {
+                    labCommittedText += out.commitText
+                }
+            }
+        }
+        .onAppear {
+            syncSimulatorBridge()
+        }
+        .onChange(of: bridge.prefs) { _, newPrefs in
+            simBridge.applyAndSavePreferences(newPrefs, persist: false)
+        }
+        .onChange(of: bridge.touchCalibrations) { _, newCal in
+            simBridge.applyTouchCalibrations(newCal)
+        }
+        .onChange(of: calibrationResetSeq) { _, _ in
+            simBridge.resetTouchCalibration(persist: false)
+            lastTouchInfo = "已清空全部按键的个人热区偏移校准记录"
+        }
+    }
+}
+
 /// Interactive 1:1 Apple iOS 26-key virtual keyboard simulator for testing continuous touch coordinates!
 struct TouchKeyboardSimulatorView: View {
     var onTouchLetter: (UInt8, Float, Float) -> Void
@@ -1050,13 +1066,15 @@ final class SettingsWindow: NSWindow {
 }
 
 @MainActor
-public final class SettingsWindowController {
+public final class SettingsWindowController: NSObject, NSWindowDelegate {
     public static let shared = SettingsWindowController()
     private var window: NSWindow?
     private var hostingView: NSHostingView<SettingsRootView>?
     private let navigation = SettingsNavigationModel()
 
-    private init() {}
+    private override init() {
+        super.init()
+    }
 
     public func show(section: SettingsSection = .schema) {
         navigation.selectedSection = section
@@ -1071,6 +1089,7 @@ public final class SettingsWindowController {
             win.toolbarStyle = .unified
             win.center()
             win.isReleasedWhenClosed = false
+            win.delegate = self
             let host = NSHostingView(rootView: SettingsRootView(bridge: .shared, navigation: navigation))
             win.contentView = host
             self.hostingView = host
@@ -1080,7 +1099,8 @@ public final class SettingsWindowController {
         if let hostingView, win.contentView !== hostingView {
             win.contentView = hostingView
         }
-        let bringToFront: @MainActor () -> Void = {
+        let bringToFront: @MainActor () -> Void = { [weak win] in
+            guard let win else { return }
             NSApp.activate(ignoringOtherApps: true)
             win.makeKeyAndOrderFront(nil)
             win.orderFrontRegardless()
@@ -1089,6 +1109,17 @@ public final class SettingsWindowController {
         // Re-assert activation on the next runloop tick so closing the status-bar menu doesn't steal focus back.
         DispatchQueue.main.async {
             bringToFront()
+        }
+    }
+
+    public func windowWillClose(_ notification: Notification) {
+        guard let closing = notification.object as? NSWindow, closing === window else { return }
+        closing.delegate = nil
+        closing.contentView = nil
+        hostingView = nil
+        window = nil
+        if !VoicePreferencesStore.shared.prefs.enabled {
+            VoiceLocalInstaller.unload()
         }
     }
 }

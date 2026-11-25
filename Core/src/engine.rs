@@ -481,18 +481,20 @@ impl JuxuEngine {
                 *slot = None;
             }
             for mask_vec in &mut self.dict_key_masks {
-                mask_vec.clear();
+                *mask_vec = Vec::new();
             }
+            self.user.clear_code_index();
         } else {
             self.pinyin_dict = None;
             self.pinyin_stream.clear();
-            self.pinyin_paths.clear();
-            self.pinyin_candidates.clear();
+            self.pinyin_paths = Vec::new();
+            self.pinyin_candidates = Vec::new();
+            self.user.clear_pinyin_index();
             let keep = schema.slot_index();
             for (idx, slot) in self.dicts.iter_mut().enumerate() {
                 if idx != keep {
                     *slot = None;
-                    self.dict_key_masks[idx].clear();
+                    self.dict_key_masks[idx] = Vec::new();
                 }
             }
         }
@@ -856,6 +858,7 @@ impl JuxuEngine {
     pub fn trim_idle_memory(&mut self) {
         self.neural_tracker.trim_ring(2);
         if !self.is_composing() {
+            self.user.trim_idle_memory();
             self.raw_code.shrink_to(32);
             self.pinyin_candidates.shrink_to_fit();
             self.pinyin_paths.shrink_to_fit();

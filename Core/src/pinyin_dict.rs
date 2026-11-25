@@ -194,9 +194,9 @@ pub struct PinyinDictView {
     char_entries_off: usize,
     string_pool_off: usize,
     /// Compact sorted reverse index `(unicode_cp, syl_id)` for O(log N) char -> syllables lookup.
-    char_syl_index: Vec<(u32, u16)>,
-    /// Per-character primary (max) reading weight across syllables to suppress rare literary readings without penalizing major polyphone readings.
-    char_max_weights: HashMap<char, f32>,
+    char_syl_index: Box<[(u32, u16)]>,
+    /// Sorted `(unicode_cp, max_weight)` table across syllables to suppress rare literary readings without HashMap heap bloat.
+    char_max_weights: Box<[(u32, f32)]>,
     /// Prebuilt T9 digit sequence -> `syl_id` list (built once on dictionary load, zero per-keystroke alloc).
     t9_index: HashMap<String, Vec<u16>>,
 }
@@ -238,8 +238,7 @@ impl PinyinDictView {
         }
 
         let mut char_syl_index = Vec::<(u32, u16)>::with_capacity(char_entry_count);
-        let mut char_max_weights =
-            HashMap::<char, f32>::with_capacity(char_entry_count.min(16_384));
+        let mut char_max_weights_vec = Vec::<(u32, f32)>::with_capacity(char_entry_count);
         for sid in 0..syl_count {
             let boff = char_buckets_off + sid * CHAR_BUCKET_STRIDE;
             let start = read_u32(b, boff) as usize;
@@ -256,12 +255,10 @@ impl PinyinDictView {
                     if let Ok(text) = std::str::from_utf8(&b[text_start..text_start + str_len]) {
                         let mut chars = text.chars();
                         if let (Some(ch), None) = (chars.next(), chars.next()) {
+                            let cp = ch as u32;
                             let w = (read_u32(b, eoff + 4) as f32).max(1.0);
-                            char_syl_index.push((ch as u32, sid as u16));
-                            char_max_weights
-                                .entry(ch)
-                                .and_modify(|prev| *prev = prev.max(w))
-                                .or_insert(w);
+                            char_syl_index.push((cp, sid as u16));
+                            char_max_weights_vec.push((cp, w));
                         }
                     }
                 }
@@ -269,6 +266,18 @@ impl PinyinDictView {
         }
         char_syl_index.sort_unstable();
         char_syl_index.dedup();
+        let char_syl_index = char_syl_index.into_boxed_slice();
+
+        char_max_weights_vec.sort_unstable_by_key(|&(cp, _)| cp);
+        char_max_weights_vec.dedup_by(|dup, keep| {
+            if dup.0 == keep.0 {
+                keep.1 = keep.1.max(dup.1);
+                true
+            } else {
+                false
+            }
+        });
+        let char_max_weights = char_max_weights_vec.into_boxed_slice();
 
         let mut t9_index = HashMap::<String, Vec<u16>>::with_capacity(256);
         for sid in 0..syl_count {
@@ -282,6 +291,10 @@ impl PinyinDictView {
                 }
             }
         }
+        for v in t9_index.values_mut() {
+            v.shrink_to_fit();
+        }
+        t9_index.shrink_to_fit();
 
         Ok(Self {
             buf,
@@ -303,9 +316,18 @@ impl PinyinDictView {
     }
 
     #[inline]
+    fn max_weight_for(&self, ch: char, fallback: f32) -> f32 {
+        let cp = ch as u32;
+        match self.char_max_weights.binary_search_by_key(&cp, |&(c, _)| c) {
+            Ok(idx) => self.char_max_weights[idx].1.max(fallback),
+            Err(_) => fallback,
+        }
+    }
+
+    #[inline]
     pub fn char_emission_logp(&self, ch: char, syl_weight: u32) -> f32 {
         let w = (syl_weight as f32).max(1.0);
-        let max_w = self.char_max_weights.get(&ch).copied().unwrap_or(w).max(w);
+        let max_w = self.max_weight_for(ch, w);
         0.38 * (w / max_w).clamp(0.002, 1.0).ln()
     }
 
@@ -314,7 +336,7 @@ impl PinyinDictView {
     #[inline]
     pub fn is_viable_initial_reading(&self, ch: char, syl_weight: u32) -> bool {
         let w = (syl_weight as f32).max(1.0);
-        let max_w = self.char_max_weights.get(&ch).copied().unwrap_or(w).max(w);
+        let max_w = self.max_weight_for(ch, w);
         w >= 0.015 * max_w
     }
 

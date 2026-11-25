@@ -131,6 +131,13 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
         payload.append(0x0A)
         payload.append(pcm)
 
+        final class TimerBox: @unchecked Sendable {
+            var item: DispatchWorkItem?
+            func cancel() { item?.cancel(); item = nil }
+        }
+        let timerBox = TimerBox()
+        defer { timerBox.cancel() }
+
         let reply: [String: Any] = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String: Any], Error>) in
                 if Task.isCancelled {
@@ -145,6 +152,7 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
                         if isFinal, self?.connection === current { self?.stop() } else { self?.send(cancel: id, on: current) }
                     }
                 }
+                timerBox.item = timer
                 DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: timer)
                 current.writer.async { [weak self] in
                     do {
@@ -289,6 +297,13 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
         connection = current
         startReader(output.fileHandleForReading, for: current)
 
+        final class ReadyTimerBox: @unchecked Sendable {
+            var item: DispatchWorkItem?
+            func cancel() { item?.cancel(); item = nil }
+        }
+        let readyTimerBox = ReadyTimerBox()
+        defer { readyTimerBox.cancel() }
+
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 if current.isReady {
@@ -304,6 +319,7 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
                         if self?.connection === current { self?.stop() }
                     }
                 }
+                readyTimerBox.item = timer
                 DispatchQueue.main.asyncAfter(deadline: .now() + 45, execute: timer)
             }
         } onCancel: {
@@ -318,20 +334,28 @@ public final class VoiceQwenHelperManager: VoiceASREngine {
 
     private func startReader(_ handle: FileHandle, for current: Connection) {
         let thread = Thread { [weak self] in
+            defer { try? handle.close() }
             var buffer = Data()
             while true {
-                let chunk = handle.availableData
-                if chunk.isEmpty { break }
-                buffer.append(chunk)
-                while let newline = buffer.firstIndex(of: 0x0A) {
-                    let line = buffer[buffer.startIndex..<newline]
-                    buffer.removeSubrange(buffer.startIndex...newline)
-                    guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
-                    let box = ReplyBox(object)
-                    DispatchQueue.main.async {
-                        MainActor.assumeIsolated { self?.handle(box.value, from: current) }
+                let reachedEOF: Bool = autoreleasepool {
+                    let chunk = handle.availableData
+                    if chunk.isEmpty { return true }
+                    buffer.append(chunk)
+                    while let newline = buffer.firstIndex(of: 0x0A) {
+                        let line = Data(buffer[buffer.startIndex..<newline])
+                        buffer.removeSubrange(buffer.startIndex...newline)
+                        guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+                        let box = ReplyBox(object)
+                        DispatchQueue.main.async {
+                            MainActor.assumeIsolated { self?.handle(box.value, from: current) }
+                        }
                     }
+                    if buffer.isEmpty {
+                        buffer = Data()
+                    }
+                    return false
                 }
+                if reachedEOF { break }
             }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated { self?.handleExit(of: current) }

@@ -40,8 +40,8 @@ public final class KeyboardViewController: UIInputViewController {
 
     private var heightConstraint: NSLayoutConstraint?
     private var ribbonHeightConstraint: NSLayoutConstraint?
-    private var saveUserDataTimer: Timer?
-    private var backspaceTimer: Timer?
+    nonisolated(unsafe) private var saveUserDataTimer: Timer?
+    nonisolated(unsafe) private var backspaceTimer: Timer?
     private var backspaceHoldStart: TimeInterval = 0
     private var lastVisualKeySignature: VisualLayoutSignature?
     private var planeBeforePress: IOSKeyPlane = .letters
@@ -51,8 +51,8 @@ public final class KeyboardViewController: UIInputViewController {
     private var composingDocumentID: UUID?
     private var lastKnownDocumentID: UUID?
     private var lastKeyboardEditUptime: TimeInterval = 0
-    private var nilDocSweepWorkItem: DispatchWorkItem?
-    private var appearanceSweepWorkItem: DispatchWorkItem?
+    nonisolated(unsafe) private var nilDocSweepWorkItem: DispatchWorkItem?
+    nonisolated(unsafe) private var appearanceSweepWorkItem: DispatchWorkItem?
     private var isKeyboardPresentingOrVisible = false
     private var proxySink: ProxyDocumentSink { ProxyDocumentSink(proxy: textDocumentProxy) }
     private let clipboardStore = IOSClipboardSuggestionStore()
@@ -94,6 +94,14 @@ public final class KeyboardViewController: UIInputViewController {
         let returnRole: IOSReturnKeyRole
         let isTrackpadActive: Bool
         let size: CGSize
+    }
+
+    deinit {
+        saveUserDataTimer?.invalidate()
+        backspaceTimer?.invalidate()
+        nilDocSweepWorkItem?.cancel()
+        appearanceSweepWorkItem?.cancel()
+        NotificationCenter.default.removeObserver(self)
     }
 
     public override func viewDidLoad() {

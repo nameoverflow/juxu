@@ -68,7 +68,9 @@ impl AsciiTrie {
         }
         for node in &mut trie.nodes {
             node.edges.sort_unstable_by_key(|&(b, _)| b);
+            node.edges.shrink_to_fit();
         }
+        trie.nodes.shrink_to_fit();
         trie
     }
 

@@ -132,7 +132,7 @@ final class IOSKeyboardFeedbackController {
     private var rigidRing: [UIImpactFeedbackGenerator] = []
     private var ringIndex = 0
     private let selectionGenerator = UISelectionFeedbackGenerator()
-    private var isPrepared = false
+    nonisolated(unsafe) private var isPrepared = false
 
     init(attachingTo view: UIView? = nil) {
         for _ in 0..<3 {
@@ -143,6 +143,14 @@ final class IOSKeyboardFeedbackController {
             }
         }
         _ = SharedCoreHapticsDriver.shared
+    }
+
+    deinit {
+        if isPrepared {
+            Task { @MainActor in
+                SharedCoreHapticsDriver.shared.releaseClient()
+            }
+        }
     }
 
     func prepare() {

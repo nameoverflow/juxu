@@ -104,7 +104,7 @@ final class VoiceHUDContentView: NSView {
     private var barsAlpha: CGFloat = 1
     private var clock: CFTimeInterval = 0
     private var lastTimestamp: CFTimeInterval?
-    private var displayLinkHandle: CADisplayLink?
+    nonisolated(unsafe) private var displayLinkHandle: CADisplayLink?
     private var currentPartial = ""
     private var currentTentativeCount = 0
     private var captionSource = ""
@@ -460,10 +460,27 @@ final class VoiceHUDContentView: NSView {
 
     // MARK: Animation
 
+    private final class DisplayLinkWeakProxy: NSObject {
+        weak var owner: VoiceHUDContentView?
+        init(_ owner: VoiceHUDContentView) { self.owner = owner }
+        @MainActor @objc func step(_ link: CADisplayLink) {
+            if let owner {
+                owner.onDisplayLink(link)
+            } else {
+                link.invalidate()
+            }
+        }
+    }
+
+    deinit {
+        displayLinkHandle?.invalidate()
+    }
+
     func startAnimating() {
         guard displayLinkHandle == nil else { return }
         lastTimestamp = nil
-        let link = displayLink(target: self, selector: #selector(onDisplayLink(_:)))
+        let proxy = DisplayLinkWeakProxy(self)
+        let link = displayLink(target: proxy, selector: #selector(DisplayLinkWeakProxy.step(_:)))
         link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
         link.add(to: .main, forMode: .common)
         displayLinkHandle = link
@@ -475,7 +492,7 @@ final class VoiceHUDContentView: NSView {
         lastTimestamp = nil
     }
 
-    @objc private func onDisplayLink(_ link: CADisplayLink) {
+    fileprivate func onDisplayLink(_ link: CADisplayLink) {
         let now = link.timestamp
         let dt = lastTimestamp.map { min(0.1, max(0.001, now - $0)) } ?? (1.0 / 60)
         lastTimestamp = now

@@ -711,6 +711,8 @@ public final class VoiceSessionController {
                 if self.sessionGeneration == generation {
                     self.activeRecorder = nil
                     self.activeTask = nil
+                    self.activeCommitHandler = nil
+                    self.activeContext = VoiceContext()
                     self.phase = .idle
                 }
             }
@@ -951,6 +953,8 @@ public final class VoiceSessionController {
         activeTask = nil
         activeRecorder?.cancel()
         activeRecorder = nil
+        activeCommitHandler = nil
+        activeContext = VoiceContext()
         phase = .idle
         if showNotice {
             self.showNotice("已取消语音输入", isError: false, duration: 1.0)
@@ -974,6 +978,8 @@ public final class VoiceSessionController {
         activeTask = nil
         activeRecorder?.cancel()
         activeRecorder = nil
+        activeCommitHandler = nil
+        activeContext = VoiceContext()
         pipelineClient?.invalidate()
         pipelineClient = nil
         phase = .idle

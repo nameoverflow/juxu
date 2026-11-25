@@ -792,6 +792,13 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
             return alreadyResult
         }
 
+        final class TimeoutBox: @unchecked Sendable {
+            var item: DispatchWorkItem?
+            func cancel() { item?.cancel(); item = nil }
+        }
+        let timeoutBox = TimeoutBox()
+        defer { timeoutBox.cancel() }
+
         let text: String = try await withCheckedThrowingContinuation { cont in
             lock.lock()
             if appleFinished {
@@ -803,7 +810,7 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
             appleFinalContinuation = cont
             lock.unlock()
 
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds) { [weak self] in
+            let item = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 self.lock.lock()
                 let pending = self.appleFinalContinuation
@@ -813,6 +820,8 @@ public final class VoiceAudioRecorder: @unchecked Sendable {
                 self.lock.unlock()
                 pending?.resume(returning: fallback)
             }
+            timeoutBox.item = item
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: item)
         }
         teardownAppleSpeech()
         return text

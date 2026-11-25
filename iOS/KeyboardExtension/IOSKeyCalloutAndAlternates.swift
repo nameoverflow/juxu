@@ -81,6 +81,9 @@ final class IOSKeyAlternatesView: UIView {
     func hide() {
         isHidden = true
         items = []
+        labels.forEach { $0.removeFromSuperview() }
+        labels.removeAll()
+        layer.shadowPath = nil
     }
 }
 

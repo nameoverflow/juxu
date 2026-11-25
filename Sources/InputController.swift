@@ -12,11 +12,15 @@ public final class JuxuInputController: IMKInputController {
     private var lastExpectedAnchor: Int? = nil
     private var sawClientSupportForRanges: Bool = false
     private var needsEngineContextSync: Bool = true
-    private var saveUserDataTimer: Timer?
+    nonisolated(unsafe) private var saveUserDataTimer: Timer?
 
     public override init!(server: IMKServer!, delegate: Any!, client inputClient: Any!) {
         super.init(server: server, delegate: delegate, client: inputClient)
         self.activeClient = inputClient as? (any IMKTextInput & NSObjectProtocol)
+    }
+
+    deinit {
+        saveUserDataTimer?.invalidate()
     }
 
     private func configurePanelCallbacks() {

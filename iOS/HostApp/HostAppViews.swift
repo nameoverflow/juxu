@@ -66,6 +66,7 @@ public struct IOSHostRootView: View {
     @State private var newWord: String = ""
     @FocusState private var newWordFocused: Bool
     @State private var wordFeedback: String = ""
+    @State private var exportedEvalLogURL: URL?
 
     public init(bridge: JuxuBridge, initialTab: IOSHostTab = .home) {
         self.bridge = bridge
@@ -88,7 +89,7 @@ public struct IOSHostRootView: View {
                 .tag(IOSHostTab.typo)
                 .onAppear {
                     bridge.reloadTouchCalibration()
-                    bridge.reloadEvalLogSummary()
+                    refreshEvalLogState()
                 }
 
             lexiconTab
@@ -541,13 +542,13 @@ public struct IOSHostRootView: View {
                         }
                         HStack(spacing: 10) {
                             Button("刷新统计") {
-                                bridge.reloadEvalLogSummary()
+                                refreshEvalLogState()
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
 
                             #if os(iOS)
-                            if let exportURL = bridge.exportEvalLogFileURL() {
+                            if let exportURL = exportedEvalLogURL {
                                 ShareLink(item: exportURL) {
                                     Label("导出 JSONL", systemImage: "square.and.arrow.up")
                                 }
@@ -560,6 +561,10 @@ public struct IOSHostRootView: View {
 
                             Button("清空", role: .destructive) {
                                 bridge.clearEvalLog()
+                                if let oldURL = exportedEvalLogURL {
+                                    try? FileManager.default.removeItem(at: oldURL)
+                                }
+                                exportedEvalLogURL = nil
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
@@ -825,6 +830,13 @@ public struct IOSHostRootView: View {
         default:
             selectedTab = .typing
         }
+    }
+
+    private func refreshEvalLogState() {
+        bridge.reloadEvalLogSummary()
+        #if os(iOS)
+        exportedEvalLogURL = bridge.evalLogSummary.totalEvents > 0 ? bridge.exportEvalLogFileURL() : nil
+        #endif
     }
 
     private func openSystemKeyboardSettings() {

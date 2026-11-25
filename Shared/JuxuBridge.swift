@@ -602,12 +602,6 @@ public final class JuxuBridge: ObservableObject {
                 if FileManager.default.fileExists(atPath: pEn) {
                     _ = pEn.withCString { juxu_engine_load_english_dict_mmap(h, $0) }
                 }
-                #if os(macOS)
-                for sid: UInt32 in [86, 98, 6, 10, 33, 35, 36] {
-                    ensureDictionaryLoaded(for: sid)
-                }
-                ensureDictionaryLoaded(for: 20)
-                #endif
                 break
             }
         }
@@ -626,12 +620,10 @@ public final class JuxuBridge: ObservableObject {
             }
         }
         if schemaId == 20 || schemaId == 21 {
-            #if os(iOS)
             if !loadedDictSchemas.isEmpty {
                 juxu_engine_retain_only_schema_dict(h, schemaId)
                 loadedDictSchemas.removeAll()
             }
-            #endif
             if !pinyinDictLoaded || !juxu_engine_has_active_dict(h) {
                 let pPy = dir.appendingPathComponent("pinyin.pydict").path
                 if pPy.withCString({ juxu_engine_load_pinyin_dict_mmap(h, $0) }) {
@@ -640,15 +632,13 @@ public final class JuxuBridge: ObservableObject {
             }
             return
         }
-        #if os(iOS)
-        // Release the 67 MB Pinyin dictionary and other unused dicts BEFORE mapping the new `.wbdict`
-        // so iOS keyboard extension never peaks above its memory ceiling during a schema switch.
+        // Release the 67 MB Pinyin dictionary and inactive `.wbdict` slots BEFORE mapping the new `.wbdict`
+        // so both iOS keyboard extensions and the resident macOS IME daemon keep only the active schema in memory.
         if pinyinDictLoaded || loadedDictSchemas.contains(where: { $0 != schemaId }) {
             juxu_engine_retain_only_schema_dict(h, schemaId)
             pinyinDictLoaded = false
             loadedDictSchemas = loadedDictSchemas.contains(schemaId) ? [schemaId] : []
         }
-        #endif
         if !loadedDictSchemas.contains(schemaId) || (juxu_engine_get_schema(h) == schemaId && !juxu_engine_has_active_dict(h)) {
             let fileName: String
             switch schemaId {

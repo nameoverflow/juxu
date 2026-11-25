@@ -1125,6 +1125,16 @@ struct SwiftBridgeTests {
         check(handledCmdW)
         check(spy.closeCount == 1, "Expected Cmd+W to close SettingsWindow, got closeCount=\(spy.closeCount)")
 
+        // 11. Verify VoiceHUDContentView does NOT self-retain via CADisplayLink when animating
+        weak var weakHUDView: VoiceHUDContentView?
+        autoreleasepool {
+            let hudView = VoiceHUDContentView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
+            hudView.startAnimating()
+            check(hudView.isAnimating)
+            weakHUDView = hudView
+        }
+        check(weakHUDView == nil, "Expected VoiceHUDContentView to deallocate cleanly even while CADisplayLink was active")
+
         print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Cangjie, Bayesian typo, SettingsWindow Cmd+W & macOS Voice MVP tests passed!")
     }
 }
