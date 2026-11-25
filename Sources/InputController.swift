@@ -184,22 +184,31 @@ public final class JuxuInputController: IMKInputController {
         shiftTapDetector.handleKeyDown()
 
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        let hasCmdOrOption = mods.contains(.command) || mods.contains(.option)
-        if hasCmdOrOption {
+        let hasCmd = mods.contains(.command)
+        let hasOption = mods.contains(.option)
+        let hasCtrl = mods.contains(.control)
+        let hasShift = mods.contains(.shift)
+        let isCmdBackspaceWhileComposing =
+            event.keyCode == 0x33
+            && hasCmd
+            && !hasOption
+            && !hasCtrl
+            && !hasShift
+            && !JuxuBridge.shared.state.preedit.isEmpty
+        if (hasCmd || hasOption) && !isCmdBackspaceWhileComposing {
             invalidateContextAndQuoteState()
             return false
         }
-        let hasCtrl = mods.contains(.control)
         let scalar: UInt32 = event.characters?.unicodeScalars.first?.value ?? 0
 
-        if !hasCtrl && JuxuBridge.shared.state.preedit.isEmpty {
+        if !hasCtrl && !isCmdBackspaceWhileComposing && JuxuBridge.shared.state.preedit.isEmpty {
             syncEngineContextBeforeFreshCompositionIfNeeded(client: clientObj)
         }
 
         let out = JuxuBridge.shared.handleKey(
             keyCode: event.keyCode,
             scalar: scalar,
-            hasCmdOrCtrl: hasCtrl,
+            hasCmdOrCtrl: hasCtrl || isCmdBackspaceWhileComposing,
             timestampMs: Self.nowMs()
         )
 
