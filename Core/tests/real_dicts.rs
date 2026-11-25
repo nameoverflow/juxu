@@ -2458,3 +2458,41 @@ fn real_dicts_archaic_polyphone_does_not_hijack_common_words() {
         );
     }
 }
+
+#[test]
+fn real_dicts_cold_start_bigram_prior_lifts_content_words_over_bos_nonwords() {
+    let dir = dicts_dir();
+    if !dir.join("pinyin.pydict").exists() || !dir.join("wubi_aux.wbaux").exists() {
+        return;
+    }
+    let mut engine = JuxuEngine::new(JuxuConfig {
+        schema: InputSchema::XiaoheShuangpin,
+        ..JuxuConfig::default()
+    });
+    engine.load_pinyin_dict(PinyinDictView::from_file(dir.join("pinyin.pydict")).unwrap());
+    engine.set_aux(AuxView::open_mmap(dir.join("wubi_aux.wbaux")).unwrap());
+
+    for (code, expected) in [
+        ("zitd", "姿态"),
+        ("djif", "诞辰"),
+        ("hyys", "昏庸"),
+        ("bulp", "捕猎"),
+        ("igsj", "撑伞"),
+        ("fupk", "浮萍"),
+    ] {
+        engine.clear_context();
+        engine.clear_composition();
+        for (i, ch) in code.chars().enumerate() {
+            engine.handle_key_event(0, Some(ch), false, 1_000 + i as u64 * 90);
+        }
+        let top = engine
+            .all_candidates()
+            .first()
+            .map(|c| c.text.as_str())
+            .unwrap_or("");
+        assert_eq!(
+            top, expected,
+            "cold-start Xiaohe {code} expected {expected}, got {top:?}"
+        );
+    }
+}
