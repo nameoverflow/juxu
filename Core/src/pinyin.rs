@@ -109,6 +109,38 @@ impl PinyinPath {
         parts.join("'")
     }
 
+    /// Segment the raw typed keys along syllable boundaries without expanding
+    /// Shuangpin pairs into full pinyin (e.g. `"ceuiyixx"` -> `"ce'ui'yi'xx"`).
+    pub fn raw_segmented_code(&self, raw: &str) -> String {
+        let mut parts = Vec::with_capacity(self.boundaries.len() + 1);
+        let mut start = 0usize;
+        for b in &self.boundaries {
+            let end = b.keys.min(raw.len());
+            if end > start {
+                if let Some(seg) = raw.get(start..end) {
+                    let trimmed = seg.trim_matches('\'');
+                    if !trimmed.is_empty() {
+                        parts.push(trimmed);
+                    }
+                }
+            }
+            start = end;
+        }
+        if start < raw.len() {
+            if let Some(rest) = raw.get(start..) {
+                let trimmed = rest.trim_matches('\'');
+                if !trimmed.is_empty() {
+                    parts.push(trimmed);
+                }
+            }
+        }
+        if parts.is_empty() {
+            raw.to_owned()
+        } else {
+            parts.join("'")
+        }
+    }
+
     pub fn correction_hint(&self) -> String {
         let mut hints = Vec::new();
         let mut start = 0usize;
