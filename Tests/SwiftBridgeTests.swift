@@ -391,7 +391,7 @@ struct SwiftBridgeTests {
         )
         candidateView.state = narrowState
         let sz1 = candidateView.computeFittingSize()
-        check(sz1.height == 30.0, "Expected exact 30pt single-line bar height, got \(sz1.height)")
+        check(sz1.height == CandidatePanelMetrics.barHeight, "Expected exact single-line bar height, got \(sz1.height)")
 
         let wideMultiPhraseState = JuxuActionState(
             consumed: true, bell: false, asciiMode: false, schemaId: 86, page: 0, totalPages: 3, vertical: false,
@@ -406,7 +406,7 @@ struct SwiftBridgeTests {
         )
         candidateView.state = wideMultiPhraseState
         let sz2 = candidateView.computeFittingSize()
-        check(sz2.height == 30.0, "Expected strictly single-line 30pt height without wrapping, got \(sz2.height)")
+        check(sz2.height == CandidatePanelMetrics.barHeight, "Expected strictly single-line bar height without wrapping, got \(sz2.height)")
         check(sz2.width > sz1.width + 200.0, "Expected horizontal candidate bar to expand cleanly on single line")
 
         bridge.setContext("")
@@ -417,7 +417,7 @@ struct SwiftBridgeTests {
         candidateView.frame.size = candidateView.computeFittingSize()
         candidateView.layout()
         check(bridge.state.preedit == "我感觉" && bridge.state.macOSPreedit == "q·dgip")
-        check(candidateView.frame.height == 30 && candidateView.subviews.isEmpty)
+        check(candidateView.frame.height == CandidatePanelMetrics.barHeight && candidateView.subviews.isEmpty)
         candidateView.state = narrowState
         check(narrowState.macOSPreedit == "g")
 

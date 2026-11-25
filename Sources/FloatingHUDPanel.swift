@@ -33,21 +33,6 @@ public final class FloatingHUDPanel: NSPanel {
         self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
     }
 
-    public static func makePopoverEffectView(
-        frame: NSRect,
-        cornerRadius: CGFloat
-    ) -> NSVisualEffectView {
-        let effect = NSVisualEffectView(frame: frame)
-        effect.material = .popover
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = cornerRadius
-        effect.layer?.cornerCurve = .continuous
-        effect.layer?.masksToBounds = true
-        return effect
-    }
-
     public static func visibleScreenFrame(for caretRect: NSRect) -> NSRect {
         let targetScreen = NSScreen.screens.first(where: { $0.frame.intersects(caretRect) })
             ?? NSScreen.main
@@ -117,5 +102,59 @@ public final class FloatingHUDPanel: NSPanel {
         orderOut(nil)
         CATransaction.commit()
         NSAnimationContext.endGrouping()
+    }
+}
+
+/// System backdrop for the floating input UI: Liquid Glass on macOS 26 and later, the menu
+/// material before. Put the panel's own views in `contentContainer`.
+@MainActor
+public final class HUDBackdropView: NSView {
+    public let contentContainer: NSView
+    private let backdrop: NSView
+
+    /// True when the backdrop is Liquid Glass, which draws its own edge and highlight.
+    public let usesGlass: Bool
+
+    public var cornerRadius: CGFloat {
+        didSet { applyCornerRadius() }
+    }
+
+    public init(frame frameRect: NSRect, cornerRadius: CGFloat) {
+        self.cornerRadius = cornerRadius
+        let container = NSView(frame: NSRect(origin: .zero, size: frameRect.size))
+        container.autoresizingMask = [.width, .height]
+        self.contentContainer = container
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView(frame: NSRect(origin: .zero, size: frameRect.size))
+            glass.contentView = container
+            self.backdrop = glass
+            self.usesGlass = true
+        } else {
+            let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: frameRect.size))
+            effect.material = .menu
+            effect.blendingMode = .behindWindow
+            effect.state = .active
+            effect.wantsLayer = true
+            effect.addSubview(container)
+            self.backdrop = effect
+            self.usesGlass = false
+        }
+        super.init(frame: frameRect)
+        backdrop.autoresizingMask = [.width, .height]
+        addSubview(backdrop)
+        applyCornerRadius()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    private func applyCornerRadius() {
+        if #available(macOS 26.0, *), let glass = backdrop as? NSGlassEffectView {
+            glass.cornerRadius = cornerRadius
+        } else {
+            backdrop.layer?.cornerRadius = cornerRadius
+            backdrop.layer?.cornerCurve = .continuous
+            backdrop.layer?.masksToBounds = true
+        }
     }
 }
