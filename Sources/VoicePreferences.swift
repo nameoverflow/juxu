@@ -262,6 +262,32 @@ public struct VoicePreferences: Codable, Equatable, Sendable {
     public var voiceCues: Bool?
     public var areVoiceCuesEnabled: Bool { voiceCues ?? true }
 
+    /// Optional so existing voice.json files still decode; nil means the default, on.
+    public var contextCapture: Bool?
+    /// Whether dictation reads the focused app's window, cursor and screen text through the Accessibility API.
+    public var isContextCaptureEnabled: Bool {
+        get { contextCapture ?? true }
+        set { contextCapture = newValue }
+    }
+
+    /// Optional so existing voice.json files still decode; nil means the default, on.
+    public var contextBlacklist: Bool?
+    /// Whether blacklisted apps and pages give no text at all. Password managers, secure fields, terminals
+    /// and private browser windows are never read, whatever this says.
+    public var respectsContextBlacklist: Bool {
+        get { contextBlacklist ?? true }
+        set { contextBlacklist = newValue }
+    }
+
+    /// Optional so existing voice.json files still decode; nil means the default, off.
+    public var screenContextToCloud: Bool?
+    /// Whether the visible screen and the text around the input area may go to cloud recognition and polish.
+    /// Local models always get them.
+    public var sendsScreenContextToCloud: Bool {
+        get { screenContextToCloud ?? false }
+        set { screenContextToCloud = newValue }
+    }
+
     public init() {}
 
     public var effectiveCloudASRBaseURL: String {

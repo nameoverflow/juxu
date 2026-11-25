@@ -77,16 +77,14 @@ public struct VoiceSettingsView: View {
                     )
                 }
                 triggerAndBehaviorCard
-                VoiceContextInspectorCard(
-                    inspector: VoiceContextInspectorStore.shared,
-                    voiceStore: voiceStore
-                )
+                contextPrivacyCard
+                if voiceStore.prefs.isContextCaptureEnabled {
+                    VoiceContextInspectorCard(
+                        inspector: VoiceContextInspectorStore.shared,
+                        voiceStore: voiceStore
+                    )
+                }
                 vocabularyAndTestCard
-            } else {
-                VoiceContextInspectorCard(
-                    inspector: VoiceContextInspectorStore.shared,
-                    voiceStore: voiceStore
-                )
             }
         }
         .onAppear {
@@ -441,6 +439,53 @@ public struct VoiceSettingsView: View {
                         .controlSize(.small)
                 }
             }
+        }
+    }
+
+    // MARK: - Context & Privacy
+
+    private var contextPrivacyCard: some View {
+        let capture = voiceStore.prefs.isContextCaptureEnabled
+        return card {
+            VStack(spacing: 11) {
+                contextToggleRow(
+                    "读取当前应用的上下文",
+                    "通过辅助功能读取窗口标题、网址、光标前后文和屏幕可见文字，帮助识别专有名词、衔接前文。密码框、密码管理器、终端和浏览器无痕窗口始终不读。",
+                    isOn: voiceBinding(\.isContextCaptureEnabled)
+                )
+                Divider()
+                contextToggleRow(
+                    "敏感应用/网址黑名单",
+                    "开启时，微信、Excel、WPS、Google 文档、腾讯文档等黑名单应用和网页不读取任何窗口、光标或屏幕文字，只发送应用名和个人词表（“选中改写”时会发送你选中的文字）。",
+                    isOn: voiceBinding(\.respectsContextBlacklist)
+                )
+                .disabled(!capture)
+                Divider()
+                contextToggleRow(
+                    "把屏幕和输入框周围的文字发给云端",
+                    "关闭时，云端识别和整理只收到窗口标题、网址和光标前后文，不含屏幕可见文字和输入框周围的文字；本地模型不受影响。",
+                    isOn: voiceBinding(\.sendsScreenContextToCloud)
+                )
+                .disabled(!capture)
+            }
+        }
+    }
+
+    private func contextToggleRow(_ title: String, _ detail: String, isOn: Binding<Bool>) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 13, weight: .medium))
+                Text(detail)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Toggle("", isOn: isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
         }
     }
 
@@ -858,23 +903,22 @@ private struct VoiceContextInspectorCard: View {
                 } else {
                     Button("3 秒后抓取前台窗口") {
                         axTrusted = AXIsProcessTrusted()
-                        inspector.captureAfterDelay(seconds: 3)
+                        inspector.captureAfterDelay(
+                            seconds: 3,
+                            respectBlacklist: voiceStore.prefs.respectsContextBlacklist
+                        )
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                 }
 
-                Toggle("敏感应用/URL 黑名单", isOn: $inspector.respectBlacklist)
-                    .toggleStyle(.checkbox)
-                    .font(.system(size: 11.5))
-
                 Spacer()
 
-                if !inspector.lastJSON.isEmpty {
+                if inspector.lastCaptured != nil {
                     Button(copiedNotice ? "已复制" : "复制 JSON") {
                         let pb = NSPasteboard.general
                         pb.clearContents()
-                        pb.setString(inspector.lastJSON, forType: .string)
+                        pb.setString(inspector.lastPrettyJSON(), forType: .string)
                         copiedNotice = true
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
                             copiedNotice = false
@@ -979,7 +1023,7 @@ private struct VoiceContextInspectorCard: View {
 
                 if showRawJSON {
                     ScrollView([.vertical, .horizontal]) {
-                        Text(inspector.lastJSON)
+                        Text(inspector.lastPrettyJSON())
                             .font(.system(size: 10.5, design: .monospaced))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1004,7 +1048,11 @@ private struct VoiceContextInspectorCard: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.6)
         )
-        .onAppear { axTrusted = AXIsProcessTrusted() }
+        .onAppear {
+            axTrusted = AXIsProcessTrusted()
+            inspector.setPresented(true)
+        }
+        .onDisappear { inspector.setPresented(false) }
     }
 
     private func summaryRow(_ label: String, _ value: String) -> some View {

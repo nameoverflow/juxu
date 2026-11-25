@@ -484,12 +484,12 @@ public final class VoiceSessionController {
 
     /// Folds a finished AX capture into the dictation and re-biases the engine that is already listening.
     func applyCapturedContext(_ captured: VoiceCapturedContext) {
+        let prefs = VoicePreferencesStore.shared.prefs
         activeContext = activeContext.merged(with: captured)
-        activeEngine?.updateContext(activeContext)
-        let preview = VoiceContextPromptPreview.build(
-            context: activeContext,
-            prefs: VoicePreferencesStore.shared.prefs
-        )
+        activeEngine?.updateContext(prefs.recognitionContext(activeContext))
+        // The preview is only worth building while someone can see it.
+        guard VoiceContextInspectorStore.shared.isPresented else { return }
+        let preview = VoiceContextPromptPreview.build(context: activeContext, prefs: prefs)
         VoiceContextInspectorStore.shared.recordModelContext(
             asrTargetLabel: preview.asrTargetLabel,
             asrContext: preview.asrContext,
@@ -505,6 +505,13 @@ public final class VoiceSessionController {
         while !contextCaptureDone, activeContextCaptureTask != nil, !Task.isCancelled, Date() < deadline {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
+    }
+
+    /// Stops the AX capture of a session that will not use it.
+    private func cancelContextCapture() {
+        activeContextCaptureTask?.cancel()
+        activeContextCaptureTask = nil
+        contextCaptureDone = true
     }
 
     /// Test seam: stands in for a capture task that has not finished yet.
@@ -544,7 +551,7 @@ public final class VoiceSessionController {
         let useAppleSpeech = (prefs.providerMode == .local && prefs.localASRPreset == .appleSpeech)
 
         // A blacklisted app is known from its bundle ID at once; the capture adds URL and secure-field checks later.
-        let respectBlacklist = VoiceContextInspectorStore.shared.respectBlacklist
+        let respectBlacklist = prefs.respectsContextBlacklist
         let blacklisted = context.bundleIdentifier.map {
             VoiceContextPolicy.blacklistReason(
                 bundleId: $0,
@@ -566,18 +573,24 @@ public final class VoiceSessionController {
 
         // Capture full AXUIElement context asynchronously so key-down / HUD display stays instant (0 ms added).
         activeContextCaptureTask?.cancel()
-        contextCaptureDone = false
-        let captureGeneration = sessionGeneration &+ 1
-        activeContextCaptureTask = Task { @MainActor [weak self] in
-            let captured = await VoiceContextCapture.captureAsync(
-                options: VoiceContextCaptureOptions(respectBlacklist: respectBlacklist)
-            )
-            guard !Task.isCancelled, let self else { return }
-            VoiceContextInspectorStore.shared.record(captured)
-            if self.phase == .recording || self.isStarting || self.sessionGeneration == captureGeneration {
-                self.applyCapturedContext(captured)
+        activeContextCaptureTask = nil
+        contextCaptureDone = true
+        if prefs.isContextCaptureEnabled {
+            contextCaptureDone = false
+            let captureGeneration = sessionGeneration &+ 1
+            activeContextCaptureTask = Task { @MainActor [weak self] in
+                let captured = await VoiceContextCapture.captureAsync(
+                    options: VoiceContextCaptureOptions(respectBlacklist: respectBlacklist)
+                )
+                guard !Task.isCancelled, let self else { return }
+                if VoiceContextInspectorStore.shared.isPresented {
+                    VoiceContextInspectorStore.shared.record(captured)
+                }
+                if self.phase == .recording || self.isStarting || self.sessionGeneration == captureGeneration {
+                    self.applyCapturedContext(captured)
+                }
+                self.contextCaptureDone = true
             }
-            self.contextCaptureDone = true
         }
 
         isStarting = true
@@ -606,6 +619,7 @@ public final class VoiceSessionController {
                 self.isStarting = false
                 self.resetPressState()
                 self.cancelEngineWarm()
+                self.cancelContextCapture()
                 if self.startAborted {
                     self.runPendingRestart()
                 } else {
@@ -679,6 +693,7 @@ public final class VoiceSessionController {
                 self.isStarting = false
                 if self.startAborted {
                     recorder.cancel()
+                    self.cancelContextCapture()
                     self.runPendingRestart()
                     return
                 }
@@ -801,12 +816,6 @@ public final class VoiceSessionController {
             do {
                 try await Task.sleep(nanoseconds: UInt64(Self.releaseTailDelay * 1_000_000_000))
                 try Task.checkCancellation()
-                // A short press can release before the AX capture lands; give it a moment so the final pass sees it.
-                await self.awaitContextCapture(maxWait: Self.contextCaptureGrace)
-                try Task.checkCancellation()
-                let context = self.activeContext
-                let replaceSelection = prefs.speakToEditSelection
-                    && !(context.promptSafe().selectedText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
                 let samples = recorder.stopAndCollectSamples()
                 // Played only after the microphone has stopped, so it cannot be captured.
                 if endCue { self.playCue(.end) }
@@ -830,6 +839,15 @@ public final class VoiceSessionController {
                     }
                     showTranscribing()
                 }
+
+                // The microphone is off and the press is known to carry speech; a capture still landing gets a moment
+                // so the final pass sees it.
+                await self.awaitContextCapture(maxWait: Self.contextCaptureGrace)
+                try Task.checkCancellation()
+                let context = prefs.recognitionContext(self.activeContext)
+                let polishContext = prefs.polishContext(self.activeContext)
+                let replaceSelection = prefs.speakToEditSelection
+                    && !(polishContext.promptSafe().selectedText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
                 let rawTranscript: String
                 if useAppleSpeech {
@@ -911,7 +929,7 @@ public final class VoiceSessionController {
                         client: client,
                         llmKey: llmKey,
                         rawTranscript: cleanedRaw,
-                        context: context
+                        context: polishContext
                     )
                 }
 

@@ -327,11 +327,14 @@ public enum VoicePromptBuilder {
             bundleIdentifier: safe.bundleIdentifier
         )
         let vocab = deduplicatedVocabulary(safe.personalVocabulary, limit: budget == .full ? 50 : 30)
+            .map(VoiceContextText.neutralized)
         let vocabBlock = vocab.isEmpty
             ? ""
             : "\n- 个人常用词表（遇到谐音或近似词时优先拼写为以下词条）：\(vocab.joined(separator: "、"))"
 
-        let selected = safe.selectedText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // The selection and the transcript are untrusted too: neither may close or open a prompt section.
+        let selected = VoiceContextText.neutralized(safe.selectedText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawTranscript = VoiceContextText.neutralized(rawTranscript)
         if !selected.isEmpty {
             let reference = VoicePolishContextBuilder.referenceBlock(safe, budget: budget, includeText: false)
             let referenceBlock = reference.isEmpty ? "" : "\n\n\(reference)"
@@ -1129,7 +1132,8 @@ public final class VoicePipelineClient: Sendable {
                 mlxArgs.append(contentsOf: ["--language", language])
             }
             if let prompt, !prompt.isEmpty {
-                mlxArgs.append(contentsOf: ["--initial-prompt", prompt])
+                // One argument, so a prompt that starts with "-" is not read as a flag by argparse.
+                mlxArgs.append("--initial-prompt=\(prompt)")
             }
             args = mlxArgs
         } else {
@@ -1188,8 +1192,9 @@ public final class VoicePipelineClient: Sendable {
             context: context,
             budget: .compact
         )
-        let systemPrompt = messages.first?["content"] ?? ""
-        let userPrompt = messages.last?["content"] ?? rawTranscript
+        // The untrusted parts are already neutralised; strip control tokens once more so nothing can break the ChatML frame.
+        let systemPrompt = VoiceContextText.withoutChatMLTokens(messages.first?["content"] ?? "")
+        let userPrompt = VoiceContextText.withoutChatMLTokens(messages.last?["content"] ?? rawTranscript)
         let chatML = "<|im_start|>system\n\(systemPrompt)<|im_end|>\n<|im_start|>user\n\(userPrompt)<|im_end|>\n<|im_start|>assistant\n"
 
         let result = try await VoiceSubprocessRunner.run(

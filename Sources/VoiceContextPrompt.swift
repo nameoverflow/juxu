@@ -2,7 +2,8 @@ import Foundation
 
 // Turns the captured `VoiceContext` into what each recogniser and the polish model may see.
 // Every builder starts from `promptSafe()`: a secure field or a password manager sends nothing but the
-// personal vocabulary, and a blacklisted app or page sends no screen or surrounding text.
+// personal vocabulary; a blacklisted app or page, a terminal or a private browser window sends the app name,
+// the vocabulary and, for speak-to-edit, the selection the user made, but no window, cursor or screen text.
 
 // MARK: - Privacy gate
 
@@ -16,29 +17,78 @@ extension VoiceContext {
         return false
     }
 
-    /// Whether the window title, the selection and the text around the cursor may leave the input method.
-    public var allowsCursorContext: Bool { !isSecureOrHardBlocked }
-
-    /// Whether the URL, the text around the input area and the visible screen may leave the input method.
-    /// The blacklist exists to keep those large reads away from some apps and pages; the cursor state is still read there.
-    public var allowsScreenContext: Bool {
-        allowsCursorContext && !policyRestricted && captured?.contextMetadata.isBlacklisted != true
+    /// The app or page is on the blacklist, or is a terminal or a private browser window.
+    public var isBlacklisted: Bool {
+        if policyRestricted || captured?.contextMetadata.isBlacklisted == true { return true }
+        if let bid = bundleIdentifier ?? captured?.activeApplication.appIdentifier, VoiceContextPolicy.isTerminal(bundleId: bid) {
+            return true
+        }
+        return false
     }
+
+    /// Whether the window title, URL, cursor text, surrounding text and visible screen may leave the input method.
+    public var allowsScreenContext: Bool { !isSecureOrHardBlocked && !isBlacklisted }
 
     /// The context with everything the privacy gate forbids removed.
     public func promptSafe() -> VoiceContext {
         if allowsScreenContext { return self }
-        let cursor = allowsCursorContext
+        if isSecureOrHardBlocked {
+            // Not even the app's name: "1Password" says what is being typed.
+            return VoiceContext(
+                bundleIdentifier: bundleIdentifier,
+                personalVocabulary: personalVocabulary,
+                captured: nil,
+                policyRestricted: true
+            )
+        }
+        // Blacklisted: the capture reads no text there, so a selection can only come from the input method itself,
+        // where the user selected it to speak an edit.
         return VoiceContext(
             bundleIdentifier: bundleIdentifier,
             appName: appName,
-            windowTitle: cursor ? windowTitle : nil,
-            selectedText: cursor ? selectedText : nil,
-            beforeContext: cursor ? beforeContext : nil,
-            afterContext: cursor ? afterContext : nil,
+            selectedText: selectedText,
             personalVocabulary: personalVocabulary,
             captured: nil,
             policyRestricted: true
+        )
+    }
+
+    /// The same context without the selection, so plain dictation never turns into an edit of it.
+    public func withoutSelection() -> VoiceContext {
+        guard selectedText != nil else { return self }
+        return VoiceContext(
+            bundleIdentifier: bundleIdentifier,
+            appName: appName,
+            windowTitle: windowTitle,
+            webURL: webURL,
+            selectedText: nil,
+            beforeContext: beforeContext,
+            afterContext: afterContext,
+            surroundingBefore: surroundingBefore,
+            surroundingAfter: surroundingAfter,
+            visibleScreenText: visibleScreenText,
+            personalVocabulary: personalVocabulary,
+            captured: captured,
+            policyRestricted: policyRestricted
+        )
+    }
+
+    /// The same context without the visible screen and the text around the input area.
+    public func withoutScreenText() -> VoiceContext {
+        VoiceContext(
+            bundleIdentifier: bundleIdentifier,
+            appName: appName,
+            windowTitle: windowTitle,
+            webURL: webURL,
+            selectedText: selectedText,
+            beforeContext: beforeContext,
+            afterContext: afterContext,
+            surroundingBefore: nil,
+            surroundingAfter: nil,
+            visibleScreenText: nil,
+            personalVocabulary: personalVocabulary,
+            captured: captured,
+            policyRestricted: policyRestricted
         )
     }
 
@@ -63,16 +113,79 @@ extension VoiceContext {
     }
 }
 
+// MARK: - What the configured models receive
+
+extension VoicePreferences {
+    /// The context as the recognisers may see it: screen and surrounding text only reach a cloud service
+    /// when the user allowed it.
+    public func recognitionContext(_ context: VoiceContext) -> VoiceContext {
+        if providerMode == .cloudBYOK && !sendsScreenContextToCloud {
+            return context.withoutScreenText()
+        }
+        return context
+    }
+
+    /// The context as the polish model may see it: as for recognition, and without the selection
+    /// unless speak-to-edit is on.
+    public func polishContext(_ context: VoiceContext) -> VoiceContext {
+        let ctx = recognitionContext(context)
+        return speakToEditSelection ? ctx : ctx.withoutSelection()
+    }
+}
+
 // MARK: - Text helpers
 
 public enum VoiceContextText {
+    /// Prompt delimiters that untrusted text must never reproduce: the polish prompt's own section markers
+    /// and the ChatML control tokens the local model is driven with.
+    static let reservedMarkers: [(String, String)] = [
+        ("【参考上下文结束】", "[参考上下文结束]"),
+        ("【参考上下文】", "[参考上下文]"),
+        ("【选中文本】", "[选中文本]"),
+        ("【语音指令】", "[语音指令]"),
+        ("<|im_start|>", ""),
+        ("<|im_end|>", ""),
+        ("<|endoftext|>", ""),
+    ]
+
+    static let chatMLTokens = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
+
+    /// Defuses every reserved prompt marker in text read from the screen, the selection or the vocabulary.
+    public static func neutralized(_ text: String) -> String {
+        guard text.contains("【") || text.contains("<|") else { return text }
+        return replacingUntilStable(text, reservedMarkers)
+    }
+
+    /// Removes ChatML control tokens only, for a prompt whose own section markers must stay.
+    public static func withoutChatMLTokens(_ text: String) -> String {
+        guard text.contains("<|") else { return text }
+        return replacingUntilStable(text, chatMLTokens.map { ($0, "") })
+    }
+
+    /// Repeats the replacements so a marker reassembled from the pieces around a removed one is caught too.
+    private static func replacingUntilStable(_ text: String, _ pairs: [(String, String)]) -> String {
+        var out = text
+        while true {
+            var next = out
+            for (marker, replacement) in pairs {
+                next = next.replacingOccurrences(of: marker, with: replacement)
+            }
+            if next == out { return out }
+            out = next
+        }
+    }
+
     private static let boundaries: Set<Character> = [
         "\n", " ", "\t", "。", "！", "？", "；", "，", "、", "：", ".", "!", "?", ";", ",", ":",
     ]
 
-    /// Drops AX placeholder and control characters and collapses runs of blank space.
+    /// Drops AX placeholder and control characters, collapses runs of blank space and defuses prompt markers.
     public static func clean(_ raw: String?) -> String {
         guard let raw, !raw.isEmpty else { return "" }
+        return neutralized(collapse(raw))
+    }
+
+    private static func collapse(_ raw: String) -> String {
         var out = ""
         out.reserveCapacity(raw.count)
         var pendingSpace = false
@@ -236,7 +349,9 @@ public enum VoiceContextTerms {
                     CharacterSet.decimalDigits.contains($0) || "._+#-".unicodeScalars.contains($0)
                 }
                 let isAllCaps = uppercase == letters.count && uppercase >= 2
-                let isMixedCase = uppercase >= 2 && !isAllCaps
+                // `WhisperKit` and also lowerCamelCase such as `myVar`, `iPhone`, `juxuApp`.
+                let isMixedCase = !isAllCaps
+                    && (uppercase >= 2 || (uppercase >= 1 && token.first?.isLowercase == true))
                 let isCapitalized = uppercase == 1 && token.first?.isUppercase == true
                 if isMixedCase || isAllCaps || hasDigitOrSeparator {
                     add(token, base: 3, weight: weight, lowercasePlain: false)
@@ -372,6 +487,9 @@ public enum VoiceASRContextBuilder {
     }
 
     /// The recogniser returned its own prompt instead of the speech, which Whisper does on unclear audio.
+    /// An echo reads back a run of the prompt's items: at least two of them, starting where the prompt starts
+    /// or covering most of it. Saying one glossary term (`WhisperKit`), or a phrase that also appears in the
+    /// text before the cursor, is real speech.
     public static func isPromptEcho(_ transcript: String, prompt: String?) -> Bool {
         guard let prompt, !prompt.isEmpty else { return false }
         func normalized(_ s: String) -> String {
@@ -380,8 +498,14 @@ public enum VoiceASRContextBuilder {
             })
         }
         let spoken = normalized(transcript)
-        guard spoken.count >= 6 else { return false }
-        return normalized(prompt).contains(spoken)
+        let whole = normalized(prompt)
+        guard spoken.count >= 6, whole.contains(spoken) else { return false }
+
+        let separators = CharacterSet(charactersIn: "、，,。.；;：:\n").union(.whitespaces)
+        let items = Set(prompt.components(separatedBy: separators).map(normalized).filter { $0.count >= 2 })
+        let matched = items.filter { spoken.contains($0) }.count
+        guard matched >= 2 else { return false }
+        return whole.hasPrefix(spoken) || spoken.count * 2 >= whole.count
     }
 }
 
@@ -470,7 +594,8 @@ public struct VoiceContextPromptPreview: Equatable, Sendable {
     public let polishBudgetLabel: String
     public let polishContext: String
 
-    public static func build(context: VoiceContext, prefs: VoicePreferences) -> VoiceContextPromptPreview {
+    public static func build(context fullContext: VoiceContext, prefs: VoicePreferences) -> VoiceContextPromptPreview {
+        let context = prefs.recognitionContext(fullContext)
         let asrTargetLabel: String
         let asrContext: String
         switch prefs.providerMode {
@@ -513,7 +638,7 @@ public struct VoiceContextPromptPreview: Equatable, Sendable {
         let polishBudgetLabel = polishEnabled
             ? "AI 润色（\(budgetName)）"
             : "AI 润色未开启（预览 · \(budgetName)）"
-        let polishContext = VoicePolishContextBuilder.referenceBlock(context, budget: budget)
+        let polishContext = VoicePolishContextBuilder.referenceBlock(prefs.polishContext(fullContext), budget: budget)
 
         return VoiceContextPromptPreview(
             asrTargetLabel: asrTargetLabel,

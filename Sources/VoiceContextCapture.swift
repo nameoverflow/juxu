@@ -6,18 +6,21 @@ import Foundation
 // MARK: - macOS Native Context Capture (AXUIElement + AXEnhancedUserInterface)
 
 public struct VoiceContextCaptureOptions: Equatable, Sendable {
+    // Every limit is clamped on assignment too, so a negative value set after `init` (e.g. by a CLI flag)
+    // can never reach `String.prefix` / `suffix`, which trap on negative lengths.
+
     /// Maximum time allowed for each expensive AX read phase (visible screen text, surrounding context).
-    public var timeoutMs: Int
+    public var timeoutMs: Int { didSet { timeoutMs = max(50, timeoutMs) } }
     /// Maximum characters to collect for `visible_screen_content` (~10K tokens ≈ 20K chars).
-    public var maxVisibleChars: Int
+    public var maxVisibleChars: Int { didSet { maxVisibleChars = max(0, maxVisibleChars) } }
     /// Maximum characters before/after cursor in `cursor_state` (~1K tokens ≈ 2K chars each).
-    public var maxCursorBeforeChars: Int
-    public var maxCursorAfterChars: Int
+    public var maxCursorBeforeChars: Int { didSet { maxCursorBeforeChars = max(0, maxCursorBeforeChars) } }
+    public var maxCursorAfterChars: Int { didSet { maxCursorAfterChars = max(0, maxCursorAfterChars) } }
     /// Maximum characters for `selected_text` (~5K tokens ≈ 12K chars).
-    public var maxSelectedChars: Int
+    public var maxSelectedChars: Int { didSet { maxSelectedChars = max(0, maxSelectedChars) } }
     /// Maximum characters before/after the input area in `surrounding_context`.
-    public var maxSurroundingBeforeChars: Int
-    public var maxSurroundingAfterChars: Int
+    public var maxSurroundingBeforeChars: Int { didSet { maxSurroundingBeforeChars = max(0, maxSurroundingBeforeChars) } }
+    public var maxSurroundingAfterChars: Int { didSet { maxSurroundingAfterChars = max(0, maxSurroundingAfterChars) } }
     /// Whether to enforce the check-before-read app/URL blacklist for visible & surrounding content.
     public var respectBlacklist: Bool
     /// Additional user-configured bundle IDs to blacklist.
@@ -371,20 +374,67 @@ public enum VoiceContextPolicy {
 
     public static let knownCodeEditorHints: [String] = [
         "vscode", "cursor", "xcode", "jetbrains", "intellij", "pycharm",
-        "zed", "sublimetext", "terminal", "iterm", "ghostty", "warp", "alacritty", "kitty",
+        "zed", "sublimetext",
+    ]
+
+    /// Terminal buffers routinely show `.env` files, tokens and API keys, so terminals are never read,
+    /// whatever the blacklist setting.
+    public static let terminalBundleIds: Set<String> = [
+        "com.apple.Terminal",
+        "com.googlecode.iterm2",
+        "com.mitchellh.ghostty",
+        "dev.warp.Warp-Stable",
+        "dev.warp.Warp-Preview",
+        "dev.warp.Warp",
+        "net.kovidgoyal.kitty",
+        "org.alacritty",
+        "io.alacritty",
+        "com.github.wez.wezterm",
+        "co.zeit.hyper",
+        "org.tabby",
+        "com.raphaelamorim.rio",
+    ]
+
+    /// Window-title markers browsers add to private / incognito windows (lowercased).
+    /// Chrome, Edge, Brave, Arc and Firefox put one of these in the window title; Safari does not,
+    /// so a Safari private window is only caught when its title carries one.
+    public static let privateWindowTitleMarkers: [String] = [
+        "private browsing", "private window", "incognito", "inprivate",
+        "隐私浏览", "无痕", "隐身", "私密浏览",
     ]
 
     public static func isHardBlocked(bundleId: String) -> Bool {
         hardBlockedBundleIds.contains(bundleId)
     }
 
+    public static func isTerminal(bundleId: String) -> Bool {
+        terminalBundleIds.contains(bundleId)
+    }
+
+    /// Whether a browser window is a private / incognito one, judged from its title.
+    public static func isPrivateBrowsingWindow(bundleId: String, windowTitle: String?) -> Bool {
+        guard isWebBrowser(bundleId: bundleId), let title = windowTitle?.lowercased(), !title.isEmpty else {
+            return false
+        }
+        return privateWindowTitleMarkers.contains { title.contains($0) }
+    }
+
+    /// Why nothing but the app name may be read here, or nil when the capture may go on.
+    /// Password managers, terminals and private browser windows are excluded even with the blacklist off.
     public static func blacklistReason(
         bundleId: String,
         webURL: String?,
+        windowTitle: String? = nil,
         options: VoiceContextCaptureOptions
     ) -> String? {
         if isHardBlocked(bundleId: bundleId) {
             return "password_manager:\(bundleId)"
+        }
+        if isTerminal(bundleId: bundleId) {
+            return "terminal:\(bundleId)"
+        }
+        if isPrivateBrowsingWindow(bundleId: bundleId, windowTitle: windowTitle) {
+            return "private_window:\(bundleId)"
         }
         guard options.respectBlacklist else { return nil }
         if defaultBlacklistedBundleIds.contains(bundleId) || options.extraBlacklistedBundleIds.contains(bundleId) {
@@ -401,6 +451,34 @@ public enum VoiceContextPolicy {
 
     public static func isWebBrowser(bundleId: String) -> Bool {
         knownBrowserBundleIds.contains(bundleId)
+    }
+
+    /// What the capture may do, decided from the bundle ID and `IsSecureEventInputEnabled()` alone,
+    /// before a single AX message is sent to the target app.
+    public enum Preflight: Equatable, Sendable {
+        /// Secure event input is on (a password is being typed somewhere): no AX call at all.
+        case secureInput
+        /// Password manager, terminal or blacklisted app: no AX call at all.
+        case blocked(reason: String)
+        /// The capture may talk to the app; the window title, URL and focused field are checked next.
+        case proceed
+    }
+
+    public static func preflight(
+        bundleId: String,
+        isSecureEventInput: Bool,
+        options: VoiceContextCaptureOptions
+    ) -> Preflight {
+        if isHardBlocked(bundleId: bundleId) {
+            return .blocked(reason: "password_manager:\(bundleId)")
+        }
+        if isSecureEventInput {
+            return .secureInput
+        }
+        if let reason = blacklistReason(bundleId: bundleId, webURL: nil, options: options) {
+            return .blocked(reason: reason)
+        }
+        return .proceed
     }
 
     public static func isElectronOrChromiumApp(bundleId: String, appPath: String?) -> Bool {
@@ -521,12 +599,40 @@ public enum VoiceContextPolicy {
 
 // MARK: - Live AX Capture Engine
 
+/// Set when the dictation that asked for a capture no longer needs it; every AX loop checks it.
+public final class VoiceContextCaptureCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    public init() {}
+
+    public var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    public func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+}
+
 public enum VoiceContextCapture {
+    /// Captures run one at a time, and a newer capture cancels the one before it (see `supersedePreviousCapture`),
+    /// so an app that hangs in AX IPC cannot pile up threads.
     private static let captureQueue = DispatchQueue(
         label: "im.juxu.voice.context-capture",
-        qos: .userInitiated,
-        attributes: .concurrent
+        qos: .userInitiated
     )
+    /// The one extra thread a capture may use: surrounding context is read here while the capture thread reads the screen.
+    private static let auxiliaryQueue = DispatchQueue(
+        label: "im.juxu.voice.context-capture.aux",
+        qos: .userInitiated
+    )
+    /// Every AX message waits at most this long, instead of the 6 s macOS default.
+    static let messagingTimeout: Float = 0.25
 
     private struct FrontmostSnapshot: Sendable {
         let appName: String
@@ -537,25 +643,54 @@ public enum VoiceContextCapture {
         let isSecureEventInput: Bool
     }
 
+    private final class LatestCapture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var current: VoiceContextCaptureCancellation?
+
+        func replace(with next: VoiceContextCaptureCancellation) -> VoiceContextCaptureCancellation? {
+            lock.lock()
+            defer { lock.unlock() }
+            let previous = current
+            current = next
+            return previous
+        }
+    }
+
+    private static let latestCapture = LatestCapture()
+
+    /// Starts a new capture's cancellation and cancels the capture before it, which nobody waits for any more.
+    static func supersedePreviousCapture() -> VoiceContextCaptureCancellation {
+        let next = VoiceContextCaptureCancellation()
+        latestCapture.replace(with: next)?.cancel()
+        return next
+    }
+
     /// Captures frontmost app metadata on MainActor, then performs all AXUIElement queries off the main thread
     /// with strict per-phase deadlines so a frozen target app never blocks the UI or typing.
+    /// Cancelling the calling task stops the AX work at its next step.
     public static func captureAsync(
         options: VoiceContextCaptureOptions = VoiceContextCaptureOptions()
     ) async -> VoiceCapturedContext {
+        let cancellation = supersedePreviousCapture()
         let frontmost: FrontmostSnapshot = await MainActor.run {
             snapshotFrontmost()
         }
-        return await withCheckedContinuation { cont in
-            captureQueue.async {
-                let result = performCapture(frontmost: frontmost, options: options)
-                cont.resume(returning: result)
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { cont in
+                captureQueue.async {
+                    let result = performCapture(frontmost: frontmost, options: options, cancellation: cancellation)
+                    cont.resume(returning: result)
+                }
             }
+        } onCancel: {
+            cancellation.cancel()
         }
     }
 
     /// Synchronous entry point (for CLI / background threads).
     public static func captureSync(
-        options: VoiceContextCaptureOptions = VoiceContextCaptureOptions()
+        options: VoiceContextCaptureOptions = VoiceContextCaptureOptions(),
+        cancellation: VoiceContextCaptureCancellation = VoiceContextCaptureCancellation()
     ) -> VoiceCapturedContext {
         let frontmost: FrontmostSnapshot
         if Thread.isMainThread {
@@ -563,7 +698,7 @@ public enum VoiceContextCapture {
         } else {
             frontmost = DispatchQueue.main.sync { snapshotFrontmost() }
         }
-        return performCapture(frontmost: frontmost, options: options)
+        return performCapture(frontmost: frontmost, options: options, cancellation: cancellation)
     }
 
     private static func snapshotFrontmost() -> FrontmostSnapshot {
@@ -580,13 +715,57 @@ public enum VoiceContextCapture {
         )
     }
 
+    /// Results of the two text reads, written from two threads.
+    private final class TextReads: @unchecked Sendable {
+        private let lock = NSLock()
+        private var surrounding = VoiceCapturedContext.TextInsertionPoint.SurroundingContext()
+        private var surroundingTimedOut = false
+        private var surroundingDone = false
+        private var visible: String?
+        private var visibleTimedOut = false
+        private var visibleDone = false
+
+        func setSurrounding(_ value: VoiceCapturedContext.TextInsertionPoint.SurroundingContext, timedOut: Bool) {
+            lock.lock()
+            surrounding = value
+            surroundingTimedOut = timedOut
+            surroundingDone = true
+            lock.unlock()
+        }
+
+        func setVisible(_ value: String?, timedOut: Bool) {
+            lock.lock()
+            visible = value
+            visibleTimedOut = timedOut
+            visibleDone = true
+            lock.unlock()
+        }
+
+        /// What finished in time; a read that is still running counts as timed out.
+        func snapshot(surroundingStarted: Bool, visibleStarted: Bool) -> (
+            surrounding: VoiceCapturedContext.TextInsertionPoint.SurroundingContext,
+            surroundingTimedOut: Bool,
+            visible: String?,
+            visibleTimedOut: Bool
+        ) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (
+                surroundingDone ? surrounding : .init(),
+                surroundingTimedOut || (surroundingStarted && !surroundingDone),
+                visibleDone ? visible : nil,
+                visibleTimedOut || (visibleStarted && !visibleDone)
+            )
+        }
+    }
+
     private static func performCapture(
         frontmost: FrontmostSnapshot,
-        options: VoiceContextCaptureOptions
+        options: VoiceContextCaptureOptions,
+        cancellation: VoiceContextCaptureCancellation
     ) -> VoiceCapturedContext {
         let startNs = DispatchTime.now().uptimeNanoseconds
         let isoTimestamp = ISO8601DateFormatter().string(from: Date())
-        let trusted = AXIsProcessTrusted()
         let isBrowser = VoiceContextPolicy.isWebBrowser(bundleId: frontmost.bundleId)
         let appType = VoiceContextPolicy.classifyAppType(bundleId: frontmost.bundleId, appPath: frontmost.appPath)
 
@@ -603,7 +782,7 @@ public enum VoiceContextCapture {
         var insertion = VoiceCapturedContext.TextInsertionPoint()
         var meta = VoiceCapturedContext.ContextMetadata(
             isOwnApplication: frontmost.isOwnApp,
-            isAccessibilityTrusted: trusted,
+            isAccessibilityTrusted: false,
             enhancedUIEnabled: false,
             isBlacklisted: false,
             blacklistReason: nil,
@@ -624,12 +803,40 @@ public enum VoiceContextCapture {
             )
         }
 
-        guard trusted, frontmost.pid > 0 else {
+        /// Ends the capture with nothing but the app name: the title and URL may name what is on screen.
+        func finishWithoutText(blacklistReason: String?) -> VoiceCapturedContext {
+            if let blacklistReason {
+                meta.isBlacklisted = true
+                meta.blacklistReason = blacklistReason
+            }
+            activeApp.windowTitle = ""
+            activeApp.webURL = nil
+            return finish()
+        }
+
+        // Step 0: password managers, secure event input, terminals and blacklisted apps are known
+        // from the bundle ID alone, so they get no AX message at all.
+        switch VoiceContextPolicy.preflight(
+            bundleId: frontmost.bundleId,
+            isSecureEventInput: frontmost.isSecureEventInput,
+            options: options
+        ) {
+        case .secureInput:
+            return finishWithoutText(blacklistReason: nil)
+        case .blocked(let reason):
+            return finishWithoutText(blacklistReason: reason)
+        case .proceed:
+            break
+        }
+
+        let trusted = AXIsProcessTrusted()
+        meta.isAccessibilityTrusted = trusted
+        guard trusted, frontmost.pid > 0, !cancellation.isCancelled else {
             return finish()
         }
 
         let appElement = AXUIElementCreateApplication(frontmost.pid)
-        AXUIElementSetMessagingTimeout(appElement, 0.25)
+        AXUIElementSetMessagingTimeout(appElement, messagingTimeout)
 
         // Step 1: Enable AXEnhancedUserInterface for browsers / Electron / Chromium apps so DOM & editor AX trees are exposed.
         if VoiceContextPolicy.isElectronOrChromiumApp(bundleId: frontmost.bundleId, appPath: frontmost.appPath) {
@@ -638,15 +845,20 @@ public enum VoiceContextCapture {
                 bundleId: frontmost.bundleId
             )
         }
+        if cancellation.isCancelled { return finish() }
 
-        // Step 2: Focused window & focused element.
+        // Step 2: Focused window; a private browser window ends the capture here.
         let focusedWindow = copyElement(appElement, kAXFocusedWindowAttribute)
             ?? copyElement(appElement, kAXMainWindowAttribute)
         if let focusedWindow {
-            AXUIElementSetMessagingTimeout(focusedWindow, 0.25)
             activeApp.windowTitle = copyString(focusedWindow, kAXTitleAttribute) ?? ""
         }
+        if VoiceContextPolicy.isPrivateBrowsingWindow(bundleId: frontmost.bundleId, windowTitle: activeApp.windowTitle) {
+            return finishWithoutText(blacklistReason: "private_window:\(frontmost.bundleId)")
+        }
+        if cancellation.isCancelled { return finish() }
 
+        // Step 3: Focused element; a secure text field ends the capture before the URL or any text is read.
         var focusedElement = resolveFocusedElement(appElement: appElement)
         let focusedRoleBeforeEnhance = focusedElement.flatMap { copyString($0, kAXRoleAttribute) } ?? ""
         let needsEnhancedFallback = focusedElement == nil
@@ -655,7 +867,7 @@ public enum VoiceContextCapture {
             || focusedRoleBeforeEnhance == (kAXApplicationRole as String)
             || focusedRoleBeforeEnhance == (kAXGroupRole as String)
             || focusedRoleBeforeEnhance == (kAXUnknownRole as String)
-        if needsEnhancedFallback, !meta.enhancedUIEnabled {
+        if needsEnhancedFallback, !meta.enhancedUIEnabled, !cancellation.isCancelled {
             // Fallback: some Chromium/Electron apps don't expose standard frameworks at top level;
             // enable AXEnhancedUserInterface once and re-query the focused element.
             if enableEnhancedUI(on: appElement, bundleId: frontmost.bundleId) {
@@ -663,56 +875,57 @@ public enum VoiceContextCapture {
                 focusedElement = resolveFocusedElement(appElement: appElement)
             }
         }
-        if let focusedElement {
-            AXUIElementSetMessagingTimeout(focusedElement, 0.25)
-        }
 
-        // Step 3: Browser URL (pure AX, zero AppleScript / Automation prompts).
+        let subrole = focusedElement.flatMap { copyString($0, kAXSubroleAttribute) }
+        insertion.accessibilitySubrole = subrole
+        if subrole == (kAXSecureTextFieldSubrole as String) {
+            meta.isSecureInput = true
+            insertion.inputCapabilities = .init(isEditable: true, isSecure: true)
+            return finishWithoutText(blacklistReason: nil)
+        }
+        if cancellation.isCancelled { return finish() }
+
+        // Step 4: Browser URL (pure AX, zero AppleScript / Automation prompts), then the URL blacklist.
         if isBrowser || appType == "electron_app" {
-            let urlDeadline = deadlineAfter(ms: min(180, options.timeoutMs))
+            let urlBudget = CaptureBudget(ms: min(180, options.timeoutMs), cancellation: cancellation)
             activeApp.webURL = extractWebURL(
                 focusedElement: focusedElement,
                 focusedWindow: focusedWindow,
-                deadline: urlDeadline
+                budget: urlBudget
             )
         }
-
-        // Step 4: Check security & blacklist BEFORE reading text.
-        let hardBlocked = VoiceContextPolicy.isHardBlocked(bundleId: frontmost.bundleId)
-        let subrole = focusedElement.flatMap { copyString($0, kAXSubroleAttribute) }
-        let isSecureElement = (subrole == (kAXSecureTextFieldSubrole as String))
-        let isSecure = frontmost.isSecureEventInput || isSecureElement || hardBlocked
-        meta.isSecureInput = frontmost.isSecureEventInput || isSecureElement
-
-        let blacklistReason = VoiceContextPolicy.blacklistReason(
+        if let reason = VoiceContextPolicy.blacklistReason(
             bundleId: frontmost.bundleId,
             webURL: activeApp.webURL,
+            windowTitle: activeApp.windowTitle,
             options: options
-        )
-        meta.isBlacklisted = (blacklistReason != nil)
-        meta.blacklistReason = blacklistReason
+        ) {
+            // A blacklisted app or page gives neither cursor text nor screen text.
+            return finishWithoutText(blacklistReason: reason)
+        }
+        if cancellation.isCancelled { return finish() }
 
         let role = focusedElement.flatMap { copyString($0, kAXRoleAttribute) } ?? ""
-        let isInsideWebArea = focusedElement.map { hasAncestor(of: $0, role: "AXWebArea", maxHops: 24) } ?? false
+        let ancestorBudget = CaptureBudget(ms: min(120, options.timeoutMs), cancellation: cancellation)
+        let isInsideWebArea = focusedElement.map {
+            hasAncestor(of: $0, role: "AXWebArea", maxHops: 24, budget: ancestorBudget)
+        } ?? false
         let isEditable = focusedElement.map { isElementEditable($0, role: role) } ?? false
 
         insertion.accessibilityRole = role
-        insertion.accessibilitySubrole = subrole
-        insertion.inputCapabilities = .init(isEditable: isEditable, isSecure: isSecureElement)
+        insertion.inputCapabilities = .init(isEditable: isEditable, isSecure: false)
         insertion.inputAreaType = VoiceContextPolicy.classifyInputAreaType(
             bundleId: frontmost.bundleId,
             role: role,
             isEditable: isEditable,
             isInsideWebArea: isInsideWebArea
         )
+        if cancellation.isCancelled { return finish() }
 
-        if isSecure {
-            return finish()
-        }
-
-        // Step 5: Cursor state (collected for non-secure focused field).
+        // Step 5: Cursor state of the focused field.
         if let focusedElement, !frontmost.isOwnApp {
-            var cursorState = readCursorState(element: focusedElement, options: options)
+            let cursorBudget = CaptureBudget(ms: options.timeoutMs, cancellation: cancellation)
+            var cursorState = readCursorState(element: focusedElement, options: options, budget: cursorBudget)
             if VoiceContextPolicy.shouldClearNotionWebAreaCursor(
                 isWebBrowser: isBrowser,
                 webURL: activeApp.webURL,
@@ -727,71 +940,54 @@ public enum VoiceContextCapture {
             insertion.cursorState = cursorState
         }
 
-        // Step 6: Blacklist gate BEFORE reading surrounding_context and visible_screen_content.
-        guard !meta.isBlacklisted, !frontmost.isOwnApp else {
+        guard !frontmost.isOwnApp, !cancellation.isCancelled else {
             return finish()
         }
 
-        // Run surrounding context & visible screen content concurrently under the timeout budget.
+        // Step 6: Surrounding context on the auxiliary thread while this thread reads the visible screen,
+        // both under the same budget.
+        let reads = TextReads()
         let group = DispatchGroup()
-        let resultLock = NSLock()
-        var surroundingResult = VoiceCapturedContext.TextInsertionPoint.SurroundingContext()
-        var timedOutSurrounding = false
-        var visibleResult: String? = nil
-        var timedOutVisible = false
+        let budget = CaptureBudget(ms: options.timeoutMs, cancellation: cancellation)
+        let surroundingStarted = focusedElement != nil
+            && (options.maxSurroundingBeforeChars > 0 || options.maxSurroundingAfterChars > 0)
+        let visibleStarted = focusedWindow != nil && options.maxVisibleChars > 0
 
-        if let focusedElement,
-           (options.maxSurroundingBeforeChars > 0 || options.maxSurroundingAfterChars > 0) {
+        if surroundingStarted, let focusedElement {
             group.enter()
             let elemBox = UncheckedAXBox(element: focusedElement)
-            let dl = deadlineAfter(ms: options.timeoutMs)
-            captureQueue.async {
+            let maxBefore = options.maxSurroundingBeforeChars
+            let maxAfter = options.maxSurroundingAfterChars
+            auxiliaryQueue.async {
                 let (ctx, timedOut) = readSurroundingContext(
                     focusedElement: elemBox.element,
-                    maxBeforeChars: options.maxSurroundingBeforeChars,
-                    maxAfterChars: options.maxSurroundingAfterChars,
-                    deadline: dl
+                    maxBeforeChars: maxBefore,
+                    maxAfterChars: maxAfter,
+                    budget: budget
                 )
-                resultLock.lock()
-                surroundingResult = ctx
-                timedOutSurrounding = timedOut
-                resultLock.unlock()
+                reads.setSurrounding(ctx, timedOut: timedOut)
                 group.leave()
             }
         }
 
-        if let rootWindow = focusedWindow, options.maxVisibleChars > 0 {
-            group.enter()
-            let winBox = UncheckedAXBox(element: rootWindow)
-            let dl = deadlineAfter(ms: options.timeoutMs)
-            captureQueue.async {
-                let (text, timedOut) = readVisibleScreenText(
-                    window: winBox.element,
-                    maxChars: options.maxVisibleChars,
-                    deadline: dl
-                )
-                resultLock.lock()
-                visibleResult = text.isEmpty ? nil : text
-                timedOutVisible = timedOut
-                resultLock.unlock()
-                group.leave()
-            }
+        if visibleStarted, let rootWindow = focusedWindow {
+            let (text, timedOut) = readVisibleScreenText(
+                window: rootWindow,
+                maxChars: options.maxVisibleChars,
+                budget: budget
+            )
+            reads.setVisible(text.isEmpty ? nil : text, timedOut: timedOut)
         }
 
-        let waitLimit = DispatchTime.now() + .milliseconds(options.timeoutMs + 80)
-        if group.wait(timeout: waitLimit) == .timedOut {
-            resultLock.lock()
-            timedOutVisible = timedOutVisible || (visibleResult == nil && focusedWindow != nil && options.maxVisibleChars > 0)
-            timedOutSurrounding = timedOutSurrounding || (focusedElement != nil && options.maxSurroundingBeforeChars > 0)
-            resultLock.unlock()
+        if surroundingStarted {
+            _ = group.wait(timeout: DispatchTime(uptimeNanoseconds: budget.deadline &+ 80_000_000))
         }
 
-        resultLock.lock()
-        insertion.surroundingContext = surroundingResult
-        activeApp.visibleScreenContent = visibleResult
-        meta.timedOutSurrounding = timedOutSurrounding
-        meta.timedOutVisible = timedOutVisible
-        resultLock.unlock()
+        let result = reads.snapshot(surroundingStarted: surroundingStarted, visibleStarted: visibleStarted)
+        insertion.surroundingContext = result.surrounding
+        activeApp.visibleScreenContent = result.visible
+        meta.timedOutSurrounding = result.surroundingTimedOut
+        meta.timedOutVisible = result.visibleTimedOut
 
         return finish()
     }
@@ -826,7 +1022,7 @@ public enum VoiceContextCapture {
             return elem
         }
         let system = AXUIElementCreateSystemWide()
-        AXUIElementSetMessagingTimeout(system, 0.25)
+        AXUIElementSetMessagingTimeout(system, messagingTimeout)
         return copyElement(system, kAXFocusedUIElementAttribute)
     }
 
@@ -852,10 +1048,15 @@ public enum VoiceContextCapture {
         return editableRoles.contains(role)
     }
 
-    private static func hasAncestor(of element: AXUIElement, role targetRole: String, maxHops: Int) -> Bool {
+    private static func hasAncestor(
+        of element: AXUIElement,
+        role targetRole: String,
+        maxHops: Int,
+        budget: CaptureBudget
+    ) -> Bool {
         var current: AXUIElement? = element
         for _ in 0..<maxHops {
-            guard let node = current else { return false }
+            guard let node = current, !budget.isExhausted else { return false }
             if copyString(node, kAXRoleAttribute) == targetRole {
                 return true
             }
@@ -869,13 +1070,13 @@ public enum VoiceContextCapture {
     private static func extractWebURL(
         focusedElement: AXUIElement?,
         focusedWindow: AXUIElement?,
-        deadline: UInt64
+        budget: CaptureBudget
     ) -> String? {
         // 1. Walk up from focusedElement to find AXWebArea / AXURL.
         if let focusedElement {
             var current: AXUIElement? = focusedElement
             for _ in 0..<32 {
-                if isPast(deadline) { break }
+                if budget.isExhausted { break }
                 guard let node = current else { break }
                 if let url = copyURLString(node, "AXURL" as CFString) {
                     return url
@@ -898,7 +1099,7 @@ public enum VoiceContextCapture {
         let maxVisited = 160
         var addressBarFallback: String? = nil
 
-        while !queue.isEmpty && visited < maxVisited && !isPast(deadline) {
+        while !queue.isEmpty && visited < maxVisited && !budget.isExhausted {
             let (node, depth) = queue.removeFirst()
             visited += 1
             let role = copyString(node, kAXRoleAttribute) ?? ""
@@ -937,7 +1138,8 @@ public enum VoiceContextCapture {
 
     private static func readCursorState(
         element: AXUIElement,
-        options: VoiceContextCaptureOptions
+        options: VoiceContextCaptureOptions,
+        budget: CaptureBudget
     ) -> VoiceCapturedContext.TextInsertionPoint.CursorState {
         var selectedText = copyString(element, kAXSelectedTextAttribute) ?? ""
         if selectedText.count > options.maxSelectedChars {
@@ -1005,6 +1207,14 @@ public enum VoiceContextCapture {
             }
         }
 
+        if budget.isExhausted {
+            return .init(
+                selectionLength: selectedText.utf16.count,
+                hasTextSelected: !selectedText.isEmpty,
+                selectedText: selectedText
+            )
+        }
+
         // Strategy B: Web / Chromium / Electron `AXSelectedTextMarkerRange` + `AXStringForTextMarkerRange`.
         if let markerState = readWebTextMarkerCursorState(element: element, existingSelected: selectedText, options: options) {
             return markerState
@@ -1023,7 +1233,9 @@ public enum VoiceContextCapture {
         }
 
         // Contenteditable rich editors sometimes expose text only via direct child AXStaticText elements.
-        let childTexts = collectInlineText(from: element, maxChars: options.maxCursorBeforeChars, maxNodes: 40)
+        let childTexts = budget.isExhausted
+            ? ""
+            : collectInlineText(from: element, maxChars: options.maxCursorBeforeChars, maxNodes: 40, budget: budget)
         if !childTexts.isEmpty || !selectedText.isEmpty {
             return .init(
                 cursorPosition: nil,
@@ -1169,7 +1381,7 @@ public enum VoiceContextCapture {
         focusedElement: AXUIElement,
         maxBeforeChars: Int,
         maxAfterChars: Int,
-        deadline: UInt64
+        budget: CaptureBudget
     ) -> (VoiceCapturedContext.TextInsertionPoint.SurroundingContext, Bool) {
         var beforePieces: [String] = []
         var afterPieces: [String] = []
@@ -1182,7 +1394,7 @@ public enum VoiceContextCapture {
         // Walk up a few ancestors and inspect sibling subtrees immediately before and after the focused branch.
         var current = focusedElement
         for _ in 0..<6 {
-            if isPast(deadline) {
+            if budget.isExhausted {
                 timedOut = true
                 break
             }
@@ -1196,14 +1408,14 @@ public enum VoiceContextCapture {
                 if beforeCount < maxBeforeChars && idx > 0 {
                     var localBefore: [String] = []
                     for sIdx in stride(from: idx - 1, through: max(0, idx - 6), by: -1) {
-                        if isPast(deadline) { timedOut = true; break }
+                        if budget.isExhausted { timedOut = true; break }
                         if visited >= maxVisited || beforeCount >= maxBeforeChars { break }
                         let snippet = collectSnippet(
                             from: siblings[sIdx],
-                            budget: maxBeforeChars - beforeCount,
+                            charBudget: maxBeforeChars - beforeCount,
                             visited: &visited,
                             maxVisited: maxVisited,
-                            deadline: deadline,
+                            budget: budget,
                             timedOut: &timedOut
                         )
                         if !snippet.isEmpty {
@@ -1219,14 +1431,14 @@ public enum VoiceContextCapture {
                 // Collect siblings after current.
                 if afterCount < maxAfterChars && idx + 1 < siblings.count {
                     for sIdx in (idx + 1)..<min(siblings.count, idx + 7) {
-                        if isPast(deadline) { timedOut = true; break }
+                        if budget.isExhausted { timedOut = true; break }
                         if visited >= maxVisited || afterCount >= maxAfterChars { break }
                         let snippet = collectSnippet(
                             from: siblings[sIdx],
-                            budget: maxAfterChars - afterCount,
+                            charBudget: maxAfterChars - afterCount,
                             visited: &visited,
                             maxVisited: maxVisited,
-                            deadline: deadline,
+                            budget: budget,
                             timedOut: &timedOut
                         )
                         if !snippet.isEmpty {
@@ -1273,7 +1485,7 @@ public enum VoiceContextCapture {
     private static func readVisibleScreenText(
         window: AXUIElement,
         maxChars: Int,
-        deadline: UInt64
+        budget: CaptureBudget
     ) -> (String, Bool) {
         let windowFrame = copyFrame(window)
         var lines: [String] = []
@@ -1284,7 +1496,7 @@ public enum VoiceContextCapture {
 
         func walk(_ node: AXUIElement, depth: Int) {
             if totalChars >= maxChars || visited >= maxVisited { return }
-            if isPast(deadline) {
+            if budget.isExhausted {
                 timedOut = true
                 return
             }
@@ -1320,7 +1532,7 @@ public enum VoiceContextCapture {
             let toVisit = children.isEmpty ? copyElementArray(node, kAXChildrenAttribute) : children
             for child in toVisit {
                 if totalChars >= maxChars || visited >= maxVisited { break }
-                if isPast(deadline) {
+                if budget.isExhausted {
                     timedOut = true
                     break
                 }
@@ -1363,18 +1575,18 @@ public enum VoiceContextCapture {
 
     private static func collectSnippet(
         from root: AXUIElement,
-        budget: Int,
+        charBudget: Int,
         visited: inout Int,
         maxVisited: Int,
-        deadline: UInt64,
+        budget: CaptureBudget,
         timedOut: inout Bool
     ) -> String {
         var pieces: [String] = []
         var count = 0
 
         func walk(_ node: AXUIElement, depth: Int) {
-            if count >= budget || visited >= maxVisited { return }
-            if isPast(deadline) { timedOut = true; return }
+            if count >= charBudget || visited >= maxVisited { return }
+            if budget.isExhausted { timedOut = true; return }
             visited += 1
 
             let role = copyString(node, kAXRoleAttribute) ?? ""
@@ -1382,7 +1594,7 @@ public enum VoiceContextCapture {
             if copyString(node, kAXSubroleAttribute) == (kAXSecureTextFieldSubrole as String) { return }
 
             if textLeafRoles.contains(role) {
-                if let text = readVisibleTextOfLeaf(node, role: role, remaining: budget - count)?
+                if let text = readVisibleTextOfLeaf(node, role: role, remaining: charBudget - count)?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
                    !text.isEmpty {
                     pieces.append(text)
@@ -1396,8 +1608,8 @@ public enum VoiceContextCapture {
             guard depth < 8 else { return }
             let children = copyElementArray(node, kAXChildrenAttribute)
             for child in children.prefix(24) {
-                if count >= budget || visited >= maxVisited { break }
-                if isPast(deadline) { timedOut = true; break }
+                if count >= charBudget || visited >= maxVisited { break }
+                if budget.isExhausted { timedOut = true; break }
                 walk(child, depth: depth + 1)
             }
         }
@@ -1406,13 +1618,18 @@ public enum VoiceContextCapture {
         return deduplicatedLines(pieces).joined(separator: " ")
     }
 
-    private static func collectInlineText(from root: AXUIElement, maxChars: Int, maxNodes: Int) -> String {
+    private static func collectInlineText(
+        from root: AXUIElement,
+        maxChars: Int,
+        maxNodes: Int,
+        budget: CaptureBudget
+    ) -> String {
         var pieces: [String] = []
         var count = 0
         var visited = 0
 
         func walk(_ node: AXUIElement, depth: Int) {
-            if count >= maxChars || visited >= maxNodes { return }
+            if count >= maxChars || visited >= maxNodes || budget.isExhausted { return }
             visited += 1
             let role = copyString(node, kAXRoleAttribute) ?? ""
             if copyString(node, kAXSubroleAttribute) == (kAXSecureTextFieldSubrole as String) { return }
@@ -1453,12 +1670,26 @@ public enum VoiceContextCapture {
         init(element: AXUIElement) { self.element = element }
     }
 
-    private static func deadlineAfter(ms: Int) -> UInt64 {
-        DispatchTime.now().uptimeNanoseconds &+ UInt64(max(1, ms)) &* 1_000_000
+    /// A deadline plus the capture's cancellation: every AX loop stops as soon as either is reached.
+    struct CaptureBudget: Sendable {
+        let deadline: UInt64
+        let cancellation: VoiceContextCaptureCancellation
+
+        init(ms: Int, cancellation: VoiceContextCaptureCancellation) {
+            self.deadline = DispatchTime.now().uptimeNanoseconds &+ UInt64(max(1, ms)) &* 1_000_000
+            self.cancellation = cancellation
+        }
+
+        var isExhausted: Bool {
+            DispatchTime.now().uptimeNanoseconds >= deadline || cancellation.isCancelled
+        }
     }
 
-    private static func isPast(_ deadline: UInt64) -> Bool {
-        DispatchTime.now().uptimeNanoseconds >= deadline
+    /// Every element handed out gets the short messaging timeout before anything else is asked of it,
+    /// so no traversed node falls back to the 6 s macOS default.
+    private static func withMessagingTimeout(_ element: AXUIElement) -> AXUIElement {
+        AXUIElementSetMessagingTimeout(element, messagingTimeout)
+        return element
     }
 
     private static func copyElement(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
@@ -1467,7 +1698,7 @@ public enum VoiceContextCapture {
               let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else {
             return nil
         }
-        return unsafeDowncast(ref, to: AXUIElement.self)
+        return withMessagingTimeout(unsafeDowncast(ref, to: AXUIElement.self))
     }
 
     private static func copyElementArray(_ element: AXUIElement, _ attribute: String) -> [AXUIElement] {
@@ -1478,7 +1709,7 @@ public enum VoiceContextCapture {
         }
         let targetID = AXUIElementGetTypeID()
         return arr.compactMap { item in
-            CFGetTypeID(item) == targetID ? unsafeDowncast(item, to: AXUIElement.self) : nil
+            CFGetTypeID(item) == targetID ? withMessagingTimeout(unsafeDowncast(item, to: AXUIElement.self)) : nil
         }
     }
 
@@ -1587,26 +1818,51 @@ public final class VoiceContextInspectorStore: ObservableObject {
     public static let shared = VoiceContextInspectorStore()
 
     @Published public private(set) var lastCaptured: VoiceCapturedContext?
-    @Published public private(set) var lastJSON: String = ""
     @Published public private(set) var lastASRTargetLabel: String = ""
     @Published public private(set) var lastASRContext: String = ""
     @Published public private(set) var lastPolishBudgetLabel: String = ""
     @Published public private(set) var lastPolishContext: String = ""
     @Published public private(set) var countdownSeconds: Int = 0
     @Published public private(set) var isCapturing: Bool = false
-    @Published public var respectBlacklist: Bool = true
+    /// Whether the inspector card is on screen. Dictation only records into the store while it is,
+    /// and the last capture is dropped once it goes away.
+    public private(set) var isPresented = false
 
+    /// Encoded on first use: only "copy JSON" and the expanded JSON view need it.
+    private var cachedJSON: String?
     private var scheduledTask: Task<Void, Never>?
 
     private init() {}
 
+    public func setPresented(_ presented: Bool) {
+        isPresented = presented
+        if !presented {
+            cancelScheduledCapture()
+            lastCaptured = nil
+            cachedJSON = nil
+            lastASRTargetLabel = ""
+            lastASRContext = ""
+            lastPolishBudgetLabel = ""
+            lastPolishContext = ""
+        }
+    }
+
     public func record(_ captured: VoiceCapturedContext) {
         self.lastCaptured = captured
-        self.lastJSON = captured.prettyJSON()
+        self.cachedJSON = nil
         self.lastASRTargetLabel = ""
         self.lastASRContext = ""
         self.lastPolishBudgetLabel = ""
         self.lastPolishContext = ""
+    }
+
+    /// The last capture as pretty-printed JSON, encoded only when asked for.
+    public func lastPrettyJSON() -> String {
+        if let cachedJSON { return cachedJSON }
+        guard let lastCaptured else { return "" }
+        let json = lastCaptured.prettyJSON()
+        cachedJSON = json
+        return json
     }
 
     public func recordModelContext(
@@ -1621,9 +1877,8 @@ public final class VoiceContextInspectorStore: ObservableObject {
         self.lastPolishContext = polishContext
     }
 
-    public func captureAfterDelay(seconds: Int = 3) {
+    public func captureAfterDelay(seconds: Int = 3, respectBlacklist: Bool) {
         scheduledTask?.cancel()
-        let respect = respectBlacklist
         scheduledTask = Task { @MainActor [weak self] in
             guard let self else { return }
             self.isCapturing = true
@@ -1637,7 +1892,7 @@ public final class VoiceContextInspectorStore: ObservableObject {
                 if Task.isCancelled { return }
             }
             self.countdownSeconds = 0
-            let opts = VoiceContextCaptureOptions(respectBlacklist: respect)
+            let opts = VoiceContextCaptureOptions(respectBlacklist: respectBlacklist)
             let captured = await VoiceContextCapture.captureAsync(options: opts)
             if Task.isCancelled { return }
             self.record(captured)
