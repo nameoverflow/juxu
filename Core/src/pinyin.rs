@@ -1994,7 +1994,7 @@ fn score_char_pure_neural(
 ) -> f32 {
     let tok = nv.char_to_token(ch);
     let raw_lp = if tok == TOK_UNK {
-        -12.0 + 0.05 * ((dict_weight as f32) + 1.0).ln()
+        nv.score_next_token(state, TOK_UNK).min(-18.0) + 0.05 * ((dict_weight as f32) + 1.0).ln()
     } else {
         nv.score_next_token(state, tok)
     };
@@ -2647,7 +2647,7 @@ fn extend_pinyin_layer(
                         let ctx_after_c1 = gp.personal_context.push(c1);
                         for &(c2, w2) in &c2_raw {
                             let raw_lp2 = if nv.char_to_token(c2) == TOK_UNK {
-                                -12.0
+                                nv.score_mtp2_char(&p2_q, p2_sc, c2).min(-18.0)
                             } else {
                                 nv.score_mtp2_char(&p2_q, p2_sc, c2)
                             };

@@ -2424,4 +2424,32 @@ fn real_dicts_archaic_polyphone_does_not_hijack_common_words() {
             "legitimate polyphone {keys} regressed"
         );
     }
+
+    // 4. Out-of-vocab rare characters (`TOK_UNK`, e.g. `唼` under `sha`) must NOT use an inflated
+    //    `-12.0` floor that beats normal in-vocab characters (`啥的`) in low-prior contexts.
+    for ctx in ["", "文件", "模型", "会议"] {
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::XiaoheShuangpin;
+        engine.set_config(cfg);
+        engine.clear_composition();
+        engine.set_recent_context(ctx);
+        for (i, ch) in "uade".chars().enumerate() {
+            engine.handle_key_event(0, Some(ch), false, 6_000 + i as u64 * 90);
+        }
+        let top5: Vec<String> = engine
+            .all_candidates()
+            .iter()
+            .take(5)
+            .map(|c| c.text.clone())
+            .collect();
+        assert_eq!(
+            top5.first().map(String::as_str),
+            Some("啥的"),
+            "ctx={ctx:?} uade expected 啥的 at #1, got {top5:?}"
+        );
+        assert!(
+            !top5.iter().any(|t| t.contains('唼')),
+            "ctx={ctx:?} uade must not surface TOK_UNK 唼 in top5, got {top5:?}"
+        );
+    }
 }
