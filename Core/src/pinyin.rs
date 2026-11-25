@@ -110,6 +110,38 @@ impl PinyinPath {
         parts.join("'")
     }
 
+    /// Segment the raw typed keys along syllable boundaries without expanding
+    /// Shuangpin pairs into full pinyin (e.g. `"ceuiyixx"` -> `"ce'ui'yi'xx"`).
+    pub fn raw_segmented_code(&self, raw: &str) -> String {
+        let mut parts = Vec::with_capacity(self.boundaries.len() + 1);
+        let mut start = 0usize;
+        for b in &self.boundaries {
+            let end = b.keys.min(raw.len());
+            if end > start {
+                if let Some(seg) = raw.get(start..end) {
+                    let trimmed = seg.trim_matches('\'');
+                    if !trimmed.is_empty() {
+                        parts.push(trimmed);
+                    }
+                }
+            }
+            start = end;
+        }
+        if start < raw.len() {
+            if let Some(rest) = raw.get(start..) {
+                let trimmed = rest.trim_matches('\'');
+                if !trimmed.is_empty() {
+                    parts.push(trimmed);
+                }
+            }
+        }
+        if parts.is_empty() {
+            raw.to_owned()
+        } else {
+            parts.join("'")
+        }
+    }
+
     pub fn correction_hint(&self) -> String {
         let mut hints = Vec::new();
         let mut start = 0usize;
@@ -2015,7 +2047,7 @@ fn score_char_pure_neural(
 ) -> f32 {
     let tok = nv.char_to_token(ch);
     let raw_lp = if tok == TOK_UNK {
-        -12.0 + 0.05 * ((dict_weight as f32) + 1.0).ln()
+        nv.score_next_token(state, TOK_UNK).min(-18.0) + 0.05 * ((dict_weight as f32) + 1.0).ln()
     } else {
         nv.score_next_token(state, tok)
     };
@@ -2677,7 +2709,7 @@ fn extend_pinyin_layer(
                         let ctx_after_c1 = gp.personal_context.push(c1);
                         for &(c2, w2) in &c2_raw {
                             let raw_lp2 = if nv.char_to_token(c2) == TOK_UNK {
-                                -12.0
+                                nv.score_mtp2_char(&p2_q, p2_sc, c2).min(-18.0)
                             } else {
                                 nv.score_mtp2_char(&p2_q, p2_sc, c2)
                             };
@@ -2936,11 +2968,35 @@ fn extend_pinyin_layer(
                     let mut st = (**gp_rc).clone();
                     let mut acc_lp = 0.0f32;
                     for (ci, &ch) in chars.iter().enumerate() {
+                        let char_w = match constraints[ci] {
+                            SylConstraint::Full(sid) => {
+                                decoder.dict.lookup_char_weight(sid, ch).unwrap_or(1)
+                            }
+                            SylConstraint::Initial(init_id, is_digraph) => decoder
+                                .dict
+                                .char_syllables(ch)
+                                .into_iter()
+                                .filter(|&sid| {
+                                    let (si, dg) = decoder.dict.syllable_init(sid);
+                                    si == init_id && (!is_digraph || dg)
+                                })
+                                .filter_map(|sid| decoder.dict.lookup_char_weight(sid, ch))
+                                .max()
+                                .unwrap_or(1),
+                            SylConstraint::Prefix(pref) => decoder
+                                .dict
+                                .char_syllables(ch)
+                                .into_iter()
+                                .filter(|&sid| decoder.dict.syllable_str(sid).starts_with(pref))
+                                .filter_map(|sid| decoder.dict.lookup_char_weight(sid, ch))
+                                .max()
+                                .unwrap_or(1),
+                        };
                         acc_lp += score_char_pure_neural(
                             nv,
                             &st,
                             ch,
-                            50_000,
+                            char_w,
                             decoder.dict,
                             personal,
                             pctx,

@@ -635,10 +635,16 @@ impl JuxuEngine {
 
     pub fn segmented_code(&self) -> String {
         if self.is_pinyin_mode() && self.is_composing() {
-            return self
-                .pinyin_paths
-                .first()
-                .map_or_else(|| self.raw_code.clone(), |p| p.segmented_code(&self.raw_code));
+            return self.pinyin_paths.first().map_or_else(
+                || self.raw_code.clone(),
+                |p| {
+                    if self.config.schema.is_shuangpin() {
+                        p.raw_segmented_code(&self.raw_code)
+                    } else {
+                        p.segmented_code(&self.raw_code)
+                    }
+                },
+            );
         }
         if !self.uses_spaceless() || !self.is_composing() {
             return String::new();
@@ -1766,9 +1772,19 @@ impl JuxuEngine {
         timestamp_ms: u64,
     ) -> EngineOutput {
         if has_cmd_or_ctrl {
-            if ch == Some('=') && !self.ascii_mode {
-                if let Some(out) = self.manual_create_phrase_from_recent() {
-                    return out;
+            if !self.ascii_mode {
+                if keycode == KEY_BACKSPACE && !self.raw_code.is_empty() {
+                    self.log_abandon_event(timestamp_ms);
+                    self.clear_composition();
+                    return EngineOutput {
+                        consumed: true,
+                        ..Default::default()
+                    };
+                }
+                if ch == Some('=') {
+                    if let Some(out) = self.manual_create_phrase_from_recent() {
+                        return out;
+                    }
                 }
             }
             return EngineOutput::default();
@@ -3180,5 +3196,38 @@ mod perf_correctness_tests {
             .map(|c| c.text.clone())
             .unwrap_or_default();
         assert_eq!(inc_top1, cold_top1);
+    }
+
+    #[test]
+    fn cmd_backspace_clears_composition_and_passes_through_when_idle() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let py_path = root.join("Resources/Dicts/pinyin.pydict");
+        let aux_path = root.join("Resources/Dicts/wubi_aux.wbaux");
+        if !py_path.exists() || !aux_path.exists() {
+            return;
+        }
+        let mut eng = JuxuEngine::default();
+        eng.load_pinyin_dict(PinyinDictView::from_file(&py_path).expect("load pydict"));
+        eng.set_aux(AuxView::open_mmap(&aux_path).expect("load wbaux"));
+        eng.config.schema = InputSchema::XiaoheShuangpin;
+
+        for (i, ch) in "ceuiyixx".chars().enumerate() {
+            let out = eng.handle_key_event(0, Some(ch), false, 1000 + i as u64 * 40);
+            assert!(out.consumed);
+        }
+        assert!(eng.is_composing());
+        assert!(!eng.preedit().is_empty());
+        assert!(!eng.all_candidates().is_empty());
+
+        let cleared = eng.handle_key_event(KEY_BACKSPACE, None, true, 1500);
+        assert!(cleared.consumed);
+        assert!(cleared.commit_text.is_empty());
+        assert!(cleared.preedit.is_empty());
+        assert!(!eng.is_composing());
+        assert!(eng.preedit().is_empty());
+        assert!(eng.all_candidates().is_empty());
+
+        let idle = eng.handle_key_event(KEY_BACKSPACE, None, true, 1600);
+        assert!(!idle.consumed);
     }
 }

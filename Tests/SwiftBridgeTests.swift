@@ -898,6 +898,32 @@ struct SwiftBridgeTests {
                 "Expected Pinyin commitPending to commit top CJK candidate '\(expectedTop)', got '\(pyCommitted.commitText)'"
             )
             check(!pyCommitted.commitText.contains(where: { $0.isASCII && $0.isLetter }))
+
+            // Xiaohe Shuangpin displays raw segmented keys (`ce'ui'yi'xx`), not expanded full pinyin (`ce'shi'yi'xia`)
+            bridge.switchSchema(21, persist: false)
+            bridge.clearComposition()
+            bridge.setContext("")
+            for ch in "ceuiyixx".unicodeScalars {
+                let s = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 830)
+                check(s.commitText.isEmpty)
+            }
+            check(
+                bridge.state.macOSPreedit == "ce'ui'yi'xx",
+                "Expected Shuangpin macOSPreedit 'ce'ui'yi'xx', got '\(bridge.state.macOSPreedit)'"
+            )
+            check(
+                bridge.state.candidates.first?.text == "测试一下",
+                "Expected Shuangpin top candidate '测试一下', got '\(bridge.state.candidates.first?.text ?? "")'"
+            )
+            bridge.clearComposition()
+            for ch in "ceuiyiu".unicodeScalars {
+                _ = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 840)
+            }
+            check(
+                bridge.state.macOSPreedit == "ce'ui'yi'u",
+                "Expected trailing Shuangpin initial to stay raw 'ce'ui'yi'u', got '\(bridge.state.macOSPreedit)'"
+            )
+            bridge.clearComposition()
             check(pyCommitted.preedit.isEmpty && bridge.state.preedit.isEmpty)
 
             // Idle commitPending is a clean no-op
@@ -1257,6 +1283,39 @@ struct SwiftBridgeTests {
         check(mergedCtx.beforeContext == "Let me check ")
         check(mergedCtx.afterContext == "now")
         check(mergedCtx.visibleScreenText == "Alice: check CI")
+
+        // Cmd+Backspace clears entire active composition and passes through when idle
+        do {
+            let cmdBsBridge = JuxuBridge(customDictsDir: dictsURL, inMemoryOnly: true)
+            cmdBsBridge.switchSchema(21, persist: false) // Xiaohe Shuangpin
+            for (idx, ch) in "ceuiyixx".unicodeScalars.enumerated() {
+                let s = cmdBsBridge.handleKey(
+                    keyCode: 0,
+                    scalar: ch.value,
+                    hasCmdOrCtrl: false,
+                    timestampMs: UInt64(700 + idx * 30)
+                )
+                check(s.consumed)
+            }
+            check(!cmdBsBridge.state.preedit.isEmpty && !cmdBsBridge.state.macOSPreedit.isEmpty)
+            check(!cmdBsBridge.state.candidates.isEmpty)
+
+            let cleared = cmdBsBridge.handleKey(
+                keyCode: 0x33,
+                scalar: 0,
+                hasCmdOrCtrl: true,
+                timestampMs: 1000
+            )
+            check(cleared.consumed && cleared.commitText.isEmpty && cleared.preedit.isEmpty && cleared.macOSPreedit.isEmpty && cleared.candidates.isEmpty)
+
+            let idle = cmdBsBridge.handleKey(
+                keyCode: 0x33,
+                scalar: 0,
+                hasCmdOrCtrl: true,
+                timestampMs: 1050
+            )
+            check(!idle.consumed)
+        }
 
         VoiceContextPromptTests.run()
 

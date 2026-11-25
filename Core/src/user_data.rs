@@ -362,7 +362,7 @@ impl UserStore {
         }
         let mut readings: Vec<Vec<u16>> = vec![Vec::with_capacity(len)];
         for &ch in &chars {
-            let syls = pdict.char_syllables(ch);
+            let syls = pdict.char_syllables_for_phrase_index(ch);
             if syls.is_empty() {
                 return;
             }

@@ -938,11 +938,26 @@ mod tests {
         }
 
         // 1. Full Shuangpin sentence: wo + mf(men) + uu(shu) + ru + fa -> "我们输入法"
+        //    Shuangpin preedit displays raw segmented keys (without expanding to full pinyin).
         for ch in "womfuurufa".chars() {
             let _ = engine.handle_key_event(0, Some(ch), false, 100);
         }
         assert_eq!(engine.page_candidates()[0].text, "我们输入法");
-        assert_eq!(engine.segmented_code(), "wo'men'shu'ru'fa");
+        assert_eq!(engine.segmented_code(), "wo'mf'uu'ru'fa");
+        engine.clear_composition();
+
+        // 1b. Trailing incomplete shuangpin initial (`u` for `sh`) stays raw, not expanded to `sh`,
+        //     and explicit apostrophe separators do not double up.
+        for ch in "womfu".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 120);
+        }
+        assert_eq!(engine.segmented_code(), "wo'mf'u");
+        engine.clear_composition();
+
+        for ch in "wo'mf'uu".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 140);
+        }
+        assert_eq!(engine.segmented_code(), "wo'mf'uu");
         engine.clear_composition();
 
         // 2. Zero-initial + consonant-initial: xi + an -> "西安", xm -> "先"
@@ -950,12 +965,14 @@ mod tests {
             let _ = engine.handle_key_event(0, Some(ch), false, 200);
         }
         assert_eq!(engine.page_candidates()[0].text, "西安");
+        assert_eq!(engine.segmented_code(), "xi'an");
         engine.clear_composition();
 
         for ch in "xm".chars() {
             let _ = engine.handle_key_event(0, Some(ch), false, 250);
         }
         assert_eq!(engine.page_candidates()[0].text, "先");
+        assert_eq!(engine.segmented_code(), "xm");
         engine.clear_composition();
 
         // 3. Digraph initial v=zh + s=ong, g + o=uo: "vsgo" -> "中国"

@@ -21,18 +21,15 @@ public struct VoiceSettingsView: View {
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("语音识别与智能整理")
-                    .font(.system(size: 17, weight: .semibold))
-                Text("云端预设填 Key 即用，本地一键下载模型与依赖；未开启时不占内存、不申请麦克风权限")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-            }
+        Group {
+            SettingsFormHeader(
+                title: "语音识别与智能整理",
+                subtitle: "云端预设填 Key 即用，本地一键下载模型与依赖；未开启时不占内存、不申请麦克风权限"
+            )
 
             // Master Switch Card — zero side effects when off
             card {
-                VStack(alignment: .leading, spacing: 10) {
+                Group {
                     HStack(alignment: .center, spacing: 12) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("开启句序语音输入入口")
@@ -51,9 +48,9 @@ public struct VoiceSettingsView: View {
                             .toggleStyle(.switch)
                             .controlSize(.small)
                     }
+                    .modifier(lifecycle)
 
                     if !voiceStore.prefs.enabled {
-                        Divider()
                         HStack(spacing: 8) {
                             Image(systemName: "bolt.shield")
                                 .font(.system(size: 12))
@@ -87,40 +84,34 @@ public struct VoiceSettingsView: View {
                 vocabularyAndTestCard
             }
         }
-        .onAppear {
-            if voiceStore.prefs.enabled {
-                reloadKeysForCurrentPreset()
-            }
-        }
-        .onChange(of: voiceStore.prefs.enabled) { _, enabled in
-            if enabled {
-                reloadKeysForCurrentPreset()
-            } else {
+    }
+
+    /// Lifecycle hooks attached to the always-present master switch row (a `Group` in a `Form` would fire them once per row).
+    private var lifecycle: VoiceSettingsLifecycle {
+        VoiceSettingsLifecycle(
+            enabled: voiceStore.prefs.enabled,
+            cloudPreset: voiceStore.prefs.cloudPreset,
+            reloadKeys: { reloadKeysForCurrentPreset() },
+            clearDrafts: {
                 primaryKeyDraft = ""
                 splitLLMKeyDraft = ""
                 loadedKeyAccount = nil
                 testStatus = ""
             }
-        }
-        .onChange(of: voiceStore.prefs.cloudPreset) { _, _ in
-            if voiceStore.prefs.enabled {
-                reloadKeysForCurrentPreset()
-            }
-        }
+        )
     }
 
     // MARK: - Provider Mode Selector
 
     private var providerCard: some View {
-        card {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("运行方案")
-                    .font(.system(size: 13, weight: .medium))
-                HStack(spacing: 10) {
-                    providerOptionCard(.cloudBYOK)
-                    providerOptionCard(.local)
-                }
+        Section {
+            HStack(spacing: 10) {
+                providerOptionCard(.cloudBYOK)
+                providerOptionCard(.local)
             }
+            .fixedSize(horizontal: false, vertical: true)
+        } header: {
+            Text("运行方案")
         }
     }
 
@@ -143,7 +134,7 @@ public struct VoiceSettingsView: View {
                     .lineLimit(2)
             }
             .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(selected ? Color.accentColor.opacity(0.11) : Color.primary.opacity(0.03))
@@ -167,7 +158,7 @@ public struct VoiceSettingsView: View {
         let hasSavedKey = !primaryKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
         return card {
-            VStack(alignment: .leading, spacing: 11) {
+            Group {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("云端服务商")
@@ -183,14 +174,14 @@ public struct VoiceSettingsView: View {
                         }
                     }
                     .labelsHidden()
-                    .frame(width: 195)
                 }
 
-                Divider()
 
                 fieldRow(title: "API Key") {
                     HStack(spacing: 8) {
-                        SecureField(preset.keyPlaceholder, text: primaryKeyBinding)
+                        SecureField("", text: primaryKeyBinding, prompt: Text(verbatim: preset.keyPlaceholder))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
                             .textFieldStyle(.roundedBorder)
                         Text(hasSavedKey ? "✓ 钥匙串" : "必填")
                             .font(.system(size: 11, weight: .medium))
@@ -201,16 +192,22 @@ public struct VoiceSettingsView: View {
 
                 if preset == .custom {
                     fieldRow(title: "Base URL") {
-                        TextField("https://api.openai.com/v1", text: voiceBinding(\.customBaseURL))
+                        TextField("", text: voiceBinding(\.customBaseURL), prompt: Text(verbatim: "https://api.openai.com/v1"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
                             .textFieldStyle(.roundedBorder)
                     }
                     fieldRow(title: "语音识别模型") {
-                        TextField("whisper-1", text: voiceBinding(\.customASRModel))
+                        TextField("", text: voiceBinding(\.customASRModel), prompt: Text(verbatim: "whisper-1"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
                             .textFieldStyle(.roundedBorder)
                     }
                     if voiceStore.prefs.cloudPolishEnabled {
                         fieldRow(title: "口语整理模型") {
-                            TextField("gpt-4o-mini", text: voiceBinding(\.customLLMModel))
+                            TextField("", text: voiceBinding(\.customLLMModel), prompt: Text(verbatim: "gpt-4o-mini"))
+                                .labelsHidden()
+                                .multilineTextAlignment(.leading)
                                 .textFieldStyle(.roundedBorder)
                         }
                         HStack {
@@ -225,18 +222,21 @@ public struct VoiceSettingsView: View {
                         }
                         if voiceStore.prefs.customSplitLLM {
                             fieldRow(title: "整理 Base URL") {
-                                TextField("https://api.deepseek.com/v1", text: voiceBinding(\.customLLMBaseURL))
+                                TextField("", text: voiceBinding(\.customLLMBaseURL), prompt: Text(verbatim: "https://api.deepseek.com/v1"))
+                                    .labelsHidden()
+                                    .multilineTextAlignment(.leading)
                                     .textFieldStyle(.roundedBorder)
                             }
                             fieldRow(title: "整理 API Key") {
-                                SecureField("sk-...", text: splitLLMKeyBinding)
+                                SecureField("", text: splitLLMKeyBinding, prompt: Text(verbatim: "sk-..."))
+                                    .labelsHidden()
+                                    .multilineTextAlignment(.leading)
                                     .textFieldStyle(.roundedBorder)
                             }
                         }
                     }
                 }
 
-                Divider()
 
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
@@ -343,7 +343,7 @@ public struct VoiceSettingsView: View {
 
     private var triggerAndBehaviorCard: some View {
         card {
-            VStack(spacing: 11) {
+            Group {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("触发快捷键")
@@ -359,14 +359,11 @@ public struct VoiceSettingsView: View {
                         }
                     }
                     .labelsHidden()
-                    .frame(width: 205)
                 }
 
-                Divider()
 
                 globalHotkeyRow
 
-                Divider()
 
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
@@ -386,7 +383,6 @@ public struct VoiceSettingsView: View {
                     .controlSize(.small)
                 }
 
-                Divider()
 
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
@@ -403,7 +399,6 @@ public struct VoiceSettingsView: View {
                         }
                     }
                     .labelsHidden()
-                    .frame(width: 165)
                 }
 
                 if voiceStore.prefs.outputMode == .smartPolish {
@@ -418,11 +413,9 @@ public struct VoiceSettingsView: View {
                             }
                         }
                         .labelsHidden()
-                        .frame(width: 195)
                     }
                 }
 
-                Divider()
 
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
@@ -447,20 +440,18 @@ public struct VoiceSettingsView: View {
     private var contextPrivacyCard: some View {
         let capture = voiceStore.prefs.isContextCaptureEnabled
         return card {
-            VStack(spacing: 11) {
+            Group {
                 contextToggleRow(
                     "读取当前应用的上下文",
                     "通过辅助功能读取窗口标题、网址、光标前后文和屏幕可见文字，帮助识别专有名词、衔接前文。密码框、密码管理器、终端和浏览器无痕窗口始终不读。",
                     isOn: voiceBinding(\.isContextCaptureEnabled)
                 )
-                Divider()
                 contextToggleRow(
                     "敏感应用/网址黑名单",
                     "开启时，微信、Excel、WPS、Google 文档、腾讯文档等黑名单应用和网页不读取任何窗口、光标或屏幕文字，只发送应用名和个人词表（“选中改写”时会发送你选中的文字）。",
                     isOn: voiceBinding(\.respectsContextBlacklist)
                 )
                 .disabled(!capture)
-                Divider()
                 contextToggleRow(
                     "把屏幕和输入框周围的文字发给云端",
                     "关闭时，云端识别和整理只收到窗口标题、网址和光标前后文，不含屏幕可见文字和输入框周围的文字；本地模型不受影响。",
@@ -493,7 +484,7 @@ public struct VoiceSettingsView: View {
 
     private var vocabularyAndTestCard: some View {
         card {
-            VStack(alignment: .leading, spacing: 11) {
+            Group {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("联动句序个人词库（\(bridge.userPhrases.count) 条）")
@@ -509,16 +500,16 @@ public struct VoiceSettingsView: View {
                         .controlSize(.small)
                 }
 
-                Divider()
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text("自定义语音热词（逗号或换行分隔）")
                         .font(.system(size: 12.5, weight: .medium))
-                    TextField("例如：句序, Juxu, RWKV-7, Typeless, SwiftUI", text: voiceBinding(\.customVocabulary))
+                    TextField("", text: voiceBinding(\.customVocabulary), prompt: Text(verbatim: "例如：句序, Juxu, RWKV-7, Typeless, SwiftUI"))
+                        .labelsHidden()
+                        .multilineTextAlignment(.leading)
                         .textFieldStyle(.roundedBorder)
                 }
 
-                Divider()
 
                 HStack {
                     Button(isTesting ? "检测中…" : "检测当前配置") {
@@ -596,17 +587,9 @@ public struct VoiceSettingsView: View {
     }
 
     private func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        content()
-            .padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color(nsColor: .controlBackgroundColor))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.6)
-            )
+        Section {
+            content()
+        }
     }
 
     private func voiceBinding<T>(_ keyPath: WritableKeyPath<VoicePreferences, T>) -> Binding<T> {
@@ -631,106 +614,116 @@ private struct LocalVoiceConfigCard: View {
         let llmPreset = voiceStore.prefs.localLLMPreset
         let llmStatus = VoiceLocalInstaller.llmStatus(for: llmPreset)
 
-        VStack(alignment: .leading, spacing: 12) {
-            // 1. Local ASR Section
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("本地语音识别模型")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text("选择模型并一键下载；按需运行，闲置自动释放")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Picker("", selection: binding(\.localASRPreset)) {
-                    ForEach(VoiceLocalASRModelPreset.allCases) { item in
-                        Text(item.displayName).tag(item)
+        Section {
+            VStack(alignment: .leading, spacing: 10) {
+                // 1. Local ASR Section
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("本地语音识别模型")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("选择模型并一键下载；按需运行，闲置自动释放")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
                     }
-                }
-                .labelsHidden()
-                .frame(width: 245)
-            }
-
-            switch asrPreset.backend {
-            case .engine:
-                installActionRow(
-                    status: asrStatus,
-                    sizeLabel: asrPreset.approximateSizeLabel,
-                    depName: asrPreset.descriptor.engineLabel,
-                    onInstall: { installer.installASR(preset: asrPreset) },
-                    onDelete: {
-                        if let file = asrPreset.modelFilename {
-                            installer.deleteModel(filename: file)
-                        }
-                    }
-                )
-            case .appleSpeech:
-                HStack(spacing: 10) {
-                    Text("识别语言")
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(.secondary)
-                    TextField("zh-CN", text: binding(\.localAppleLocale))
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 90)
                     Spacer()
-                    Text("仅离线")
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(.secondary)
-                    Toggle("", isOn: binding(\.localAppleRequireOnDevice))
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                        .controlSize(.small)
-                }
-            case .customHTTP:
-                HStack(spacing: 8) {
-                    TextField("http://127.0.0.1:8080/v1", text: binding(\.localHTTPASRBaseURL))
-                        .textFieldStyle(.roundedBorder)
-                    TextField("whisper-1", text: binding(\.localHTTPASRModel))
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 110)
-                }
-            }
-
-            Divider()
-
-            // 2. Local Polish Section
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("本地 LLM 整理引擎")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text("一键下载 Qwen2.5-1.5B（llama.cpp Metal 加速），或接入已有本地 LLM 服务")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Picker("", selection: binding(\.localLLMPreset)) {
-                    ForEach(VoiceLocalLLMPreset.allCases) { item in
-                        Text(item.displayName).tag(item)
-                    }
-                }
-                .labelsHidden()
-                .frame(width: 245)
-            }
-
-            if llmPreset == .qwen15B {
-                installActionRow(
-                    status: llmStatus,
-                    sizeLabel: llmPreset.approximateSizeLabel,
-                    depName: "llama.cpp",
-                    onInstall: { installer.installLLM(preset: .qwen15B) },
-                    onDelete: {
-                        if let file = llmPreset.modelFilename {
-                            installer.deleteModel(filename: file)
+                    Picker("", selection: binding(\.localASRPreset)) {
+                        ForEach(VoiceLocalASRModelPreset.allCases) { item in
+                            Text(item.displayName).tag(item)
                         }
                     }
-                )
-            } else if llmPreset == .ollamaHTTP {
-                HStack(spacing: 8) {
-                    TextField("http://127.0.0.1:11434/v1", text: binding(\.localHTTPLLMBaseURL))
-                        .textFieldStyle(.roundedBorder)
-                    TextField("qwen2.5:3b", text: binding(\.localHTTPLLMModel))
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 120)
+                    .labelsHidden()
+                }
+
+                switch asrPreset.backend {
+                case .engine:
+                    installActionRow(
+                        status: asrStatus,
+                        sizeLabel: asrPreset.approximateSizeLabel,
+                        depName: asrPreset.descriptor.engineLabel,
+                        onInstall: { installer.installASR(preset: asrPreset) },
+                        onDelete: {
+                            if let file = asrPreset.modelFilename {
+                                installer.deleteModel(filename: file)
+                            }
+                        }
+                    )
+                case .appleSpeech:
+                    HStack(spacing: 10) {
+                        Text("识别语言")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.secondary)
+                        TextField("", text: binding(\.localAppleLocale), prompt: Text(verbatim: "zh-CN"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 90)
+                        Spacer()
+                        Text("仅离线")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.secondary)
+                        Toggle("", isOn: binding(\.localAppleRequireOnDevice))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                    }
+                case .customHTTP:
+                    HStack(spacing: 8) {
+                        TextField("", text: binding(\.localHTTPASRBaseURL), prompt: Text(verbatim: "http://127.0.0.1:8080/v1"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
+                            .textFieldStyle(.roundedBorder)
+                        TextField("", text: binding(\.localHTTPASRModel), prompt: Text(verbatim: "whisper-1"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 110)
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                // 2. Local Polish Section
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("本地 LLM 整理引擎")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("一键下载 Qwen2.5-1.5B（llama.cpp Metal 加速），或接入已有本地 LLM 服务")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Picker("", selection: binding(\.localLLMPreset)) {
+                        ForEach(VoiceLocalLLMPreset.allCases) { item in
+                            Text(item.displayName).tag(item)
+                        }
+                    }
+                    .labelsHidden()
+                }
+
+                if llmPreset == .qwen15B {
+                    installActionRow(
+                        status: llmStatus,
+                        sizeLabel: llmPreset.approximateSizeLabel,
+                        depName: "llama.cpp",
+                        onInstall: { installer.installLLM(preset: .qwen15B) },
+                        onDelete: {
+                            if let file = llmPreset.modelFilename {
+                                installer.deleteModel(filename: file)
+                            }
+                        }
+                    )
+                } else if llmPreset == .ollamaHTTP {
+                    HStack(spacing: 8) {
+                        TextField("", text: binding(\.localHTTPLLMBaseURL), prompt: Text(verbatim: "http://127.0.0.1:11434/v1"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
+                            .textFieldStyle(.roundedBorder)
+                        TextField("", text: binding(\.localHTTPLLMModel), prompt: Text(verbatim: "qwen2.5:3b"))
+                            .labelsHidden()
+                            .multilineTextAlignment(.leading)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 120)
+                    }
                 }
             }
 
@@ -739,7 +732,6 @@ private struct LocalVoiceConfigCard: View {
             case .idle:
                 EmptyView()
             case .installingDependency(let name):
-                Divider()
                 HStack(spacing: 8) {
                     ProgressView()
                         .controlSize(.small)
@@ -751,7 +743,6 @@ private struct LocalVoiceConfigCard: View {
                         .controlSize(.mini)
                 }
             case .downloadingModel(let name, let progress, let detail):
-                Divider()
                 VStack(alignment: .leading, spacing: 5) {
                     HStack {
                         Text("正在下载 \(name)")
@@ -767,28 +758,16 @@ private struct LocalVoiceConfigCard: View {
                         .progressViewStyle(.linear)
                 }
             case .completed(let msg):
-                Divider()
                 Text(msg)
                     .font(.system(size: 11.5))
                     .foregroundStyle(.green)
             case .failed(let msg):
-                Divider()
                 Text(msg)
                     .font(.system(size: 11.5))
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
             }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.6)
-        )
     }
 
     private func installActionRow(
@@ -831,9 +810,6 @@ private struct LocalVoiceConfigCard: View {
                     .disabled(installer.phase.isBusy)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private func binding<T>(_ keyPath: WritableKeyPath<VoicePreferences, T>) -> Binding<T> {
@@ -874,185 +850,177 @@ private struct VoiceContextInspectorCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .center, spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("上下文抓取实测（AXUIElement）")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text("抓取前台 App、窗口标题、网页 URL、光标前后文、选区与屏幕可见文本")
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(.secondary)
+        Section {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .center, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("上下文抓取实测（AXUIElement）")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("抓取前台 App、窗口标题、网页 URL、光标前后文、选区与屏幕可见文本")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    HStack(spacing: 4) {
+                        Image(systemName: axTrusted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                            .foregroundStyle(axTrusted ? Color.green : Color.orange)
+                            .font(.system(size: 11.5))
+                        Text(axTrusted ? "辅助功能已授权" : "未授权辅助功能")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
                 }
-                Spacer()
-                HStack(spacing: 4) {
-                    Image(systemName: axTrusted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                        .foregroundStyle(axTrusted ? Color.green : Color.orange)
-                        .font(.system(size: 11.5))
-                    Text(axTrusted ? "辅助功能已授权" : "未授权辅助功能")
+
+                HStack(spacing: 8) {
+                    if inspector.isCapturing {
+                        Button(inspector.countdownSeconds > 0 ? "切到目标 App… (\(inspector.countdownSeconds)s)" : "抓取中…") {
+                            inspector.cancelScheduledCapture()
+                        }
+                        .controlSize(.small)
+                    } else {
+                        Button("3 秒后抓取前台窗口") {
+                            axTrusted = AXIsProcessTrusted()
+                            inspector.captureAfterDelay(
+                                seconds: 3,
+                                respectBlacklist: voiceStore.prefs.respectsContextBlacklist
+                            )
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+
+                    Spacer()
+
+                    if inspector.lastCaptured != nil {
+                        Button(copiedNotice ? "已复制" : "复制 JSON") {
+                            let pb = NSPasteboard.general
+                            pb.clearContents()
+                            pb.setString(inspector.lastPrettyJSON(), forType: .string)
+                            copiedNotice = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                                copiedNotice = false
+                            }
+                        }
+                        .controlSize(.small)
+
+                        Button(showRawJSON ? "收起 JSON" : "展开 JSON") {
+                            showRawJSON.toggle()
+                        }
+                        .controlSize(.small)
+                    }
+                }
+
+                if let captured = inspector.lastCaptured {
+                    let app = captured.activeApplication
+                    let ip = captured.textInsertionPoint
+                    let cur = ip.cursorState
+                    let sur = ip.surroundingContext
+                    let meta = captured.contextMetadata
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        summaryRow("应用", "\(app.appName.isEmpty ? "(未知)" : app.appName) · \(app.appIdentifier) (\(app.appType)) · \(meta.elapsedMs) ms")
+                        if !app.windowTitle.isEmpty {
+                            summaryRow("窗口", app.windowTitle)
+                        }
+                        if let url = app.webURL {
+                            summaryRow("URL", url)
+                        }
+                        summaryRow(
+                            "状态",
+                            "enhancedUI=\(meta.enhancedUIEnabled ? "是" : "否") · role=\(ip.accessibilityRole.isEmpty ? "无" : ip.accessibilityRole) · editable=\(ip.inputCapabilities.isEditable ? "是" : "否")\(meta.isBlacklisted ? " · 命中黑名单(\(meta.blacklistReason ?? ""))" : "")\(meta.isSecureInput ? " · 密码框已跳过" : "")"
+                        )
+                        if !cur.selectedText.isEmpty {
+                            summaryRow("选区", compactPreview(cur.selectedText))
+                        }
+                        if !cur.textBeforeCursor.isEmpty || !cur.textAfterCursor.isEmpty {
+                            summaryRow("光标前/后", "前(\(cur.textBeforeCursor.count)字)：\(compactPreview(cur.textBeforeCursor, limit: 60)) | 后(\(cur.textAfterCursor.count)字)：\(compactPreview(cur.textAfterCursor, limit: 40))")
+                        }
+                        if !sur.textBeforeInputArea.isEmpty || !sur.textAfterInputArea.isEmpty {
+                            summaryRow("周边上下文", "上(\(sur.textBeforeInputArea.count)字) / 下(\(sur.textAfterInputArea.count)字)")
+                        }
+                        let visCount = app.visibleScreenContent?.count ?? 0
+                        summaryRow("屏幕可见文本", visCount > 0 ? "\(visCount) 字：\(compactPreview(app.visibleScreenContent ?? "", limit: 80))" : (meta.isBlacklisted ? "黑名单跳过" : "无"))
+                    }
+
+                    let preview = resolvedPreview(for: captured)
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text("实际送给 ASR 模型的上下文")
+                                .font(.system(size: 11.5, weight: .semibold))
+                            Text("\(preview.asrTargetLabel) · 实发 \(preview.asrContext.count) 字")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            if !preview.asrContext.isEmpty {
+                                Button(copiedASRNotice ? "已复制" : "复制") {
+                                    let pb = NSPasteboard.general
+                                    pb.clearContents()
+                                    pb.setString(preview.asrContext, forType: .string)
+                                    copiedASRNotice = true
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                                        copiedASRNotice = false
+                                    }
+                                }
+                                .controlSize(.mini)
+                            }
+                        }
+                        ScrollView(.vertical) {
+                            Text(preview.asrContext.isEmpty ? "（无上下文发送）" : preview.asrContext)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(preview.asrContext.isEmpty ? .secondary : .primary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                        }
+                        .frame(minHeight: 36, maxHeight: 110)
+                        .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                        HStack(spacing: 8) {
+                            Text("实际送给润色模型的上下文")
+                                .font(.system(size: 11.5, weight: .semibold))
+                            Text("\(preview.polishBudgetLabel) · \(preview.polishContext.count) 字")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.secondary)
+                        }
+                        ScrollView(.vertical) {
+                            Text(preview.polishContext.isEmpty ? "（无参考上下文）" : preview.polishContext)
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .foregroundStyle(preview.polishContext.isEmpty ? .secondary : .primary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                        }
+                        .frame(minHeight: 32, maxHeight: 100)
+                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+
+                    if showRawJSON {
+                        ScrollView([.vertical, .horizontal]) {
+                            Text(inspector.lastPrettyJSON())
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                        }
+                        .frame(maxHeight: 210)
+                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                } else {
+                    Text("点击「3 秒后抓取前台窗口」后切到 Chrome / Slack / Cursor / 微信等任意应用，或在任意窗口按右 Command 语音输入，即可在此看到实时抓取结果。")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
             }
-
-            HStack(spacing: 8) {
-                if inspector.isCapturing {
-                    Button(inspector.countdownSeconds > 0 ? "切到目标 App… (\(inspector.countdownSeconds)s)" : "抓取中…") {
-                        inspector.cancelScheduledCapture()
-                    }
-                    .controlSize(.small)
-                } else {
-                    Button("3 秒后抓取前台窗口") {
-                        axTrusted = AXIsProcessTrusted()
-                        inspector.captureAfterDelay(
-                            seconds: 3,
-                            respectBlacklist: voiceStore.prefs.respectsContextBlacklist
-                        )
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                }
-
-                Spacer()
-
-                if inspector.lastCaptured != nil {
-                    Button(copiedNotice ? "已复制" : "复制 JSON") {
-                        let pb = NSPasteboard.general
-                        pb.clearContents()
-                        pb.setString(inspector.lastPrettyJSON(), forType: .string)
-                        copiedNotice = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
-                            copiedNotice = false
-                        }
-                    }
-                    .controlSize(.small)
-
-                    Button(showRawJSON ? "收起 JSON" : "展开 JSON") {
-                        showRawJSON.toggle()
-                    }
-                    .controlSize(.small)
-                }
+            .onAppear {
+                axTrusted = AXIsProcessTrusted()
+                inspector.setPresented(true)
             }
-
-            if let captured = inspector.lastCaptured {
-                let app = captured.activeApplication
-                let ip = captured.textInsertionPoint
-                let cur = ip.cursorState
-                let sur = ip.surroundingContext
-                let meta = captured.contextMetadata
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 4) {
-                    summaryRow("应用", "\(app.appName.isEmpty ? "(未知)" : app.appName) · \(app.appIdentifier) (\(app.appType)) · \(meta.elapsedMs) ms")
-                    if !app.windowTitle.isEmpty {
-                        summaryRow("窗口", app.windowTitle)
-                    }
-                    if let url = app.webURL {
-                        summaryRow("URL", url)
-                    }
-                    summaryRow(
-                        "状态",
-                        "enhancedUI=\(meta.enhancedUIEnabled ? "是" : "否") · role=\(ip.accessibilityRole.isEmpty ? "无" : ip.accessibilityRole) · editable=\(ip.inputCapabilities.isEditable ? "是" : "否")\(meta.isBlacklisted ? " · 命中黑名单(\(meta.blacklistReason ?? ""))" : "")\(meta.isSecureInput ? " · 密码框已跳过" : "")"
-                    )
-                    if !cur.selectedText.isEmpty {
-                        summaryRow("选区", compactPreview(cur.selectedText))
-                    }
-                    if !cur.textBeforeCursor.isEmpty || !cur.textAfterCursor.isEmpty {
-                        summaryRow("光标前/后", "前(\(cur.textBeforeCursor.count)字)：\(compactPreview(cur.textBeforeCursor, limit: 60)) | 后(\(cur.textAfterCursor.count)字)：\(compactPreview(cur.textAfterCursor, limit: 40))")
-                    }
-                    if !sur.textBeforeInputArea.isEmpty || !sur.textAfterInputArea.isEmpty {
-                        summaryRow("周边上下文", "上(\(sur.textBeforeInputArea.count)字) / 下(\(sur.textAfterInputArea.count)字)")
-                    }
-                    let visCount = app.visibleScreenContent?.count ?? 0
-                    summaryRow("屏幕可见文本", visCount > 0 ? "\(visCount) 字：\(compactPreview(app.visibleScreenContent ?? "", limit: 80))" : (meta.isBlacklisted ? "黑名单跳过" : "无"))
-                }
-
-                let preview = resolvedPreview(for: captured)
-                Divider()
-
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        Text("实际送给 ASR 模型的上下文")
-                            .font(.system(size: 11.5, weight: .semibold))
-                        Text("\(preview.asrTargetLabel) · 实发 \(preview.asrContext.count) 字")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        if !preview.asrContext.isEmpty {
-                            Button(copiedASRNotice ? "已复制" : "复制") {
-                                let pb = NSPasteboard.general
-                                pb.clearContents()
-                                pb.setString(preview.asrContext, forType: .string)
-                                copiedASRNotice = true
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
-                                    copiedASRNotice = false
-                                }
-                            }
-                            .controlSize(.mini)
-                        }
-                    }
-                    ScrollView(.vertical) {
-                        Text(preview.asrContext.isEmpty ? "（无上下文发送）" : preview.asrContext)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(preview.asrContext.isEmpty ? .secondary : .primary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(8)
-                    }
-                    .frame(minHeight: 36, maxHeight: 110)
-                    .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-
-                    HStack(spacing: 8) {
-                        Text("实际送给润色模型的上下文")
-                            .font(.system(size: 11.5, weight: .semibold))
-                        Text("\(preview.polishBudgetLabel) · \(preview.polishContext.count) 字")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                    }
-                    ScrollView(.vertical) {
-                        Text(preview.polishContext.isEmpty ? "（无参考上下文）" : preview.polishContext)
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(preview.polishContext.isEmpty ? .secondary : .primary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(8)
-                    }
-                    .frame(minHeight: 32, maxHeight: 100)
-                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                }
-
-                if showRawJSON {
-                    ScrollView([.vertical, .horizontal]) {
-                        Text(inspector.lastPrettyJSON())
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(8)
-                    }
-                    .frame(maxHeight: 210)
-                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                }
-            } else {
-                Text("点击「3 秒后抓取前台窗口」后切到 Chrome / Slack / Cursor / 微信等任意应用，或在任意窗口按右 Command 语音输入，即可在此看到实时抓取结果。")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
+            .onDisappear { inspector.setPresented(false) }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.6)
-        )
-        .onAppear {
-            axTrusted = AXIsProcessTrusted()
-            inspector.setPresented(true)
-        }
-        .onDisappear { inspector.setPresented(false) }
     }
 
     private func summaryRow(_ label: String, _ value: String) -> some View {
@@ -1072,5 +1040,25 @@ private struct VoiceContextInspectorCard: View {
         let oneLine = s.replacingOccurrences(of: "\n", with: " ⏎ ")
         if oneLine.count <= limit { return oneLine }
         return String(oneLine.prefix(limit)) + "…"
+    }
+}
+
+private struct VoiceSettingsLifecycle: ViewModifier {
+    let enabled: Bool
+    let cloudPreset: VoiceCloudPreset
+    let reloadKeys: () -> Void
+    let clearDrafts: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear {
+                if enabled { reloadKeys() }
+            }
+            .onChange(of: enabled) { _, isOn in
+                if isOn { reloadKeys() } else { clearDrafts() }
+            }
+            .onChange(of: cloudPreset) { _, _ in
+                if enabled { reloadKeys() }
+            }
     }
 }

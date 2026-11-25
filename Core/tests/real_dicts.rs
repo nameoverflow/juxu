@@ -2348,6 +2348,113 @@ fn minus_and_equal_turn_pages_in_spaceless_and_all_modes_without_committing() {
 }
 
 #[test]
+fn real_dicts_archaic_polyphone_does_not_hijack_common_words() {
+    let dir = dicts_dir();
+    if !dir.join("pinyin.pydict").exists() || !dir.join("wubi_aux.wbaux").exists() {
+        return;
+    }
+    let mut engine = JuxuEngine::new(JuxuConfig {
+        schema: InputSchema::XiaoheShuangpin,
+        ..JuxuConfig::default()
+    });
+    engine.load_pinyin_dict(PinyinDictView::from_file(dir.join("pinyin.pydict")).unwrap());
+    engine.set_aux(AuxView::open_mmap(dir.join("wubi_aux.wbaux")).unwrap());
+
+    let type_and_top = |engine: &mut JuxuEngine, schema: InputSchema, keys: &str| -> String {
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = schema;
+        engine.set_config(cfg);
+        engine.clear_context();
+        engine.clear_composition();
+        for (i, ch) in keys.chars().enumerate() {
+            engine.handle_key_event(0, Some(ch), false, 1_000 + i as u64 * 90);
+        }
+        engine
+            .all_candidates()
+            .first()
+            .map(|c| c.text.clone())
+            .unwrap_or_default()
+    };
+
+    // 1. Cold start: archaic/zero-weight readings (`么=ma`, `不=fou`) must not hijack common words.
+    assert_eq!(type_and_top(&mut engine, InputSchema::XiaoheShuangpin, "uima"), "是吗");
+    assert_eq!(type_and_top(&mut engine, InputSchema::Pinyin, "shima"), "是吗");
+    assert_eq!(type_and_top(&mut engine, InputSchema::XiaoheShuangpin, "uifz"), "是否");
+    assert_eq!(type_and_top(&mut engine, InputSchema::Pinyin, "shifou"), "是否");
+    assert_eq!(type_and_top(&mut engine, InputSchema::XiaoheShuangpin, "fzrf"), "否认");
+    assert_eq!(type_and_top(&mut engine, InputSchema::Pinyin, "fouren"), "否认");
+
+    // 2. Repeatedly committing "什么" via `ufme` must NOT cause `uima` (`shi ma`) to flip to "什么"!
+    for k in 0..5u64 {
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::XiaoheShuangpin;
+        engine.set_config(cfg);
+        engine.clear_context();
+        engine.clear_composition();
+        for (i, ch) in "ufme".chars().enumerate() {
+            engine.handle_key_event(0, Some(ch), false, 3_000 + k * 500 + i as u64 * 80);
+        }
+        let res = engine.handle_key_event(KEY_SPACE, Some(' '), false, 3_400 + k * 500);
+        assert_eq!(res.commit_text, "什么");
+    }
+    assert_eq!(
+        type_and_top(&mut engine, InputSchema::XiaoheShuangpin, "uima"),
+        "是吗",
+        "committing 什么 via ufme must not hijack uima (是吗)"
+    );
+    assert_eq!(
+        type_and_top(&mut engine, InputSchema::Pinyin, "shima"),
+        "是吗",
+        "committing 什么 must not hijack shima (是吗)"
+    );
+
+    // 3. Legitimate attested polyphone words must remain intact at #1.
+    for (keys, expected) in [
+        ("mudi", "目的"),
+        ("pianyi", "便宜"),
+        ("liaojie", "了解"),
+        ("kuaiji", "会计"),
+        ("daifu", "大夫"),
+        ("juejiang", "倔强"),
+        ("shuijiao", "睡觉"), ("xizang", "西藏"),
+    ] {
+        assert_eq!(
+            type_and_top(&mut engine, InputSchema::Pinyin, keys),
+            expected,
+            "legitimate polyphone {keys} regressed"
+        );
+    }
+
+    // 4. Out-of-vocab rare characters (`TOK_UNK`, e.g. `唼` under `sha`) must NOT use an inflated
+    //    `-12.0` floor that beats normal in-vocab characters (`啥的`) in low-prior contexts.
+    for ctx in ["", "文件", "模型", "会议"] {
+        let mut cfg = JuxuConfig::default();
+        cfg.schema = InputSchema::XiaoheShuangpin;
+        engine.set_config(cfg);
+        engine.clear_composition();
+        engine.set_recent_context(ctx);
+        for (i, ch) in "uade".chars().enumerate() {
+            engine.handle_key_event(0, Some(ch), false, 6_000 + i as u64 * 90);
+        }
+        let top5: Vec<String> = engine
+            .all_candidates()
+            .iter()
+            .take(5)
+            .map(|c| c.text.clone())
+            .collect();
+        assert_eq!(
+            top5.first().map(String::as_str),
+            Some("啥的"),
+            "ctx={ctx:?} uade expected 啥的 at #1, got {top5:?}"
+        );
+        assert!(
+            !top5.iter().any(|t| t.contains('唼')),
+            "ctx={ctx:?} uade must not surface TOK_UNK 唼 in top5, got {top5:?}"
+        );
+    }
+}
+
+#[test]
 fn real_dicts_cold_start_bigram_prior_lifts_content_words_over_bos_nonwords() {
     let dir = dicts_dir();
     if !dir.join("pinyin.pydict").exists() || !dir.join("wubi_aux.wbaux").exists() {
