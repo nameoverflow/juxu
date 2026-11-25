@@ -55,7 +55,7 @@ public struct SettingsRootView: View {
     private var sidebarSelection: Binding<SettingsSection?> {
         Binding(
             get: { navigation.selectedSection },
-            set: { if let newValue { navigation.selectedSection = newValue } }
+            set: { newValue in if let newValue { navigation.selectedSection = newValue } }
         )
     }
 
