@@ -45,6 +45,8 @@ public final class VoiceSessionController {
     private static let tapWindow: TimeInterval = 0.6
     /// Keep capturing briefly after key-up so CoreAudio's ~100 ms tap buffer and trailing syllables arrive.
     private static let releaseTailDelay: TimeInterval = 0.18
+    /// After the release tail, how much longer the final pass waits for a context capture still running.
+    static let contextCaptureGrace: TimeInterval = 0.25
     private var engineWarmItem: DispatchWorkItem?
     private var engineWarmed = false
     private var warmHold: (any VoiceASREngine)?
@@ -80,10 +82,15 @@ public final class VoiceSessionController {
     private var sessionGeneration: UInt64 = 0
     private var pipelineClient: VoicePipelineClient?
     private var activeTask: Task<Void, Never>?
+    private var activeContextCaptureTask: Task<Void, Never>?
+    private var contextCaptureDone = true
+    /// The local engine of this dictation, told when the AX capture lands. Internal for tests.
+    var activeEngine: (any VoiceASREngine)?
     private var activeCaretRect: NSRect = .zero
     private var activeWindowLevel: CGWindowLevel?
     private var activeCommitHandler: ((String, Bool) -> Void)?
-    private var activeContext: VoiceContext = VoiceContext()
+    /// Internal for tests.
+    var activeContext: VoiceContext = VoiceContext()
     private var lastEscapeCancelUptime: TimeInterval = 0
 
     private init() {}
@@ -449,12 +456,13 @@ public final class VoiceSessionController {
         warmHold = nil
     }
 
-    private func warmEngine(prefs: VoicePreferences, vocabulary: [String]) {
+    private func warmEngine(prefs: VoicePreferences) {
         engineWarmItem = nil
         guard isCapturing, prefs.providerMode == .local else { return }
         timeline.mark(.holdFired)
         engineWarmed = true
-        guard let engine = VoiceASRRegistry.engine(for: prefs, vocabulary: vocabulary) else { return }
+        guard let engine = VoiceASRRegistry.engine(for: prefs, context: activeContext) else { return }
+        activeEngine = engine
         if phase == .recording, let recorder = activeRecorder {
             startEngineStreamIfAvailable(prefs: prefs, recorder: recorder)
         } else {
@@ -472,6 +480,50 @@ public final class VoiceSessionController {
         let restart = pendingRestart
         pendingRestart = nil
         restart?()
+    }
+
+    /// Folds a finished AX capture into the dictation and re-biases the engine that is already listening.
+    func applyCapturedContext(_ captured: VoiceCapturedContext) {
+        let prefs = VoicePreferencesStore.shared.prefs
+        activeContext = activeContext.merged(with: captured)
+        activeEngine?.updateContext(prefs.recognitionContext(activeContext))
+        // The preview is only worth building while someone can see it.
+        guard VoiceContextInspectorStore.shared.isPresented else { return }
+        let preview = VoiceContextPromptPreview.build(context: activeContext, prefs: prefs)
+        VoiceContextInspectorStore.shared.recordModelContext(
+            asrTargetLabel: preview.asrTargetLabel,
+            asrContext: preview.asrContext,
+            polishBudgetLabel: preview.polishBudgetLabel,
+            polishContext: preview.polishContext
+        )
+    }
+
+    /// Lets a capture that is about to land reach the final pass, never holding the release up by more than `maxWait`.
+    func awaitContextCapture(maxWait: TimeInterval) async {
+        guard activeContextCaptureTask != nil, !contextCaptureDone else { return }
+        let deadline = Date().addingTimeInterval(maxWait)
+        while !contextCaptureDone, activeContextCaptureTask != nil, !Task.isCancelled, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    /// Stops the AX capture of a session that will not use it.
+    private func cancelContextCapture() {
+        activeContextCaptureTask?.cancel()
+        activeContextCaptureTask = nil
+        contextCaptureDone = true
+    }
+
+    /// Test seam: stands in for a capture task that has not finished yet.
+    func beginPendingContextCaptureForTesting() {
+        contextCaptureDone = false
+        activeContextCaptureTask = Task {}
+    }
+
+    /// Test seam: the pending capture lands.
+    func finishPendingContextCaptureForTesting(_ captured: VoiceCapturedContext) {
+        applyCapturedContext(captured)
+        contextCaptureDone = true
     }
 
     private func ensurePipelineClient() -> VoicePipelineClient {
@@ -498,15 +550,48 @@ public final class VoiceSessionController {
         let prefs = VoicePreferencesStore.shared.prefs
         let useAppleSpeech = (prefs.providerMode == .local && prefs.localASRPreset == .appleSpeech)
 
+        // A blacklisted app is known from its bundle ID at once; the capture adds URL and secure-field checks later.
+        let respectBlacklist = prefs.respectsContextBlacklist
+        let blacklisted = context.bundleIdentifier.map {
+            VoiceContextPolicy.blacklistReason(
+                bundleId: $0,
+                webURL: nil,
+                options: VoiceContextCaptureOptions(respectBlacklist: respectBlacklist)
+            ) != nil
+        } ?? false
+
         activeCaretRect = caretRect
         activeWindowLevel = windowLevel
-        activeContext = context
+        activeContext = context.restricted(blacklisted)
+        activeEngine = nil
         activeCommitHandler = onCommit
         latestLevel = 0
         peakLevelSinceDraw = nil
         latestPartial = ""
         latestTentativeCount = 0
         cueSounded = false
+
+        // Capture full AXUIElement context asynchronously so key-down / HUD display stays instant (0 ms added).
+        activeContextCaptureTask?.cancel()
+        activeContextCaptureTask = nil
+        contextCaptureDone = true
+        if prefs.isContextCaptureEnabled {
+            contextCaptureDone = false
+            let captureGeneration = sessionGeneration &+ 1
+            activeContextCaptureTask = Task { @MainActor [weak self] in
+                let captured = await VoiceContextCapture.captureAsync(
+                    options: VoiceContextCaptureOptions(respectBlacklist: respectBlacklist)
+                )
+                guard !Task.isCancelled, let self else { return }
+                if VoiceContextInspectorStore.shared.isPresented {
+                    VoiceContextInspectorStore.shared.record(captured)
+                }
+                if self.phase == .recording || self.isStarting || self.sessionGeneration == captureGeneration {
+                    self.applyCapturedContext(captured)
+                }
+                self.contextCaptureDone = true
+            }
+        }
 
         isStarting = true
         startAborted = false
@@ -518,12 +603,11 @@ public final class VoiceSessionController {
         )
         timeline.mark(.hudShown)
         cancelEngineWarm()
-        let vocabulary = context.personalVocabulary
         if warmDelay <= 0 {
-            warmEngine(prefs: prefs, vocabulary: vocabulary)
+            warmEngine(prefs: prefs)
         } else if prefs.providerMode == .local {
             let item = DispatchWorkItem { [weak self] in
-                self?.warmEngine(prefs: prefs, vocabulary: vocabulary)
+                self?.warmEngine(prefs: prefs)
             }
             engineWarmItem = item
             DispatchQueue.main.asyncAfter(deadline: .now() + warmDelay, execute: item)
@@ -535,6 +619,7 @@ public final class VoiceSessionController {
                 self.isStarting = false
                 self.resetPressState()
                 self.cancelEngineWarm()
+                self.cancelContextCapture()
                 if self.startAborted {
                     self.runPendingRestart()
                 } else {
@@ -594,13 +679,21 @@ public final class VoiceSessionController {
                 // Starting the audio engine can take a while, so it must not block the main thread.
                 let locale = prefs.localAppleLocale
                 let onDevice = prefs.localAppleRequireOnDevice
+                // Apple Speech fixes its phrases when the request starts, so it gets what is known by now.
+                let phrases = useAppleSpeech ? VoiceASRContextBuilder.contextualStrings(self.activeContext) : []
                 try await Task.detached(priority: .userInitiated) {
-                    try recorder.start(useAppleSpeech: useAppleSpeech, appleLocale: locale, requireOnDevice: onDevice)
+                    try recorder.start(
+                        useAppleSpeech: useAppleSpeech,
+                        appleLocale: locale,
+                        requireOnDevice: onDevice,
+                        contextualStrings: phrases
+                    )
                 }.value
                 self.timeline.mark(.micRunning)
                 self.isStarting = false
                 if self.startAborted {
                     recorder.cancel()
+                    self.cancelContextCapture()
                     self.runPendingRestart()
                     return
                 }
@@ -628,7 +721,8 @@ public final class VoiceSessionController {
     /// Starts live partials from the selected engine. If it is unavailable, dictation still works on release.
     private func startEngineStreamIfAvailable(prefs: VoicePreferences, recorder: VoiceAudioRecorder) {
         guard prefs.providerMode == .local,
-              let manager = VoiceASRRegistry.engine(for: prefs, vocabulary: activeContext.personalVocabulary) else { return }
+              let manager = VoiceASRRegistry.engine(for: prefs, context: activeContext) else { return }
+        activeEngine = manager
         let generation = sessionGeneration
         let stream = VoiceWhisperStreamSession(
             transcriber: manager,
@@ -682,10 +776,7 @@ public final class VoiceSessionController {
             ? prefs.cloudPreset.displayName
             : "本地"
         let useAppleSpeech = (prefs.providerMode == .local && prefs.localASRPreset == .appleSpeech)
-        let context = activeContext
         let commitHandler = activeCommitHandler
-        let replaceSelection = prefs.speakToEditSelection
-            && !(context.selectedText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
         let showTranscribing = { [weak self] in
             guard let self else { return }
@@ -713,6 +804,11 @@ public final class VoiceSessionController {
                     self.activeTask = nil
                     self.activeCommitHandler = nil
                     self.activeContext = VoiceContext()
+                    self.activeEngine = nil
+                    // A capture still running must not refill the context of a finished dictation.
+                    self.activeContextCaptureTask?.cancel()
+                    self.activeContextCaptureTask = nil
+                    self.contextCaptureDone = true
                     self.phase = .idle
                 }
             }
@@ -743,6 +839,15 @@ public final class VoiceSessionController {
                     }
                     showTranscribing()
                 }
+
+                // The microphone is off and the press is known to carry speech; a capture still landing gets a moment
+                // so the final pass sees it.
+                await self.awaitContextCapture(maxWait: Self.contextCaptureGrace)
+                try Task.checkCancellation()
+                let context = prefs.recognitionContext(self.activeContext)
+                let polishContext = prefs.polishContext(self.activeContext)
+                let replaceSelection = prefs.speakToEditSelection
+                    && !(polishContext.promptSafe().selectedText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
                 let rawTranscript: String
                 if useAppleSpeech {
@@ -789,7 +894,7 @@ public final class VoiceSessionController {
                             client: client,
                             asrKey: asrKey,
                             wavData: wavData,
-                            vocabulary: context.personalVocabulary
+                            context: context
                         )
                         rawTranscript = usesLocalEngine
                             ? VoiceHallucinationFilter.filtered(
@@ -824,7 +929,7 @@ public final class VoiceSessionController {
                         client: client,
                         llmKey: llmKey,
                         rawTranscript: cleanedRaw,
-                        context: context
+                        context: polishContext
                     )
                 }
 
@@ -853,36 +958,59 @@ public final class VoiceSessionController {
         client: VoicePipelineClient,
         asrKey: String,
         wavData: Data,
-        vocabulary: [String]
+        context: VoiceContext
     ) async throws -> String {
-        let prompt = VoicePromptBuilder.asrPrompt(vocabulary: vocabulary)
+        /// Sends the prompt, and once more without it if the service only read the prompt back.
+        func transcribeHTTP(baseURL: String, apiKey: String?, model: String) async throws -> String {
+            let prompt = VoiceASRContextBuilder.recognitionContext(
+                context,
+                target: .cloud(model: model),
+                language: prefs.language
+            )
+            let text = try await client.transcribeOpenAICompatible(
+                baseURL: baseURL,
+                apiKey: apiKey,
+                model: model,
+                language: prefs.language,
+                prompt: prompt,
+                wavData: wavData
+            )
+            guard VoiceASRContextBuilder.isPromptEcho(text, prompt: prompt) else { return text }
+            return try await client.transcribeOpenAICompatible(
+                baseURL: baseURL,
+                apiKey: apiKey,
+                model: model,
+                language: prefs.language,
+                prompt: nil,
+                wavData: wavData
+            )
+        }
         switch prefs.providerMode {
         case .cloudBYOK:
             guard !asrKey.isEmpty else {
                 throw VoiceEngineError.missingAPIKey(prefs.cloudPreset.displayName)
             }
-            return try await client.transcribeOpenAICompatible(
+            return try await transcribeHTTP(
                 baseURL: prefs.effectiveCloudASRBaseURL,
                 apiKey: asrKey,
-                model: prefs.effectiveCloudASRModel,
-                language: prefs.language,
-                prompt: prompt,
-                wavData: wavData
+                model: prefs.effectiveCloudASRModel
             )
         case .local:
             switch prefs.localASRPreset.backend {
             case .appleSpeech:
                 return ""
             case .engine:
-                return try await VoiceASRRegistry.transcribeWithFallback(prefs: prefs, client: client, wavData: wavData)
+                return try await VoiceASRRegistry.transcribeWithFallback(
+                    prefs: prefs,
+                    client: client,
+                    wavData: wavData,
+                    context: context
+                )
             case .customHTTP:
-                return try await client.transcribeOpenAICompatible(
+                return try await transcribeHTTP(
                     baseURL: prefs.localHTTPASRBaseURL,
                     apiKey: nil,
-                    model: prefs.localHTTPASRModel,
-                    language: prefs.language,
-                    prompt: prompt,
-                    wavData: wavData
+                    model: prefs.localHTTPASRModel
                 )
             }
         }
@@ -928,13 +1056,15 @@ public final class VoiceSessionController {
                     context: context
                 )
             case .ollamaHTTP:
+                // A local service usually runs a small model, so it gets the compact context.
                 return try await client.polishOpenAICompatible(
                     baseURL: prefs.localHTTPLLMBaseURL,
                     apiKey: nil,
                     model: prefs.localHTTPLLMModel,
                     rawTranscript: rawTranscript,
                     toneMode: prefs.toneMode,
-                    context: context
+                    context: context,
+                    budget: .compact
                 )
             }
         }
@@ -952,6 +1082,10 @@ public final class VoiceSessionController {
         activeStream = nil
         activeTask?.cancel()
         activeTask = nil
+        activeContextCaptureTask?.cancel()
+        activeContextCaptureTask = nil
+        contextCaptureDone = true
+        activeEngine = nil
         activeRecorder?.cancel()
         activeRecorder = nil
         activeCommitHandler = nil
@@ -977,6 +1111,10 @@ public final class VoiceSessionController {
         activeStream = nil
         activeTask?.cancel()
         activeTask = nil
+        activeContextCaptureTask?.cancel()
+        activeContextCaptureTask = nil
+        contextCaptureDone = true
+        activeEngine = nil
         activeRecorder?.cancel()
         activeRecorder = nil
         activeCommitHandler = nil

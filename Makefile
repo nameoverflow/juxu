@@ -1,4 +1,4 @@
-.PHONY: all dicts rust-test swift-test ios-test test app pkg install previews ios-previews ios-project ios-core clean
+.PHONY: all dicts context-capture rust-test swift-test ios-test test app pkg install previews ios-previews ios-project ios-core clean
 
 CERT_NAME ?= Talus Local Code Signing
 CODESIGN_IDENTITY ?= auto
@@ -15,10 +15,10 @@ CORE_SOURCES = Core/Cargo.toml $(wildcard Core/src/*.rs)
 SHARED_SOURCES = Shared/JuxuModels.swift Shared/JuxuBridge.swift Shared/TextFormatting.swift Shared/SharedSettingsComponents.swift
 SHARED_CORE_SOURCES = Shared/JuxuModels.swift Shared/JuxuBridge.swift Shared/TextFormatting.swift
 IOS_SHARED_SOURCES = iOS/Shared/IOSInlineMarkedTextSession.swift iOS/Shared/IOSKeyboardLayoutEngine.swift iOS/Shared/IOSKeyboardGesturesAndEditing.swift iOS/Shared/IOSClipboardSuggestion.swift
-VOICE_SOURCES = Sources/VoicePreferences.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoicePartialStabilizer.swift Sources/VoiceSessionTimeline.swift Sources/VoiceQwenHelper.swift Sources/VoiceASREngine.swift Sources/VoiceGlobalHotkey.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Sources/VoiceSettingsView.swift
+VOICE_SOURCES = Sources/VoicePreferences.swift Sources/VoiceContextCapture.swift Sources/VoiceContextPrompt.swift Sources/VoiceLocalInstaller.swift Sources/VoiceEngine.swift Sources/VoiceWhisperServer.swift Sources/VoicePartialStabilizer.swift Sources/VoiceSessionTimeline.swift Sources/VoiceQwenHelper.swift Sources/VoiceASREngine.swift Sources/VoiceGlobalHotkey.swift Sources/VoiceHUDPanel.swift Sources/VoiceSessionController.swift Sources/VoiceSettingsView.swift
 UI_SOURCES = $(SHARED_SOURCES) Sources/FloatingHUDPanel.swift Sources/CandidatePanel.swift $(VOICE_SOURCES) Sources/SettingsWindow.swift
 APP_SOURCES = $(UI_SOURCES) Sources/ShiftTapDetector.swift Sources/InputController.swift Sources/main.swift
-FRAMEWORKS = -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework Carbon -framework AVFoundation -framework Speech -framework Security -framework Accelerate
+FRAMEWORKS = -framework Cocoa -framework SwiftUI -framework InputMethodKit -framework Carbon -framework AVFoundation -framework Speech -framework Security -framework Accelerate -framework ApplicationServices
 
 all: build/Juxu
 
@@ -38,6 +38,10 @@ dicts:
 build/Juxu: $(APP_SOURCES) $(CORE_LIB) $(CORE_HEADER)
 	mkdir -p build
 	swiftc -O $(MACOS_TARGET) $(APP_SOURCES) $(CORE_FLAGS) $(FRAMEWORKS) -o $@
+
+context-capture: Sources/VoiceContextCapture.swift Scripts/ContextCaptureCLI.swift
+	mkdir -p build
+	swiftc -O $(MACOS_TARGET) Sources/VoiceContextCapture.swift Scripts/ContextCaptureCLI.swift -framework Cocoa -framework ApplicationServices -framework Carbon -o build/context-capture
 
 build/AppIcon.icns build/menu_icon.pdf: Scripts/DrawAssets.swift
 	mkdir -p build/AppIcon.iconset
@@ -85,7 +89,7 @@ rust-test:
 
 swift-test: $(CORE_LIB)
 	mkdir -p build
-	swiftc -Onone $(MACOS_TARGET) $(UI_SOURCES) Sources/ShiftTapDetector.swift Tests/SwiftBridgeTests.swift $(CORE_FLAGS) $(FRAMEWORKS) -o build/swift-bridge-tests
+	swiftc -Onone $(MACOS_TARGET) $(UI_SOURCES) Sources/ShiftTapDetector.swift Tests/SwiftBridgeTests.swift Tests/VoiceContextPromptTests.swift $(CORE_FLAGS) $(FRAMEWORKS) -o build/swift-bridge-tests
 	build/swift-bridge-tests
 
 test: rust-test swift-test ios-test

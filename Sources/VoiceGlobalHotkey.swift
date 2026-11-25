@@ -475,10 +475,16 @@ public final class VoiceGlobalHotkeyController {
                 },
                 windowLevel: nil,
                 contextProvider: {
-                    VoiceContext(
-                        bundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+                    let frontmost = NSWorkspace.shared.frontmostApplication
+                    var vocab = prefs.parsedCustomVocabulary
+                    if prefs.syncJuxuLexicon {
+                        vocab.append(contentsOf: JuxuBridge.shared.userPhrases.prefix(40).map(\.text))
+                    }
+                    return VoiceContext(
+                        bundleIdentifier: frontmost?.bundleIdentifier,
+                        appName: frontmost?.localizedName,
                         selectedText: prefs.speakToEditSelection ? committer.selectedText() : nil,
-                        personalVocabulary: prefs.parsedCustomVocabulary
+                        personalVocabulary: vocab
                     )
                 },
                 onCommit: { text, replaceSelection in
