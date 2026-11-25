@@ -795,7 +795,7 @@ private struct LocalVoiceConfigCard: View {
     }
 }
 
-/// Interactive tester & inspector for Typeless-style AXUIElement + AXEnhancedUserInterface context capture.
+/// Interactive tester & inspector for AXUIElement + AXEnhancedUserInterface context capture.
 private struct VoiceContextInspectorCard: View {
     @ObservedObject var inspector: VoiceContextInspectorStore
     @State private var showRawJSON = true
@@ -808,7 +808,7 @@ private struct VoiceContextInspectorCard: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("上下文抓取实测（AXUIElement）")
                         .font(.system(size: 13, weight: .semibold))
-                    Text("按 Typeless 方式抓取前台 App、窗口标题、网页 URL、光标前后文、选区与屏幕可见文本")
+                    Text("抓取前台 App、窗口标题、网页 URL、光标前后文、选区与屏幕可见文本")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                 }

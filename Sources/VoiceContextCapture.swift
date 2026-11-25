@@ -3,7 +3,7 @@ import ApplicationServices
 import Carbon.HIToolbox
 import Foundation
 
-// MARK: - Typeless-Style macOS Native Context Capture (AXUIElement + AXEnhancedUserInterface)
+// MARK: - macOS Native Context Capture (AXUIElement + AXEnhancedUserInterface)
 
 public struct VoiceContextCaptureOptions: Equatable, Sendable {
     /// Maximum time allowed for each expensive AX read phase (visible screen text, surrounding context).
@@ -313,7 +313,7 @@ public enum VoiceContextPolicy {
         "org.keepassxc.keepassxc",
     ]
 
-    /// Default check-before-read blacklist for large screen/surrounding captures (matches Typeless defaults).
+    /// Default check-before-read blacklist for large screen/surrounding captures.
     public static let defaultBlacklistedBundleIds: Set<String> = [
         "com.sublimetext.4",
         "com.tencent.xinWeChat",
@@ -455,7 +455,7 @@ public enum VoiceContextPolicy {
         return isEditable ? "plain_text" : "unknown"
     }
 
-    /// Typeless hardcoded guard: in Notion web pages when focus lands on the whole `AXWebArea`,
+    /// Hardcoded guard: in Notion web pages when focus lands on the whole `AXWebArea`,
     /// do not treat the entire document as cursor state.
     public static func shouldClearNotionWebAreaCursor(
         isWebBrowser: Bool,
@@ -710,7 +710,7 @@ public enum VoiceContextCapture {
             return finish()
         }
 
-        // Step 5: Cursor state (collected for non-secure focused field, matching Typeless's `getCurrentInputState`).
+        // Step 5: Cursor state (collected for non-secure focused field).
         if let focusedElement, !frontmost.isOwnApp {
             var cursorState = readCursorState(element: focusedElement, options: options)
             if VoiceContextPolicy.shouldClearNotionWebAreaCursor(

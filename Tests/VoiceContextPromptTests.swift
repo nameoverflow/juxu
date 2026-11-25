@@ -1,7 +1,7 @@
 import AppKit
 
 /// What each recogniser and the polish model receive from the captured context.
-/// Uses `precondition` because the suite is built with `-O`, which removes `assert`.
+/// Uses `precondition` so a failure stops the run in every build configuration.
 enum VoiceContextPromptTests {
     @MainActor
     final class RecordingEngine: VoiceASREngine {

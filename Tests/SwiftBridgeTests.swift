@@ -1156,28 +1156,27 @@ struct SwiftBridgeTests {
         check(loudPeak >= 24000 && loudPeak <= 32767, "Expected loud speech to stay unclipped, got peak=\(loudPeak)")
         check(VoiceAudioNormalizer.conditionForASR([]).isEmpty)
 
-
-        // 9. Verify Typeless-style VoiceContextCapture policy, JSON schema, blacklist, and UTF-16 cursor slicing
+        // 13. Verify VoiceContextCapture policy, JSON schema, blacklist, and UTF-16 cursor slicing
         let defaultOpts = VoiceContextCaptureOptions()
-        assert(VoiceContextPolicy.isHardBlocked(bundleId: "com.1password.1password"))
-        assert(VoiceContextPolicy.isHardBlocked(bundleId: "com.apple.Passwords"))
-        assert(!VoiceContextPolicy.isHardBlocked(bundleId: "com.tinyspeck.slackmacgap"))
+        check(VoiceContextPolicy.isHardBlocked(bundleId: "com.1password.1password"))
+        check(VoiceContextPolicy.isHardBlocked(bundleId: "com.apple.Passwords"))
+        check(!VoiceContextPolicy.isHardBlocked(bundleId: "com.tinyspeck.slackmacgap"))
 
-        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.tencent.xinWeChat", webURL: nil, options: defaultOpts) == "app_blacklist:com.tencent.xinWeChat")
-        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.microsoft.Excel", webURL: nil, options: defaultOpts) == "app_blacklist:com.microsoft.Excel")
-        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.google.Chrome", webURL: "https://docs.google.com/document/d/abc123/edit", options: defaultOpts)?.hasPrefix("url_blacklist:") == true)
-        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.google.Chrome", webURL: "https://github.com/nameoverflow/juxu", options: defaultOpts) == nil)
-        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.tinyspeck.slackmacgap", webURL: nil, options: defaultOpts) == nil)
+        check(VoiceContextPolicy.blacklistReason(bundleId: "com.tencent.xinWeChat", webURL: nil, options: defaultOpts) == "app_blacklist:com.tencent.xinWeChat")
+        check(VoiceContextPolicy.blacklistReason(bundleId: "com.microsoft.Excel", webURL: nil, options: defaultOpts) == "app_blacklist:com.microsoft.Excel")
+        check(VoiceContextPolicy.blacklistReason(bundleId: "com.google.Chrome", webURL: "https://docs.google.com/document/d/abc123/edit", options: defaultOpts)?.hasPrefix("url_blacklist:") == true)
+        check(VoiceContextPolicy.blacklistReason(bundleId: "com.google.Chrome", webURL: "https://github.com/nameoverflow/juxu", options: defaultOpts) == nil)
+        check(VoiceContextPolicy.blacklistReason(bundleId: "com.tinyspeck.slackmacgap", webURL: nil, options: defaultOpts) == nil)
 
         var noBlacklistOpts = VoiceContextCaptureOptions()
         noBlacklistOpts.respectBlacklist = false
-        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.tencent.xinWeChat", webURL: nil, options: noBlacklistOpts) == nil)
+        check(VoiceContextPolicy.blacklistReason(bundleId: "com.tencent.xinWeChat", webURL: nil, options: noBlacklistOpts) == nil)
         // Password managers remain hard-blocked even when content blacklist is disabled.
-        assert(VoiceContextPolicy.blacklistReason(bundleId: "com.1password.1password", webURL: nil, options: noBlacklistOpts) == "password_manager:com.1password.1password")
+        check(VoiceContextPolicy.blacklistReason(bundleId: "com.1password.1password", webURL: nil, options: noBlacklistOpts) == "password_manager:com.1password.1password")
 
-        assert(VoiceContextPolicy.shouldClearNotionWebAreaCursor(isWebBrowser: true, webURL: "https://www.notion.so/page-1", role: "AXWebArea"))
-        assert(!VoiceContextPolicy.shouldClearNotionWebAreaCursor(isWebBrowser: true, webURL: "https://www.notion.so/page-1", role: "AXTextArea"))
-        assert(!VoiceContextPolicy.shouldClearNotionWebAreaCursor(isWebBrowser: true, webURL: "https://github.com", role: "AXWebArea"))
+        check(VoiceContextPolicy.shouldClearNotionWebAreaCursor(isWebBrowser: true, webURL: "https://www.notion.so/page-1", role: "AXWebArea"))
+        check(!VoiceContextPolicy.shouldClearNotionWebAreaCursor(isWebBrowser: true, webURL: "https://www.notion.so/page-1", role: "AXTextArea"))
+        check(!VoiceContextPolicy.shouldClearNotionWebAreaCursor(isWebBrowser: true, webURL: "https://github.com", role: "AXWebArea"))
 
         // Safe UTF-16 cursor slicing with CJK + emoji surrogate pairs
         let mixedText = "你好😀世界abc"
@@ -1190,13 +1189,13 @@ struct SwiftBridgeTests {
             maxAfterChars: 10,
             maxSelectedChars: 10
         )
-        assert(sliced.before == "你好😀", "Expected before='你好😀', got '\(sliced.before)'")
-        assert(sliced.selected == "世界", "Expected selected='世界', got '\(sliced.selected)'")
-        assert(sliced.after == "abc", "Expected after='abc', got '\(sliced.after)'")
+        check(sliced.before == "你好😀", "Expected before='你好😀', got '\(sliced.before)'")
+        check(sliced.selected == "世界", "Expected selected='世界', got '\(sliced.selected)'")
+        check(sliced.after == "abc", "Expected after='abc', got '\(sliced.after)'")
 
-        assert(VoiceContextPolicy.normalizeURLCandidate("github.com/nameoverflow/juxu") == "https://github.com/nameoverflow/juxu")
-        assert(VoiceContextPolicy.normalizeURLCandidate("https://example.com/a?b=1") == "https://example.com/a?b=1")
-        assert(VoiceContextPolicy.normalizeURLCandidate("just some text") == nil)
+        check(VoiceContextPolicy.normalizeURLCandidate("github.com/nameoverflow/juxu") == "https://github.com/nameoverflow/juxu")
+        check(VoiceContextPolicy.normalizeURLCandidate("https://example.com/a?b=1") == "https://example.com/a?b=1")
+        check(VoiceContextPolicy.normalizeURLCandidate("just some text") == nil)
 
         let sampleCaptured = VoiceCapturedContext(
             activeApplication: .init(
@@ -1241,19 +1240,19 @@ struct SwiftBridgeTests {
             )
         )
         let sampleJSON = sampleCaptured.prettyJSON()
-        assert(sampleJSON.contains("\"active_application\""))
-        assert(sampleJSON.contains("\"visible_screen_content\""))
-        assert(sampleJSON.contains("\"text_before_cursor\""))
-        assert(sampleJSON.contains("\"enhanced_ui_enabled\""))
+        check(sampleJSON.contains("\"active_application\""))
+        check(sampleJSON.contains("\"visible_screen_content\""))
+        check(sampleJSON.contains("\"text_before_cursor\""))
+        check(sampleJSON.contains("\"enhanced_ui_enabled\""))
         let decodedCaptured = try! JSONDecoder().decode(VoiceCapturedContext.self, from: Data(sampleJSON.utf8))
-        assert(decodedCaptured == sampleCaptured)
+        check(decodedCaptured == sampleCaptured)
 
         let mergedCtx = VoiceContext(personalVocabulary: ["Juxu"]).merged(with: sampleCaptured)
-        assert(mergedCtx.bundleIdentifier == "com.tinyspeck.slackmacgap")
-        assert(mergedCtx.appName == "Slack")
-        assert(mergedCtx.beforeContext == "Let me check ")
-        assert(mergedCtx.afterContext == "now")
-        assert(mergedCtx.visibleScreenText == "Alice: check CI")
+        check(mergedCtx.bundleIdentifier == "com.tinyspeck.slackmacgap")
+        check(mergedCtx.appName == "Slack")
+        check(mergedCtx.beforeContext == "Let me check ")
+        check(mergedCtx.afterContext == "now")
+        check(mergedCtx.visibleScreenText == "Alice: check CI")
 
         VoiceContextPromptTests.run()
 

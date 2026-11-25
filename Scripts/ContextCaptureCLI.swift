@@ -7,7 +7,7 @@ import Foundation
 
 private func printUsage() {
     let text = """
-    context-capture — macOS AXUIElement + AXEnhancedUserInterface 上下文抓取工具（Typeless 同款原理）
+    context-capture — macOS AXUIElement + AXEnhancedUserInterface 上下文抓取工具
 
     用法:
       context-capture [选项]
