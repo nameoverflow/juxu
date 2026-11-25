@@ -898,6 +898,32 @@ struct SwiftBridgeTests {
                 "Expected Pinyin commitPending to commit top CJK candidate '\(expectedTop)', got '\(pyCommitted.commitText)'"
             )
             check(!pyCommitted.commitText.contains(where: { $0.isASCII && $0.isLetter }))
+
+            // Xiaohe Shuangpin displays raw segmented keys (`ce'ui'yi'xx`), not expanded full pinyin (`ce'shi'yi'xia`)
+            bridge.switchSchema(21, persist: false)
+            bridge.clearComposition()
+            bridge.setContext("")
+            for ch in "ceuiyixx".unicodeScalars {
+                let s = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 830)
+                check(s.commitText.isEmpty)
+            }
+            check(
+                bridge.state.macOSPreedit == "ce'ui'yi'xx",
+                "Expected Shuangpin macOSPreedit 'ce'ui'yi'xx', got '\(bridge.state.macOSPreedit)'"
+            )
+            check(
+                bridge.state.candidates.first?.text == "测试一下",
+                "Expected Shuangpin top candidate '测试一下', got '\(bridge.state.candidates.first?.text ?? "")'"
+            )
+            bridge.clearComposition()
+            for ch in "ceuiyiu".unicodeScalars {
+                _ = bridge.handleKey(keyCode: 0, scalar: ch.value, hasCmdOrCtrl: false, timestampMs: 840)
+            }
+            check(
+                bridge.state.macOSPreedit == "ce'ui'yi'u",
+                "Expected trailing Shuangpin initial to stay raw 'ce'ui'yi'u', got '\(bridge.state.macOSPreedit)'"
+            )
+            bridge.clearComposition()
             check(pyCommitted.preedit.isEmpty && bridge.state.preedit.isEmpty)
 
             // Idle commitPending is a clean no-op

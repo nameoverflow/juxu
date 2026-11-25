@@ -635,10 +635,16 @@ impl JuxuEngine {
 
     pub fn segmented_code(&self) -> String {
         if self.is_pinyin_mode() && self.is_composing() {
-            return self
-                .pinyin_paths
-                .first()
-                .map_or_else(|| self.raw_code.clone(), |p| p.segmented_code(&self.raw_code));
+            return self.pinyin_paths.first().map_or_else(
+                || self.raw_code.clone(),
+                |p| {
+                    if self.config.schema.is_shuangpin() {
+                        p.raw_segmented_code(&self.raw_code)
+                    } else {
+                        p.segmented_code(&self.raw_code)
+                    }
+                },
+            );
         }
         if !self.uses_spaceless() || !self.is_composing() {
             return String::new();
