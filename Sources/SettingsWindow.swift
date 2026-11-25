@@ -52,105 +52,43 @@ public struct SettingsRootView: View {
         self.navigation = navigation
     }
 
+    private var sidebarSelection: Binding<SettingsSection?> {
+        Binding(
+            get: { navigation.selectedSection },
+            set: { if let newValue { navigation.selectedSection = newValue } }
+        )
+    }
+
     public var body: some View {
-        HStack(spacing: 0) {
-            // Left Sidebar aligned to macOS System Settings
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 10) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(
-                                LinearGradient(
-                                    colors: [Color(red: 0.98, green: 0.97, blue: 0.94), Color(red: 0.91, green: 0.89, blue: 0.85)],
-                                    startPoint: .top,
-                                    endPoint: .bottom
-                                )
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .strokeBorder(Color.black.opacity(0.08), lineWidth: 0.5)
-                            )
-                            .frame(width: 32, height: 32)
-                        Image(systemName: "pencil.tip")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(Color(red: 0.11, green: 0.12, blue: 0.15))
-                    }
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("句序 Juxu")
-                            .font(.system(size: 13.5, weight: .semibold))
-                        Text(bridge.state.schemaName)
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .padding(.horizontal, 10)
-                .padding(.top, 14)
-                .padding(.bottom, 12)
-
+        NavigationSplitView {
+            List(selection: sidebarSelection) {
                 ForEach(SettingsSection.allCases) { sec in
-                    Button {
-                        navigation.selectedSection = sec
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: sec.symbolName)
-                                .font(.system(size: 13, weight: .medium))
-                                .frame(width: 18)
-                                .foregroundStyle(navigation.selectedSection == sec ? Color.white : Color.accentColor)
-                            Text(sec.rawValue)
-                                .font(.system(size: 13, weight: navigation.selectedSection == sec ? .medium : .regular))
-                                .foregroundStyle(navigation.selectedSection == sec ? Color.white : Color.primary)
-                            Spacer()
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6.5)
-                        .background(
-                            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .fill(navigation.selectedSection == sec ? Color.accentColor : Color.clear)
-                        )
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
+                    Label(sec.rawValue, systemImage: sec.symbolName)
+                        .tag(sec)
                 }
-
-                Spacer()
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("零拷贝 mmap 内核")
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(.secondary)
-                    Text("macOS · iOS 通用引擎")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(.horizontal, 10)
-                .padding(.bottom, 12)
             }
-            .padding(.horizontal, 10)
-            .frame(width: 176)
-            .background(.ultraThinMaterial)
-
-            Divider()
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    switch navigation.selectedSection {
-                    case .schema:
-                        schemaSectionView
-                    case .typo:
-                        typoSectionView
-                    case .lexicon:
-                        lexiconSectionView
-                    case .voice:
-                        VoiceSettingsView(bridge: bridge, voiceStore: VoicePreferencesStore.shared)
-                    case .appearance:
-                        appearanceSectionView
-                    }
+            .listStyle(.sidebar)
+            .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 240)
+            .toolbar(removing: .sidebarToggle)
+        } detail: {
+            Form {
+                switch navigation.selectedSection {
+                case .schema:
+                    schemaSectionView
+                case .typo:
+                    typoSectionView
+                case .lexicon:
+                    lexiconSectionView
+                case .voice:
+                    VoiceSettingsView(bridge: bridge, voiceStore: VoicePreferencesStore.shared)
+                case .appearance:
+                    appearanceSectionView
                 }
-                .padding(22)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .formStyle(.grouped)
+            .navigationTitle(navigation.selectedSection.rawValue)
         }
-        .frame(minWidth: 680, minHeight: 540)
+        .frame(minWidth: 720, minHeight: 540)
     }
 
     // MARK: - Section 1: Schema & Core Typing
@@ -162,14 +100,14 @@ public struct SettingsRootView: View {
         let pushCodeLabel = SharedSchemaDisplayHelpers.pushCodeChineseNumeral(isCangjie: isCangjie)
         let maxCodeNum = SharedSchemaDisplayHelpers.maxCodeDigits(isCangjie: isCangjie)
         let pushCodeNum = SharedSchemaDisplayHelpers.pushCodeDigits(isCangjie: isCangjie)
-        return VStack(alignment: .leading, spacing: 16) {
+        return Group {
             sectionHeader(
                 title: "输入方案与编码规则",
                 subtitle: "内置拼音、五笔、仓颉三大类零拷贝词典，共用 RWKV-7 语言模型与触点纠错"
             )
 
             settingsCard {
-                VStack(alignment: .leading, spacing: 14) {
+                Group {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("1. 选择方案大类")
@@ -187,7 +125,6 @@ public struct SettingsRootView: View {
                         }
                     }
 
-                    Divider()
 
                     VStack(alignment: .leading, spacing: 8) {
                         Text("2. 选择\(activeCategory.rawValue)方案版本")
@@ -204,19 +141,17 @@ public struct SettingsRootView: View {
 
             if !bridge.prefs.isPinyinFamily {
                 settingsCard {
-                    VStack(spacing: 11) {
+                    Group {
                         toggleRow(
                             title: "\(maxCodeLabel)码唯一自动上屏",
                             subtitle: "输满\(maxCodeLabel)码且精确匹配唯一候选时免按空格直接上屏",
                             isOn: binding(\.fourthCodeAutoCommit)
                         )
-                        Divider()
                         toggleRow(
                             title: "第\(pushCodeLabel)码顶字上屏",
                             subtitle: "\(maxCodeLabel)码存在重码时，继续敲第 \(pushCodeNum) 码自动将首选词顶上屏并开始新编码",
                             isOn: binding(\.fifthCodePushCommit)
                         )
-                        Divider()
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("\(maxCodeLabel)码空码处理")
@@ -238,7 +173,7 @@ public struct SettingsRootView: View {
             }
 
             settingsCard {
-                VStack(spacing: 11) {
+                Group {
                     if bridge.prefs.isPinyinFamily {
                         toggleRow(
                             title: "声母简拼",
@@ -247,14 +182,12 @@ public struct SettingsRootView: View {
                                 : "支持首字母简拼与全简混拼（如 srf / shurf → 输入法）",
                             isOn: binding(\.pinyinInitialAbbr)
                         )
-                        Divider()
                     } else {
                         toggleRow(
                             title: "流式无空格连打（实验）",
                             subtitle: "连续输入词组和简码。标点确认中文，回车输入原始字母",
                             isOn: binding(\.spaceless)
                         )
-                        Divider()
                         toggleRow(
                             title: "最短编码（简码）优先",
                             subtitle: isCangjie
@@ -262,7 +195,6 @@ public struct SettingsRootView: View {
                                 : "输入 1–3 码时简码字词始终优先于长码前缀补全",
                             isOn: binding(\.shortestCodeFirst)
                         )
-                        Divider()
                         toggleRow(
                             title: "全码显示简码提示",
                             subtitle: isCangjie
@@ -270,7 +202,6 @@ public struct SettingsRootView: View {
                                 : "打全码时在候选旁标注最短简码（如打 khk 在“中”旁轻提示 k）",
                             isOn: binding(\.showShortcodeHint)
                         )
-                        Divider()
                         toggleRow(
                             title: "出简不出全",
                             subtitle: bridge.prefs.spaceless
@@ -279,7 +210,6 @@ public struct SettingsRootView: View {
                             isOn: binding(\.strictShortcode)
                         )
                         if bridge.prefs.isWubiFamily || isCangjie {
-                            Divider()
                             toggleRow(
                                 title: isCangjie ? "z 键拼音反查" : "z 键万能通配与拼音反查",
                                 subtitle: isCangjie
@@ -288,7 +218,6 @@ public struct SettingsRootView: View {
                                 isOn: binding(\.zOmnipotent)
                             )
                         }
-                        Divider()
                     }
                     toggleRow(
                         title: "启用 Unicode 扩展区大字集",
@@ -303,38 +232,34 @@ public struct SettingsRootView: View {
     // MARK: - Section 2: Typo Correction & Touch Hitbox Lab
 
     private var typoSectionView: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        Group {
             sectionHeader(
                 title: "统计置信度误触纠正与动态触控热区",
                 subtitle: "融合连续二维触点高斯似然、语料 N-gram、RWKV-7 与个人输入历史，专为解决打字滑偏与错键痛点设计"
             )
 
             settingsCard {
-                VStack(spacing: 11) {
+                Group {
                     toggleRow(
                         title: "启用贝叶斯误触纠正解码器",
                         subtitle: "对空码滑偏、键边缘误触与双指快速换位产出归一化置信度",
                         isOn: binding(\.typoEnabled)
                     )
-                    Divider()
                     toggleRow(
                         title: "纠错救回项抑制「四码自动上屏」",
                         subtitle: "纠错产生的非精确首选词满四码时留待空格/第五码确认，绝不盲目顶错字",
                         isOn: binding(\.suppressAutoCommitOnCorrection)
                     )
-                    Divider()
                     toggleRow(
                         title: "语言模型漏空格切分纠错",
                         subtitle: "打完简码或三码字漏按空格续打下一字时，结合 Micro-RWKV-7 智能顶屏或提示切分候选",
                         isOn: binding(\.missedSpaceCorrection)
                     )
-                    Divider()
                     toggleRow(
                         title: "触屏个人热区动态校准（EMA 自适应）",
                         subtitle: "根据历史触点残差微调每个按键判定中心（限幅 ±0.20 键宽），适配个人拇指习惯",
                         isOn: binding(\.touchHitboxAdapt)
                     )
-                    Divider()
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("空码 / 边缘滑偏直推首选阈值：\(Int(bridge.prefs.promoteThreshold * 100))%")
@@ -347,7 +272,6 @@ public struct SettingsRootView: View {
                         Slider(value: binding(\.promoteThreshold), in: 0.60...0.96, step: 0.02)
                             .frame(width: 170)
                     }
-                    Divider()
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("精确码有效时次选纠错提示阈值：\(Int(bridge.prefs.suggestThreshold * 100))%")
@@ -360,7 +284,6 @@ public struct SettingsRootView: View {
                         Slider(value: binding(\.suggestThreshold), in: 0.15...0.70, step: 0.05)
                             .frame(width: 170)
                     }
-                    Divider()
                     HStack {
                         Text("已学习热区偏移按键数：\(SharedCalibrationFormatting.calibratedProgressText(calibratedCount: bridge.state.calibratedKeyCount))")
                             .font(.system(size: 12))
@@ -387,7 +310,6 @@ public struct SettingsRootView: View {
                         subtitle: "保存手选非首选、RWKV 策略压制标记、纠错与退格重打到 ~/Library/Application Support/Juxu/eval_log.jsonl",
                         isOn: binding(\.evalLogging)
                     )
-                    Divider()
                     let s = bridge.evalLogSummary
                     HStack(spacing: 12) {
                         ForEach(EvalLogMetricItem.metrics(from: s)) { metric in
@@ -428,20 +350,19 @@ public struct SettingsRootView: View {
     // MARK: - Section 3: Auto-Phrase & Personal Lexicon
 
     private var lexiconSectionView: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        Group {
             sectionHeader(
                 title: "自动组词、动态调频与跨版本个人词库",
                 subtitle: "自造词仅存词条文本，切换 86 / 98 / 新世纪时实时按目标方案字根重算四码"
             )
 
             settingsCard {
-                VStack(spacing: 11) {
+                Group {
                     toggleRow(
                         title: "连打单字自动组词",
                         subtitle: "连续单字输入同一双字/三字组合达到阈值后自动收录进个人词库（打字时也可按 Ctrl + = 手动造词）",
                         isOn: binding(\.autoPhrase)
                     )
-                    Divider()
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("自动成词触发次数")
@@ -459,13 +380,11 @@ public struct SettingsRootView: View {
                         .labelsHidden()
                         .frame(width: 168)
                     }
-                    Divider()
                     toggleRow(
                         title: "词组动态调频",
                         subtitle: "常用词组与上下文连贯词组自动前移",
                         isOn: binding(\.dynamicWordFreq)
                     )
-                    Divider()
                     toggleRow(
                         title: "单字动态调频",
                         subtitle: "默认关闭以保持单字固定重码顺序，保护五笔盲打肌肉记忆",
@@ -475,7 +394,7 @@ public struct SettingsRootView: View {
             }
 
             settingsCard {
-                VStack(alignment: .leading, spacing: 10) {
+                Group {
                     Text("添加个人词条（自动按当前 \(bridge.state.schemaName) 推导编码）")
                         .font(.system(size: 13, weight: .medium))
 
@@ -500,7 +419,6 @@ public struct SettingsRootView: View {
                             .foregroundStyle(Color.accentColor)
                     }
 
-                    Divider()
 
                     if bridge.userPhrases.isEmpty {
                         Text("暂无个人词条。日常连打单字会自动学习常用新词，也可在上方手动添加。")
@@ -508,7 +426,7 @@ public struct SettingsRootView: View {
                             .foregroundStyle(.secondary)
                             .padding(.vertical, 8)
                     } else {
-                        VStack(spacing: 4) {
+                        Group {
                             ForEach(bridge.userPhrases.prefix(12)) { item in
                                 HStack {
                                     Text(item.text)
@@ -525,9 +443,8 @@ public struct SettingsRootView: View {
                                             .font(.system(size: 11))
                                             .foregroundStyle(.secondary)
                                     }
-                                    .buttonStyle(.plain)
+                                    .buttonStyle(.borderless)
                                 }
-                                .padding(.vertical, 3)
                             }
                         }
                     }
@@ -539,14 +456,14 @@ public struct SettingsRootView: View {
     // MARK: - Section 4: Appearance & Punctuation
 
     private var appearanceSectionView: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        Group {
             sectionHeader(
                 title: "原生候选栏外观、中英切换与标点",
                 subtitle: "对齐 macOS 原生毛玻璃材质与深浅色自适应，配置文件保存于 \(bridge.configURL.lastPathComponent)"
             )
 
             settingsCard {
-                VStack(spacing: 11) {
+                Group {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("候选词排列方向")
@@ -563,7 +480,6 @@ public struct SettingsRootView: View {
                         .pickerStyle(.segmented)
                         .frame(width: 180)
                     }
-                    Divider()
                     HStack {
                         Text("每页候选词数量：\(bridge.prefs.pageSize) 个")
                             .font(.system(size: 13, weight: .medium))
@@ -571,7 +487,6 @@ public struct SettingsRootView: View {
                         Stepper("", value: binding(\.pageSize), in: 3...9)
                             .labelsHidden()
                     }
-                    Divider()
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Shift 键切换中/英时行为")
@@ -589,33 +504,28 @@ public struct SettingsRootView: View {
                         .labelsHidden()
                         .frame(width: 168)
                     }
-                    Divider()
                     toggleRow(
                         title: "中文标点与引号智能配对",
                         subtitle: "中文模式下自动转换全角标点，并成对输入引号、括号、直角引号与书名号",
                         isOn: binding(\.smartPunctuation)
                     )
-                    Divider()
                     toggleRow(
                         title: "Emoji 候选",
                         subtitle: "输入时，在匹配的词语后显示 Emoji 作为次要候选（如 思考 → 🤔）",
                         isOn: binding(\.emojiCandidates)
                     )
-                    Divider()
                     toggleRow(
                         title: "中英文之间自动加空格",
                         subtitle: "中英混输或切换上屏时自动在汉字与英文边界补全空格（保留 URL 及退格删去的空格）",
                         isOn: binding(\.autoSpaceZhEn)
                     )
                     if bridge.prefs.autoSpaceZhEn {
-                        Divider()
                         toggleRow(
                             title: "数字与中文之间也加空格",
                             subtitle: "在汉字与数字边界自动加空格（如「第 2 候选词」；关闭后仅对英文词加空格）",
                             isOn: binding(\.autoSpaceDigits)
                         )
                     }
-                    Divider()
                     toggleRow(
                         title: "分号 (;) 与引号 (') 快捷选重",
                         subtitle: "编码输入中按 ; 直接上屏第 2 候选词、按 ' 上屏第 3 候选词",
@@ -674,28 +584,25 @@ public struct SettingsRootView: View {
                 HStack(spacing: 6) {
                     Image(systemName: category.symbolName)
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(selected ? Color.white : Color.accentColor)
+                        .foregroundStyle(Color.accentColor)
                     Text(category.rawValue)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(selected ? Color.white : Color.primary)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color.primary)
                     Spacer()
-                    if selected {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 13))
-                            .foregroundStyle(Color.white.opacity(0.92))
-                    }
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 13))
+                        .foregroundStyle(selected ? Color.accentColor : Color.secondary.opacity(0.5))
                 }
                 Text(category.subtitle)
                     .font(.system(size: 11))
-                    .foregroundStyle(selected ? Color.white.opacity(0.85) : Color.secondary)
+                    .foregroundStyle(Color.secondary)
                     .lineLimit(1)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+            .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(selected ? Color.accentColor : Color.primary.opacity(0.035))
+                    .fill(selected ? Color.accentColor.opacity(0.11) : Color.primary.opacity(0.03))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -740,27 +647,14 @@ public struct SettingsRootView: View {
     }
 
     private func sectionHeader(title: String, subtitle: String) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-                .font(.system(size: 17, weight: .semibold))
-            Text(subtitle)
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-        }
+        SettingsFormHeader(title: title, subtitle: subtitle)
     }
 
+    /// One grouped `Form` section; each direct child becomes a native row with system separators.
     private func settingsCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        content()
-            .padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color(nsColor: .controlBackgroundColor))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.6)
-            )
+        Section {
+            content()
+        }
     }
 
     private func toggleRow(title: String, subtitle: String, isOn: Binding<Bool>) -> some View {
@@ -793,6 +687,29 @@ public struct SettingsRootView: View {
 
     private func currentMs() -> UInt64 {
         UInt64(Date().timeIntervalSince1970 * 1000.0)
+    }
+}
+
+/// Page title and summary shown at the top of a grouped settings `Form`, outside any row background.
+struct SettingsFormHeader: View {
+    let title: String
+    let subtitle: String
+
+    var body: some View {
+        Section {
+        } header: {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.primary)
+                Text(subtitle)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .textCase(nil)
+            .padding(.bottom, 2)
+        }
     }
 }
 
@@ -1080,8 +997,8 @@ public final class SettingsWindowController: NSObject, NSWindowDelegate {
         navigation.selectedSection = section
         if window == nil {
             let win = SettingsWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 720, height: 580),
-                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                contentRect: NSRect(x: 0, y: 0, width: 780, height: 620),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                 backing: .buffered,
                 defer: false
             )
