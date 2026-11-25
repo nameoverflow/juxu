@@ -494,6 +494,20 @@ public final class JuxuInputController: IMKInputController {
 
         let docLen = client.length()
         let safeAnchor = (docLen != NSNotFound && docLen >= 0) ? min(sel.location, docLen) : sel.location
+
+        // Guard against clients that stub `selectedRange()` and `length()` to always return 0.
+        if safeAnchor == 0 && (docLen == NSNotFound || docLen == 0) && !sawClientSupportForRanges {
+            if let expected = lastExpectedAnchor, expected > 0 {
+                lastExpectedAnchor = nil
+            } else {
+                lastExpectedAnchor = 0
+            }
+            if needsEngineContextSync {
+                syncEngineContextFromClient(client)
+            }
+            return
+        }
+
         let cursorMovedExternally: Bool
         if let expected = lastExpectedAnchor {
             cursorMovedExternally = (safeAnchor != expected)
