@@ -398,6 +398,8 @@ public final class VoiceWhisperServerManager: VoiceASREngine {
     private var binaryPath = ""
     private var modelPath = ""
     private var launchLanguage = "auto"
+    /// Initial prompt for every pass of the current dictation; nil sends none.
+    private(set) var prompt: String?
     private var process: Process?
     private var stdinPipe: Pipe?
     private var port: Int?
@@ -425,6 +427,10 @@ public final class VoiceWhisperServerManager: VoiceASREngine {
         self.binaryPath = binaryPath
         self.modelPath = modelPath
         self.launchLanguage = language.isEmpty ? "auto" : language
+    }
+
+    public func updateContext(_ context: VoiceContext) {
+        prompt = VoiceASRContextBuilder.recognitionContext(context, target: .whisper, language: launchLanguage)
     }
 
     public func beginSession() {
@@ -461,6 +467,15 @@ public final class VoiceWhisperServerManager: VoiceASREngine {
             scheduleIdleStopIfNeeded()
         }
 
+        let sentPrompt = prompt
+        let text = try await run(wavData: wavData, language: language, timeout: timeout, prompt: sentPrompt)
+        guard VoiceASRContextBuilder.isPromptEcho(text, prompt: sentPrompt) else { return text }
+        // Whisper read its prompt back instead of the speech: a partial is dropped, a final is redone without it.
+        guard isFinal else { return "" }
+        return try await run(wavData: wavData, language: language, timeout: timeout, prompt: nil)
+    }
+
+    private func run(wavData: Data, language: String, timeout: TimeInterval, prompt: String?) async throws -> String {
         let port = try await ensureRunning()
         try Task.checkCancellation()
         guard let url = URL(string: "http://127.0.0.1:\(port)/inference") else {
@@ -477,7 +492,7 @@ public final class VoiceWhisperServerManager: VoiceASREngine {
             wavData: wavData,
             model: "whisper",
             language: language,
-            prompt: nil
+            prompt: prompt
         )
 
         let data: Data
