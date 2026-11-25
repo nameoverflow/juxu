@@ -1135,6 +1135,27 @@ struct SwiftBridgeTests {
         }
         check(weakHUDView == nil, "Expected VoiceHUDContentView to deallocate cleanly even while CADisplayLink was active")
 
+        // 12. Verify VoiceAudioNormalizer boosts quiet speech without clipping or amplifying DC silence
+        let quietTone = (0..<1600).map { i -> Int16 in
+            Int16((sin(2.0 * Double.pi * 400.0 * Double(i) / 16000.0) * 1200.0).rounded())
+        }
+        let boostedTone = VoiceAudioNormalizer.conditionForASR(quietTone)
+        let boostedPeak = boostedTone.map { abs(Int($0)) }.max() ?? 0
+        check(boostedPeak >= 6000 && boostedPeak <= 26000, "Expected quiet speech to be boosted cleanly, got peak=\(boostedPeak)")
+
+        let dcSilence = [Int16](repeating: 40, count: 800)
+        let silenceOut = VoiceAudioNormalizer.conditionForASR(dcSilence)
+        let silencePeak = silenceOut.map { abs(Int($0)) }.max() ?? 0
+        check(silencePeak <= 60, "Expected DC silence to remain quiet, got peak=\(silencePeak)")
+
+        let loudTone = (0..<1600).map { i -> Int16 in
+            Int16((sin(2.0 * Double.pi * 400.0 * Double(i) / 16000.0) * 28000.0).rounded())
+        }
+        let loudOut = VoiceAudioNormalizer.conditionForASR(loudTone)
+        let loudPeak = loudOut.map { abs(Int($0)) }.max() ?? 0
+        check(loudPeak >= 24000 && loudPeak <= 32767, "Expected loud speech to stay unclipped, got peak=\(loudPeak)")
+        check(VoiceAudioNormalizer.conditionForASR([]).isEmpty)
+
         print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Cangjie, Bayesian typo, SettingsWindow Cmd+W & macOS Voice MVP tests passed!")
     }
 }
