@@ -3002,6 +3002,7 @@ impl JuxuEngine {
             dict: pdict,
             english: &self.english_dict,
             model: nv,
+            aux: self.aux.as_ref(),
             config: &self.config,
             user: &self.user,
             context: &self.recent_context,

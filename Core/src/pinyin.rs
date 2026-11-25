@@ -8,6 +8,7 @@ use crate::code::PackedCode;
 use crate::config::JuxuConfig;
 use crate::engine::{Candidate, CandidateBadge};
 use crate::english::{resolve_english_display, EnDictView};
+use crate::format::AuxView;
 use crate::neural::{NeuralView, RwkvState, TOK_UNK};
 use crate::personalization::Context as PersonalContext;
 use crate::pinyin_dict::{base_initial_id, PinyinDictView, SylConstraint};
@@ -133,10 +134,30 @@ pub struct PinyinDecoder<'a> {
     pub dict: &'a PinyinDictView,
     pub english: &'a EnDictView,
     pub model: Option<NeuralView<'a>>,
+    pub aux: Option<&'a AuxView>,
     pub config: &'a JuxuConfig,
     pub user: &'a UserStore,
     pub context: &'a [char],
     pub layout: &'a KeyLayout,
+}
+
+/// Light lexical bigram prior applied ONLY at the 2nd character from cold BOS (`context.is_empty()`)
+/// to counteract RWKV-7's sentence-initial function-word bias (`字太` beating `姿态`, `不列` beating `捕猎`).
+const COLD_START_BIGRAM_BETA: f32 = 0.35;
+
+#[inline]
+fn cold_start_bigram_bonus(decoder: &PinyinDecoder<'_>, prev_text: &str, ch: char) -> f32 {
+    if !decoder.context.is_empty() {
+        return 0.0;
+    }
+    let Some(aux) = decoder.aux else {
+        return 0.0;
+    };
+    let mut chars = prev_text.chars();
+    let (Some(prev_ch), None) = (chars.next(), chars.next()) else {
+        return 0.0;
+    };
+    COLD_START_BIGRAM_BETA * aux.bigram_boost(prev_ch, ch)
 }
 
 /// Decode a 2-key Xiaohe Shuangpin pair `(k1, k2)` into matching full-pinyin syllable(s) present in `dict`.
@@ -2236,13 +2257,22 @@ fn extend_pinyin_layer(
                         }
                     }
                     for (ch, lp) in top {
+                        let bi_bonus = if edge.correction == CorrectionKind::Exact
+                            && parent.boundaries.len() == 1
+                            && parent.boundaries[0].correction == CorrectionKind::Exact
+                            && parent.boundaries[0].syl_display.len() >= 2
+                        {
+                            cold_start_bigram_bonus(decoder, &parent.text, ch)
+                        } else {
+                            0.0
+                        };
                         steps.push(Step {
                             parent,
                             parent_rc,
                             text: ch.to_string(),
                             ch,
                             is_latin: false,
-                            score: parent.score + syl_score + lp,
+                            score: parent.score + syl_score + lp + bi_bonus,
                             syl_display: edge.display_syl.clone(),
                             correction: edge.correction,
                             end,
@@ -2657,7 +2687,18 @@ fn extend_pinyin_layer(
                                 raw_lp2
                             };
                             let lp2 = lm_lp2 + decoder.dict.char_emission_logp(c2, w2);
-                            let est = gp.score + syl_score1 + syl_score2 + lp1 + lp2;
+                            let bi_bonus = if decoder.context.is_empty()
+                                && gp.text.is_empty()
+                                && matches!(e1.syl, SylMatch::Full(_))
+                                && matches!(e2.syl, SylMatch::Full(_))
+                            {
+                                decoder
+                                    .aux
+                                    .map_or(0.0, |a| COLD_START_BIGRAM_BETA * a.bigram_boost(c1, c2))
+                            } else {
+                                0.0
+                            };
+                            let est = gp.score + syl_score1 + syl_score2 + lp1 + lp2 + bi_bonus;
                             if est <= beam_floor - 1.5 {
                                 continue;
                             }
@@ -2748,7 +2789,18 @@ fn extend_pinyin_layer(
                     use_personal_states,
                 );
                 let pctx2 = pctx1.push(r.c2);
-                let exact_score = r.gp.score + syl_score1 + syl_score2 + lp1 + lp2;
+                let bi_bonus = if decoder.context.is_empty()
+                    && r.gp.text.is_empty()
+                    && matches!(r.e1.syl, SylMatch::Full(_))
+                    && matches!(r.e2.syl, SylMatch::Full(_))
+                {
+                    decoder
+                        .aux
+                        .map_or(0.0, |a| COLD_START_BIGRAM_BETA * a.bigram_boost(r.c1, r.c2))
+                } else {
+                    0.0
+                };
+                let exact_score = r.gp.score + syl_score1 + syl_score2 + lp1 + lp2 + bi_bonus;
                 let mut boundaries = r.gp.boundaries.clone();
                 let mid_bytes = r.gp.text.len() + r.c1.len_utf8();
                 boundaries.push(PinyinBoundary {
