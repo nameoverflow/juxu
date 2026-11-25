@@ -2627,3 +2627,130 @@ fn real_dicts_deterministic_pinyin_hardcode_fixes() {
     assert_ne!(mask_after_ios_x & (1 << (b'i' - b'a')), 0, "'i' (xi) must be valid final for 'x'");
     assert_eq!(mask_after_ios_x & (1 << (b'v' - b'a')), 0, "'v' is invalid final for 'x' in Xiaohe");
 }
+
+#[test]
+fn real_dicts_hybrid_lexicon_heteronym_and_cold_start_short_words() {
+    use juxu_core::english::EnDictView;
+    use juxu_core::pinyin_dict::PinyinDictView;
+
+    let dir = dicts_dir();
+    if !dir.join("pinyin.pydict").exists()
+        || !dir.join("wubi_aux.wbaux").exists()
+        || !dir.join("english.endict").exists()
+    {
+        return;
+    }
+
+    let mut engine = JuxuEngine::new(JuxuConfig {
+        schema: InputSchema::Pinyin,
+        ..JuxuConfig::default()
+    });
+    engine.load_pinyin_dict(PinyinDictView::from_file(dir.join("pinyin.pydict")).unwrap());
+    engine.load_english_dict(EnDictView::open_mmap(dir.join("english.endict")).unwrap());
+    engine.set_aux(AuxView::open_mmap(dir.join("wubi_aux.wbaux")).unwrap());
+
+    let top1_with_ctx =
+        |engine: &mut JuxuEngine, schema: InputSchema, ctx: &str, keys: &str| -> String {
+            let mut scfg = JuxuConfig::default();
+            scfg.schema = schema;
+            engine.set_config(scfg);
+            engine.clear_context();
+            engine.clear_composition();
+            if !ctx.is_empty() {
+                engine.set_recent_context(ctx);
+            }
+            for (i, ch) in keys.chars().enumerate() {
+                engine.handle_key_event(0, Some(ch), false, 1_000 + i as u64 * 70);
+            }
+            engine
+                .all_candidates()
+                .first()
+                .map(|c| c.text.clone())
+                .unwrap_or_default()
+        };
+
+    // 1. Contextual heteronym disambiguation & secondary-reading rescue (Full Pinyin)
+    for (keys, expected) in [
+        ("moshi", "模式"),
+        ("meishi", "没事"),
+        ("moren", "默认"),
+        ("meiren", "没人"),
+        ("yanmo", "淹没"),
+        ("moshou", "没收"),
+        ("hangye", "行业"),
+        ("xingzou", "行走"),
+        ("changda", "长达"),
+        ("zhangda", "长大"),
+        ("zhangcheng", "章程"),
+        ("changcheng", "长城"),
+        ("zhongyao", "重要"),
+        ("zhongxin", "中心"),
+        ("chongxin", "重新"),
+        ("haishi", "还是"),
+        ("shuijiao", "睡觉"),
+        ("mudi", "目的"),
+        ("pianyi", "便宜"),
+        ("jiou", "奇偶"),
+        ("qiou", "奇偶"),
+    ] {
+        let got = top1_with_ctx(&mut engine, InputSchema::Pinyin, "", keys);
+        assert_eq!(got, expected, "Full Pinyin {keys:?} expected {expected:?}, got {got:?}");
+    }
+
+    for (keys, forbidden) in [
+        ("moshi", "没事"),
+        ("moren", "没人"),
+        ("xingye", "行业"),
+        ("hangzou", "行走"),
+        ("chongyao", "重要"),
+        ("huanshi", "还是"),
+        ("shuijue", "睡觉"),
+    ] {
+        let got = top1_with_ctx(&mut engine, InputSchema::Pinyin, "", keys);
+        assert_ne!(
+            got, forbidden,
+            "Full Pinyin {keys:?} must never be hijacked by wrong heteronym reading {forbidden:?}"
+        );
+    }
+
+    // 2. Cold-start short words vs unpolluted long-sentence continuations (Full Pinyin & Xiaohe Shuangpin)
+    for (ctx, keys, expected) in [
+        ("", "zaima", "在吗"),
+        ("", "zaimalushang", "在马路上"),
+        ("", "shihou", "时候"),
+        ("", "shihoufaxian", "事后发现"),
+        ("", "shiba", "是吧"),
+        ("", "shibasui", "十八岁"),
+        ("", "haoma", "好吗"),
+        ("", "juxu", "句序"),
+        ("达成目", "biaodeshihou", "标的时候"),
+        ("", "srf", "输入法"),
+        ("", "jsj", "计算机"),
+        ("", "rgzn", "人工智能"),
+        ("", "cbd", "差不多"),
+        ("", "zmy", "怎么样"),
+        ("", "wmdjsj", "我们的计算机"),
+    ] {
+        let got = top1_with_ctx(&mut engine, InputSchema::Pinyin, ctx, keys);
+        assert_eq!(
+            got, expected,
+            "Full Pinyin ctx={ctx:?} keys={keys:?} expected {expected:?}, got {got:?}"
+        );
+    }
+
+    for (keys, expected) in [
+        ("moui", "模式"),
+        ("morf", "默认"),
+        ("zdma", "在吗"),
+        ("uihz", "时候"),
+        ("uiba", "是吧"),
+        ("hcma", "好吗"),
+        ("hhye", "行业"),
+    ] {
+        let got = top1_with_ctx(&mut engine, InputSchema::XiaoheShuangpin, "", keys);
+        assert_eq!(
+            got, expected,
+            "Xiaohe Shuangpin {keys:?} expected {expected:?}, got {got:?}"
+        );
+    }
+}

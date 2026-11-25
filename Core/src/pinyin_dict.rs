@@ -10,13 +10,34 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
-pub const PYDICT_MAGIC: &[u8; 8] = b"PYDICT02";
-const HEADER_LEN: usize = 32;
+pub const PYDICT_MAGIC: &[u8; 8] = b"PYDICT03";
+const PYDICT_MAGIC_V2: &[u8; 8] = b"PYDICT02";
+const HEADER_LEN_V2: usize = 32;
+const HEADER_LEN: usize = 56;
 const SYL_STRIDE: usize = 12; // name[8], init_id: u8, is_digraph: u8, pad: u16
 const CHAR_BUCKET_STRIDE: usize = 8; // start: u32, count: u16, pad: u16
 const CHAR_ENTRY_STRIDE: usize = 12; // str_off: u32, weight: u32, str_len: u16, flags: u16
+const PHRASE_BUCKET_STRIDE: usize = 12; // bucket_key: u32, start: u32, count: u32
+const PHRASE_ENTRY_STRIDE: usize = 16; // packed_syls: u64, str_off: u32, log_wt_q8: u16, str_len: u16
+const HETERO_ENTRY_STRIDE: usize = 12; // pair_key: u32, s1_a: u16, s1_b: u16, s2_a: u16, s2_b: u16
 
 pub const PY_FLAG_EXT_RARE: u16 = 1 << 1;
+const HETERO_NONE: u16 = 0xFFFF;
+const HETERO_RESCUE_BIT: u16 = 0x8000;
+
+#[inline]
+fn read_u64(b: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        b[off],
+        b[off + 1],
+        b[off + 2],
+        b[off + 3],
+        b[off + 4],
+        b[off + 5],
+        b[off + 6],
+        b[off + 7],
+    ])
+}
 
 /// Map a toneless syllable (or initial string) to its base initial ID (`0..=20`).
 /// `zh/ch/sh` map to the same base ID as `z/c/s` so `srf` and `shrf` share one bucket.
@@ -67,15 +88,31 @@ pub struct PinyinEntryRef<'a> {
     pub flags: u16,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PinyinPhraseRef<'a> {
+    pub text: &'a str,
+    pub log_wt: f32,
+    pub syl_ids: [u16; 4],
+    pub syl_len: u8,
+}
+
 pub struct PinyinDictBuildInput {
     /// (syllable, text, weight, flags)
     pub chars: Vec<(String, String, u32, u16)>,
 }
 
 pub fn serialize_pydict(input: PinyinDictBuildInput) -> Vec<u8> {
+    serialize_pydict_with_phrases(input.chars, Vec::new(), Vec::new())
+}
+
+pub fn serialize_pydict_with_phrases(
+    chars_in: Vec<(String, String, u32, u16)>,
+    phrases_in: Vec<(String, Vec<String>, u32)>,
+    heteros_in: Vec<(char, char, String, String)>,
+) -> Vec<u8> {
     // 1. Collect all unique syllables and assign sorted IDs
     let mut syl_set = std::collections::BTreeSet::<String>::new();
-    for (syl, _, _, _) in &input.chars {
+    for (syl, _, _, _) in &chars_in {
         if !syl.is_empty() && syl.len() <= 7 {
             syl_set.insert(syl.clone());
         }
@@ -104,7 +141,7 @@ pub fn serialize_pydict(input: PinyinDictBuildInput) -> Vec<u8> {
 
     // 3. Group chars by syl_id
     let mut chars_by_syl: Vec<Vec<(u32, u16, u32, u16)>> = vec![Vec::new(); syllables.len()];
-    for (syl, text, weight, flags) in &input.chars {
+    for (syl, text, weight, flags) in &chars_in {
         if let Some(&sid) = syl_to_id.get(syl.as_str()) {
             let (off, len) = intern(text);
             chars_by_syl[sid as usize].push((off, len, *weight, *flags));
@@ -114,8 +151,6 @@ pub fn serialize_pydict(input: PinyinDictBuildInput) -> Vec<u8> {
     let mut char_entries_buf = Vec::new();
     let mut char_entry_count = 0u32;
     for list in &mut chars_by_syl {
-        // First deduplicate identical `(str_off, str_len)` within each syllable bucket,
-        // keeping the highest weight and clearing `PY_FLAG_EXT_RARE` if any source marks it standard.
         list.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         list.dedup_by(|dup, keep| {
             if dup.0 == keep.0 && dup.1 == keep.1 {
@@ -126,7 +161,6 @@ pub fn serialize_pydict(input: PinyinDictBuildInput) -> Vec<u8> {
                 false
             }
         });
-        // Sort by (ext_rare ASC, weight DESC, str_off ASC)
         list.sort_by(|a, b| {
             let ra = (a.3 & PY_FLAG_EXT_RARE) != 0;
             let rb = (b.3 & PY_FLAG_EXT_RARE) != 0;
@@ -148,7 +182,134 @@ pub fn serialize_pydict(input: PinyinDictBuildInput) -> Vec<u8> {
         char_buckets_buf.extend_from_slice(&0u16.to_le_bytes());
     }
 
-    // 4. Serialize syllable table
+    // 4. Serialize compact core phrases (`2..=4` syllables) grouped by `(syl_len, init_key)`
+    let mut phrases_by_bucket: std::collections::BTreeMap<u32, Vec<(u64, u32, u16, u16, u32)>> =
+        std::collections::BTreeMap::new();
+    for (text, syls, wt) in &phrases_in {
+        let slen = syls.len();
+        if !(2..=4).contains(&slen) || text.chars().count() != slen {
+            continue;
+        }
+        let mut sids = [0u16; 4];
+        let mut inits = [0u8; 4];
+        let mut ok = true;
+        for (i, s) in syls.iter().enumerate() {
+            if let Some(&sid) = syl_to_id.get(s.as_str()) {
+                sids[i] = sid;
+                inits[i] = base_initial_id(s);
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let Some(init_key) = pack_init_key(&inits[..slen]) else {
+            continue;
+        };
+        let bucket_key = ((slen as u32) << 24) | init_key;
+        let packed_syls = (sids[0] as u64)
+            | ((sids[1] as u64) << 12)
+            | ((sids[2] as u64) << 24)
+            | ((sids[3] as u64) << 36)
+            | ((slen as u64) << 48);
+        let (off, len) = intern(text);
+        let log_wt_q8 = (((*wt as f32 + 1.0).ln() * 256.0).round().clamp(0.0, 65535.0)) as u16;
+        phrases_by_bucket
+            .entry(bucket_key)
+            .or_default()
+            .push((packed_syls, off, log_wt_q8, len, *wt));
+    }
+
+    let mut phrase_buckets_buf = Vec::with_capacity(phrases_by_bucket.len() * PHRASE_BUCKET_STRIDE);
+    let mut phrase_entries_buf = Vec::new();
+    let mut phrase_bucket_count = 0u32;
+    let mut phrase_entry_count = 0u32;
+    for (bkey, mut list) in phrases_by_bucket {
+        list.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| b.4.cmp(&a.4))
+        });
+        list.dedup_by(|dup, keep| {
+            if dup.1 == keep.1 && dup.0 == keep.0 {
+                if dup.4 > keep.4 {
+                    keep.4 = dup.4;
+                    keep.2 = dup.2;
+                }
+                true
+            } else {
+                false
+            }
+        });
+        list.sort_by(|a, b| b.4.cmp(&a.4).then_with(|| a.1.cmp(&b.1)));
+        let start = phrase_entry_count;
+        let count = list.len() as u32;
+        for (packed_syls, off, log_wt_q8, len, _) in list {
+            phrase_entries_buf.extend_from_slice(&packed_syls.to_le_bytes());
+            phrase_entries_buf.extend_from_slice(&off.to_le_bytes());
+            phrase_entries_buf.extend_from_slice(&log_wt_q8.to_le_bytes());
+            phrase_entries_buf.extend_from_slice(&len.to_le_bytes());
+            phrase_entry_count += 1;
+        }
+        phrase_buckets_buf.extend_from_slice(&bkey.to_le_bytes());
+        phrase_buckets_buf.extend_from_slice(&start.to_le_bytes());
+        phrase_buckets_buf.extend_from_slice(&count.to_le_bytes());
+        phrase_bucket_count += 1;
+    }
+
+    // 5. Serialize heteronym pronunciation-pair table (`pair_key = (c1_u16 << 16) | c2_u16`)
+    let parse_hetero_spec = |spec: &str| -> (u16, u16) {
+        let trimmed = spec.trim();
+        if trimmed.is_empty() || trimmed == "*" {
+            return (HETERO_NONE, HETERO_NONE);
+        }
+        let mut out = [HETERO_NONE; 2];
+        for (idx, raw_part) in trimmed.split(',').take(2).enumerate() {
+            let (rescue, s_name) = if let Some(rest) = raw_part.strip_prefix('+') {
+                (true, rest)
+            } else {
+                (false, raw_part)
+            };
+            if let Some(&sid) = syl_to_id.get(s_name) {
+                out[idx] = if idx == 0 && rescue {
+                    sid | HETERO_RESCUE_BIT
+                } else {
+                    sid
+                };
+            }
+        }
+        (out[0], out[1])
+    };
+
+    let mut hetero_list: Vec<(u32, u16, u16, u16, u16)> = Vec::with_capacity(heteros_in.len());
+    for (c1, c2, sp1, sp2) in &heteros_in {
+        let u1 = *c1 as u32;
+        let u2 = *c2 as u32;
+        if u1 > 0xFFFF || u2 > 0xFFFF {
+            continue;
+        }
+        let (s1_a, s1_b) = parse_hetero_spec(sp1);
+        let (s2_a, s2_b) = parse_hetero_spec(sp2);
+        if s1_a == HETERO_NONE && s2_a == HETERO_NONE {
+            continue;
+        }
+        hetero_list.push(((u1 << 16) | u2, s1_a, s1_b, s2_a, s2_b));
+    }
+    hetero_list.sort_by_key(|x| x.0);
+    hetero_list.dedup_by_key(|x| x.0);
+    let hetero_count = hetero_list.len() as u32;
+    let mut hetero_entries_buf = Vec::with_capacity(hetero_list.len() * HETERO_ENTRY_STRIDE);
+    for (pkey, s1_a, s1_b, s2_a, s2_b) in hetero_list {
+        hetero_entries_buf.extend_from_slice(&pkey.to_le_bytes());
+        hetero_entries_buf.extend_from_slice(&s1_a.to_le_bytes());
+        hetero_entries_buf.extend_from_slice(&s1_b.to_le_bytes());
+        hetero_entries_buf.extend_from_slice(&s2_a.to_le_bytes());
+        hetero_entries_buf.extend_from_slice(&s2_b.to_le_bytes());
+    }
+
+    // 6. Serialize syllable table
     let mut syl_table_buf = Vec::with_capacity(syllables.len() * SYL_STRIDE);
     for s in &syllables {
         let mut name = [0u8; 8];
@@ -163,10 +324,14 @@ pub fn serialize_pydict(input: PinyinDictBuildInput) -> Vec<u8> {
         syl_table_buf.extend_from_slice(&0u16.to_le_bytes());
     }
 
+    // Align 8-byte `phrase_entries_buf` cleanly (all preceding sections are multiples of 4; pad if needed)
     let syl_table_off = HEADER_LEN as u32;
     let char_buckets_off = syl_table_off + syl_table_buf.len() as u32;
     let char_entries_off = char_buckets_off + char_buckets_buf.len() as u32;
-    let string_pool_off = char_entries_off + char_entries_buf.len() as u32;
+    let phrase_buckets_off = char_entries_off + char_entries_buf.len() as u32;
+    let phrase_entries_off = phrase_buckets_off + phrase_buckets_buf.len() as u32;
+    let hetero_entries_off = phrase_entries_off + phrase_entries_buf.len() as u32;
+    let string_pool_off = hetero_entries_off + hetero_entries_buf.len() as u32;
 
     let mut out = Vec::with_capacity(string_pool_off as usize + string_pool.len());
     out.extend_from_slice(PYDICT_MAGIC);
@@ -176,11 +341,20 @@ pub fn serialize_pydict(input: PinyinDictBuildInput) -> Vec<u8> {
     out.extend_from_slice(&char_buckets_off.to_le_bytes());
     out.extend_from_slice(&char_entries_off.to_le_bytes());
     out.extend_from_slice(&string_pool_off.to_le_bytes());
+    out.extend_from_slice(&phrase_bucket_count.to_le_bytes());
+    out.extend_from_slice(&phrase_entry_count.to_le_bytes());
+    out.extend_from_slice(&phrase_buckets_off.to_le_bytes());
+    out.extend_from_slice(&phrase_entries_off.to_le_bytes());
+    out.extend_from_slice(&hetero_count.to_le_bytes());
+    out.extend_from_slice(&hetero_entries_off.to_le_bytes());
     debug_assert_eq!(out.len(), HEADER_LEN);
 
     out.extend_from_slice(&syl_table_buf);
     out.extend_from_slice(&char_buckets_buf);
     out.extend_from_slice(&char_entries_buf);
+    out.extend_from_slice(&phrase_buckets_buf);
+    out.extend_from_slice(&phrase_entries_buf);
+    out.extend_from_slice(&hetero_entries_buf);
     out.extend_from_slice(&string_pool);
     out
 }
@@ -193,6 +367,12 @@ pub struct PinyinDictView {
     char_buckets_off: usize,
     char_entries_off: usize,
     string_pool_off: usize,
+    phrase_bucket_count: usize,
+    phrase_entry_count: usize,
+    phrase_buckets_off: usize,
+    phrase_entries_off: usize,
+    hetero_count: usize,
+    hetero_entries_off: usize,
     /// Compact sorted reverse index `(unicode_cp, syl_id)` for O(log N) char -> syllables lookup.
     char_syl_index: Box<[(u32, u16)]>,
     /// Sorted `(unicode_cp, max_weight)` table across syllables to suppress rare literary readings without HashMap heap bloat.
@@ -213,27 +393,53 @@ impl PinyinDictView {
 
     fn from_source(buf: ByteSource) -> io::Result<Self> {
         let b = buf.as_slice();
-        if b.len() < HEADER_LEN || &b[0..8] != PYDICT_MAGIC {
+        let is_v3 = if b.len() >= HEADER_LEN && &b[0..8] == PYDICT_MAGIC {
+            true
+        } else if b.len() >= HEADER_LEN_V2 && &b[0..8] == PYDICT_MAGIC_V2 {
+            false
+        } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid PYDICT02 magic",
+                "invalid PYDICT02/PYDICT03 magic",
             ));
-        }
+        };
         let syl_count = read_u32(b, 8) as usize;
         let char_entry_count = read_u32(b, 12) as usize;
         let syl_table_off = read_u32(b, 16) as usize;
         let char_buckets_off = read_u32(b, 20) as usize;
         let char_entries_off = read_u32(b, 24) as usize;
         let string_pool_off = read_u32(b, 28) as usize;
+        let (
+            phrase_bucket_count,
+            phrase_entry_count,
+            phrase_buckets_off,
+            phrase_entries_off,
+            hetero_count,
+            hetero_entries_off,
+        ) = if is_v3 {
+            (
+                read_u32(b, 32) as usize,
+                read_u32(b, 36) as usize,
+                read_u32(b, 40) as usize,
+                read_u32(b, 44) as usize,
+                read_u32(b, 48) as usize,
+                read_u32(b, 52) as usize,
+            )
+        } else {
+            (0, 0, 0, 0, 0, 0)
+        };
 
         if syl_table_off + syl_count * SYL_STRIDE > b.len()
             || char_buckets_off + syl_count * CHAR_BUCKET_STRIDE > b.len()
             || char_entries_off + char_entry_count * CHAR_ENTRY_STRIDE > b.len()
+            || phrase_buckets_off + phrase_bucket_count * PHRASE_BUCKET_STRIDE > b.len()
+            || phrase_entries_off + phrase_entry_count * PHRASE_ENTRY_STRIDE > b.len()
+            || hetero_entries_off + hetero_count * HETERO_ENTRY_STRIDE > b.len()
             || string_pool_off > b.len()
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "truncated PYDICT02",
+                "truncated PYDICT02/PYDICT03",
             ));
         }
 
@@ -304,6 +510,12 @@ impl PinyinDictView {
             char_buckets_off,
             char_entries_off,
             string_pool_off,
+            phrase_bucket_count,
+            phrase_entry_count,
+            phrase_buckets_off,
+            phrase_entries_off,
+            hetero_count,
+            hetero_entries_off,
             char_syl_index,
             char_max_weights,
             t9_index,
@@ -549,6 +761,270 @@ impl PinyinDictView {
             }
         }
         mask
+    }
+
+    #[inline]
+    pub fn has_phrases(&self) -> bool {
+        self.phrase_bucket_count > 0
+    }
+
+    fn find_phrase_bucket(&self, bucket_key: u32) -> Option<(usize, usize)> {
+        if self.phrase_bucket_count == 0 {
+            return None;
+        }
+        let b = self.buf.as_slice();
+        let mut lo = 0usize;
+        let mut hi = self.phrase_bucket_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let off = self.phrase_buckets_off + mid * PHRASE_BUCKET_STRIDE;
+            let k = read_u32(b, off);
+            match k.cmp(&bucket_key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let start = read_u32(b, off + 4) as usize;
+                    let count = read_u32(b, off + 8) as usize;
+                    return Some((start, count));
+                }
+            }
+        }
+        None
+    }
+
+    /// Look up compact core phrases (`2..=4` syllables) matching `constraints` in descending weight order.
+    pub fn lookup_phrases<'a>(
+        &'a self,
+        constraints: &[SylConstraint<'_>],
+        limit: usize,
+    ) -> Vec<PinyinPhraseRef<'a>> {
+        let slen = constraints.len();
+        if !(2..=4).contains(&slen) || limit == 0 || self.phrase_bucket_count == 0 {
+            return Vec::new();
+        }
+        let mut inits = [0u8; 4];
+        for (i, c) in constraints.iter().enumerate() {
+            inits[i] = match *c {
+                SylConstraint::Full(sid) => self.syllable_init(sid).0,
+                SylConstraint::Initial(id, _) => id,
+                SylConstraint::Prefix(pref) => base_initial_id(pref),
+            };
+        }
+        let Some(init_key) = pack_init_key(&inits[..slen]) else {
+            return Vec::new();
+        };
+        let bucket_key = ((slen as u32) << 24) | init_key;
+        let Some((start, count)) = self.find_phrase_bucket(bucket_key) else {
+            return Vec::new();
+        };
+        let b = self.buf.as_slice();
+        let mut out = Vec::with_capacity(limit.min(16));
+        for i in 0..count {
+            if start + i >= self.phrase_entry_count {
+                break;
+            }
+            let eoff = self.phrase_entries_off + (start + i) * PHRASE_ENTRY_STRIDE;
+            let packed = read_u64(b, eoff);
+            let sids = [
+                (packed & 0xFFF) as u16,
+                ((packed >> 12) & 0xFFF) as u16,
+                ((packed >> 24) & 0xFFF) as u16,
+                ((packed >> 36) & 0xFFF) as u16,
+            ];
+            let mut matched = true;
+            for (ci, cons) in constraints.iter().enumerate() {
+                let sid = sids[ci];
+                let ok = match *cons {
+                    SylConstraint::Full(req_sid) => sid == req_sid,
+                    SylConstraint::Initial(req_id, req_dg) => {
+                        let (si, dg) = self.syllable_init(sid);
+                        si == req_id && (!req_dg || dg)
+                    }
+                    SylConstraint::Prefix(pref) => self.syllable_str(sid).starts_with(pref),
+                };
+                if !ok {
+                    matched = false;
+                    break;
+                }
+            }
+            if !matched {
+                continue;
+            }
+            let str_off = read_u32(b, eoff + 8) as usize;
+            let log_wt_q8 = read_u16(b, eoff + 12);
+            let str_len = read_u16(b, eoff + 14) as usize;
+            let text_start = self.string_pool_off + str_off;
+            if text_start + str_len <= b.len() {
+                if let Ok(text) = std::str::from_utf8(&b[text_start..text_start + str_len]) {
+                    out.push(PinyinPhraseRef {
+                        text,
+                        log_wt: (log_wt_q8 as f32) / 256.0,
+                        syl_ids: sids,
+                        syl_len: slen as u8,
+                    });
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Check if `(text, constraints)` matches a syllable-verified entry in the compact core phrase table,
+    /// returning its `ln(weight + 1)` if attested.
+    pub fn lookup_matching_phrase_log_wt(
+        &self,
+        text: &str,
+        constraints: &[SylConstraint<'_>],
+    ) -> Option<f32> {
+        let slen = constraints.len();
+        if !(2..=4).contains(&slen) || self.phrase_bucket_count == 0 {
+            return None;
+        }
+        let mut inits = [0u8; 4];
+        for (i, c) in constraints.iter().enumerate() {
+            inits[i] = match *c {
+                SylConstraint::Full(sid) => self.syllable_init(sid).0,
+                SylConstraint::Initial(id, _) => id,
+                SylConstraint::Prefix(pref) => base_initial_id(pref),
+            };
+        }
+        let init_key = pack_init_key(&inits[..slen])?;
+        let bucket_key = ((slen as u32) << 24) | init_key;
+        let (start, count) = self.find_phrase_bucket(bucket_key)?;
+        let b = self.buf.as_slice();
+        let target_bytes = text.as_bytes();
+        for i in 0..count {
+            if start + i >= self.phrase_entry_count {
+                break;
+            }
+            let eoff = self.phrase_entries_off + (start + i) * PHRASE_ENTRY_STRIDE;
+            let str_len = read_u16(b, eoff + 14) as usize;
+            if str_len != target_bytes.len() {
+                continue;
+            }
+            let str_off = read_u32(b, eoff + 8) as usize;
+            let text_start = self.string_pool_off + str_off;
+            if text_start + str_len > b.len()
+                || &b[text_start..text_start + str_len] != target_bytes
+            {
+                continue;
+            }
+            let packed = read_u64(b, eoff);
+            let sids = [
+                (packed & 0xFFF) as u16,
+                ((packed >> 12) & 0xFFF) as u16,
+                ((packed >> 24) & 0xFFF) as u16,
+                ((packed >> 36) & 0xFFF) as u16,
+            ];
+            let matched = constraints.iter().enumerate().all(|(ci, cons)| {
+                let sid = sids[ci];
+                match *cons {
+                    SylConstraint::Full(req_sid) => sid == req_sid,
+                    SylConstraint::Initial(req_id, req_dg) => {
+                        let (si, dg) = self.syllable_init(sid);
+                        si == req_id && (!req_dg || dg)
+                    }
+                    SylConstraint::Prefix(pref) => self.syllable_str(sid).starts_with(pref),
+                }
+            });
+            if matched {
+                let log_wt_q8 = read_u16(b, eoff + 12);
+                return Some((log_wt_q8 as f32) / 256.0);
+            }
+        }
+        None
+    }
+
+    fn find_hetero_entry(&self, c1: char, c2: char) -> Option<(u16, u16, u16, u16)> {
+        if self.hetero_count == 0 {
+            return None;
+        }
+        let u1 = c1 as u32;
+        let u2 = c2 as u32;
+        if u1 > 0xFFFF || u2 > 0xFFFF {
+            return None;
+        }
+        let target = (u1 << 16) | u2;
+        let b = self.buf.as_slice();
+        let mut lo = 0usize;
+        let mut hi = self.hetero_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let off = self.hetero_entries_off + mid * HETERO_ENTRY_STRIDE;
+            let k = read_u32(b, off);
+            match k.cmp(&target) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    return Some((
+                        read_u16(b, off + 4),
+                        read_u16(b, off + 6),
+                        read_u16(b, off + 8),
+                        read_u16(b, off + 10),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// True if `(c1, c2)` specifically validates `sid2` for `c2` (so `c2` in `(c1, c2, c3)` won't be
+    /// falsely penalized by a cross-word `(c2, c3)` pair such as `淹没人`).
+    #[inline]
+    pub fn heteronym_c2_licensed(&self, c1: char, c2: char, sid2: u16) -> bool {
+        let Some((_, _, s2_a, s2_b)) = self.find_hetero_entry(c1, c2) else {
+            return false;
+        };
+        if s2_a == HETERO_NONE {
+            return false;
+        }
+        let a2 = s2_a & !HETERO_RESCUE_BIT;
+        sid2 == a2 || (s2_b != HETERO_NONE && sid2 == s2_b)
+    }
+
+    /// Contextual pronunciation log-probability adjustment for transitioning `(c1, sid1_opt) -> (c2, sid2)`.
+    /// Penalizes wrong heteronym readings (`moshi -> 没事`, `xingye -> 行业`, `chongyao -> 重要`, `shuijue -> 睡觉`)
+    /// while refunding context-free secondary-reading penalties on valid words (`yanmo -> 淹没`, `mudi -> 目的`).
+    #[inline]
+    pub fn heteronym_pair_delta(
+        &self,
+        c1: char,
+        sid1_opt: Option<u16>,
+        c1_already_licensed: bool,
+        c2: char,
+        sid2: u16,
+        c2_char_wt: u32,
+    ) -> f32 {
+        let Some((s1_a, s1_b, s2_a, s2_b)) = self.find_hetero_entry(c1, c2) else {
+            return 0.0;
+        };
+        let mut delta = 0.0f32;
+        if s1_a != HETERO_NONE {
+            if let Some(sid1) = sid1_opt {
+                let a1 = s1_a & !HETERO_RESCUE_BIT;
+                let ok1 = sid1 == a1 || (s1_b != HETERO_NONE && sid1 == s1_b);
+                if !ok1 {
+                    if !c1_already_licensed {
+                        delta -= 8.5;
+                    }
+                } else if (s1_a & HETERO_RESCUE_BIT) != 0 && sid1 == a1 {
+                    delta += 2.2;
+                }
+            }
+        }
+        if s2_a != HETERO_NONE {
+            let a2 = s2_a & !HETERO_RESCUE_BIT;
+            let ok2 = sid2 == a2 || (s2_b != HETERO_NONE && sid2 == s2_b);
+            if !ok2 {
+                delta -= 8.5;
+            } else if (s2_a & HETERO_RESCUE_BIT) != 0 && sid2 == a2 {
+                let refund = (-self.char_emission_logp(c2, c2_char_wt)).clamp(0.0, 2.5);
+                delta += refund;
+            }
+        }
+        delta
     }
 }
 

@@ -8,7 +8,9 @@ use juxu_core::format::{
     pack_trigram, serialize_wbaux, serialize_wbdict, AuxBuildInput, AuxView, CharMeta,
     DictBuildInput, ENTRY_FLAG_EXT_RARE, ENTRY_FLAG_SINGLE_CHAR, ENTRY_FLAG_SYMBOL,
 };
-use juxu_core::pinyin_dict::{serialize_pydict, PinyinDictBuildInput, PY_FLAG_EXT_RARE};
+use juxu_core::pinyin_dict::{
+    serialize_pydict_with_phrases, PY_FLAG_EXT_RARE,
+};
 
 fn strip_pinyin_tone(toned: &str) -> (String, Option<String>) {
     let mut primary = String::with_capacity(toned.len());
@@ -562,7 +564,7 @@ fn main() {
                 let out_path = out_dir.join("pinyin.pydict");
                 fs::write(&out_path, &py_blob).expect("failed to write pinyin.pydict");
                 println!(
-                    "Built char-only pinyin.pydict ({:.2} KB)",
+                    "Built PYDICT03 pinyin.pydict ({:.2} KB)",
                     py_blob.len() as f64 / 1024.0
                 );
                 return;
@@ -1208,7 +1210,55 @@ fn build_pinyin_dict(ice_dir: &Path, tghz_set: &HashSet<u32>) -> Vec<u8> {
         }
     }
 
-    serialize_pydict(PinyinDictBuildInput { chars })
+    let mut phrases: Vec<(String, Vec<String>, u32)> = Vec::new();
+    if let Ok(content) = fs::read_to_string(ice_dir.join("core_phrases.tsv")) {
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            let text = parts[0].trim();
+            let syls: Vec<String> = parts[1]
+                .split_whitespace()
+                .map(|s| s.to_owned())
+                .collect();
+            let Ok(wt) = parts[2].trim().parse::<u32>() else {
+                continue;
+            };
+            if (2..=4).contains(&syls.len()) && text.chars().count() == syls.len() {
+                phrases.push((text.to_owned(), syls, wt));
+            }
+        }
+    }
+
+    let mut heteros: Vec<(char, char, String, String)> = Vec::new();
+    if let Ok(content) = fs::read_to_string(ice_dir.join("heteronym_pairs.tsv")) {
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            let mut chs = parts[0].trim().chars();
+            if let (Some(c1), Some(c2), None) = (chs.next(), chs.next(), chs.next()) {
+                heteros.push((
+                    c1,
+                    c2,
+                    parts[1].trim().to_owned(),
+                    parts[2].trim().to_owned(),
+                ));
+            }
+        }
+    }
+
+    serialize_pydict_with_phrases(chars, phrases, heteros)
 }
 
 fn build_english_dict(ice_dir: &Path) -> (Vec<u8>, usize) {

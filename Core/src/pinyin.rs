@@ -53,6 +53,7 @@ pub struct PinyinBoundary {
     pub keys: usize,
     pub text_bytes: usize,
     pub syl_display: String,
+    pub syl_id: Option<u16>,
     pub correction: CorrectionKind,
 }
 
@@ -2013,17 +2014,26 @@ impl PinyinStream {
 
         // Ephemeral terminal overlay if `lattice[n]` has trailing `SylMatch::Prefix` edges:
         // temporarily swap `self.layers[n]` to build candidates & Top-1 prior, then restore clean `self.layers[n]`!
+        let mat_limit = if decoder.context.is_empty() && n <= 16 {
+            8
+        } else {
+            1
+        };
         let has_terminal_prefix = lattice[n]
             .iter()
             .any(|e| matches!(e.syl, SylMatch::Prefix(_)));
         if has_terminal_prefix {
             let mut terminal_n =
                 extend_pinyin_layer(n, &lattice, &mut self.layers[..n], decoder, true);
-            materialize_paths_batch(&mut terminal_n, decoder.model.as_ref(), 1);
+            materialize_paths_batch(&mut terminal_n, decoder.model.as_ref(), mat_limit);
             let saved_n = std::mem::replace(&mut self.layers[n], terminal_n);
             if saved_n.is_empty() {
                 if let Some(best_end) = (1..=n).rev().find(|&pos| !self.layers[pos].is_empty()) {
-                    materialize_paths_batch(&mut self.layers[best_end], decoder.model.as_ref(), 1);
+                    materialize_paths_batch(
+                        &mut self.layers[best_end],
+                        decoder.model.as_ref(),
+                        mat_limit,
+                    );
                 }
             }
             let res = build_pinyin_candidates(n, raw_code, &lattice, &self.layers, decoder);
@@ -2032,7 +2042,11 @@ impl PinyinStream {
         }
 
         if let Some(best_end) = (1..=n).rev().find(|&pos| !self.layers[pos].is_empty()) {
-            materialize_paths_batch(&mut self.layers[best_end], decoder.model.as_ref(), 1);
+            materialize_paths_batch(
+                &mut self.layers[best_end],
+                decoder.model.as_ref(),
+                mat_limit,
+            );
         }
 
         build_pinyin_candidates(n, raw_code, &lattice, &self.layers, decoder)
@@ -2114,6 +2128,46 @@ fn score_char_pure_neural(
     lm_lp + dict.char_emission_logp(ch, dict_weight)
 }
 
+/// Extract `(prev_char, prev_exact_syl_id, prev_char_licensed)` from `parent` (or `decoder.context`)
+/// for contextual heteronym pair disambiguation (`heteronym_pair_delta`).
+#[inline]
+fn parent_last_char_and_sid(
+    parent: &PinyinPath,
+    decoder: &PinyinDecoder<'_>,
+) -> Option<(char, Option<u16>, bool)> {
+    if let Some(b_last) = parent.boundaries.last() {
+        let c1 = parent.text.chars().next_back()?;
+        if c1.is_ascii() {
+            return None;
+        }
+        let sid1 = if b_last.correction == CorrectionKind::Exact {
+            b_last.syl_id
+        } else {
+            None
+        };
+        let c0 = if parent.boundaries.len() >= 2 {
+            parent.text.chars().rev().nth(1)
+        } else {
+            decoder.context.last().copied()
+        };
+        let c1_lic = match (c0, sid1) {
+            (Some(c0_ch), Some(s1)) if !c0_ch.is_ascii() => {
+                decoder.dict.heteronym_c2_licensed(c0_ch, c1, s1)
+            }
+            _ => false,
+        };
+        Some((c1, sid1, c1_lic))
+    } else if let Some(&c1) = decoder.context.last() {
+        if c1.is_ascii() {
+            None
+        } else {
+            Some((c1, None, true))
+        }
+    } else {
+        None
+    }
+}
+
 fn extend_pinyin_layer(
     end: usize,
     lattice: &[Vec<LatticeEdge>],
@@ -2173,7 +2227,9 @@ fn extend_pinyin_layer(
                     .take(3)
                 {
                     add_req(e1.start, 8);
-                    if decoder.user.has_pinyin_phrases() && e1.start > 0 {
+                    if (decoder.user.has_pinyin_phrases() || decoder.dict.has_phrases())
+                        && e1.start > 0
+                    {
                         for e0 in lattice[e1.start]
                             .iter()
                             .filter(|e| {
@@ -2220,14 +2276,14 @@ fn extend_pinyin_layer(
         is_latin: bool,
         score: f32,
         syl_display: String,
+        syl_id: Option<u16>,
         correction: CorrectionKind,
         end: usize,
     }
 
     let mut steps: Vec<Step<'_>> = Vec::with_capacity(128);
 
-    // Pure character-level single-syllable expansion:
-    // ZERO multi-syllable phrase chains, ZERO dictionary phrase lookup, ZERO phrase/user-phrase bonuses.
+    // Character-level single-syllable expansion with contextual heteronym pronunciation constraints:
     for edge in &lattice[end] {
         if !include_prefix_edges && matches!(edge.syl, SylMatch::Prefix(_)) {
             continue;
@@ -2278,6 +2334,7 @@ fn extend_pinyin_layer(
                         is_latin: true,
                         score: parent.score + shared_bias + neural_est,
                         syl_display: edge.display_syl.clone(),
+                        syl_id: None,
                         correction: edge.correction,
                         end,
                     });
@@ -2298,13 +2355,18 @@ fn extend_pinyin_layer(
                         continue;
                     };
                     let parent_st = parent_rc.as_ref();
-                    let mut top: Vec<(char, f32)> = Vec::with_capacity(per_parent_keep + 1);
+                    let prev_hetero = if edge.correction == CorrectionKind::Exact {
+                        parent_last_char_and_sid(parent, decoder)
+                    } else {
+                        None
+                    };
+                    let mut top: Vec<(char, f32, bool)> = Vec::with_capacity(per_parent_keep + 1);
                     let mut floor = f32::NEG_INFINITY;
                     for e in &chars[..scan_limit] {
                         let Some(ch) = e.text.chars().next() else {
                             continue;
                         };
-                        let lp = if let Some(nv) = &decoder.model {
+                        let base_lp = if let Some(nv) = &decoder.model {
                             score_char_pure_neural(
                                 nv,
                                 parent_st,
@@ -2324,12 +2386,20 @@ fn extend_pinyin_layer(
                                     0.0
                                 }
                         };
+                        let hetero_adj = if let Some((c1, sid1_opt, c1_lic)) = prev_hetero {
+                            decoder
+                                .dict
+                                .heteronym_pair_delta(c1, sid1_opt, c1_lic, ch, *sid, e.weight)
+                        } else {
+                            0.0
+                        };
+                        let lp = base_lp + hetero_adj;
                         if top.len() == per_parent_keep && lp <= floor {
                             continue;
                         }
                         let pos = top.partition_point(|x| x.1 > lp);
                         if pos < per_parent_keep {
-                            top.insert(pos, (ch, lp));
+                            top.insert(pos, (ch, lp, hetero_adj < -1.0));
                             if top.len() > per_parent_keep {
                                 top.pop();
                             }
@@ -2338,12 +2408,13 @@ fn extend_pinyin_layer(
                             }
                         }
                     }
-                    for (ch, lp) in top {
-                        let bi_bonus = if matches!(edge.syl, SylMatch::Full(_))
+                    for (ch, lp, hetero_penalized) in top {
+                        let bi_bonus = if !hetero_penalized
+                            && matches!(edge.syl, SylMatch::Full(_))
                             && edge.correction == CorrectionKind::Exact
                             && parent.boundaries.len() == 1
                             && parent.boundaries[0].correction == CorrectionKind::Exact
-                            && parent.boundaries[0].syl_display.len() >= 2
+                            && parent.boundaries[0].syl_id.is_some()
                         {
                             cold_start_bigram_bonus(decoder, &parent.text, ch)
                         } else {
@@ -2357,6 +2428,7 @@ fn extend_pinyin_layer(
                             is_latin: false,
                             score: parent.score + syl_score + lp + bi_bonus,
                             syl_display: edge.display_syl.clone(),
+                            syl_id: Some(*sid),
                             correction: edge.correction,
                             end,
                         });
@@ -2434,6 +2506,7 @@ fn extend_pinyin_layer(
                             is_latin: false,
                             score: parent.score + syl_score + lp,
                             syl_display: edge.display_syl.clone(),
+                            syl_id: None,
                             correction: edge.correction,
                             end,
                         });
@@ -2518,6 +2591,7 @@ fn extend_pinyin_layer(
                             is_latin: false,
                             score: parent.score + syl_score + lp,
                             syl_display: edge.display_syl.clone(),
+                            syl_id: None,
                             correction: edge.correction,
                             end,
                         });
@@ -2576,6 +2650,7 @@ fn extend_pinyin_layer(
             keys: step.end,
             text_bytes: full_text.len(),
             syl_display: step.syl_display,
+            syl_id: step.syl_id,
             correction: step.correction,
         });
         next_paths.push(PinyinPath {
@@ -2752,10 +2827,21 @@ fn extend_pinyin_layer(
                     if gp_st.mat_state.is_empty() {
                         continue;
                     }
+                    let gp_hetero = parent_last_char_and_sid(gp, decoder);
+                    let e1_sid = if let SylMatch::Full(s1) = e1.syl {
+                        Some(s1)
+                    } else {
+                        None
+                    };
+                    let e2_sid = if let SylMatch::Full(s2) = e2.syl {
+                        Some(s2)
+                    } else {
+                        None
+                    };
                     let mut top_c1: Vec<(char, u32, f32)> = Vec::with_capacity(c1_keep + 1);
                     let mut c1_floor = f32::NEG_INFINITY;
                     for &(ch1, w1) in &c1_raw {
-                        let lp1 = score_char_pure_neural(
+                        let mut lp1 = score_char_pure_neural(
                             nv,
                             gp_st,
                             ch1,
@@ -2766,6 +2852,11 @@ fn extend_pinyin_layer(
                             personalize,
                             use_personal_states,
                         );
+                        if let (Some((c0, sid0_opt, c0_lic)), Some(s1)) = (gp_hetero, e1_sid) {
+                            lp1 += decoder
+                                .dict
+                                .heteronym_pair_delta(c0, sid0_opt, c0_lic, ch1, s1, w1);
+                        }
                         if top_c1.len() == c1_keep && lp1 <= c1_floor {
                             continue;
                         }
@@ -2784,6 +2875,12 @@ fn extend_pinyin_layer(
                     for &(c1, w1, lp1) in &top_c1 {
                         let p2_sc = nv.prepare_mtp2_vec(gp_st, c1, &mut p2_q);
                         let ctx_after_c1 = gp.personal_context.push(c1);
+                        let c1_lic = match (gp_hetero, e1_sid) {
+                            (Some((c0, _, _)), Some(s1)) => {
+                                decoder.dict.heteronym_c2_licensed(c0, c1, s1)
+                            }
+                            _ => false,
+                        };
                         for &(c2, w2) in &c2_raw {
                             let raw_lp2 = if nv.char_to_token(c2) == TOK_UNK {
                                 nv.score_mtp2_char(&p2_q, p2_sc, c2).min(-18.0)
@@ -2795,8 +2892,17 @@ fn extend_pinyin_layer(
                             } else {
                                 raw_lp2
                             };
-                            let lp2 = lm_lp2 + decoder.dict.char_emission_logp(c2, w2);
-                            let bi_bonus = if decoder.context.is_empty()
+                            let hetero_adj2 = if let Some(s2) = e2_sid {
+                                decoder
+                                    .dict
+                                    .heteronym_pair_delta(c1, e1_sid, c1_lic, c2, s2, w2)
+                            } else {
+                                0.0
+                            };
+                            let lp2 =
+                                lm_lp2 + decoder.dict.char_emission_logp(c2, w2) + hetero_adj2;
+                            let bi_bonus = if hetero_adj2 >= -1.0
+                                && decoder.context.is_empty()
                                 && gp.text.is_empty()
                                 && matches!(e1.syl, SylMatch::Full(_))
                                 && matches!(e2.syl, SylMatch::Full(_))
@@ -2874,7 +2980,18 @@ fn extend_pinyin_layer(
             for ((r, full_text), st_after_c1) in active_rescues.into_iter().zip(c1_states.into_iter()) {
                 let syl_score1 = 1.8 * r.e1.spatial_logp + r.e1.kind_cost;
                 let syl_score2 = 1.8 * r.e2.spatial_logp + r.e2.kind_cost;
-                let lp1 = score_char_pure_neural(
+                let gp_hetero = parent_last_char_and_sid(r.gp, decoder);
+                let r_sid1 = if let SylMatch::Full(s1) = r.e1.syl {
+                    Some(s1)
+                } else {
+                    None
+                };
+                let r_sid2 = if let SylMatch::Full(s2) = r.e2.syl {
+                    Some(s2)
+                } else {
+                    None
+                };
+                let mut lp1 = score_char_pure_neural(
                     nv,
                     r.gp_rc.as_ref(),
                     r.c1,
@@ -2885,8 +3002,13 @@ fn extend_pinyin_layer(
                     personalize,
                     use_personal_states,
                 );
+                if let (Some((c0, sid0_opt, c0_lic)), Some(s1)) = (gp_hetero, r_sid1) {
+                    lp1 += decoder
+                        .dict
+                        .heteronym_pair_delta(c0, sid0_opt, c0_lic, r.c1, s1, r.w1);
+                }
                 let pctx1 = r.gp.personal_context.push(r.c1);
-                let lp2 = score_char_pure_neural(
+                let mut lp2 = score_char_pure_neural(
                     nv,
                     &st_after_c1,
                     r.c2,
@@ -2897,8 +3019,22 @@ fn extend_pinyin_layer(
                     personalize,
                     use_personal_states,
                 );
+                let mut hetero_adj2 = 0.0f32;
+                if let Some(s2) = r_sid2 {
+                    let c1_lic = match (gp_hetero, r_sid1) {
+                        (Some((c0, _, _)), Some(s1)) => {
+                            decoder.dict.heteronym_c2_licensed(c0, r.c1, s1)
+                        }
+                        _ => false,
+                    };
+                    hetero_adj2 = decoder
+                        .dict
+                        .heteronym_pair_delta(r.c1, r_sid1, c1_lic, r.c2, s2, r.w2);
+                    lp2 += hetero_adj2;
+                }
                 let pctx2 = pctx1.push(r.c2);
-                let bi_bonus = if decoder.context.is_empty()
+                let bi_bonus = if hetero_adj2 >= -1.0
+                    && decoder.context.is_empty()
                     && r.gp.text.is_empty()
                     && matches!(r.e1.syl, SylMatch::Full(_))
                     && matches!(r.e2.syl, SylMatch::Full(_))
@@ -2916,12 +3052,14 @@ fn extend_pinyin_layer(
                     keys: r.e1.end,
                     text_bytes: mid_bytes,
                     syl_display: r.e1.display_syl.clone(),
+                    syl_id: r_sid1,
                     correction: r.e1.correction,
                 });
                 boundaries.push(PinyinBoundary {
                     keys: r.e2.end,
                     text_bytes: full_text.len(),
                     syl_display: r.e2.display_syl.clone(),
+                    syl_id: r_sid2,
                     correction: r.e2.correction,
                 });
                 next_paths.push(PinyinPath {
@@ -3114,6 +3252,11 @@ fn extend_pinyin_layer(
                         keys: ce.end,
                         text_bytes: cur_bytes,
                         syl_display: ce.display_syl.clone(),
+                        syl_id: if let SylMatch::Full(sid) = ce.syl {
+                            Some(sid)
+                        } else {
+                            None
+                        },
                         correction: ce.correction,
                     });
                 }
@@ -3140,6 +3283,218 @@ fn extend_pinyin_layer(
         }
     }
 
+    // Compact Core Lexicon (`PYDICT03`) phrase recall:
+    //   1. Recalls syllable-verified core words (2..=4 syllables) for initial abbreviations (`srf`, `jsj`, `rgzn`)
+    //      that would otherwise be pruned by single-syllable `Initial` top-K limits;
+    //   2. Ensures cold/short words (`start == 0`, 2..=3 syllables, e.g. `juxu -> 句序`, `yanmo -> 淹没`) enter
+    //      `next_paths` calibrated in true RWKV forward log-likelihood (zero distortion to long-sentence beam!).
+    if decoder.dict.has_phrases() {
+        let mut core_chains: Vec<Vec<&LatticeEdge>> = Vec::new();
+        for e_last in lattice[end]
+            .iter()
+            .filter(|e| {
+                e.correction == CorrectionKind::Exact
+                    && (include_prefix_edges || !matches!(e.syl, SylMatch::Prefix(_)))
+                    && !matches!(e.syl, SylMatch::Latin { .. })
+            })
+            .take(3)
+        {
+            if e_last.start > 0 {
+                for e_prev in lattice[e_last.start]
+                    .iter()
+                    .filter(|e| {
+                        e.correction == CorrectionKind::Exact
+                            && !matches!(e.syl, SylMatch::Latin { .. } | SylMatch::Prefix(_))
+                    })
+                    .take(2)
+                {
+                    core_chains.push(vec![e_prev, e_last]);
+                    if e_prev.start > 0 {
+                        for e_p2 in lattice[e_prev.start]
+                            .iter()
+                            .filter(|e| {
+                                e.correction == CorrectionKind::Exact
+                                    && !matches!(
+                                        e.syl,
+                                        SylMatch::Latin { .. } | SylMatch::Prefix(_)
+                                    )
+                            })
+                            .take(2)
+                        {
+                            core_chains.push(vec![e_p2, e_prev, e_last]);
+                            if e_p2.start > 0 {
+                                for e_p3 in lattice[e_p2.start]
+                                    .iter()
+                                    .filter(|e| {
+                                        e.correction == CorrectionKind::Exact
+                                            && !matches!(
+                                                e.syl,
+                                                SylMatch::Latin { .. } | SylMatch::Prefix(_)
+                                            )
+                                    })
+                                    .take(1)
+                                {
+                                    core_chains.push(vec![e_p3, e_p2, e_prev, e_last]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut evaluated_unseen = 0usize;
+        for chain in core_chains {
+            let start_pos = chain[0].start;
+            let init_cnt = chain
+                .iter()
+                .filter(|ce| matches!(ce.syl, SylMatch::Initial(_, _)))
+                .count();
+            let all_init = init_cnt == chain.len();
+            // Pure initial-abbreviation chains (`all_init`, e.g. `srf`, `jsj`, `rgzn`, `wmdjsj`) are recalled anywhere;
+            // full-syllable chains (`init_cnt == 0`) only need recall at `start_pos == 0` for short `2..=3` words.
+            // Mixed `Initial + Full` chains (`sglang` = `s+g+lang`, `tas` = `ta+s`) are skipped so they never
+            // hijack English words or mid-syllable typing!
+            if !all_init && (init_cnt > 0 || start_pos != 0 || chain.len() > 3) {
+                continue;
+            }
+            let Some(gp) = layers[start_pos].first() else {
+                continue;
+            };
+            let Some(gp_rc) = gp.ready_rc() else {
+                continue;
+            };
+            let mut constraints: Vec<SylConstraint<'_>> = Vec::with_capacity(chain.len());
+            let mut syl_sum = 0.0f32;
+            for &ce in &chain {
+                syl_sum += 1.8 * ce.spatial_logp + ce.kind_cost;
+                match &ce.syl {
+                    SylMatch::Full(sid) => constraints.push(SylConstraint::Full(*sid)),
+                    SylMatch::Initial(id, dg) => constraints.push(SylConstraint::Initial(*id, *dg)),
+                    SylMatch::Prefix(p) => constraints.push(SylConstraint::Prefix(p.as_str())),
+                    SylMatch::Latin { .. } => break,
+                }
+            }
+            if constraints.len() != chain.len() {
+                continue;
+            }
+            let fetch_cap = if all_init { 5 } else { 3 };
+            for phr in decoder.dict.lookup_phrases(&constraints, fetch_cap) {
+                let mut full_text = String::with_capacity(gp.text.len() + phr.text.len());
+                full_text.push_str(&gp.text);
+                full_text.push_str(phr.text);
+
+                // Never inflate forward `self.layers` scores with static lexical priors:
+                // skip any candidate already in `seen_texts`, and score newly recalled candidates
+                // purely under RWKV-7 + `heteronym_pair_delta` so multi-syllable / English continuations
+                // (`zaimalushang`, `shihoufaxian`, `sglang`) stay 100% unpolluted!
+                if seen_texts.contains(&full_text) || evaluated_unseen >= 6 {
+                    continue;
+                }
+                let chars: Vec<char> = phr.text.chars().collect();
+                if chars.len() != chain.len() {
+                    continue;
+                }
+                evaluated_unseen += 1;
+
+                let mut pctx = gp.personal_context;
+                let gp_hetero = parent_last_char_and_sid(gp, decoder);
+                let (lm_sum, path_state) = if let Some(nv) = &decoder.model {
+                    let mut st = (**gp_rc).clone();
+                    let mut acc_lp = 0.0f32;
+                    let mut prev_c_sid: Option<(char, Option<u16>, bool)> = gp_hetero;
+                    for (ci, &ch) in chars.iter().enumerate() {
+                        let sid = phr.syl_ids[ci];
+                        let char_w = decoder.dict.lookup_char_weight(sid, ch).unwrap_or(1);
+                        let mut step_lp = score_char_pure_neural(
+                            nv,
+                            &st,
+                            ch,
+                            char_w,
+                            decoder.dict,
+                            personal,
+                            pctx,
+                            personalize,
+                            use_personal_states,
+                        );
+                        if let Some((pc, psid_opt, plic)) = prev_c_sid {
+                            step_lp += decoder
+                                .dict
+                                .heteronym_pair_delta(pc, psid_opt, plic, ch, sid, char_w);
+                        }
+                        if ci == 1
+                            && start_pos == 0
+                            && decoder.context.is_empty()
+                            && matches!(chain[0].syl, SylMatch::Full(_))
+                            && matches!(chain[1].syl, SylMatch::Full(_))
+                        {
+                            if let Some(aux) = decoder.aux {
+                                step_lp +=
+                                    COLD_START_BIGRAM_BETA * aux.bigram_boost(chars[0], ch);
+                            }
+                        }
+                        acc_lp += step_lp;
+                        let cur_lic = prev_c_sid.is_some_and(|(pc, _, _)| {
+                            decoder.dict.heteronym_c2_licensed(pc, ch, sid)
+                        });
+                        prev_c_sid = Some((ch, Some(sid), cur_lic));
+                        pctx = pctx.push(ch);
+                        if ci + 1 < chars.len() {
+                            nv.step_token(nv.char_to_token(ch), &mut st);
+                        }
+                    }
+                    let last_ch = *chars.last().unwrap();
+                    let ps = if chars.len() == 1 {
+                        PathState::PendingChar {
+                            parent: Rc::clone(gp_rc),
+                            tok: nv.char_to_token(last_ch),
+                        }
+                    } else {
+                        PathState::PendingChar {
+                            parent: Rc::new(st),
+                            tok: nv.char_to_token(last_ch),
+                        }
+                    };
+                    (acc_lp, ps)
+                } else {
+                    for &ch in &chars {
+                        pctx = pctx.push(ch);
+                    }
+                    (-2.0 * (chars.len() as f32), PathState::Ready(Rc::clone(gp_rc)))
+                };
+
+                let total_score = gp.score + syl_sum + lm_sum;
+                let mut boundaries = gp.boundaries.clone();
+                let mut cur_bytes = gp.text.len();
+                for ((&ce, &ch), &phr_sid) in
+                    chain.iter().zip(chars.iter()).zip(phr.syl_ids.iter())
+                {
+                    cur_bytes += ch.len_utf8();
+                    boundaries.push(PinyinBoundary {
+                        keys: ce.end,
+                        text_bytes: cur_bytes,
+                        syl_display: ce.display_syl.clone(),
+                        syl_id: if matches!(ce.syl, SylMatch::Full(_)) {
+                            Some(phr_sid)
+                        } else {
+                            None
+                        },
+                        correction: ce.correction,
+                    });
+                }
+                seen_texts.insert(full_text.clone());
+                next_paths.push(PinyinPath {
+                    text: full_text,
+                    score: total_score,
+                    boundaries,
+                    path_state,
+                    personal_context: pctx,
+                    any_corrected: gp.any_corrected,
+                });
+            }
+        }
+    }
+
     next_paths.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
     next_paths.truncate(BEAM_WIDTH);
     next_paths
@@ -3160,11 +3515,144 @@ fn build_pinyin_candidates(
     let mut out = Vec::<PinyinCandidate>::new();
     let mut seen = HashSet::<String>::new();
 
-    let (best_end, full_paths) = (1..=n)
+    let (best_end, raw_full_paths) = (1..=n)
         .rev()
         .find(|&pos| !layers[pos].is_empty())
         .map_or((0, &[][..]), |pos| (pos, layers[pos].as_slice()));
 
+    let raw_top_char_len = raw_full_paths
+        .first()
+        .map_or(0, |p| p.text.chars().count());
+
+    // Terminal-only cold-start short-word (`2..=4` syllables) & pure-initial suffix lexical prior:
+    // Re-ranks candidates ONLY when stopping at `best_end` without mutating `layers[best_end]`,
+    // so isolated `<BOS>` inputs (`zaima -> 在吗`, `shihou -> 时候`, `shiba -> 是吧`, `haoma -> 好吗`, `juxu -> 句序`)
+    // and initial abbreviations (`srf -> 输入法`, `jsj -> 计算机`, `rgzn -> 人工智能`, `wmdjsj -> 我们的计算机`)
+    // resolve cleanly while continuing to type (`zaimalushang -> 在马路上`, `shihoufaxian -> 事后发现`, `sglang -> sglang`)
+    // remains 100% driven by RWKV-7's unpolluted recurrent forward beam!
+    let has_short_cjk = raw_full_paths
+        .iter()
+        .any(|p| (2..=4).contains(&p.text.chars().count()) && p.boundaries.len() >= 2);
+    let has_trailing_initials = raw_full_paths.iter().any(|p| {
+        let blen = p.boundaries.len();
+        blen >= 2
+            && p.boundaries[blen - 2..]
+                .iter()
+                .all(|b| b.syl_id.is_none() && b.correction == CorrectionKind::Exact)
+    });
+    let ranked_vec: Vec<(PinyinPath, f32)> = if !raw_full_paths.is_empty()
+        && ((decoder.context.is_empty() && ((2..=4).contains(&raw_top_char_len) || has_short_cjk))
+            || has_trailing_initials)
+    {
+        let mut items: Vec<(PinyinPath, f32)> = raw_full_paths
+            .iter()
+            .map(|path| {
+                let mut rank_sc = path.score;
+                let chars_vec: Vec<char> = path.text.chars().collect();
+                let clen = chars_vec.len();
+                if !path.any_corrected && path.boundaries.len() == clen && clen >= 2 {
+                    let is_user_learned = decoder.config.dynamic_word_freq
+                        && decoder.user.phrases.contains_key(&path.text);
+                    if decoder.context.is_empty()
+                        && (2..=4).contains(&clen)
+                        && path.boundaries.iter().all(|b| b.syl_id.is_some())
+                    {
+                        let cons: Vec<SylConstraint<'_>> = path
+                            .boundaries
+                            .iter()
+                            .filter_map(|b| b.syl_id.map(SylConstraint::Full))
+                            .collect();
+                        if is_user_learned {
+                            rank_sc += 2.40;
+                        } else if cons.len() == clen {
+                            if let Some(lwt) =
+                                decoder.dict.lookup_matching_phrase_log_wt(&path.text, &cons)
+                            {
+                                let scale = if clen == 2 {
+                                    1.0
+                                } else if clen == 3 {
+                                    0.75
+                                } else {
+                                    0.40
+                                };
+                                rank_sc +=
+                                    scale * (1.55 + 1.50 * (lwt - 9.60).clamp(0.0, 6.0));
+                            }
+                        }
+                        if clen <= 3 {
+                            if let (Some(nv), Some(st)) = (&decoder.model, path.ready_state()) {
+                                let lp_period =
+                                    nv.score_next_token(st, crate::neural::TOK_PERIOD);
+                                rank_sc += 0.80 * (lp_period + 2.25).max(0.0);
+                            }
+                        }
+                    } else if has_trailing_initials {
+                        // Count trailing pure-initial boundaries (`2..=4`) at the end of `path`
+                        let init_tail = path
+                            .boundaries
+                            .iter()
+                            .rev()
+                            .take(4)
+                            .take_while(|b| {
+                                b.syl_id.is_none()
+                                    && b.correction == CorrectionKind::Exact
+                                    && (b.syl_display.len() == 1
+                                        || (b.syl_display.len() == 2
+                                            && matches!(
+                                                b.syl_display.as_str(),
+                                                "zh" | "ch" | "sh"
+                                            )))
+                            })
+                            .count();
+                        if init_tail >= 2 {
+                            if is_user_learned && init_tail == clen {
+                                rank_sc += 2.40;
+                            } else {
+                                let start_idx = clen - init_tail;
+                                let suffix_str: String =
+                                    chars_vec[start_idx..].iter().collect();
+                                let mut cons: Vec<SylConstraint<'_>> =
+                                    Vec::with_capacity(init_tail);
+                                for b in &path.boundaries[start_idx..] {
+                                    let init_id = base_initial_id(&b.syl_display);
+                                    if init_id > 0 {
+                                        cons.push(SylConstraint::Initial(
+                                            init_id,
+                                            b.syl_display.len() == 2,
+                                        ));
+                                    }
+                                }
+                                if cons.len() == init_tail {
+                                    if let Some(lwt) = decoder
+                                        .dict
+                                        .lookup_matching_phrase_log_wt(&suffix_str, &cons)
+                                    {
+                                        let base = if init_tail == 2 {
+                                            0.90
+                                        } else {
+                                            1.25 * (init_tail as f32)
+                                        };
+                                        rank_sc +=
+                                            base + 0.24 * (lwt - 9.0).clamp(0.0, 6.5);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                (path.clone(), rank_sc)
+            })
+            .collect();
+        items.sort_by(|a, b| b.1.total_cmp(&a.1));
+        items
+    } else {
+        raw_full_paths
+            .iter()
+            .map(|p| (p.clone(), p.score))
+            .collect()
+    };
+
+    let full_paths: Vec<PinyinPath> = ranked_vec.iter().map(|(p, _)| p.clone()).collect();
     let top_char_len = full_paths
         .first()
         .map_or(0, |p| p.text.chars().count());
@@ -3174,16 +3662,16 @@ fn build_pinyin_candidates(
     } else {
         BEAM_WIDTH
     };
-    let top_score = full_paths.first().map_or(f32::NEG_INFINITY, |p| p.score);
+    let top_score = ranked_vec.first().map_or(f32::NEG_INFINITY, |x| x.1);
 
-    let raw_scores: Vec<f32> = full_paths.iter().map(|p| p.score).collect();
+    let raw_scores: Vec<f32> = ranked_vec.iter().map(|x| x.1).collect();
     let confs = softmax_confidences(&raw_scores);
     let mut full_added = 0usize;
     let mut deferred_full_cands: Vec<PinyinCandidate> = Vec::new();
-    for (idx, path) in full_paths.iter().enumerate() {
+    for (idx, (path, rank_sc)) in ranked_vec.iter().enumerate() {
         let allow_in_head = full_added < head_full_cap
-            && (!is_long_sentence || full_added == 0 || path.score >= top_score - 4.5);
-        if !allow_in_head && (deferred_full_cands.len() >= 12 || path.score < top_score - 14.0) {
+            && (!is_long_sentence || full_added == 0 || *rank_sc >= top_score - 4.5);
+        if !allow_in_head && (deferred_full_cands.len() >= 12 || *rank_sc < top_score - 14.0) {
             continue;
         }
         if seen.insert(path.text.clone()) {
@@ -3601,7 +4089,7 @@ fn build_pinyin_candidates(
         }
     }
 
-    (out, full_paths.to_vec())
+    (out, full_paths)
 }
 
 /// Compute 26-bit `validNextMask` and 26-key `nextKeyPriors` for Xiaohe Shuangpin touch-keyboard键缝裁决.
