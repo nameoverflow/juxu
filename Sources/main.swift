@@ -142,8 +142,13 @@ final class JuxuAppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Allow launching standalone settings UI via `--settings`
-        if CommandLine.arguments.contains("--settings") {
-            SettingsWindowController.shared.show()
+        // (`--settings-section=voice` opens a given page, for screenshots and debugging).
+        let sectionArg = CommandLine.arguments
+            .first { $0.hasPrefix("--settings-section=") }
+            .map { String($0.dropFirst("--settings-section=".count)) }
+        if CommandLine.arguments.contains("--settings") || sectionArg != nil {
+            let section = SettingsSection.allCases.first { "\($0)" == sectionArg } ?? .schema
+            SettingsWindowController.shared.show(section: section)
         }
     }
 
