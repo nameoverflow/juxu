@@ -328,7 +328,78 @@ impl PinyinDictView {
     pub fn char_emission_logp(&self, ch: char, syl_weight: u32) -> f32 {
         let w = (syl_weight as f32).max(1.0);
         let max_w = self.max_weight_for(ch, w);
-        0.38 * (w / max_w).clamp(0.002, 1.0).ln()
+        let base = 0.38 * (w / max_w).clamp(0.002, 1.0).ln();
+        if max_w >= 100.0 {
+            if syl_weight == 0 {
+                // Zero-weight suppressed readings (`8105.dict.yaml` weight=0 like `么=ma`) and
+                // unattested archaic readings from `41448.dict.yaml` (`不=fou`, `说=yue`, `大=tai`):
+                // prevent them from hijacking common words (`uima`->`是吗`, `shifou`->`是否`, `fouren`->`否认`).
+                base - 3.5
+            } else if syl_weight == 1 {
+                // Rare attested secondary readings (`强=jiang` in `倔强`) stay reachable with a light extra prior.
+                base - 1.2
+            } else {
+                base
+            }
+        } else {
+            base
+        }
+    }
+
+    /// Look up the dictionary weight of a single character `ch` under `syl_id` without allocating.
+    pub fn lookup_char_weight(&self, syl_id: u16, ch: char) -> Option<u32> {
+        let idx = syl_id as usize;
+        if idx >= self.syl_count {
+            return None;
+        }
+        let mut ch_buf = [0u8; 4];
+        let ch_bytes = ch.encode_utf8(&mut ch_buf).as_bytes();
+        let b = self.buf.as_slice();
+        let boff = self.char_buckets_off + idx * CHAR_BUCKET_STRIDE;
+        let start = read_u32(b, boff) as usize;
+        let count = read_u16(b, boff + 4) as usize;
+        for i in 0..count {
+            if start + i >= self.char_entry_count {
+                break;
+            }
+            let eoff = self.char_entries_off + (start + i) * CHAR_ENTRY_STRIDE;
+            let str_len = read_u16(b, eoff + 8) as usize;
+            if str_len != ch_bytes.len() {
+                continue;
+            }
+            let str_off = read_u32(b, eoff) as usize;
+            let text_start = self.string_pool_off + str_off;
+            if text_start + str_len <= b.len() && &b[text_start..text_start + str_len] == ch_bytes {
+                return Some(read_u32(b, eoff + 4));
+            }
+        }
+        None
+    }
+
+    /// Return syllable IDs for `ch` suitable for user-phrase Pinyin indexing, sorted by descending
+    /// weight and excluding archaic/zero-weight secondary readings (`weight <= 1` when `max_w >= 100`).
+    pub fn char_syllables_for_phrase_index(&self, ch: char) -> Vec<u16> {
+        let sids = self.char_syllables(ch);
+        if sids.len() <= 1 {
+            return sids;
+        }
+        let max_w = self.max_weight_for(ch, 1.0);
+        let mut weighted: Vec<(u16, u32)> = sids
+            .into_iter()
+            .map(|sid| (sid, self.lookup_char_weight(sid, ch).unwrap_or(1)))
+            .collect();
+        weighted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        if max_w >= 100.0 {
+            let filtered: Vec<u16> = weighted
+                .iter()
+                .filter(|&&(_, w)| w > 1)
+                .map(|&(sid, _)| sid)
+                .collect();
+            if !filtered.is_empty() {
+                return filtered;
+            }
+        }
+        weighted.into_iter().map(|(sid, _)| sid).collect()
     }
 
     /// Whether `syl_weight` is a viable modern reading for initial-only abbreviation expansion
