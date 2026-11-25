@@ -352,6 +352,11 @@ final class VoiceHUDContentView: NSView {
         captionFadeCount = 0
         cardWidthFloor = 0
         cardLinesFloor = 1
+        // A resize cut short by hide() must not carry over into the next presentation.
+        if isResizingPill {
+            pillResizeElapsed = 0
+            setPillWidth(pillWidthTarget)
+        }
         layoutCard()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -390,9 +395,15 @@ final class VoiceHUDContentView: NSView {
             setPillWidth(width)
         }
 
+        // The spinner fades over the resize so it does not sit on the waveform while the pill widens.
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(animated ? VoiceHUDMetrics.pillResizeDuration : 0)
+        CATransaction.setDisableActions(!animated)
+        spinnerLayer.opacity = mode == .processing ? 1 : 0
+        CATransaction.commit()
+
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        spinnerLayer.opacity = mode == .processing ? 1 : 0
         barsLayer.isHidden = mode == .notice
         noticeLayer.opacity = mode == .notice ? 1 : 0
         errorDotLayer.opacity = mode == .notice && currentNoticeIsError ? 1 : 0
@@ -544,7 +555,7 @@ final class VoiceHUDContentView: NSView {
     }
 
     func startAnimating() {
-        guard displayLinkHandle == nil else { return }
+        guard needsFrames, displayLinkHandle == nil else { return }
         lastTimestamp = nil
         let proxy = DisplayLinkWeakProxy(self)
         let link = displayLink(target: proxy, selector: #selector(DisplayLinkWeakProxy.step(_:)))
