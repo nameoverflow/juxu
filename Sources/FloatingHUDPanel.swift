@@ -81,9 +81,13 @@ public final class FloatingHUDPanel: NSPanel {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
 
+        // Recomputing the shadow is a WindowServer round trip; skip it while the size stays the same.
+        let needsShadowRefresh = !isVisible || frame.size != targetFrame.size
         setFrame(targetFrame, display: false, animate: false)
         prepareContent()
-        invalidateShadow()
+        if needsShadowRefresh {
+            invalidateShadow()
+        }
 
         if !isVisible {
             orderFrontRegardless()

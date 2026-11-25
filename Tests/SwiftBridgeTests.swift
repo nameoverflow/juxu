@@ -1139,6 +1139,27 @@ struct SwiftBridgeTests {
         }
         check(weakHUDView == nil, "Expected VoiceHUDContentView to deallocate cleanly even while CADisplayLink was active")
 
+        // 11b. The pill's resize is stepped frame by frame and every step reaches the backdrop,
+        // so the glass never runs on a different clock from the pill's contents.
+        do {
+            let hudView = VoiceHUDContentView(frame: NSRect(origin: .zero, size: VoiceHUDMetrics.canvasSize))
+            var reported: [CGRect] = []
+            hudView.onBackdropLayout = { pill, _ in reported.append(pill) }
+            hudView.apply(.recording(level: 0, elapsed: 0, partial: "", modeLabel: ""), animated: false)
+            let startWidth = reported.last?.width ?? 0
+            hudView.apply(.notice(text: "已复制到剪贴板，可以直接粘贴", isError: false), animated: true)
+            hudView.advance(dt: VoiceHUDMetrics.pillResizeDuration / 2)
+            let midWidth = reported.last?.width ?? 0
+            hudView.advance(dt: VoiceHUDMetrics.pillResizeDuration)
+            let endWidth = reported.last?.width ?? 0
+            check(startWidth == VoiceHUDMetrics.listeningWidth, "Expected the pill to start at the listening width, got \(startWidth)")
+            check(midWidth > startWidth && midWidth < endWidth, "Expected a mid-resize width between \(startWidth) and \(endWidth), got \(midWidth)")
+            check(abs((reported.last?.midX ?? 0) - VoiceHUDMetrics.canvasSize.width / 2) <= 0.5, "Expected the resized pill to stay centred")
+            let settledCount = reported.count
+            hudView.advance(dt: 0.1)
+            check(reported.count == settledCount, "Expected no backdrop updates once the resize has settled")
+        }
+
         // 12. Verify VoiceAudioNormalizer boosts quiet speech without clipping or amplifying DC silence
         let quietTone = (0..<1600).map { i -> Int16 in
             Int16((sin(2.0 * Double.pi * 400.0 * Double(i) / 16000.0) * 1200.0).rounded())

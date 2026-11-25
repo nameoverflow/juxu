@@ -17,10 +17,6 @@ public enum CandidatePanelMetrics {
 }
 
 public final class NativeCandidateContentView: NSView {
-    /// Hairline edge for the pre-glass material; Liquid Glass draws its own edge.
-    public var drawsHairlineBorder: Bool = true {
-        didSet { needsDisplay = true }
-    }
 
     public var state: JuxuActionState = .empty {
         didSet {
@@ -459,18 +455,6 @@ public final class NativeCandidateContentView: NSView {
         if nextPageRect != .zero {
             drawChevron(up: false, in: nextPageRect, enabled: state.page + 1 < state.totalPages)
         }
-
-        guard drawsHairlineBorder else { return }
-        // Hairline inner border matching the macOS menu material
-        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let borderColor = isDark
-            ? NSColor.white.withAlphaComponent(0.16)
-            : NSColor.black.withAlphaComponent(0.11)
-        let radius = CandidatePanelMetrics.outerCornerRadius
-        let borderPath = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.25, dy: 0.25), xRadius: radius, yRadius: radius)
-        borderPath.lineWidth = 0.5
-        borderColor.setStroke()
-        borderPath.stroke()
     }
 
     private func drawChevron(up: Bool, in rect: NSRect, enabled: Bool) {
@@ -555,7 +539,7 @@ public struct CandidateBarView: NSViewRepresentable {
         )
         let content = NativeCandidateContentView(frame: backdrop.contentContainer.bounds)
         content.autoresizingMask = [.width, .height]
-        content.drawsHairlineBorder = !backdrop.usesGlass
+        backdrop.showsHairlineBorder = true
         backdrop.contentContainer.addSubview(content)
         return backdrop
     }
@@ -600,7 +584,7 @@ public final class CandidatePanelController {
 
         let content = NativeCandidateContentView(frame: effect.contentContainer.bounds)
         content.autoresizingMask = [.width, .height]
-        content.drawsHairlineBorder = !effect.usesGlass
+        effect.showsHairlineBorder = true
         effect.contentContainer.addSubview(content)
 
         let p = FloatingHUDPanel(contentRect: initialRect, hasShadow: true, ignoresMouseEvents: false)
@@ -649,7 +633,6 @@ public final class CandidatePanelController {
 
 private final class ModeIndicatorContentView: NSView {
     static let cornerRadius: CGFloat = 10.0
-    var drawsHairlineBorder = true
 
     var label: String = "中" {
         didSet {
@@ -675,16 +658,6 @@ private final class ModeIndicatorContentView: NSView {
             y: round((bounds.height - textSize.height) * 0.5)
         )
         attr.draw(at: origin)
-
-        guard drawsHairlineBorder else { return }
-        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let borderColor = isDark
-            ? NSColor.white.withAlphaComponent(0.16)
-            : NSColor.black.withAlphaComponent(0.11)
-        let borderPath = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.25, dy: 0.25), xRadius: Self.cornerRadius, yRadius: Self.cornerRadius)
-        borderPath.lineWidth = 0.5
-        borderColor.setStroke()
-        borderPath.stroke()
     }
 }
 
@@ -703,7 +676,7 @@ public final class ModeIndicatorPanelController {
 
         let content = ModeIndicatorContentView(frame: effect.contentContainer.bounds)
         content.autoresizingMask = [.width, .height]
-        content.drawsHairlineBorder = !effect.usesGlass
+        effect.showsHairlineBorder = true
         effect.contentContainer.addSubview(content)
 
         let p = FloatingHUDPanel(contentRect: frame, hasShadow: true, ignoresMouseEvents: true)
