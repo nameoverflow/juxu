@@ -119,7 +119,17 @@ public final class HUDBackdropView: NSView {
         didSet { applyCornerRadius() }
     }
 
-    public init(frame frameRect: NSRect, cornerRadius: CGFloat) {
+    /// Draws a 0.5pt appearance-aware rim on the menu material, which has no edge of its own.
+    /// Liquid Glass draws its own edge, so this does nothing there.
+    public var showsHairlineBorder = false {
+        didSet { applyBorder() }
+    }
+
+    public init(
+        frame frameRect: NSRect,
+        cornerRadius: CGFloat,
+        blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
+    ) {
         self.cornerRadius = cornerRadius
         let container = NSView(frame: NSRect(origin: .zero, size: frameRect.size))
         container.autoresizingMask = [.width, .height]
@@ -132,7 +142,7 @@ public final class HUDBackdropView: NSView {
         } else {
             let effect = NSVisualEffectView(frame: NSRect(origin: .zero, size: frameRect.size))
             effect.material = .menu
-            effect.blendingMode = .behindWindow
+            effect.blendingMode = blendingMode
             effect.state = .active
             effect.wantsLayer = true
             effect.addSubview(container)
@@ -140,9 +150,28 @@ public final class HUDBackdropView: NSView {
             self.usesGlass = false
         }
         super.init(frame: frameRect)
+        wantsLayer = true
         backdrop.autoresizingMask = [.width, .height]
         addSubview(backdrop)
         applyCornerRadius()
+    }
+
+    override public func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyBorder()
+    }
+
+    private func applyBorder() {
+        guard !usesGlass, let layer = backdrop.layer else { return }
+        guard showsHairlineBorder else {
+            layer.borderWidth = 0
+            return
+        }
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        layer.borderWidth = 0.5
+        layer.borderColor = (isDark
+            ? NSColor.white.withAlphaComponent(0.16)
+            : NSColor.black.withAlphaComponent(0.11)).cgColor
     }
 
     @available(*, unavailable)

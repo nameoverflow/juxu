@@ -878,6 +878,8 @@ public final class VoiceHUDPanelController {
         let pill = HUDBackdropView(frame: .zero, cornerRadius: VoiceHUDMetrics.pillHeight / 2)
         let card = HUDBackdropView(frame: .zero, cornerRadius: 12)
         card.isHidden = true
+        pill.showsHairlineBorder = true
+        card.showsHairlineBorder = true
         let container = NSView(frame: initialFrame)
         container.addSubview(card)
         container.addSubview(pill)
@@ -916,7 +918,10 @@ public final class VoiceHUDPanelController {
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.18
                 context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                // The glass or material inside follows by autoresizing; let it animate with the frame.
+                context.allowsImplicitAnimation = true
                 pillBackdrop.animator().frame = pill
+                pillBackdrop.layoutSubtreeIfNeeded()
             }
         } else if pillBackdrop.frame != pill {
             pillBackdrop.frame = pill

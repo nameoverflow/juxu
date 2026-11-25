@@ -550,7 +550,8 @@ public struct CandidateBarView: NSViewRepresentable {
     public func makeNSView(context: Context) -> HUDBackdropView {
         let backdrop = HUDBackdropView(
             frame: NSRect(x: 0, y: 0, width: 200, height: CandidatePanelMetrics.barHeight),
-            cornerRadius: CandidatePanelMetrics.outerCornerRadius
+            cornerRadius: CandidatePanelMetrics.outerCornerRadius,
+            blendingMode: .withinWindow
         )
         let content = NativeCandidateContentView(frame: backdrop.contentContainer.bounds)
         content.autoresizingMask = [.width, .height]
@@ -634,6 +635,8 @@ public final class CandidatePanelController {
         let targetFrame = NSRect(origin: origin, size: size)
         panel.presentWithoutAnimation(frame: targetFrame) {
             candidateView.frame = NSRect(origin: .zero, size: size)
+            // Lay the glass out inside the disabled-actions transaction so it never lags the window frame.
+            effectView.layoutSubtreeIfNeeded()
             candidateView.layout()
             candidateView.displayIfNeeded()
         }
