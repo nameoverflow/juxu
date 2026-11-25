@@ -3144,6 +3144,14 @@ fn build_pinyin_candidates(
             .cmp(&(b.correction != CorrectionKind::Exact))
             .then_with(|| b.end.cmp(&a.end))
     });
+    let mut beam_head_chars: Vec<(char, usize)> = Vec::with_capacity(4);
+    for fp in full_paths.iter().take(4) {
+        if let (Some(ch), Some(b0)) = (fp.text.chars().next(), fp.boundaries.first()) {
+            if !beam_head_chars.iter().any(|&(c, k)| c == ch && k == b0.keys) {
+                beam_head_chars.push((ch, b0.keys));
+            }
+        }
+    }
     for edge in head_full_edges.into_iter().take(3) {
         if let SylMatch::Full(sid) = edge.syl {
             let syl_s = decoder.dict.syllable_str(sid);
@@ -3155,10 +3163,22 @@ fn build_pinyin_candidates(
                 .into_iter()
                 .take(take_n)
             {
+                let first_ch = e.text.chars().next();
+                let lookahead_bonus = if !is_corr
+                    && first_ch.is_some_and(|ch| {
+                        beam_head_chars
+                            .iter()
+                            .any(|&(c, k)| c == ch && k == edge.end)
+                    }) {
+                    1.8
+                } else {
+                    0.0
+                };
                 let sc = if let (Some(nv), Some(st), Some(ch)) =
-                    (&decoder.model, init_state, e.text.chars().next())
+                    (&decoder.model, init_state, first_ch)
                 {
                     edge.kind_cost
+                        + lookahead_bonus
                         + score_char_pure_neural(
                             nv,
                             st,
@@ -3171,7 +3191,7 @@ fn build_pinyin_candidates(
                             use_personal_states,
                         )
                 } else {
-                    0.25 * (((e.weight as f32) + 1.0).ln() - 15.0) + edge.kind_cost
+                    0.25 * (((e.weight as f32) + 1.0).ln() - 15.0) + edge.kind_cost + lookahead_bonus
                 };
                 let hint = if is_corr {
                     format!("{}({})", e.text, syl_s)

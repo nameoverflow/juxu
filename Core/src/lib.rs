@@ -622,20 +622,20 @@ mod tests {
         let Ok(aux) = AuxView::open_mmap(&aux_path) else {
             return;
         };
-        let nv = aux.neural_view().expect("wubi_aux.wbaux should embed WBLM0002");
+        let nv = aux.neural_view().expect("wubi_aux.wbaux should embed WBLM0003");
         let s = nv.offs.summary;
         assert_eq!((s.vocab_size, s.rank, s.d_model, s.n_heads, s.n_layers, s.ffn_dim), (12288, 192, 320, 10, 7, 1024));
-        assert!(nv.offs.has_punct_tokens, "V4 model must expose comma/period tokens");
-        assert_eq!(nv.offs.ascii_trie.ext_count, 4096, "V4 WBLM0002 model must embed 4,096-entry ASCII/English subword Trie");
+        assert!(nv.offs.has_punct_tokens, "V7 model must expose comma/period tokens");
+        assert_eq!(nv.offs.ascii_trie.ext_count, 4096, "V7 WBLM0003 model must embed 4,096-entry bare ASCII/English subword Trie");
         assert_eq!(nv.punct_to_token('，'), Some(crate::neural::TOK_COMMA));
         assert_eq!(nv.punct_to_token('。'), Some(crate::neural::TOK_PERIOD));
 
-        // Bit-exact INT8 parity check against V4-Bilingual-Distill WBLM0002 parity.json ("今天天气真" -> 好:-0.581890, 热:-4.775658)
+        // Bit-exact INT8 parity check against V7-Bilingual-Distill WBLM0003 parity.json ("今天天气真" -> 好:-0.180265, 热:-4.410366)
         let mut tracker = crate::neural::NeuralContextTracker::default();
         tracker.set_context_str(&nv, "今天天气真");
         let sc_hao = nv.score_next_char(&tracker.active, '好');
         let sc_re = nv.score_next_char(&tracker.active, '热');
-        assert!((sc_hao - (-0.581890)).abs() < 1e-3, "unexpected score_hao={sc_hao}");
+        assert!((sc_hao - (-0.180265)).abs() < 1e-3, "unexpected score_hao={sc_hao}");
         assert!(sc_hao > sc_re);
 
         // Cross-clause state must survive comma & period, and differ from a reset clause
@@ -1013,9 +1013,9 @@ mod tests {
         assert_eq!(out.commit_text, chosen_text);
         assert!(!engine.is_composing());
 
-        // 2. Multi-segment spaceless input ending in a short tail (`khlq` -> "中" + "罗" (`kh` + `lq`)):
+        // 2. Multi-segment spaceless input ending in a short tail (`trwulq` -> "我们" + "罗" (`trwu` + `lq`)):
         //    prefix completions for trailing `lq` should commit `<prefix_segments><chosen_tail>`.
-        for (i, ch) in "khlq".chars().enumerate() {
+        for (i, ch) in "trwulq".chars().enumerate() {
             let _ = engine.handle_key_event(0, Some(ch), false, 200 + i as u64 * 20);
         }
         let mut all_multi = Vec::new();
@@ -1025,14 +1025,14 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(all_multi[0].text, "中罗");
+        assert_eq!(all_multi[0].text, "我们罗");
         let tail_prefix_idx = all_multi
             .iter()
             .position(|c| c.matched_code.len() > 2 && c.matched_code.as_string().starts_with("lq"))
             .expect("expected trailing lq* prefix completion in multi-segment spaceless mode");
         let tail_text = all_multi[tail_prefix_idx].text.clone();
         let multi_out = engine.select_abs_candidate(tail_prefix_idx, 320).unwrap();
-        assert_eq!(multi_out.commit_text, format!("中{}", tail_text));
+        assert_eq!(multi_out.commit_text, format!("我们{}", tail_text));
         assert!(!engine.is_composing());
     }
 

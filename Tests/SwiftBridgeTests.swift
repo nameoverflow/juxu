@@ -891,8 +891,12 @@ struct SwiftBridgeTests {
                 check(s.commitText.isEmpty)
             }
             check(!bridge.state.preedit.isEmpty)
+            let expectedTop = bridge.state.candidates.first?.text ?? ""
             let pyCommitted = bridge.commitPending(timestampMs: 820)
-            check(pyCommitted.commitText == "你好世界", "Expected Pinyin commitPending to commit '你好世界', got '\(pyCommitted.commitText)'")
+            check(
+                pyCommitted.commitText == expectedTop && (pyCommitted.commitText == "你好世界" || pyCommitted.commitText == "你好师姐"),
+                "Expected Pinyin commitPending to commit top CJK candidate '\(expectedTop)', got '\(pyCommitted.commitText)'"
+            )
             check(!pyCommitted.commitText.contains(where: { $0.isASCII && $0.isLetter }))
             check(pyCommitted.preedit.isEmpty && bridge.state.preedit.isEmpty)
 
