@@ -9,11 +9,14 @@ use crate::typo::{
 };
 use crate::user_data::UserStore;
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 
 const BEAM_WIDTH: usize = 8;
 const MAX_CODE_LEN: usize = 5;
 const MAX_EN_LEN: usize = 24;
 const RETAINED_LAYERS: usize = 24;
+const FULL_STATE_AGE: usize = 5;
+const TOP1_STATE_AGE: usize = 16;
 const COMMIT_DELAY: usize = 8;
 const COMMIT_SCORE_MARGIN: f32 = 5.0;
 
@@ -47,7 +50,7 @@ pub(crate) struct Path {
     pub text: String,
     pub score: f32,
     boundaries: Vec<Boundary>,
-    state: RwkvState,
+    state: Option<Rc<RwkvState>>,
     personal_context: PersonalContext,
 }
 
@@ -123,14 +126,26 @@ impl Stream {
         while !self.layers.is_empty() && self.first + self.layers.len() > observations.len() + 1 {
             self.layers.pop_back();
         }
-        if self.layers.is_empty() || (self.first > 0 && self.layers.len() < MAX_CODE_LEN) {
+        let need_tail_rebuild = self.first == 0
+            && self.layers.len() > 1
+            && self.first + self.layers.len() <= observations.len()
+            && self
+                .layers
+                .iter()
+                .rev()
+                .take(MAX_CODE_LEN)
+                .any(|layer| layer.iter().skip(1).any(|p| p.state.is_none()));
+        if self.layers.is_empty()
+            || (self.first > 0 && self.layers.len() < MAX_CODE_LEN)
+            || need_tail_rebuild
+        {
             self.first = 0;
             self.layers.clear();
             self.layers.push_back(vec![Path {
                 text: String::new(),
                 score: 0.0,
                 boundaries: Vec::new(),
-                state: initial.clone(),
+                state: Some(Rc::new(initial.clone())),
                 personal_context: PersonalContext::with_chars(decoder.context.iter().copied()),
             }]);
         }
@@ -142,6 +157,47 @@ impl Stream {
                 self.first += 1;
             }
         }
+        self.evict_old_states(FULL_STATE_AGE, TOP1_STATE_AGE);
+    }
+
+    fn evict_old_states(&mut self, full_age: usize, top1_age: usize) {
+        let len = self.layers.len();
+        for (idx, layer) in self.layers.iter_mut().enumerate() {
+            let age = len.saturating_sub(1 + idx);
+            if age > top1_age {
+                for p in layer.iter_mut() {
+                    p.state = None;
+                }
+            } else if age > full_age {
+                for p in layer.iter_mut().skip(1) {
+                    p.state = None;
+                }
+            }
+        }
+    }
+
+    pub fn trim_memory(&mut self) {
+        if self.layers.len() <= 1 {
+            self.layers = VecDeque::new();
+            self.first = 0;
+        } else {
+            self.evict_old_states(4, 8);
+            self.layers.shrink_to_fit();
+        }
+    }
+
+    pub fn live_state_count(&self) -> usize {
+        let mut ptrs = Vec::new();
+        for layer in &self.layers {
+            for p in layer {
+                if let Some(ref rc) = p.state {
+                    ptrs.push(Rc::as_ptr(rc) as usize);
+                }
+            }
+        }
+        ptrs.sort_unstable();
+        ptrs.dedup();
+        ptrs.len()
     }
 
     fn layer(&self, pos: usize) -> &[Path] {
@@ -158,7 +214,7 @@ impl Stream {
         self.layers
             .iter()
             .rev()
-            .find_map(|layer| layer.first().map(|p| &p.state))
+            .find_map(|layer| layer.first().and_then(|p| p.state.as_deref()))
     }
 
     pub fn preview(&self, code: &str) -> String {
@@ -364,13 +420,15 @@ impl Stream {
                                     let score = personal.score(parent.personal_context, entry.text);
                                     score >= 0.6
                                         || (use_personal_states
-                                            && entry.text.chars().next().is_some_and(|first| {
-                                                personal.state_bonus(
-                                                    parent.personal_context,
-                                                    first,
-                                                    &parent.state,
-                                                ) + score
-                                                    >= 0.6
+                                            && parent.state.as_deref().is_some_and(|pst| {
+                                                entry.text.chars().next().is_some_and(|first| {
+                                                    personal.state_bonus(
+                                                        parent.personal_context,
+                                                        first,
+                                                        pst,
+                                                    ) + score
+                                                        >= 0.6
+                                                })
                                             }))
                                 })
                         })
@@ -462,6 +520,9 @@ impl Stream {
                     };
                 }
                 for (parent_idx, parent) in parents.iter().enumerate() {
+                    let Some(parent_state) = parent.state.as_deref() else {
+                        continue;
+                    };
                     let mut preceding = parent
                         .text
                         .chars()
@@ -514,13 +575,13 @@ impl Stream {
                             }
                         }
                     }
-                    let raw_lp1 = decoder.model.score_next_char(&parent.state, first);
+                    let raw_lp1 = decoder.model.score_next_char(parent_state, first);
                     let lp1 = if personalize {
                         personal.interpolate_logp(
                             raw_lp1,
                             parent.personal_context,
                             first,
-                            use_personal_states.then_some(&parent.state),
+                            use_personal_states.then_some(parent_state),
                         )
                     } else {
                         raw_lp1
@@ -529,7 +590,7 @@ impl Stream {
                         lp1
                     } else {
                         let len_scale = (n_chars.min(MAX_CODE_LEN) as f32).powf(0.65);
-                        let fast_total = decoder.model.score_phrase_fast(&parent.state, text) * len_scale;
+                        let fast_total = decoder.model.score_phrase_fast(parent_state, text) * len_scale;
                         // Replace c1's scaled raw logp with Neural-Cache-interpolated lp1
                         fast_total + (lp1 - raw_lp1) * len_scale
                     };
@@ -654,7 +715,10 @@ impl Stream {
                     };
                     let n_chars = display.chars().count();
                     for (parent_idx, parent) in parents.iter().enumerate() {
-                        let est = decoder.model.estimate_latin_logp(&parent.state, &display);
+                        let Some(parent_state) = parent.state.as_deref() else {
+                            continue;
+                        };
+                        let est = decoder.model.estimate_latin_logp(parent_state, &display);
                         steps.push(Step {
                             parent,
                             parent_key: (parent_pos, parent_idx),
@@ -682,21 +746,24 @@ impl Stream {
             HashMap::with_capacity(refine_limit);
         for step in &mut steps[..refine_limit] {
             if !step.is_latin && step.n_chars >= 2 {
+                let Some(parent_state) = step.parent.state.as_deref() else {
+                    continue;
+                };
                 let cache_key = (step.parent_key.0, step.parent_key.1, step.first);
                 let state_after_c1 = prefix_cache.entry(cache_key).or_insert_with(|| {
-                    let mut st = step.parent.state.clone();
+                    let mut st = parent_state.clone();
                     decoder
                         .model
                         .step_token(decoder.model.char_to_token(step.first), &mut st);
                     st
                 });
-                let raw_lp1 = decoder.model.score_next_char(&step.parent.state, step.first);
+                let raw_lp1 = decoder.model.score_next_char(parent_state, step.first);
                 let lp1 = if personalize {
                     personal.interpolate_logp(
                         raw_lp1,
                         step.parent.personal_context,
                         step.first,
-                        use_personal_states.then_some(&step.parent.state),
+                        use_personal_states.then_some(parent_state),
                     )
                 } else {
                     raw_lp1
@@ -728,25 +795,28 @@ impl Stream {
 
         let mut paths: Vec<Path> = Vec::with_capacity(BEAM_WIDTH * 2);
         for step in steps.into_iter().take(BEAM_WIDTH * 2) {
+            let Some(parent_state) = step.parent.state.as_deref() else {
+                continue;
+            };
             let mut score = step.parent.score + step.bias;
             let mut personal_context = step.parent.personal_context;
             let state = if step.is_latin {
                 let (lp, st) = decoder
                     .model
-                    .score_and_step_latin(&step.parent.state, &step.text, true);
+                    .score_and_step_latin(parent_state, &step.text, true);
                 score += lp;
                 for ch in step.text.chars() {
                     personal_context = personal_context.push(ch);
                 }
                 st
             } else {
-                let raw_lp1 = decoder.model.score_next_char(&step.parent.state, step.first);
+                let raw_lp1 = decoder.model.score_next_char(parent_state, step.first);
                 score += if personalize {
                     personal.interpolate_logp(
                         raw_lp1,
                         personal_context,
                         step.first,
-                        use_personal_states.then_some(&step.parent.state),
+                        use_personal_states.then_some(parent_state),
                     )
                 } else {
                     raw_lp1
@@ -755,7 +825,7 @@ impl Stream {
                 let mut st = if let Some(cached) = prefix_cache.get(&cache_key) {
                     cached.clone()
                 } else {
-                    let mut s = step.parent.state.clone();
+                    let mut s = parent_state.clone();
                     decoder
                         .model
                         .step_token(decoder.model.char_to_token(step.first), &mut s);
@@ -794,7 +864,7 @@ impl Stream {
                 text,
                 score,
                 boundaries,
-                state,
+                state: Some(Rc::new(state)),
                 personal_context,
             };
             if let Some(existing) = paths.iter_mut().find(|p| p.text == path.text) {

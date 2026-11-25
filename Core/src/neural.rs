@@ -843,7 +843,7 @@ impl RwkvState {
     }
 }
 
-const HISTORY_RING_CAP: usize = 8;
+const HISTORY_RING_CAP: usize = 4;
 
 /// Rolling sentence tracker with 8-step commit history for instant Backspace rollback
 /// and token-sequence deduplication so `set_context_str` (`textDidChange`) skips redundant RWKV unrolls in `O(1)`.

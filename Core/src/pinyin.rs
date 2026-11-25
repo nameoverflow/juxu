@@ -1599,32 +1599,37 @@ fn add_latin_lattice_edges(
 }
 
 /// Retain all `BEAM_WIDTH` states for the most recent `FULL_STATE_WINDOW` keystroke layers
-/// (covering normal Pinyin syllables + 1-backspace lookback with zero recompute), top-2 states for
-/// `TOP2_STATE_WINDOW` (covering long inline English words), and 4-path checkpoints every 12 keys
-/// so even continuous hold-backspace across 60+ keys stays `< 25 MB` Dirty RAM and `< 2 ms` avg!
-const FULL_STATE_WINDOW: usize = 22;
-const TOP2_STATE_WINDOW: usize = 52;
-const CHECKPOINT_STRIDE: usize = 12;
+/// (covering all Mandarin Pinyin syllables `<= 6` letters + `'` + 1-backspace lookback with zero recompute),
+/// top-2 states for `TOP2_STATE_WINDOW` (12 keys), top-1 state up to `TOP1_STATE_WINDOW` (24 keys,
+/// covering 4-syllable phrase recall & inline English), and 3-path checkpoints every 16 keys
+/// so even 60+ key unbroken sentences stay well below iOS Keyboard Extension Jetsam limits!
+const FULL_STATE_WINDOW: usize = 6;
+const TOP2_STATE_WINDOW: usize = 10;
+const TOP1_STATE_WINDOW: usize = 20;
+const CHECKPOINT_STRIDE: usize = 16;
 
 #[inline]
 fn edge_parent_limit(edge: &LatticeEdge) -> usize {
+    let span = edge.end.saturating_sub(edge.start);
     match &edge.syl {
         SylMatch::Full(_) => match edge.correction {
             CorrectionKind::Exact => {
-                if edge.start <= 6 {
+                if edge.start <= 2 {
                     16
+                } else if edge.start <= 6 {
+                    10
                 } else {
-                    12
+                    8
                 }
             }
             CorrectionKind::TouchBoundary => 4,
             _ => 2,
         },
         SylMatch::Initial(_, _) => {
-            if edge.correction == CorrectionKind::Exact && edge.start <= 4 {
-                14
+            if edge.correction == CorrectionKind::Exact && edge.start <= 2 {
+                12
             } else if edge.correction == CorrectionKind::Exact {
-                8
+                6
             } else {
                 2
             }
@@ -1633,7 +1638,11 @@ fn edge_parent_limit(edge: &LatticeEdge) -> usize {
         SylMatch::Latin {
             is_explicit_upper, ..
         } => {
-            if *is_explicit_upper {
+            if span > TOP2_STATE_WINDOW {
+                1
+            } else if span > FULL_STATE_WINDOW {
+                2
+            } else if *is_explicit_upper {
                 4
             } else {
                 2
@@ -1822,6 +1831,51 @@ impl PinyinStream {
         self.layer_sigs.clear();
         self.prev_obs.clear();
         self.prev_t9_locked.clear();
+        self.layers.shrink_to(16);
+        self.layer_sigs.shrink_to(16);
+        self.prev_obs.shrink_to(32);
+    }
+
+    pub fn trim_memory(&mut self) {
+        if self.layers.len() <= 1 {
+            self.layers = Vec::new();
+            self.layer_sigs = Vec::new();
+            self.prev_obs = Vec::new();
+            self.prev_t9_locked = Vec::new();
+            return;
+        }
+        let n = self.layers.len() - 1;
+        for (k, layer) in self.layers.iter_mut().enumerate().skip(1) {
+            let keep = if k + 6 >= n {
+                4usize.min(layer.len())
+            } else if k % CHECKPOINT_STRIDE == 0 || k + 12 >= n {
+                1usize.min(layer.len())
+            } else {
+                0usize
+            };
+            for p in &mut layer[keep..] {
+                p.path_state = PathState::Evicted;
+            }
+            layer.shrink_to_fit();
+        }
+        self.layers.shrink_to_fit();
+        self.layer_sigs.shrink_to_fit();
+    }
+
+    pub fn live_state_count(&self) -> usize {
+        let mut ptrs = Vec::new();
+        for layer in &self.layers {
+            for p in layer {
+                match &p.path_state {
+                    PathState::Ready(rc) => ptrs.push(Rc::as_ptr(rc) as usize),
+                    PathState::PendingChar { parent, .. } => ptrs.push(Rc::as_ptr(parent) as usize),
+                    PathState::Evicted => {}
+                }
+            }
+        }
+        ptrs.sort_unstable();
+        ptrs.dedup();
+        ptrs.len()
     }
 
     fn run_incremental(
@@ -1967,7 +2021,7 @@ impl PinyinStream {
             self.layer_sigs.push(target_sigs[end]);
         }
 
-        // Bound Dirty RAM cleanly while preserving 22-key full window + 52-key top-2 window + checkpoints
+        // Bound Dirty RAM cleanly while preserving 8-key full window + 12-key top-2 + 24-key top-1 + checkpoints
         if decoder.model.is_some() && n > FULL_STATE_WINDOW {
             let full_cut = n - FULL_STATE_WINDOW;
             let mut evict_reqs: Vec<(usize, usize)> = Vec::new();
@@ -1976,9 +2030,11 @@ impl PinyinStream {
                     continue;
                 }
                 let keep_n = if k % CHECKPOINT_STRIDE == 0 {
-                    4usize.min(self.layers[k].len())
+                    2usize.min(self.layers[k].len())
                 } else if k + TOP2_STATE_WINDOW >= n {
                     2usize.min(self.layers[k].len())
+                } else if k + TOP1_STATE_WINDOW >= n {
+                    1usize.min(self.layers[k].len())
                 } else {
                     0usize
                 };
@@ -1992,9 +2048,11 @@ impl PinyinStream {
                     continue;
                 }
                 let keep_n = if k % CHECKPOINT_STRIDE == 0 {
-                    4usize.min(self.layers[k].len())
+                    2usize.min(self.layers[k].len())
                 } else if k + TOP2_STATE_WINDOW >= n {
                     2usize.min(self.layers[k].len())
+                } else if k + TOP1_STATE_WINDOW >= n {
+                    1usize.min(self.layers[k].len())
                 } else {
                     0usize
                 };
@@ -3382,7 +3440,7 @@ fn extend_pinyin_layer(
             for phr in decoder.dict.lookup_phrases(&constraints, fetch_cap) {
                 let mut full_text = String::with_capacity(gp.text.len() + phr.text.len());
                 full_text.push_str(&gp.text);
-                full_text.push_str(phr.text);
+                full_text.push_str(&phr.text);
 
                 // Never inflate forward `self.layers` scores with static lexical priors:
                 // skip any candidate already in `seen_texts`, and score newly recalled candidates

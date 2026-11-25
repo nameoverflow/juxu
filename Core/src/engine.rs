@@ -862,7 +862,9 @@ impl JuxuEngine {
 
     /// Reclaim excess transient heap allocations when idle or under iOS extension memory pressure.
     pub fn trim_idle_memory(&mut self) {
-        self.neural_tracker.trim_ring(2);
+        self.neural_tracker.trim_ring(1);
+        self.stream.trim_memory();
+        self.pinyin_stream.trim_memory();
         if !self.is_composing() {
             self.user.trim_idle_memory();
             self.raw_code.shrink_to(32);
@@ -875,6 +877,14 @@ impl JuxuEngine {
             self.candidates.shrink_to(16);
             self.spaceless_candidate_starts.shrink_to(16);
         }
+    }
+
+    /// Return `(spaceless_live_states, pinyin_live_states)` for memory peak regression tests.
+    pub fn debug_live_rwkv_states(&self) -> (usize, usize) {
+        (
+            self.stream.live_state_count(),
+            self.pinyin_stream.live_state_count(),
+        )
     }
 
     /// Flush and commit any in-progress composition (e.g. on focus loss / app switch / Return-commit).

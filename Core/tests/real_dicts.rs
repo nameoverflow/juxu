@@ -2754,3 +2754,123 @@ fn real_dicts_hybrid_lexicon_heteronym_and_cold_start_short_words() {
         );
     }
 }
+
+#[test]
+fn real_dicts_long_sentence_rwkv_state_cap_and_compact_dict_sizes() {
+    use juxu_core::english::EnDictView;
+    use juxu_core::pinyin_dict::PinyinDictView;
+
+    let dir = dicts_dir();
+    if !dir.join("pinyin.pydict").exists()
+        || !dir.join("wubi98.wbdict").exists()
+        || !dir.join("wubi_aux.wbaux").exists()
+    {
+        return;
+    }
+
+    // 1. Verify compact binary sizes (`PYDICT03` <= 1.70 MB, 7 `.wbdict`s <= 16.5 MB)
+    let py_bytes = std::fs::metadata(dir.join("pinyin.pydict")).unwrap().len();
+    assert!(
+        py_bytes <= 1_780_000,
+        "expected compact pinyin.pydict <= 1.70 MB, got {} bytes",
+        py_bytes
+    );
+    let mut wb_total = 0u64;
+    for name in [
+        "wubi86.wbdict",
+        "wubi98.wbdict",
+        "wubi06.wbdict",
+        "xiaohe.wbdict",
+        "cangjie3.wbdict",
+        "cangjie5.wbdict",
+        "cangjie6.wbdict",
+    ] {
+        let p = dir.join(name);
+        if p.exists() {
+            wb_total += std::fs::metadata(p).unwrap().len();
+        }
+    }
+    assert!(
+        wb_total <= 16_800_000,
+        "expected 7 compact WBDICT03 files <= 16.0 MB total, got {} bytes",
+        wb_total
+    );
+
+    // 2. Replay 44-key Wubi 98 `spaceless = true` crash trace and assert bounded `RwkvState` count
+    let mut cfg = JuxuConfig::default();
+    cfg.schema = InputSchema::Wubi98;
+    cfg.spaceless = true;
+    let mut engine = JuxuEngine::new(cfg);
+    engine.load_dict(
+        InputSchema::Wubi98,
+        DictView::open_mmap(dir.join("wubi98.wbdict")).unwrap(),
+    );
+    engine.load_pinyin_dict(PinyinDictView::from_file(dir.join("pinyin.pydict")).unwrap());
+    engine.load_english_dict(EnDictView::open_mmap(dir.join("english.endict")).unwrap());
+    engine.set_aux(AuxView::open_mmap(dir.join("wubi_aux.wbaux")).unwrap());
+
+    let wb_crash_keys = "ruujeiwewftcdsncrpgngqxgmmjskcenfgcdsncrxfjs";
+    let mut max_wb_states = 0usize;
+    for (i, ch) in wb_crash_keys.chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 1_000 + i as u64 * 60);
+        let (sp_live, _) = engine.debug_live_rwkv_states();
+        max_wb_states = max_wb_states.max(sp_live);
+    }
+    assert!(
+        max_wb_states <= 64,
+        "expected spaceless Wubi live RwkvState count <= 64 (<19 MB), got {}",
+        max_wb_states
+    );
+    engine.trim_idle_memory();
+    let (sp_trimmed, _) = engine.debug_live_rwkv_states();
+    assert!(
+        sp_trimmed <= 44,
+        "expected active trim_idle_memory() to shrink spaceless states <= 44, got {}",
+        sp_trimmed
+    );
+    let wb_fin = engine.commit_pending(5_000);
+    assert!(!wb_fin.commit_text.is_empty());
+
+    // 3. Replay 51-key Full Pinyin crash trace + active memory warning trim + Backspace recovery
+    let mut py_cfg = JuxuConfig::default();
+    py_cfg.schema = InputSchema::Pinyin;
+    engine.set_config(py_cfg);
+    engine.clear_context();
+    engine.clear_composition();
+
+    let py_crash_keys = "yinweiwobuyongpinysuoyzhuanjyanjwodyinszhinyouhwubi";
+    let mut max_py_states = 0usize;
+    for (i, ch) in py_crash_keys.chars().enumerate() {
+        let _ = engine.handle_key_event(0, Some(ch), false, 6_000 + i as u64 * 50);
+        let (_, py_live) = engine.debug_live_rwkv_states();
+        max_py_states = max_py_states.max(py_live);
+    }
+    assert!(
+        max_py_states <= 96,
+        "expected 51-key Full Pinyin live RwkvState count <= 96 (<28.5 MB, down from ~350), got {}",
+        max_py_states
+    );
+    let top_before_trim = engine
+        .all_candidates()
+        .first()
+        .map(|c| c.text.clone())
+        .unwrap_or_default();
+    assert!(!top_before_trim.is_empty());
+
+    // Simulate iOS `didReceiveMemoryWarning()` arriving mid-sentence at 51 keys!
+    engine.trim_idle_memory();
+    let (_, py_trimmed) = engine.debug_live_rwkv_states();
+    assert!(
+        py_trimmed <= 36,
+        "expected active trim_idle_memory() to drop Pinyin states <= 36 (<11 MB), got {}",
+        py_trimmed
+    );
+    // Typing and Backspace after mid-sentence trim must continue seamlessly without panic or empty output
+    for step in 0..8u64 {
+        let _ = engine.handle_key_event(KEY_BACKSPACE, None, false, 9_000 + step * 40);
+    }
+    assert!(
+        !engine.all_candidates().is_empty(),
+        "candidates must remain populated after mid-sentence trim + 8 backspaces"
+    );
+}

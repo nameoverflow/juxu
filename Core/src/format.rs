@@ -4,7 +4,8 @@ use crate::mmap_buf::{read_u16, read_u32, read_u64, ByteSource};
 use std::io;
 use std::path::Path;
 
-pub const WBDICT_MAGIC: &[u8; 8] = b"WBDICT02";
+pub const WBDICT_MAGIC: &[u8; 8] = b"WBDICT03";
+const WBDICT_MAGIC_V2: &[u8; 8] = b"WBDICT02";
 pub const WBAUX_MAGIC: &[u8; 8] = b"WBAUX003";
 
 pub const ENTRY_FLAG_SINGLE_CHAR: u16 = 1 << 0;
@@ -12,9 +13,12 @@ pub const ENTRY_FLAG_EXT_RARE: u16 = 1 << 1;
 pub const ENTRY_FLAG_SYMBOL: u16 = 1 << 2;
 
 const HEADER_LEN: usize = 64;
-const BUCKET_STRIDE: usize = 12; // packed_code: u32, start: u32, count: u16, reserved: u16
-const ENTRY_STRIDE: usize = 12; // str_off: u32, weight: u32, str_len: u16, flags: u16
-const CHAR_STRIDE: usize = 20; // cp: u32, stem2: u16, flags: u16, shortest: u32, primary_short: u32, full: u32
+const BUCKET_STRIDE_V2: usize = 12; // packed_code: u32, start: u32, count: u16, reserved: u16
+const ENTRY_STRIDE_V2: usize = 12; // str_off: u32, weight: u32, str_len: u16, flags: u16
+const CHAR_STRIDE_V2: usize = 20; // cp: u32, stem2: u16, flags: u16, shortest: u32, primary_short: u32, full: u32
+const BUCKET_STRIDE_V3: usize = 8; // packed_code: u32, packed_start_count: u32 ((start << 12) | count)
+const ENTRY_STRIDE_V3: usize = 8; // packed_str_flags: u32 (str_off:21 | str_len:7 | flags:4), weight: u32
+const CHAR_STRIDE_V3: usize = 16; // packed_cp_stem: u32 (cp:21 | stem10:10 | rare:1), shortest: u32, primary_short: u32, full: u32
 
 #[derive(Clone, Copy, Debug)]
 pub struct DictEntryRef<'a> {
@@ -122,19 +126,53 @@ pub fn serialize_wbdict(mut input: DictBuildInput) -> Vec<u8> {
     // Build string pool (deduplicated strings)
     let mut str_offsets = std::collections::HashMap::<String, (u32, u16)>::new();
     let mut string_pool = Vec::<u8>::new();
-    for (_, text, _, _) in &deduped {
+    let mut max_str_len = 0usize;
+    let mut max_flags = 0u16;
+    for (_, text, _, flags) in &deduped {
+        max_flags |= *flags;
         if !str_offsets.contains_key(text) {
             let off = string_pool.len() as u32;
             let bytes = text.as_bytes();
             let len = bytes.len().min(u16::MAX as usize) as u16;
+            max_str_len = max_str_len.max(len as usize);
             string_pool.extend_from_slice(&bytes[..len as usize]);
             str_offsets.insert(text.clone(), (off, len));
         }
     }
 
+    // Omit redundant non-BMP `EXT_RARE` `CharMeta` rows that carry no shortcode (`shortest == full && primary_short == EMPTY`)
+    // (their lookup entries in `deduped` remain 100% intact for `enable_rare_charset = true`).
+    input.char_metas.retain(|m| {
+        !(m.codepoint > 0xFFFF
+            && (m.flags & ENTRY_FLAG_EXT_RARE) != 0
+            && m.primary_short_code.is_empty()
+            && m.shortest_code == m.full_code)
+    });
+
+    let mut max_bucket_count = 0usize;
+    {
+        let mut i = 0usize;
+        while i < deduped.len() {
+            let c = deduped[i].0;
+            let mut j = i + 1;
+            while j < deduped.len() && deduped[j].0 == c {
+                j += 1;
+            }
+            max_bucket_count = max_bucket_count.max(j - i);
+            i = j;
+        }
+    }
+    let use_v3 = deduped.len() < (1 << 20)
+        && string_pool.len() < (1 << 21)
+        && max_str_len < (1 << 7)
+        && max_bucket_count < (1 << 12)
+        && max_flags < (1 << 4);
+
     // Build buckets + entry table
     let mut buckets_buf = Vec::<u8>::new();
-    let mut entries_buf = Vec::<u8>::with_capacity(deduped.len() * ENTRY_STRIDE);
+    let mut entries_buf = Vec::<u8>::with_capacity(
+        deduped.len() * if use_v3 { ENTRY_STRIDE_V3 } else { ENTRY_STRIDE_V2 },
+    );
     let mut bucket_count = 0u32;
 
     let mut idx = 0usize;
@@ -145,29 +183,56 @@ pub fn serialize_wbdict(mut input: DictBuildInput) -> Vec<u8> {
         while end < deduped.len() && deduped[end].0 == code {
             let (_, ref text, weight, flags) = deduped[end];
             let (str_off, str_len) = str_offsets[text];
-            entries_buf.extend_from_slice(&str_off.to_le_bytes());
-            entries_buf.extend_from_slice(&weight.to_le_bytes());
-            entries_buf.extend_from_slice(&str_len.to_le_bytes());
-            entries_buf.extend_from_slice(&flags.to_le_bytes());
+            if use_v3 {
+                let packed_str_flags = (str_off & 0x1F_FFFF)
+                    | (((str_len as u32) & 0x7F) << 21)
+                    | (((flags as u32) & 0xF) << 28);
+                entries_buf.extend_from_slice(&packed_str_flags.to_le_bytes());
+                entries_buf.extend_from_slice(&weight.to_le_bytes());
+            } else {
+                entries_buf.extend_from_slice(&str_off.to_le_bytes());
+                entries_buf.extend_from_slice(&weight.to_le_bytes());
+                entries_buf.extend_from_slice(&str_len.to_le_bytes());
+                entries_buf.extend_from_slice(&flags.to_le_bytes());
+            }
             end += 1;
         }
         let count = (end - idx).min(u16::MAX as usize) as u16;
-        buckets_buf.extend_from_slice(&code.0.to_le_bytes());
-        buckets_buf.extend_from_slice(&start.to_le_bytes());
-        buckets_buf.extend_from_slice(&count.to_le_bytes());
-        buckets_buf.extend_from_slice(&0u16.to_le_bytes());
+        if use_v3 {
+            let packed_start_count = ((start & 0xF_FFFF) << 12) | ((count as u32) & 0xFFF);
+            buckets_buf.extend_from_slice(&code.0.to_le_bytes());
+            buckets_buf.extend_from_slice(&packed_start_count.to_le_bytes());
+        } else {
+            buckets_buf.extend_from_slice(&code.0.to_le_bytes());
+            buckets_buf.extend_from_slice(&start.to_le_bytes());
+            buckets_buf.extend_from_slice(&count.to_le_bytes());
+            buckets_buf.extend_from_slice(&0u16.to_le_bytes());
+        }
         bucket_count += 1;
         idx = end;
     }
 
-    let mut chars_buf = Vec::<u8>::with_capacity(input.char_metas.len() * CHAR_STRIDE);
+    let mut chars_buf = Vec::<u8>::with_capacity(
+        input.char_metas.len() * if use_v3 { CHAR_STRIDE_V3 } else { CHAR_STRIDE_V2 },
+    );
     for m in &input.char_metas {
-        chars_buf.extend_from_slice(&m.codepoint.to_le_bytes());
-        chars_buf.extend_from_slice(&m.stem2.0.to_le_bytes());
-        chars_buf.extend_from_slice(&m.flags.to_le_bytes());
-        chars_buf.extend_from_slice(&m.shortest_code.0.to_le_bytes());
-        chars_buf.extend_from_slice(&m.primary_short_code.0.to_le_bytes());
-        chars_buf.extend_from_slice(&m.full_code.0.to_le_bytes());
+        if use_v3 {
+            let stem10 = (((m.stem2.first() as u32) & 0x1F) << 5)
+                | ((m.stem2.second() as u32) & 0x1F);
+            let rare_bit = u32::from((m.flags & ENTRY_FLAG_EXT_RARE) != 0) << 31;
+            let packed_cp_stem = (m.codepoint & 0x1F_FFFF) | (stem10 << 21) | rare_bit;
+            chars_buf.extend_from_slice(&packed_cp_stem.to_le_bytes());
+            chars_buf.extend_from_slice(&m.shortest_code.0.to_le_bytes());
+            chars_buf.extend_from_slice(&m.primary_short_code.0.to_le_bytes());
+            chars_buf.extend_from_slice(&m.full_code.0.to_le_bytes());
+        } else {
+            chars_buf.extend_from_slice(&m.codepoint.to_le_bytes());
+            chars_buf.extend_from_slice(&m.stem2.0.to_le_bytes());
+            chars_buf.extend_from_slice(&m.flags.to_le_bytes());
+            chars_buf.extend_from_slice(&m.shortest_code.0.to_le_bytes());
+            chars_buf.extend_from_slice(&m.primary_short_code.0.to_le_bytes());
+            chars_buf.extend_from_slice(&m.full_code.0.to_le_bytes());
+        }
     }
 
     let buckets_off = HEADER_LEN as u32;
@@ -177,7 +242,7 @@ pub fn serialize_wbdict(mut input: DictBuildInput) -> Vec<u8> {
     let total_len = strings_off as usize + string_pool.len();
 
     let mut out = Vec::<u8>::with_capacity(total_len);
-    out.extend_from_slice(WBDICT_MAGIC);
+    out.extend_from_slice(if use_v3 { WBDICT_MAGIC } else { WBDICT_MAGIC_V2 });
     out.extend_from_slice(&input.schema_id.to_le_bytes());
     out.extend_from_slice(&bucket_count.to_le_bytes());
     out.extend_from_slice(&(deduped.len() as u32).to_le_bytes());
@@ -197,9 +262,10 @@ pub fn serialize_wbdict(mut input: DictBuildInput) -> Vec<u8> {
     out
 }
 
-/// Zero-copy view over a `.wbdict` binary image.
+/// Zero-copy view over a `.wbdict` binary image (`WBDICT03` or `WBDICT02`).
 pub struct DictView {
     buf: ByteSource,
+    is_v3: bool,
     pub schema_id: u32,
     bucket_count: usize,
     entry_count: usize,
@@ -223,12 +289,16 @@ impl DictView {
 
     pub fn from_source(buf: ByteSource) -> io::Result<Self> {
         let b = buf.as_slice();
-        if b.len() < HEADER_LEN || &b[0..8] != WBDICT_MAGIC {
+        let is_v3 = if b.len() >= HEADER_LEN && &b[0..8] == WBDICT_MAGIC {
+            true
+        } else if b.len() >= HEADER_LEN && &b[0..8] == WBDICT_MAGIC_V2 {
+            false
+        } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid WBDICT header",
             ));
-        }
+        };
         let schema_id = read_u32(b, 8);
         let bucket_count = read_u32(b, 12) as usize;
         let entry_count = read_u32(b, 16) as usize;
@@ -239,9 +309,14 @@ impl DictView {
         let strings_off = read_u32(b, 36) as usize;
         let strings_len = read_u32(b, 40) as usize;
 
-        if buckets_off + bucket_count * BUCKET_STRIDE > b.len()
-            || entries_off + entry_count * ENTRY_STRIDE > b.len()
-            || chars_off + char_count * CHAR_STRIDE > b.len()
+        let (b_stride, e_stride, c_stride) = if is_v3 {
+            (BUCKET_STRIDE_V3, ENTRY_STRIDE_V3, CHAR_STRIDE_V3)
+        } else {
+            (BUCKET_STRIDE_V2, ENTRY_STRIDE_V2, CHAR_STRIDE_V2)
+        };
+        if buckets_off + bucket_count * b_stride > b.len()
+            || entries_off + entry_count * e_stride > b.len()
+            || chars_off + char_count * c_stride > b.len()
             || strings_off + strings_len > b.len()
         {
             return Err(io::Error::new(
@@ -252,6 +327,7 @@ impl DictView {
 
         Ok(Self {
             buf,
+            is_v3,
             schema_id,
             bucket_count,
             entry_count,
@@ -267,11 +343,18 @@ impl DictView {
     #[inline]
     fn bucket_at(&self, i: usize) -> (PackedCode, usize, usize) {
         let b = self.buf.as_slice();
-        let off = self.buckets_off + i * BUCKET_STRIDE;
-        let code = PackedCode(read_u32(b, off));
-        let start = read_u32(b, off + 4) as usize;
-        let count = read_u16(b, off + 8) as usize;
-        (code, start, count)
+        if self.is_v3 {
+            let off = self.buckets_off + i * BUCKET_STRIDE_V3;
+            let code = PackedCode(read_u32(b, off));
+            let packed = read_u32(b, off + 4);
+            (code, (packed >> 12) as usize, (packed & 0xFFF) as usize)
+        } else {
+            let off = self.buckets_off + i * BUCKET_STRIDE_V2;
+            let code = PackedCode(read_u32(b, off));
+            let start = read_u32(b, off + 4) as usize;
+            let count = read_u16(b, off + 8) as usize;
+            (code, start, count)
+        }
     }
 
     #[inline]
@@ -280,11 +363,24 @@ impl DictView {
             return None;
         }
         let b = self.buf.as_slice();
-        let off = self.entries_off + idx * ENTRY_STRIDE;
-        let str_off = read_u32(b, off) as usize;
-        let weight = read_u32(b, off + 4);
-        let str_len = read_u16(b, off + 8) as usize;
-        let flags = read_u16(b, off + 10);
+        let (str_off, str_len, weight, flags) = if self.is_v3 {
+            let off = self.entries_off + idx * ENTRY_STRIDE_V3;
+            let p = read_u32(b, off);
+            (
+                (p & 0x1F_FFFF) as usize,
+                ((p >> 21) & 0x7F) as usize,
+                read_u32(b, off + 4),
+                ((p >> 28) & 0xF) as u16,
+            )
+        } else {
+            let off = self.entries_off + idx * ENTRY_STRIDE_V2;
+            (
+                read_u32(b, off) as usize,
+                read_u16(b, off + 8) as usize,
+                read_u32(b, off + 4),
+                read_u16(b, off + 10),
+            )
+        };
         if str_off + str_len > self.strings_len {
             return None;
         }
@@ -593,23 +689,53 @@ impl DictView {
         let b = self.buf.as_slice();
         let mut lo = 0usize;
         let mut hi = self.char_count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let off = self.chars_off + mid * CHAR_STRIDE;
-            let cp = read_u32(b, off);
-            if cp < target {
-                lo = mid + 1;
-            } else if cp > target {
-                hi = mid;
-            } else {
-                return Some(CharMeta {
-                    codepoint: cp,
-                    stem2: Stem2(read_u16(b, off + 4)),
-                    flags: read_u16(b, off + 6),
-                    shortest_code: PackedCode(read_u32(b, off + 8)),
-                    primary_short_code: PackedCode(read_u32(b, off + 12)),
-                    full_code: PackedCode(read_u32(b, off + 16)),
-                });
+        if self.is_v3 {
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let off = self.chars_off + mid * CHAR_STRIDE_V3;
+                let packed = read_u32(b, off);
+                let cp = packed & 0x1F_FFFF;
+                if cp < target {
+                    lo = mid + 1;
+                } else if cp > target {
+                    hi = mid;
+                } else {
+                    let s10 = (packed >> 21) & 0x3FF;
+                    let stem2 = Stem2((((s10 >> 5) & 0x1F) as u16) << 8 | ((s10 & 0x1F) as u16));
+                    let flags = if (packed >> 31) != 0 {
+                        ENTRY_FLAG_EXT_RARE
+                    } else {
+                        0
+                    };
+                    return Some(CharMeta {
+                        codepoint: cp,
+                        stem2,
+                        flags,
+                        shortest_code: PackedCode(read_u32(b, off + 4)),
+                        primary_short_code: PackedCode(read_u32(b, off + 8)),
+                        full_code: PackedCode(read_u32(b, off + 12)),
+                    });
+                }
+            }
+        } else {
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let off = self.chars_off + mid * CHAR_STRIDE_V2;
+                let cp = read_u32(b, off);
+                if cp < target {
+                    lo = mid + 1;
+                } else if cp > target {
+                    hi = mid;
+                } else {
+                    return Some(CharMeta {
+                        codepoint: cp,
+                        stem2: Stem2(read_u16(b, off + 4)),
+                        flags: read_u16(b, off + 6),
+                        shortest_code: PackedCode(read_u32(b, off + 8)),
+                        primary_short_code: PackedCode(read_u32(b, off + 12)),
+                        full_code: PackedCode(read_u32(b, off + 16)),
+                    });
+                }
             }
         }
         None
