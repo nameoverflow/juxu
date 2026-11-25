@@ -1258,6 +1258,39 @@ struct SwiftBridgeTests {
         check(mergedCtx.afterContext == "now")
         check(mergedCtx.visibleScreenText == "Alice: check CI")
 
+        // Cmd+Backspace clears entire active composition and passes through when idle
+        do {
+            let cmdBsBridge = JuxuBridge(customDictsDir: dictsURL, inMemoryOnly: true)
+            cmdBsBridge.switchSchema(21, persist: false) // Xiaohe Shuangpin
+            for (idx, ch) in "ceuiyixx".unicodeScalars.enumerated() {
+                let s = cmdBsBridge.handleKey(
+                    keyCode: 0,
+                    scalar: ch.value,
+                    hasCmdOrCtrl: false,
+                    timestampMs: UInt64(700 + idx * 30)
+                )
+                check(s.consumed)
+            }
+            check(!cmdBsBridge.state.preedit.isEmpty && !cmdBsBridge.state.macOSPreedit.isEmpty)
+            check(!cmdBsBridge.state.candidates.isEmpty)
+
+            let cleared = cmdBsBridge.handleKey(
+                keyCode: 0x33,
+                scalar: 0,
+                hasCmdOrCtrl: true,
+                timestampMs: 1000
+            )
+            check(cleared.consumed && cleared.commitText.isEmpty && cleared.preedit.isEmpty && cleared.macOSPreedit.isEmpty && cleared.candidates.isEmpty)
+
+            let idle = cmdBsBridge.handleKey(
+                keyCode: 0x33,
+                scalar: 0,
+                hasCmdOrCtrl: true,
+                timestampMs: 1050
+            )
+            check(!idle.consumed)
+        }
+
         VoiceContextPromptTests.run()
 
         print("✓ All Swift <-> Rust C ABI bridge, pure-AppKit non-wrapping candidate bar, Cangjie, Bayesian typo, SettingsWindow Cmd+W, VoiceContextCapture & macOS Voice MVP tests passed!")
