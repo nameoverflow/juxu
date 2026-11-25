@@ -900,15 +900,13 @@ mod tests {
         assert_eq!(engine.page_candidates()[0].badge, CandidateBadge::None);
         engine.clear_composition();
 
-        // 5. Uncontracted Hanyu Pinyin finals: shuei -> shui, liou -> liu, luen -> lun
-        for (keys, expected) in [("shuei", "水"), ("liou", "留"), ("luen", "论")] {
-            for ch in keys.chars() {
-                let _ = engine.handle_key_event(0, Some(ch), false, 500);
-            }
-            assert_eq!(engine.page_candidates()[0].text, expected, "{} failed", keys);
-            assert!(engine.page_candidates()[0].is_exact);
-            engine.clear_composition();
+        // 5. Non-standard uncontracted `*iou/*uei/*uen` are NOT mapped to single chars,
+        //    so valid 2-syllable words like `xi'ou` ("西欧" when present) are never hijacked.
+        for ch in "xi".chars() {
+            let _ = engine.handle_key_event(0, Some(ch), false, 500);
         }
+        assert!(!engine.page_candidates().is_empty());
+        engine.clear_composition();
     }
 
     #[test]

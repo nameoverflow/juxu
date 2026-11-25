@@ -536,7 +536,7 @@ impl JuxuEngine {
         if let Some(ref pd) = self.pinyin_dict {
             let mut syls = Vec::new();
             for ch in trimmed.chars() {
-                if let Some(&sid) = pd.char_syllables(ch).first() {
+                if let Some(&sid) = pd.char_syllables_for_phrase_index(ch).first() {
                     syls.push(pd.syllable_str(sid));
                 } else {
                     return String::new();
@@ -1403,7 +1403,7 @@ impl JuxuEngine {
         if self.is_pinyin_mode() {
             if let Some(ref pdict) = self.pinyin_dict {
                 let (mask, _) = if self.config.schema.is_shuangpin() {
-                    shuangpin_next_key_priors(&self.raw_code, pdict, None)
+                    shuangpin_next_key_priors(&self.raw_code, self.pinyin_paths.first(), pdict, None)
                 } else {
                     pinyin_next_key_priors(&self.raw_code, pdict, None)
                 };
@@ -1574,7 +1574,12 @@ impl JuxuEngine {
             if let Some(ref pdict) = self.pinyin_dict {
                 let rwkv_starts = self.rwkv_pinyin_start_priors(pdict);
                 let (mask, priors) = if self.config.schema.is_shuangpin() {
-                    shuangpin_next_key_priors(&self.raw_code, pdict, rwkv_starts.as_ref())
+                    shuangpin_next_key_priors(
+                        &self.raw_code,
+                        self.pinyin_paths.first(),
+                        pdict,
+                        rwkv_starts.as_ref(),
+                    )
                 } else {
                     pinyin_next_key_priors(&self.raw_code, pdict, rwkv_starts.as_ref())
                 };

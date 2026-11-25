@@ -1148,9 +1148,8 @@ fn real_dicts_full_pinyin_orthographic_mappings_and_enword_resilience() {
         ("xvyao", "需要"),
         ("qvanbu", "全部"),
         ("yvanlai", "原来"),
-        ("shueiguo", "水果"),
-        ("liouxuesheng", "留学生"),
-        ("taoluen", "讨论"),
+        ("xiou", "西欧"),
+        ("qiou", "奇偶"),
     ];
 
     for (keys, expected) in cases {
@@ -2495,4 +2494,136 @@ fn real_dicts_cold_start_bigram_prior_lifts_content_words_over_bos_nonwords() {
             "cold-start Xiaohe {code} expected {expected}, got {top:?}"
         );
     }
+}
+
+#[test]
+fn real_dicts_deterministic_pinyin_hardcode_fixes() {
+    use juxu_core::english::EnDictView;
+    use juxu_core::pinyin_dict::PinyinDictView;
+
+    let dir = dicts_dir();
+    if !dir.join("pinyin.pydict").exists()
+        || !dir.join("wubi_aux.wbaux").exists()
+        || !dir.join("english.endict").exists()
+    {
+        return;
+    }
+
+    let mut cfg = JuxuConfig::default();
+    cfg.schema = InputSchema::Pinyin;
+    let mut engine = JuxuEngine::new(cfg.clone());
+    engine.load_pinyin_dict(PinyinDictView::from_file(dir.join("pinyin.pydict")).unwrap());
+    engine.load_english_dict(EnDictView::open_mmap(dir.join("english.endict")).unwrap());
+    engine.set_aux(AuxView::open_mmap(dir.join("wubi_aux.wbaux")).unwrap());
+
+    let type_cands = |engine: &mut JuxuEngine, schema: InputSchema, keys: &str, n: usize| -> Vec<String> {
+        let mut scfg = JuxuConfig::default();
+        scfg.schema = schema;
+        engine.set_config(scfg);
+        engine.clear_context();
+        engine.clear_composition();
+        for (i, ch) in keys.chars().enumerate() {
+            engine.handle_key_event(0, Some(ch), false, 1_000 + i as u64 * 80);
+        }
+        engine
+            .all_candidates()
+            .iter()
+            .take(n)
+            .map(|c| c.text.clone())
+            .collect()
+    };
+
+    // 1. Initial abbreviations must recall common characters ranked past #14 in large syllables
+    //    (`计`#16, `视`#16, `智`#17, `己`#21, `试`#21, `译`#31) and never let 2-consonant `zn` get
+    //    hijacked by 1-char omitted-vowel `咱(zan)`.
+    for (keys, expected_any, top_k) in [
+        ("jsj", &["计算机"][..], 3usize),
+        ("rgzn", &["人工智能"][..], 3),
+        ("zj", &["自己"][..], 5),
+        ("sp", &["视频"][..], 5),
+        ("cs", &["测试", "城市"][..], 12),
+        ("fy", &["翻译"][..], 5),
+    ] {
+        let cands = type_cands(&mut engine, InputSchema::Pinyin, keys, top_k);
+        assert!(
+            cands.iter().any(|t| expected_any.contains(&t.as_str())),
+            "abbr {keys:?} expected one of {expected_any:?} in top-{top_k}, got {cands:?}"
+        );
+    }
+    engine.clear_composition();
+    engine.set_recent_context("单元");
+    for (i, ch) in "cs".chars().enumerate() {
+        engine.handle_key_event(0, Some(ch), false, 1_500 + i as u64 * 80);
+    }
+    assert_eq!(
+        engine.all_candidates().first().map(|c| c.text.as_str()),
+        Some("测试"),
+        "contextual abbr '单元' + 'cs' must rank '测试' at #1"
+    );
+
+    // 2. Non-standard uncontracted `*iou/*uei/*uen` aliases are removed, so genuine 2-syllable
+    //    Mandarin words (`xi'ou` = `西欧`, `ji'ou` / `qi'ou` = `奇偶`) are never hijacked by 1-char
+    //    `修`/`就`/`秋`, while `ü` orthographic aliases (`celue` -> `策略`) remain #1.
+    let xiou = type_cands(&mut engine, InputSchema::Pinyin, "xiou", 3);
+    assert_eq!(xiou.first().map(String::as_str), Some("西欧"), "xiou got {xiou:?}");
+    let qiou = type_cands(&mut engine, InputSchema::Pinyin, "qiou", 3);
+    assert_eq!(qiou.first().map(String::as_str), Some("奇偶"), "qiou got {qiou:?}");
+    let jiou = type_cands(&mut engine, InputSchema::Pinyin, "jiou", 5);
+    assert!(
+        jiou.first().is_some_and(|t| t.chars().count() == 2) && jiou.iter().any(|t| t == "奇偶"),
+        "jiou must prefer 2-syllable exact words ahead of 1-char '就' and include '奇偶', got {jiou:?}"
+    );
+    let celue = type_cands(&mut engine, InputSchema::Pinyin, "celue", 3);
+    assert_eq!(celue.first().map(String::as_str), Some("策略"), "celue got {celue:?}");
+
+    // 3. Tier-4 English prefix completions must not hijack Page-1 (`#1..#6`) on clean lowercase Chinese
+    //    inputs (`de`, `pin`, `chan`, `blai`, `gren`, `songs`), while `pyth` still surfaces `Python` in Top-5,
+    //    and `sglang` stays #1!
+    for keys in ["de", "pin", "chan", "blai", "gren", "songs"] {
+        let top6 = type_cands(&mut engine, InputSchema::Pinyin, keys, 6);
+        assert!(
+            top6.iter().all(|t| !t.bytes().any(|b| b.is_ascii_alphabetic())),
+            "clean Chinese keys={keys:?} must not have Page-1 (#1..#6) hijacked by English completions, got {top6:?}"
+        );
+    }
+    let pyth = type_cands(&mut engine, InputSchema::Pinyin, "pyth", 5);
+    assert!(pyth.iter().any(|t| t == "Python"), "pyth expected Python in top-5, got {pyth:?}");
+    let sglang = type_cands(&mut engine, InputSchema::Pinyin, "sglang", 3);
+    assert_eq!(sglang.first().map(String::as_str), Some("sglang"));
+
+    // 4. Long (>=4 char) sentences must retain alternative full-sentence beam paths in `all_candidates()`
+    //    instead of breaking after #1!
+    let jtwm = type_cands(&mut engine, InputSchema::Pinyin, "jintianwomen", 40);
+    let four_char_cnt = jtwm.iter().filter(|t| t.chars().count() == 4).count();
+    assert!(
+        four_char_cnt >= 2,
+        "jintianwomen should retain >=2 4-char full-sentence candidates in all_candidates(), got {jtwm:?}"
+    );
+
+    // 5. `add_user_phrase` returns primary highest-weight reading (`shuo'hua`, not alphabetical `shui'hua`),
+    //    and `weight == 1` attested `8105` secondary readings (`单=shan` in `单田芳`, `哪=ne` in `哪吒`)
+    //    are indexed in `UserStore` Pinyin phrases.
+    assert_eq!(engine.add_user_phrase("说话"), "shuo'hua");
+    let _ = engine.add_user_phrase("单田芳");
+    let stf = type_cands(&mut engine, InputSchema::Pinyin, "shantianfang", 3);
+    assert!(
+        stf.iter().any(|t| t == "单田芳"),
+        "expected user phrase '单田芳' via 'shantianfang' (w=1 reading), got {stf:?}"
+    );
+
+    // 6. Shuangpin `next_key_mask_and_priors` preserves initial/final parity after odd-length inline Latin (`iOS`).
+    let _ = type_cands(&mut engine, InputSchema::XiaoheShuangpin, "woysiOS", 3);
+    let (mask_after_ios, _) = engine.next_key_mask_and_priors();
+    assert_eq!(
+        mask_after_ios, 0x03FF_FFFF,
+        "after completed inline 'iOS' in Shuangpin, next key must expect a full 26-key initial, got {mask_after_ios:#x}"
+    );
+    engine.handle_key_event(0, Some('x'), false, 2_000);
+    let (mask_after_ios_x, _) = engine.next_key_mask_and_priors();
+    assert_ne!(
+        mask_after_ios_x, 0x03FF_FFFF,
+        "after 'woysiOSx', 'x' is an incomplete Shuangpin initial and must restrict valid finals"
+    );
+    assert_ne!(mask_after_ios_x & (1 << (b'i' - b'a')), 0, "'i' (xi) must be valid final for 'x'");
+    assert_eq!(mask_after_ios_x & (1 << (b'v' - b'a')), 0, "'v' is invalid final for 'x' in Xiaohe");
 }

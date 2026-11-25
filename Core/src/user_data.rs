@@ -368,11 +368,11 @@ impl UserStore {
             }
             let mut next = Vec::new();
             'outer: for r in &readings {
-                for &sid in syls.iter().take(3) {
+                for &sid in syls.iter().take(4) {
                     let mut nr = r.clone();
                     nr.push(sid);
                     next.push(nr);
-                    if next.len() >= 8 {
+                    if next.len() >= 16 {
                         break 'outer;
                     }
                 }

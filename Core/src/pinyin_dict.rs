@@ -377,7 +377,8 @@ impl PinyinDictView {
     }
 
     /// Return syllable IDs for `ch` suitable for user-phrase Pinyin indexing, sorted by descending
-    /// weight and excluding archaic/zero-weight secondary readings (`weight <= 1` when `max_w >= 100`).
+    /// weight and excluding zero-weight suppressed / archaic glosses (`weight == 0` when `max_w >= 100`),
+    /// while keeping attested secondary readings (`weight >= 1` in `8105`, e.g. `哪=ne`, `单=shan/chan`, `绿=lu`).
     pub fn char_syllables_for_phrase_index(&self, ch: char) -> Vec<u16> {
         let sids = self.char_syllables(ch);
         if sids.len() <= 1 {
@@ -386,13 +387,13 @@ impl PinyinDictView {
         let max_w = self.max_weight_for(ch, 1.0);
         let mut weighted: Vec<(u16, u32)> = sids
             .into_iter()
-            .map(|sid| (sid, self.lookup_char_weight(sid, ch).unwrap_or(1)))
+            .map(|sid| (sid, self.lookup_char_weight(sid, ch).unwrap_or(0)))
             .collect();
-        weighted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        weighted.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         if max_w >= 100.0 {
             let filtered: Vec<u16> = weighted
                 .iter()
-                .filter(|&&(_, w)| w > 1)
+                .filter(|&&(_, w)| w > 0)
                 .map(|&(sid, _)| sid)
                 .collect();
             if !filtered.is_empty() {

@@ -719,7 +719,7 @@ fn main() {
                 if let Some(pcode) = PackedCode::from_bytes(&code_bytes) {
                     let wt = if let Some(&top) = bucket_max_wt.get(&pcode) {
                         if top > 0 {
-                            (top / 3).clamp(500_000, base_wt)
+                            (top / 3).min(base_wt).max(1)
                         } else {
                             base_wt
                         }
@@ -1300,7 +1300,19 @@ fn build_english_dict(ice_dir: &Path) -> (Vec<u8>, usize) {
             }
             let is_abbr = disp.len() <= 4 && disp.bytes().all(|b| b.is_ascii_uppercase());
             let flags = if is_abbr { EN_FLAG_ABBR } else { 0 };
-            insert_word(disp, 44_000, flags);
+            let lower = disp.to_ascii_lowercase();
+            let weight = if let Some(&rank) = freq_rank.get(&lower) {
+                if rank < 1000 {
+                    62_000 - (rank as u16) * 10
+                } else if rank < 5000 {
+                    52_000 - ((rank - 1000) as u16) * 4
+                } else {
+                    (36_000u32.saturating_sub(((rank - 5000) as u32) * 2)).max(8_000) as u16
+                }
+            } else {
+                22_000
+            };
+            insert_word(disp, weight, flags);
         }
     }
 
