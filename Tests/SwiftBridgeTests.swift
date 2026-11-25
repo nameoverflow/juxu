@@ -1145,7 +1145,7 @@ struct SwiftBridgeTests {
             let hudView = VoiceHUDContentView(frame: NSRect(origin: .zero, size: VoiceHUDMetrics.canvasSize))
             var reported: [CGRect] = []
             hudView.onBackdropLayout = { pill, _ in reported.append(pill) }
-            hudView.apply(.recording(level: 0, elapsed: 0, partial: "", modeLabel: ""), animated: false)
+            hudView.reportBackdropLayout()
             let startWidth = reported.last?.width ?? 0
             hudView.apply(.notice(text: "已复制到剪贴板，可以直接粘贴", isError: false), animated: true)
             hudView.advance(dt: VoiceHUDMetrics.pillResizeDuration / 2)
