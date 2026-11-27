@@ -6,7 +6,7 @@ use std.option.{Option, Some, None}
 use std.vec.{vecLen}
 use std.str.{intToStr}
 use objc.{
-    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcAddProtocol, objcRegisterClass,
     msgSend0, msgSend1Ptr, msgSendInt0, msgSendI64_0,
     msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64,
 }
@@ -205,6 +205,7 @@ extern init(100) def registerIosHostAppClasses(): Void = {
 
     let scCls = objcAllocateClass("UIResponder", "JuxuIOSSceneDelegate");
     if (!ptrIsNull(scCls)) {
+        let _ = objcAddProtocol(scCls, "UIWindowSceneDelegate");
         let _ = objcAddMethod(scCls, "window", cFnPtr(sceneGetWindow), "@@:");
         let _ = objcAddMethod(scCls, "setWindow:", cFnPtr(sceneSetWindow), "v@:@");
         let _ = objcAddMethod(scCls, "scene:willConnectToSession:options:", cFnPtr(sceneWillConnect), "v@:@@@");
@@ -213,6 +214,7 @@ extern init(100) def registerIosHostAppClasses(): Void = {
 
     let appCls = objcAllocateClass("UIResponder", "JuxuIOSAppDelegate");
     if (!ptrIsNull(appCls)) {
+        let _ = objcAddProtocol(appCls, "UIApplicationDelegate");
         let _ = objcAddMethod(appCls, "application:didFinishLaunchingWithOptions:", cFnPtr(appDidFinishLaunching), "B@:@@");
         objcRegisterClass(appCls)
     } else ()

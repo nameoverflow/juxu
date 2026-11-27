@@ -42,16 +42,24 @@ def ensureExtSession(): JuxuSession =
         },
     }
 
+def pinAnchor(a: Ptr, b: Ptr): Void = {
+    let c = msgSend1Ptr(a, objcSel("constraintEqualToAnchor:"), b);
+    msgSendVoid1Bool(c, objcSel("setActive:"), true)
+}
+
 def kbViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
     let session = ensureExtSession();
     let rootView = msgSend0(self, objcSel("view"));
-    let bounds = msgSendRect0(rootView, objcSel("bounds"));
-    let w = if (bounds.size.width > 10.0) bounds.size.width else 390.0;
-    let canvas = objcAllocInitFrame("JuxuIOSKeyboardView", cgRect(0.0, 0.0, w, portraitTotalHeight()));
-    // UIViewAutoresizingFlexibleWidth (2) | UIViewAutoresizingFlexibleHeight (16) = 18
-    msgSendVoid1I64(canvas, objcSel("setAutoresizingMask:"), intToI64(18));
+    let canvas = objcAllocInitFrame("JuxuIOSKeyboardView", cgRect(0.0, 0.0, 0.0, 0.0));
+    msgSendVoid1Bool(canvas, objcSel("setTranslatesAutoresizingMaskIntoConstraints:"), false);
     msgSendVoid1Bool(canvas, objcSel("setMultipleTouchEnabled:"), true);
     msgSendVoid1Ptr(rootView, objcSel("addSubview:"), canvas);
+
+    // Pin canvas edges 1-to-1 to rootView so width always matches the real screen width
+    pinAnchor(msgSend0(canvas, objcSel("leadingAnchor")), msgSend0(rootView, objcSel("leadingAnchor")));
+    pinAnchor(msgSend0(canvas, objcSel("trailingAnchor")), msgSend0(rootView, objcSel("trailingAnchor")));
+    pinAnchor(msgSend0(canvas, objcSel("topAnchor")), msgSend0(rootView, objcSel("topAnchor")));
+    pinAnchor(msgSend0(canvas, objcSel("bottomAnchor")), msgSend0(rootView, objcSel("bottomAnchor")));
 
     // Fix portrait keyboard height to 273pt with UILayoutPriority (float / Float32) = 999.0
     let heightAnchor = msgSend0(rootView, objcSel("heightAnchor"));

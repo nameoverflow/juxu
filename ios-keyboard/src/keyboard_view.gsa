@@ -94,9 +94,13 @@ def uiColorRgba(r: Float, g: Float, b: Float, a: Float): Ptr =
 
 def uiTextAttrs(size: Float, weight: Float, color: Ptr): Ptr = {
     let font = msgSendUiFont(objcClass("UIFont"), objcSel("systemFontOfSize:weight:"), size, weight);
+    let para = msgSend0(msgSend0(objcClass("NSMutableParagraphStyle"), objcSel("alloc")), objcSel("init"));
+    // NSTextAlignmentCenter == 1
+    msgSendVoid1I64(para, objcSel("setAlignment:"), intToI64(1));
     let d = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
     let _ = msgSend2Ptr(d, objcSel("setObject:forKey:"), font, nsStr("NSFont"));
     let _ = msgSend2Ptr(d, objcSel("setObject:forKey:"), color, nsStr("NSColor"));
+    let _ = msgSend2Ptr(d, objcSel("setObject:forKey:"), para, nsStr("NSParagraphStyle"));
     d
 }
 
@@ -140,13 +144,13 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
                 while (cellGet(i) < limit) {
                     let idx = cellGet(i);
                     let c = vecGetOr(cands, idx, dummy);
-                    let r = cgRect(intToFloat(idx) * slotW + 10.0, 14.0, slotW - 12.0, 26.0);
+                    let r = cgRect(intToFloat(idx) * slotW, 15.0, slotW, 24.0);
                     msgSendUiDrawInRect(nsStr(c.text), objcSel("drawInRect:withAttributes:"), r, if (idx == 0) attrsAccent else attrsMain);
                     cellSet(i, idx + 1)
                 };
                 // Right-edge expand drawer toggle
                 let expIcon = if (cellGet(gDrawerOpen)) "⌃" else "⌄";
-                let er = cgRect(usableW + 12.0, 14.0, 28.0, 26.0);
+                let er = cgRect(usableW, 15.0, expandW, 24.0);
                 msgSendUiDrawInRect(nsStr(expIcon), objcSel("drawInRect:withAttributes:"), er, attrsMuted)
             },
             None -> (),
@@ -162,7 +166,7 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
             while (cellGet(i) < limit) {
                 let idx = cellGet(i);
                 let w = vecGetOr(preds, idx, "");
-                let r = cgRect(intToFloat(idx) * slotW + 10.0, 14.0, slotW - 12.0, 26.0);
+                let r = cgRect(intToFloat(idx) * slotW, 15.0, slotW, 24.0);
                 msgSendUiDrawInRect(nsStr(w), objcSel("drawInRect:withAttributes:"), r, attrsMuted);
                 cellSet(i, idx + 1)
             }
@@ -232,7 +236,7 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
             };
             let fillCol = if (isPressed) pressBg else if (k.keyClass == CharClass) charBg else funcBg;
             fillRounded(k.frame, keyCornerRadius(), fillCol);
-            let tr = cgRect(k.frame.origin.x + 6.0, k.frame.origin.y + 11.0, k.frame.size.width - 8.0, 24.0);
+            let tr = cgRect(k.frame.origin.x, k.frame.origin.y + 11.0, k.frame.size.width, 24.0);
             msgSendUiDrawInRect(nsStr(k.label), objcSel("drawInRect:withAttributes:"), tr, keyAttrs);
             cellSet(ki, cellGet(ki) + 1)
         };
@@ -248,7 +252,7 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
                     let popRect = cgRect(if (cx < 2.0) 2.0 else cx, if (cy < 2.0) 2.0 else cy, cw, ch);
                     fillRounded(popRect, 10.0, uiColorRgba(1.0, 1.0, 1.0, 1.0));
                     let bigAttrs = uiTextAttrs(26.0, 0.23, fgMain);
-                    let br = cgRect(popRect.origin.x + 12.0, popRect.origin.y + 10.0, cw - 16.0, 32.0);
+                    let br = cgRect(popRect.origin.x, popRect.origin.y + 9.0, cw, 32.0);
                     msgSendUiDrawInRect(nsStr(ak.label), objcSel("drawInRect:withAttributes:"), br, bigAttrs)
                 },
                 _ -> (),
