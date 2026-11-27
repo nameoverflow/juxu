@@ -194,11 +194,13 @@ def candidateViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
                     cellSet(i, idx + 1)
                 };
                 if (snap.totalPages > 1) {
-                    let pg = intToStr(snap.page + 1) + "/" + intToStr(snap.totalPages);
-                    let pSz = msgSendSizeAttrs(nsStr(pg), objcSel("sizeWithAttributes:"), normNumA);
-                    let px = bounds.size.width - pSz.width - 8.0;
-                    let py = (barHeight() - pSz.height) * 0.5;
-                    msgSendDrawInRect(nsStr(pg), objcSel("drawInRect:withAttributes:"), cgRect(px, py, pSz.width + 2.0, pSz.height + 1.0), normNumA)
+                    let sepCol = msgSend0(nsCol, objcSel("separatorColor"));
+                    let divX = bounds.size.width - 42.0;
+                    fillPill(cgRect(divX, (barHeight() - 14.0) * 0.5, 0.5, 14.0), 0.0, sepCol);
+                    let prevR = cgRect(divX + 3.0, panelInset(), 16.0, pillHeight());
+                    let nextR = cgRect(divX + 20.0, panelInset(), 16.0, pillHeight());
+                    msgSendDrawInRect(nsStr("‹"), objcSel("drawInRect:withAttributes:"), cgRect(prevR.origin.x + 4.0, (barHeight() - 16.0) * 0.5, 12.0, 16.0), normNumA);
+                    msgSendDrawInRect(nsStr("›"), objcSel("drawInRect:withAttributes:"), cgRect(nextR.origin.x + 4.0, (barHeight() - 16.0) * 0.5, 12.0, 16.0), normNumA)
                 } else ()
             }
         },

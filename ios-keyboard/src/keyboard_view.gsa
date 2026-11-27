@@ -12,7 +12,7 @@ use std.option.{Option, Some, None}
 use std.vec.{Vec, vecNew, vecLen, vecPush, vecGetOr, vecClear}
 use sys.time.{monotonicMs}
 use objc.{
-    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcAddProtocol, objcRegisterClass,
     msgSend0, msgSend1Ptr, msgSend1I64, msgSendBool0, msgSendI64_0,
     msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1Bool, msgSendVoid1I64,
 }
@@ -39,6 +39,7 @@ use layout_engine.{
     ribbonHeight, keyCornerRadius, t9SyllableRailWidth,
 }
 use marked_text.{proxyCommitText, proxySetMarkedText, proxyDeleteBackward}
+use feedback.{feedbackPrepare, feedbackFireKeyDown, feedbackFireSoftStep}
 
 extern "objc_msgSend" def msgSendUiBezierRounded(cls: Ptr, sel: Ptr, rect: CGRect, radius: Float): Ptr
 extern "objc_msgSend" def msgSendUiFont(cls: Ptr, sel: Ptr, size: Float, weight: Float): Ptr
@@ -187,8 +188,11 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
     let fgWhite = uiColorRgba(1.0, 1.0, 1.0, 1.0);
     let fgMuted = if (dark) uiColorRgba(1.0, 1.0, 1.0, 0.52) else uiColorRgba(0.0, 0.0, 0.0, 0.45);
     let fgModeSub = if (dark) uiColorRgba(1.0, 1.0, 1.0, 0.45) else uiColorRgba(0.0, 0.0, 0.0, 0.38);
+    let dividerCol = if (dark) uiColorRgba(1.0, 1.0, 1.0, 0.16) else uiColorRgba(0.0, 0.0, 0.0, 0.12);
+    let dividerH = 18.0;
+    let dividerY = (ribbonHeight() - dividerH) * 0.5;
 
-    // 1. Adaptive-width Candidate / Prediction Ribbon (top 53pt, transparent glass backing)
+    // 1. Adaptive-width Candidate / Prediction Ribbon (top 53pt, transparent glass backing + hairline dividers)
     let ribRects = cellGet(gRibbonRects);
     vecClear(ribRects);
 
@@ -203,7 +207,7 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
                 let cands = snap.pageCandidates;
                 let n = vecLen(cands);
                 let dummy = emptyCandidate();
-                let expandW = 44.0;
+                let expandW = 48.0;
                 let maxX = bounds.size.width - expandW - 4.0;
                 let attrsTop = uiTextAttrs(18.5, 0.23, fgPrimary);
                 let attrsCand = uiTextAttrs(18.0, 0.0, fgPrimary);
@@ -216,6 +220,9 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
                     let sz = msgSendUiSizeAttrs(nsStr(c.text), objcSel("sizeWithAttributes:"), attrs);
                     let slotW = sz.width + 24.0;
                     if (idx == 0 || cellGet(curX) + slotW <= maxX) {
+                        if (idx > 0) {
+                            fillRounded(cgRect(cellGet(curX) - 1.0, dividerY, 0.5, dividerH), 0.0, dividerCol)
+                        } else ();
                         let r = cgRect(cellGet(curX), 6.0, slotW, ribbonHeight() - 12.0);
                         vecPush(ribRects, r);
                         drawCenteredText(c.text, r, attrs);
@@ -225,14 +232,15 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
                     };
                     cellSet(i, idx + 1)
                 };
-                // Right-edge SF Symbol chevron
+                // Vertical hairline divider before chevron expand button (exact `chevronDivider` at width - 48pt)
+                fillRounded(cgRect(bounds.size.width - expandW, dividerY, 0.5, dividerH), 0.0, dividerCol);
                 let expSym = if (cellGet(gDrawerOpen)) "chevron.up" else "chevron.down";
-                drawSfSymbolCentered(expSym, 16.0, cgRect(bounds.size.width - expandW, 6.0, expandW, ribbonHeight() - 12.0), fgMuted)
+                drawSfSymbolCentered(expSym, 15.0, cgRect(bounds.size.width - expandW, 6.0, expandW, ribbonHeight() - 12.0), fgMuted)
             },
             None -> (),
         }
     } else {
-        // Idle next-word prediction chips (adaptive width)
+        // Idle next-word prediction chips (adaptive width + hairline dividers)
         let preds = cellGet(gIosPreds);
         let pn = vecLen(preds);
         let attrsPred = uiTextAttrs(17.5, 0.0, fgPrimary);
@@ -245,6 +253,9 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
             let sz = msgSendUiSizeAttrs(nsStr(w), objcSel("sizeWithAttributes:"), attrsPred);
             let slotW = sz.width + 26.0;
             if (idx == 0 || cellGet(curX) + slotW <= maxX) {
+                if (idx > 0) {
+                    fillRounded(cgRect(cellGet(curX) - 2.0, dividerY, 0.5, dividerH), 0.0, dividerCol)
+                } else ();
                 let r = cgRect(cellGet(curX), 6.0, slotW, ribbonHeight() - 12.0);
                 vecPush(ribRects, r);
                 drawCenteredText(w, r, attrsPred);
@@ -438,8 +449,10 @@ def performBackspace(self: Ptr): Void = {
     msgSendVoid0(self, objcSel("setNeedsDisplay"))
 }
 
-def onDeleteRepeatTimer(self: Ptr, _cmd: Ptr, _timer: Ptr): Void =
+def onDeleteRepeatTimer(self: Ptr, _cmd: Ptr, _timer: Ptr): Void = {
+    feedbackFireSoftStep(true);
     performBackspace(self)
+}
 
 def dispatchKeyRelease(self: Ptr, k: KeySpec, pt: CGPoint): Void = {
     let vc = cellGet(gIosVc);
@@ -538,6 +551,7 @@ def iosTouchesBegan(self: Ptr, _cmd: Ptr, touches: Ptr, _event: Ptr): Void = {
                             if (rectContainsPoint(vecGetOr(rects, idx, z), pt)) {
                                 cellSet(done, true);
                                 if (n > 0) {
+                                    feedbackFireSoftStep(true);
                                     let nextSnap = sessionStep(s, SelectPage { index: idx, atMs: monotonicMs() });
                                     applySnapToProxy(nextSnap);
                                     msgSendVoid0(self, objcSel("setNeedsDisplay"))
@@ -545,6 +559,7 @@ def iosTouchesBegan(self: Ptr, _cmd: Ptr, touches: Ptr, _event: Ptr): Void = {
                                     let word = vecGetOr(cellGet(gIosPreds), idx, "");
                                     let vc = cellGet(gIosVc);
                                     if (!ptrIsNull(vc) && strLen(word) > 0) {
+                                        feedbackFireSoftStep(true);
                                         proxyCommitText(msgSend0(vc, objcSel("textDocumentProxy")), word);
                                         acceptPrediction(s.engine, word, monotonicMs());
                                         cellSet(gIosPreds, predictNext(s.engine, 6));
@@ -595,16 +610,19 @@ def iosTouchesBegan(self: Ptr, _cmd: Ptr, touches: Ptr, _event: Ptr): Void = {
             cellSet(gSpaceDragActive, false);
             cellSet(gSpaceDragLastX, pt.x);
             match hit {
-                Some(k) if (k.action == ActBackspace) -> {
-                    stopDeleteTimer();
-                    let timer = msgSendScheduledTimer(
-                        objcClass("NSTimer"),
-                        objcSel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
-                        0.12, self, objcSel("onDeleteRepeatTimer:"), ptrNull(), true
-                    );
-                    cellSet(gDeleteTimer, timer)
+                Some(k) -> {
+                    feedbackFireKeyDown();
+                    if (k.action == ActBackspace) {
+                        stopDeleteTimer();
+                        let timer = msgSendScheduledTimer(
+                            objcClass("NSTimer"),
+                            objcSel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+                            0.12, self, objcSel("onDeleteRepeatTimer:"), ptrNull(), true
+                        );
+                        cellSet(gDeleteTimer, timer)
+                    } else ()
                 },
-                _ -> (),
+                None -> (),
             };
             msgSendVoid0(self, objcSel("setNeedsDisplay"))
         }
@@ -622,6 +640,7 @@ def iosTouchesMoved(self: Ptr, _cmd: Ptr, touches: Ptr, _event: Ptr): Void = {
                     let steps = floatToInt(dx / 14.0);
                     cellSet(gSpaceDragActive, true);
                     cellSet(gSpaceDragLastX, cellGet(gSpaceDragLastX) + intToFloat(steps) * 14.0);
+                    feedbackFireSoftStep(false);
                     let vc = cellGet(gIosVc);
                     if (!ptrIsNull(vc)) {
                         let proxy = msgSend0(vc, objcSel("textDocumentProxy"));
@@ -668,9 +687,13 @@ def iosTouchesCancelled(self: Ptr, _cmd: Ptr, _touches: Ptr, _event: Ptr): Void 
     msgSendVoid0(self, objcSel("setNeedsDisplay"))
 }
 
+def iosEnableInputClicks(_self: Ptr, _cmd: Ptr): Bool = true
+
 extern init(100) def registerIosKeyboardViewClass(): Void = {
     let cls = objcAllocateClass("UIView", "JuxuIOSKeyboardView");
     if (!ptrIsNull(cls)) {
+        let _ = objcAddProtocol(cls, "UIInputViewAudioFeedback");
+        let _ = objcAddMethod(cls, "enableInputClicksWhenVisible", cFnPtr(iosEnableInputClicks), "B@:");
         let _ = objcAddMethod(cls, "drawRect:", cFnPtr(iosViewDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
         let _ = objcAddMethod(cls, "layoutSubviews", cFnPtr(iosViewLayoutSubviews), "v@:");
         let _ = objcAddMethod(cls, "touchesBegan:withEvent:", cFnPtr(iosTouchesBegan), "v@:@@");

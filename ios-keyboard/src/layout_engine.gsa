@@ -92,7 +92,7 @@ def makeFuncKey(label: String, secondary: String, sym: String, act: KeyAction, f
         sfSymbol: sym,
         action: act,
         keyClass: FuncClass,
-        usesFuncFill: true,
+        usesFuncFill: false,
         isBlueAccent: blue,
         frame: frame,
     }
@@ -157,10 +157,10 @@ def appendBottomRow4Key(
         frame: cgRect(spaceX, y3, spaceW, kh),
     });
 
-    // Return key: systemBlue accent fill with crisp white text!
+    // Return key: uniform pure-white keycap with `return.left` SF Symbol (blue only for prominent action roles)
     let retX = col6MaxX + gapX;
     let retW = (viewWidth - outerX) - retX;
-    vecPush(out, makeFuncKey(if (asciiMode) "return" else "换行", "", "", ActReturn, cgRect(retX, y3, retW, kh), true))
+    vecPush(out, makeFuncKey("", "", "return.left", ActReturn, cgRect(retX, y3, retW, kh), false))
 }
 
 /// Build the pixel-exact iOS 26 QWERTY portrait layout (`ribbonHeight` = 53pt at top).
@@ -357,7 +357,7 @@ pub def buildT9Layout(viewWidth: Float, asciiMode: Bool, showGlobe: Bool): Vec K
             frame: cgRect(gridX, y3, gridW, kh),
         })
     };
-    vecPush(out, makeFuncKey("换行", "", "", ActReturn, cgRect(rightX, y3, rightW, kh), true));
+    vecPush(out, makeFuncKey("", "", "return.left", ActReturn, cgRect(rightX, y3, rightW, kh), false));
     out
 }
 

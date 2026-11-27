@@ -19,6 +19,7 @@ use juxu_shared.{
 use layout_engine.{portraitTotalHeight}
 use marked_text.{proxyCleanupOrphanIfNeeded}
 use keyboard_view.{iosCanvasBind, iosCanvasRefreshPredictions}
+use feedback.{feedbackPrepare}
 
 def gExtSession: Cell (Option JuxuSession) = cellNew(None)
 
@@ -73,7 +74,8 @@ def kbViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
     msgSendVoid1F32(constraint, objcSel("setPriority:"), floatToF32(999.0));
     msgSendVoid1Bool(constraint, objcSel("setActive:"), true);
 
-    iosCanvasBind(self, canvas, session)
+    iosCanvasBind(self, canvas, session);
+    feedbackPrepare()
 }
 
 def kbTextDidChange(self: Ptr, _cmd: Ptr, _textInput: Ptr): Void = {
