@@ -36,7 +36,7 @@ use layout_engine.{
     ActLetter, ActDigitT9, ActSymbol, ActShift, ActBackspace,
     ActSwitchMode, ActToggleAscii, ActGlobe, ActSpace, ActReturn,
     emptyKeySpec, buildLayoutForMode, hitTestKeys,
-    ribbonHeight, keyCornerRadius, t9SyllableRailWidth,
+    ribbonHeightForWidth, keyCornerRadius, t9SyllableRailWidth,
 }
 use marked_text.{proxyCommitText, proxySetMarkedText, proxyDeleteBackward}
 use feedback.{feedbackPrepare, feedbackFireKeyDown, feedbackFireSoftStep}
@@ -188,9 +188,10 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
     let fgWhite = uiColorRgba(1.0, 1.0, 1.0, 1.0);
     let fgMuted = if (dark) uiColorRgba(1.0, 1.0, 1.0, 0.52) else uiColorRgba(0.0, 0.0, 0.0, 0.45);
     let fgModeSub = if (dark) uiColorRgba(1.0, 1.0, 1.0, 0.45) else uiColorRgba(0.0, 0.0, 0.0, 0.38);
+    let ribH = ribbonHeightForWidth(bounds.size.width);
     let dividerCol = if (dark) uiColorRgba(1.0, 1.0, 1.0, 0.16) else uiColorRgba(0.0, 0.0, 0.0, 0.12);
-    let dividerH = 18.0;
-    let dividerY = (ribbonHeight() - dividerH) * 0.5;
+    let dividerH = if (ribH <= 42.0) 14.0 else 18.0;
+    let dividerY = (ribH - dividerH) * 0.5;
 
     // 1. Adaptive-width Candidate / Prediction Ribbon (top 53pt, transparent glass backing + hairline dividers)
     let ribRects = cellGet(gRibbonRects);
@@ -223,7 +224,7 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
                         if (idx > 0) {
                             fillRounded(cgRect(cellGet(curX) - 1.0, dividerY, 0.5, dividerH), 0.0, dividerCol)
                         } else ();
-                        let r = cgRect(cellGet(curX), 6.0, slotW, ribbonHeight() - 12.0);
+                        let r = cgRect(cellGet(curX), 4.0, slotW, ribH - 8.0);
                         vecPush(ribRects, r);
                         drawCenteredText(c.text, r, attrs);
                         cellSet(curX, cellGet(curX) + slotW + 2.0)
@@ -235,7 +236,7 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
                 // Vertical hairline divider before chevron expand button (exact `chevronDivider` at width - 48pt)
                 fillRounded(cgRect(bounds.size.width - expandW, dividerY, 0.5, dividerH), 0.0, dividerCol);
                 let expSym = if (cellGet(gDrawerOpen)) "chevron.up" else "chevron.down";
-                drawSfSymbolCentered(expSym, 15.0, cgRect(bounds.size.width - expandW, 6.0, expandW, ribbonHeight() - 12.0), fgMuted)
+                drawSfSymbolCentered(expSym, 15.0, cgRect(bounds.size.width - expandW, 4.0, expandW, ribH - 8.0), fgMuted)
             },
             None -> (),
         }
@@ -256,7 +257,7 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
                 if (idx > 0) {
                     fillRounded(cgRect(cellGet(curX) - 2.0, dividerY, 0.5, dividerH), 0.0, dividerCol)
                 } else ();
-                let r = cgRect(cellGet(curX), 6.0, slotW, ribbonHeight() - 12.0);
+                let r = cgRect(cellGet(curX), 4.0, slotW, ribH - 8.0);
                 vecPush(ribRects, r);
                 drawCenteredText(w, r, attrsPred);
                 cellSet(curX, cellGet(curX) + slotW + 4.0)
@@ -270,7 +271,7 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
     // 2. Expanded Candidate Drawer (overlays key area when open)
     if (cellGet(gDrawerOpen)) {
         let drawerBg = if (dark) uiColorRgba(0.14, 0.14, 0.16, 0.92) else uiColorRgba(0.96, 0.96, 0.98, 0.92);
-        fillRounded(cgRect(6.0, ribbonHeight(), bounds.size.width - 12.0, bounds.size.height - ribbonHeight() - 6.0), 12.0, drawerBg);
+        fillRounded(cgRect(6.0, ribH, bounds.size.width - 12.0, bounds.size.height - ribH - 6.0), 12.0, drawerBg);
         let allC = cellGet(gDrawerCands);
         let cn = vecLen(allC);
         let limit = if (cn < 24) cn else 24;
@@ -285,7 +286,7 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
             let row = idx / cols;
             let col = idx % cols;
             let c = vecGetOr(allC, idx, dummy);
-            let r = cgRect(6.0 + intToFloat(col) * cellW, ribbonHeight() + intToFloat(row) * cellH, cellW, cellH);
+            let r = cgRect(6.0 + intToFloat(col) * cellW, ribH + intToFloat(row) * cellH, cellW, cellH);
             drawCenteredText(c.text, r, attrsD);
             cellSet(i, idx + 1)
         }
@@ -299,7 +300,7 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
 
         // T9 left syllable rail (when in ModeT9)
         if (cellGet(gIosMode) == ModeT9) {
-            let railRect = cgRect(6.67, ribbonHeight(), t9SyllableRailWidth(), 157.0);
+            let railRect = cgRect(6.67, ribH, t9SyllableRailWidth(), 157.0);
             fillRounded(railRect, keyCornerRadius(), funcBg);
             let attrsSyl = uiTextAttrs(16.0, 0.23, fgPrimary);
             match cellGet(gIosSnap) {
@@ -311,7 +312,7 @@ def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
                         while (cellGet(si) < lim) {
                             let idx = cellGet(si);
                             let syl = vecGetOr(t9.t9Syllables, idx, "");
-                            drawCenteredText(syl, cgRect(6.67, ribbonHeight() + intToFloat(idx) * 38.0, t9SyllableRailWidth(), 38.0), attrsSyl);
+                            drawCenteredText(syl, cgRect(6.67, ribH + intToFloat(idx) * 38.0, t9SyllableRailWidth(), 38.0), attrsSyl);
                             cellSet(si, idx + 1)
                         }
                     },
@@ -531,7 +532,8 @@ def iosTouchesBegan(self: Ptr, _cmd: Ptr, touches: Ptr, _event: Ptr): Void = {
     if (!ptrIsNull(t)) {
         let pt = msgSendPoint1Ptr(t, objcSel("locationInView:"), self);
         let bounds = msgSendRect0(self, objcSel("bounds"));
-        if (pt.y < ribbonHeight()) {
+        let ribH = ribbonHeightForWidth(bounds.size.width);
+        if (pt.y < ribH) {
             match (cellGet(gIosSession), cellGet(gIosSnap)) {
                 (Some(s), Some(snap)) -> {
                     let n = vecLen(snap.pageCandidates);
@@ -576,7 +578,7 @@ def iosTouchesBegan(self: Ptr, _cmd: Ptr, touches: Ptr, _event: Ptr): Void = {
         } else if (cellGet(gDrawerOpen)) {
             let cols = 4;
             let cellW = (bounds.size.width - 12.0) / intToFloat(cols);
-            let row = floatToInt((pt.y - ribbonHeight()) / 36.0);
+            let row = floatToInt((pt.y - ribH) / 36.0);
             let col = floatToInt((pt.x - 6.0) / cellW);
             let idx = row * cols + col;
             if (idx >= 0 && idx < vecLen(cellGet(gDrawerCands))) {
@@ -590,8 +592,8 @@ def iosTouchesBegan(self: Ptr, _cmd: Ptr, touches: Ptr, _event: Ptr): Void = {
                     None -> (),
                 }
             } else ()
-        } else if (cellGet(gIosMode) == ModeT9 && pt.x < t9SyllableRailWidth() + 7.0 && pt.y < ribbonHeight() + 160.0) {
-            let sIdx = floatToInt((pt.y - ribbonHeight()) / 38.0);
+        } else if (cellGet(gIosMode) == ModeT9 && pt.x < t9SyllableRailWidth() + 7.0 && pt.y < ribH + 160.0) {
+            let sIdx = floatToInt((pt.y - ribH) / 38.0);
             match (cellGet(gIosSession), cellGet(gIosSnap)) {
                 (Some(s), Some(snap)) -> match snap.t9 {
                     Some(t9) if (sIdx >= 0 && sIdx < vecLen(t9.t9Syllables)) -> {
