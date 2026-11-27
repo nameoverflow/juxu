@@ -1,11 +1,14 @@
-/// iOS virtual keyboard geometry & hit-testing (`IOSKeyboardLayoutEngine`).
-/// Preserves Juxu's exact portrait metrics:
-/// - Total height: 273pt (53pt candidate ribbon + 220pt 4-row keyboard)
-/// - keyH = 45pt, rowGap = 11pt, gapX = 6pt, cornerRadius = 7.8pt, bottomInset = 7pt
-/// - Supports QWERTY, T9 9-key Pinyin (with left syllable rail), and Numbers/Symbols panels.
+/// Pixel-accurate iOS 26/27 virtual keyboard geometry & hit-testing (`IOSKeyboardLayoutEngine`).
+/// Matches `main`'s exact portrait metrics:
+/// - Total height: 273pt (53pt transparent candidate ribbon + 220pt 4-row keyboard)
+/// - On 440pt width: outerX = 6.67pt, gapX = 6.00pt, stdKeyW = 37.27pt, keyH = 45.0pt, rowGap = 11.0pt, bottomPad = 7.0pt
+/// - Row 1 (`a..l`) locked to `outerX + pitchX * 0.5`; Row 2 (`z..m`) locked to `colRow1X[1..7]` (`s..k`)
+/// - Row 3 exact iOS 26 4-key grid: `[123]` | `[中/英]` | `[空格]` (white char fill) | `[换行]` (systemBlue accent)
+/// - No duplicate globe key on Face ID devices (`needsInputModeSwitchKey == false`).
 
 use std.option.{Option, Some, None}
 use std.vec.{Vec, vecNew, vecLen, vecPush, vecGetOr}
+use std.math.{floor}
 use std.generic
 use juxu_shared.{CGRect, CGPoint, cgRect, rectContainsPoint}
 
@@ -22,6 +25,7 @@ pub def t9SyllableRailWidth(): Float = 72.0
 pub data KeyboardMode : Eq {
     ModeQwerty,
     ModeT9,
+    ModeNumbers,
     ModeSymbols,
 }
 
@@ -36,8 +40,7 @@ pub data KeyAction : Eq {
     ActSymbol(String),
     ActShift,
     ActBackspace,
-    ActToggleSymbols,
-    ActToggleT9,
+    ActSwitchMode(KeyboardMode),
     ActToggleAscii,
     ActGlobe,
     ActSpace,
@@ -46,249 +49,324 @@ pub data KeyAction : Eq {
 
 pub data KeySpec {
     label: String,
+    secondaryLabel: String,
+    sfSymbol: String,
     action: KeyAction,
     keyClass: KeyClass,
+    usesFuncFill: Bool,
+    isBlueAccent: Bool,
     frame: CGRect,
 }
 
 pub def emptyKeySpec(): KeySpec =
     KeySpec {
         label: "",
+        secondaryLabel: "",
+        sfSymbol: "",
         action: ActSpace,
         keyClass: FuncClass,
+        usesFuncFill: true,
+        isBlueAccent: false,
         frame: cgRect(0.0, 0.0, 0.0, 0.0),
     }
 
-/// Build the 4-row QWERTY portrait layout (`ribbonHeight` = 53pt at top).
-pub def buildQwertyLayout(viewWidth: Float): Vec KeySpec = {
+def round3(v: Float): Float =
+    floor(v * 3.0 + 0.5) / 3.0
+
+def makeCharKey(label: String, act: KeyAction, frame: CGRect): KeySpec =
+    KeySpec {
+        label: label,
+        secondaryLabel: "",
+        sfSymbol: "",
+        action: act,
+        keyClass: CharClass,
+        usesFuncFill: false,
+        isBlueAccent: false,
+        frame: frame,
+    }
+
+def makeFuncKey(label: String, secondary: String, sym: String, act: KeyAction, frame: CGRect, blue: Bool): KeySpec =
+    KeySpec {
+        label: label,
+        secondaryLabel: secondary,
+        sfSymbol: sym,
+        action: act,
+        keyClass: FuncClass,
+        usesFuncFill: true,
+        isBlueAccent: blue,
+        frame: frame,
+    }
+
+/// Compute exact iOS 26 horizontal metrics for `viewWidth`.
+def computeRowMetrics(viewWidth: Float): (Float, Float, Float, Float) = {
+    let w = if (viewWidth < 280.0) 280.0 else viewWidth;
+    let isLandscape = w > 540.0;
+    let outerX = if (isLandscape) 8.0 else round3(w * (20.0 / 1320.0));
+    let gapX = if (isLandscape) 6.5 else round3(w * (18.0 / 1320.0));
+    let stdKeyW = (w - outerX * 2.0 - gapX * 9.0) / 10.0;
+    let pitchX = stdKeyW + gapX;
+    (outerX, gapX, stdKeyW, pitchX)
+}
+
+def appendBottomRow4Key(
+    out: Vec KeySpec,
+    viewWidth: Float,
+    outerX: Float,
+    gapX: Float,
+    stdKeyW: Float,
+    pitchX: Float,
+    y3: Float,
+    mode: KeyboardMode,
+    asciiMode: Bool,
+    showGlobe: Bool,
+): Void = {
+    let kh = keyHeight();
+    let row1StartX = outerX + pitchX * 0.5;
+    let col1X = row1StartX + pitchX;
+    let col2X = row1StartX + pitchX * 2.0;
+    let col6MaxX = row1StartX + pitchX * 6.0 + stdKeyW;
+
+    let leftPairSpan = (col1X + stdKeyW) - outerX;
+    let leftEachW = (leftPairSpan - gapX) * 0.5;
+
+    let (planeLbl, targetMode) = match mode {
+        ModeQwerty -> ("123", ModeNumbers),
+        _ -> ("ABC", ModeQwerty),
+    };
+    vecPush(out, makeFuncKey(planeLbl, "", "", ActSwitchMode(targetMode), cgRect(outerX, y3, leftEachW, kh), false));
+
+    let secondLeftX = outerX + leftEachW + gapX;
+    if (showGlobe) {
+        vecPush(out, makeFuncKey("", "", "globe", ActGlobe, cgRect(secondLeftX, y3, leftEachW, kh), false))
+    } else {
+        let (pLbl, sLbl) = if (asciiMode) ("EN", "/中") else ("中", "/英");
+        vecPush(out, makeFuncKey(pLbl, sLbl, "", ActToggleAscii, cgRect(secondLeftX, y3, leftEachW, kh), false))
+    };
+
+    // Spacebar: d.minX .. j.maxX, white char-key fill like native iOS 26!
+    let spaceX = col2X;
+    let spaceW = col6MaxX - col2X;
+    vecPush(out, KeySpec {
+        label: if (asciiMode) "space" else "空格",
+        secondaryLabel: "",
+        sfSymbol: "",
+        action: ActSpace,
+        keyClass: FuncClass,
+        usesFuncFill: false,
+        isBlueAccent: false,
+        frame: cgRect(spaceX, y3, spaceW, kh),
+    });
+
+    // Return key: systemBlue accent fill with crisp white text!
+    let retX = col6MaxX + gapX;
+    let retW = (viewWidth - outerX) - retX;
+    vecPush(out, makeFuncKey(if (asciiMode) "return" else "换行", "", "", ActReturn, cgRect(retX, y3, retW, kh), true))
+}
+
+/// Build the pixel-exact iOS 26 QWERTY portrait layout (`ribbonHeight` = 53pt at top).
+pub def buildQwertyLayout(viewWidth: Float, asciiMode: Bool, shifted: Bool, showGlobe: Bool): Vec KeySpec = {
     let out: Vec KeySpec = vecNew();
-    let padX = 3.0;
-    let gap = keyGapX();
+    let (outerX, gapX, stdKeyW, pitchX) = computeRowMetrics(viewWidth);
     let kh = keyHeight();
     let rg = rowGap();
-    let y0 = ribbonHeight() + 2.0;
-    let avail = viewWidth - padX * 2.0;
+    let pitchY = kh + rg;
+    let y0 = ribbonHeight();
+    let y1 = y0 + pitchY;
+    let y2 = y0 + pitchY * 2.0;
+    let y3 = y0 + pitchY * 3.0;
+    let row1StartX = outerX + pitchX * 0.5;
 
     // Row 0: q w e r t y u i o p
-    let r0 = "qwertyuiop";
-    let w10 = (avail - gap * 9.0) / 10.0;
+    let r0 = if (shifted) "QWERTYUIOP" else "qwertyuiop";
+    let r0Lower = "qwertyuiop";
     let i0 = cellNew(0);
     while (cellGet(i0) < 10) {
         let idx = cellGet(i0);
-        let ch = strByteAt(r0, idx);
-        let x = padX + intToFloat(idx) * (w10 + gap);
-        vecPush(out, KeySpec {
-            label: strSlice(r0, idx, idx + 1),
-            action: ActLetter(ch),
-            keyClass: CharClass,
-            frame: cgRect(x, y0, w10, kh),
-        });
+        let x = outerX + intToFloat(idx) * pitchX;
+        vecPush(out, makeCharKey(
+            strSlice(r0, idx, idx + 1),
+            ActLetter(strByteAt(r0Lower, idx)),
+            cgRect(x, y0, stdKeyW, kh)
+        ));
         cellSet(i0, idx + 1)
     };
 
-    // Row 1: a s d f g h j k l (centered)
-    let r1 = "asdfghjkl";
-    let y1 = y0 + kh + rg;
-    let row1W = 9.0 * w10 + 8.0 * gap;
-    let x1Start = (viewWidth - row1W) * 0.5;
+    // Row 1: a s d f g h j k l
+    let r1 = if (shifted) "ASDFGHJKL" else "asdfghjkl";
+    let r1Lower = "asdfghjkl";
     let i1 = cellNew(0);
     while (cellGet(i1) < 9) {
         let idx = cellGet(i1);
-        let ch = strByteAt(r1, idx);
-        let x = x1Start + intToFloat(idx) * (w10 + gap);
-        vecPush(out, KeySpec {
-            label: strSlice(r1, idx, idx + 1),
-            action: ActLetter(ch),
-            keyClass: CharClass,
-            frame: cgRect(x, y1, w10, kh),
-        });
+        let x = row1StartX + intToFloat(idx) * pitchX;
+        vecPush(out, makeCharKey(
+            strSlice(r1, idx, idx + 1),
+            ActLetter(strByteAt(r1Lower, idx)),
+            cgRect(x, y1, stdKeyW, kh)
+        ));
         cellSet(i1, idx + 1)
     };
 
-    // Row 2: Shift + z x c v b n m + Backspace
-    let r2 = "zxcvbnm";
-    let y2 = y1 + kh + rg;
-    let row2LettersW = 7.0 * w10 + 6.0 * gap;
-    let sideW = (avail - row2LettersW - gap * 2.0) * 0.5;
-    vecPush(out, KeySpec {
-        label: "⇧",
-        action: ActShift,
-        keyClass: FuncClass,
-        frame: cgRect(padX, y2, sideW, kh),
-    });
-    let x2Start = padX + sideW + gap;
+    // Row 2: [shift] + z x c v b n m (aligned with s..k) + [delete.backward]
+    let sideKeyW = stdKeyW * 1.342;
+    let shiftSym = if (shifted) "shift.fill" else "shift";
+    vecPush(out, makeFuncKey("", "", shiftSym, ActShift, cgRect(outerX, y2, sideKeyW, kh), false));
+
+    let r2 = if (shifted) "ZXCVBNM" else "zxcvbnm";
+    let r2Lower = "zxcvbnm";
     let i2 = cellNew(0);
     while (cellGet(i2) < 7) {
         let idx = cellGet(i2);
-        let ch = strByteAt(r2, idx);
-        let x = x2Start + intToFloat(idx) * (w10 + gap);
-        vecPush(out, KeySpec {
-            label: strSlice(r2, idx, idx + 1),
-            action: ActLetter(ch),
-            keyClass: CharClass,
-            frame: cgRect(x, y2, w10, kh),
-        });
+        let x = row1StartX + intToFloat(idx + 1) * pitchX;
+        vecPush(out, makeCharKey(
+            strSlice(r2, idx, idx + 1),
+            ActLetter(strByteAt(r2Lower, idx)),
+            cgRect(x, y2, stdKeyW, kh)
+        ));
         cellSet(i2, idx + 1)
     };
-    vecPush(out, KeySpec {
-        label: "⌫",
-        action: ActBackspace,
-        keyClass: FuncClass,
-        frame: cgRect(x2Start + row2LettersW + gap, y2, sideW, kh),
-    });
+    vecPush(out, makeFuncKey("", "", "delete.backward", ActBackspace, cgRect(viewWidth - outerX - sideKeyW, y2, sideKeyW, kh), false));
 
-    // Row 3: 123 | 🌐 | 九宫 | 句序(空格) | 换行
-    let y3 = y2 + kh + rg;
-    let symW = avail * 0.13;
-    let globeW = avail * 0.11;
-    let t9W = avail * 0.13;
-    let retW = avail * 0.21;
-    let spaceW = avail - symW - globeW - t9W - retW - gap * 4.0;
-    vecPush(out, KeySpec { label: "123", action: ActToggleSymbols, keyClass: FuncClass, frame: cgRect(padX, y3, symW, kh) });
-    vecPush(out, KeySpec { label: "🌐", action: ActGlobe, keyClass: FuncClass, frame: cgRect(padX + symW + gap, y3, globeW, kh) });
-    vecPush(out, KeySpec { label: "九宫", action: ActToggleT9, keyClass: FuncClass, frame: cgRect(padX + symW + globeW + gap * 2.0, y3, t9W, kh) });
-    vecPush(out, KeySpec { label: "句序", action: ActSpace, keyClass: FuncClass, frame: cgRect(padX + symW + globeW + t9W + gap * 3.0, y3, spaceW, kh) });
-    vecPush(out, KeySpec { label: "换行", action: ActReturn, keyClass: FuncClass, frame: cgRect(padX + symW + globeW + t9W + spaceW + gap * 4.0, y3, retW, kh) });
+    // Row 3: exact 4-key grid
+    appendBottomRow4Key(out, viewWidth, outerX, gapX, stdKeyW, pitchX, y3, ModeQwerty, asciiMode, showGlobe);
     out
 }
 
-/// Build the T9 9-key Pinyin portrait layout (left syllable rail + 3x3 digit pad + right actions).
-pub def buildT9Layout(viewWidth: Float): Vec KeySpec = {
+/// Build the Numbers & Symbols layouts matching `main`'s `.numbers` and `.symbols` planes.
+pub def buildNumbersOrSymbolsLayout(viewWidth: Float, isSymbols: Bool, asciiMode: Bool, showGlobe: Bool): Vec KeySpec = {
     let out: Vec KeySpec = vecNew();
-    let padX = 3.0;
-    let gap = keyGapX();
+    let (outerX, gapX, stdKeyW, pitchX) = computeRowMetrics(viewWidth);
     let kh = keyHeight();
     let rg = rowGap();
-    let y0 = ribbonHeight() + 2.0;
-    let railW = t9SyllableRailWidth();
-    let rightW = 62.0;
-    let gridX = padX + railW + gap;
-    let gridW = viewWidth - padX * 2.0 - railW - rightW - gap * 2.0;
-    let cellW = (gridW - gap * 2.0) / 3.0;
-    let rightX = gridX + gridW + gap;
+    let pitchY = kh + rg;
+    let y0 = ribbonHeight();
+    let y1 = y0 + pitchY;
+    let y2 = y0 + pitchY * 2.0;
+    let y3 = y0 + pitchY * 3.0;
+    let row1StartX = outerX + pitchX * 0.5;
 
-    let addPad = (row: Int, col: Int, label: String, act: KeyAction, cls: KeyClass) -> {
-        let x = gridX + intToFloat(col) * (cellW + gap);
-        let y = y0 + intToFloat(row) * (kh + rg);
-        vecPush(out, KeySpec { label: label, action: act, keyClass: cls, frame: cgRect(x, y, cellW, kh) })
-    };
-
-    // Row 0: 1(标点) | 2 ABC | 3 DEF | ⌫
-    addPad(0, 0, "，。", ActSymbol("，"), CharClass);
-    addPad(0, 1, "2 ABC", ActDigitT9(2), CharClass);
-    addPad(0, 2, "3 DEF", ActDigitT9(3), CharClass);
-    vecPush(out, KeySpec { label: "⌫", action: ActBackspace, keyClass: FuncClass, frame: cgRect(rightX, y0, rightW, kh) });
-
-    // Row 1: 4 GHI | 5 JKL | 6 MNO | 中/英
-    addPad(1, 0, "4 GHI", ActDigitT9(4), CharClass);
-    addPad(1, 1, "5 JKL", ActDigitT9(5), CharClass);
-    addPad(1, 2, "6 MNO", ActDigitT9(6), CharClass);
-    vecPush(out, KeySpec { label: "中/英", action: ActToggleAscii, keyClass: FuncClass, frame: cgRect(rightX, y0 + kh + rg, rightW, kh) });
-
-    // Row 2: 7 PQRS | 8 TUV | 9 WXYZ | 全键
-    addPad(2, 0, "7 PQRS", ActDigitT9(7), CharClass);
-    addPad(2, 1, "8 TUV", ActDigitT9(8), CharClass);
-    addPad(2, 2, "9 WXYZ", ActDigitT9(9), CharClass);
-    vecPush(out, KeySpec { label: "全键", action: ActToggleT9, keyClass: FuncClass, frame: cgRect(rightX, y0 + 2.0 * (kh + rg), rightW, kh) });
-
-    // Row 3: 123 | 🌐 | 空格 | 换行
-    let y3 = y0 + 3.0 * (kh + rg);
-    vecPush(out, KeySpec { label: "123", action: ActToggleSymbols, keyClass: FuncClass, frame: cgRect(padX, y3, railW, kh) });
-    vecPush(out, KeySpec { label: "🌐", action: ActGlobe, keyClass: FuncClass, frame: cgRect(gridX, y3, cellW, kh) });
-    vecPush(out, KeySpec { label: "空格", action: ActSpace, keyClass: FuncClass, frame: cgRect(gridX + cellW + gap, y3, cellW * 2.0 + gap, kh) });
-    vecPush(out, KeySpec { label: "换行", action: ActReturn, keyClass: FuncClass, frame: cgRect(rightX, y3, rightW, kh) });
-    out
-}
-
-/// Build the Numbers & Chinese/English Symbols portrait layout.
-pub def buildSymbolsLayout(viewWidth: Float): Vec KeySpec = {
-    let out: Vec KeySpec = vecNew();
-    let padX = 3.0;
-    let gap = keyGapX();
-    let kh = keyHeight();
-    let rg = rowGap();
-    let y0 = ribbonHeight() + 2.0;
-    let avail = viewWidth - padX * 2.0;
-    let w10 = (avail - gap * 9.0) / 10.0;
-
-    // Row 0: 1 2 3 4 5 6 7 8 9 0
-    let digits = "1234567890";
-    let i0 = cellNew(0);
-    while (cellGet(i0) < 10) {
-        let idx = cellGet(i0);
-        let s = strSlice(digits, idx, idx + 1);
-        vecPush(out, KeySpec {
-            label: s,
-            action: ActSymbol(s),
-            keyClass: CharClass,
-            frame: cgRect(padX + intToFloat(idx) * (w10 + gap), y0, w10, kh),
-        });
-        cellSet(i0, idx + 1)
-    };
-
-    // Row 1: common Chinese/English symbols
-    let y1 = y0 + kh + rg;
-    let addSymRow = (y: Float, syms: Vec String) -> {
-        let n = vecLen(syms);
-        let cw = (avail - gap * intToFloat(n - 1)) / intToFloat(n);
+    let pushRow10 = (y: Float, items: Vec String) -> {
         let i = cellNew(0);
-        while (cellGet(i) < n) {
+        while (cellGet(i) < 10) {
             let idx = cellGet(i);
-            let sym = vecGetOr(syms, idx, "");
-            vecPush(out, KeySpec {
-                label: sym,
-                action: ActSymbol(sym),
-                keyClass: CharClass,
-                frame: cgRect(padX + intToFloat(idx) * (cw + gap), y, cw, kh),
-            });
+            let s = vecGetOr(items, idx, "");
+            vecPush(out, makeCharKey(s, ActSymbol(s), cgRect(outerX + intToFloat(idx) * pitchX, y, stdKeyW, kh)));
             cellSet(i, idx + 1)
         }
     };
+
+    let r0: Vec String = vecNew();
     let r1: Vec String = vecNew();
-    vecPush(r1, "，"); vecPush(r1, "。"); vecPush(r1, "！"); vecPush(r1, "？"); vecPush(r1, "：");
-    vecPush(r1, "；"); vecPush(r1, "（"); vecPush(r1, "）"); vecPush(r1, "“"); vecPush(r1, "”");
-    addSymRow(y1, r1);
-
-    // Row 2: more symbols + Backspace
-    let y2 = y1 + kh + rg;
-    let r2: Vec String = vecNew();
-    vecPush(r2, "、"); vecPush(r2, "《"); vecPush(r2, "》"); vecPush(r2, "-");
-    vecPush(r2, "/"); vecPush(r2, "@"); vecPush(r2, "#"); vecPush(r2, "%");
-    let bsW = w10 * 1.6;
-    let r2Avail = avail - bsW - gap;
-    let r2W = (r2Avail - gap * 7.0) / 8.0;
-    let i2 = cellNew(0);
-    while (cellGet(i2) < 8) {
-        let idx = cellGet(i2);
-        let sym = vecGetOr(r2, idx, "");
-        vecPush(out, KeySpec {
-            label: sym,
-            action: ActSymbol(sym),
-            keyClass: CharClass,
-            frame: cgRect(padX + intToFloat(idx) * (r2W + gap), y2, r2W, kh),
-        });
-        cellSet(i2, idx + 1)
+    if (!isSymbols) {
+        vecPush(r0, "1"); vecPush(r0, "2"); vecPush(r0, "3"); vecPush(r0, "4"); vecPush(r0, "5");
+        vecPush(r0, "6"); vecPush(r0, "7"); vecPush(r0, "8"); vecPush(r0, "9"); vecPush(r0, "0");
+        if (asciiMode) {
+            vecPush(r1, "-"); vecPush(r1, "/"); vecPush(r1, ":"); vecPush(r1, ";"); vecPush(r1, "(");
+            vecPush(r1, ")"); vecPush(r1, "$"); vecPush(r1, "&"); vecPush(r1, "@"); vecPush(r1, "\"")
+        } else {
+            vecPush(r1, "-"); vecPush(r1, "/"); vecPush(r1, "："); vecPush(r1, "；"); vecPush(r1, "（");
+            vecPush(r1, "）"); vecPush(r1, "￥"); vecPush(r1, "@"); vecPush(r1, "“"); vecPush(r1, "”")
+        }
+    } else {
+        vecPush(r0, "["); vecPush(r0, "]"); vecPush(r0, "{"); vecPush(r0, "}"); vecPush(r0, "#");
+        vecPush(r0, "%"); vecPush(r0, "^"); vecPush(r0, "*"); vecPush(r0, "+"); vecPush(r0, "=");
+        vecPush(r1, "——"); vecPush(r1, "\\"); vecPush(r1, "|"); vecPush(r1, "～"); vecPush(r1, "《");
+        vecPush(r1, "》"); vecPush(r1, "【"); vecPush(r1, "】"); vecPush(r1, "…"); vecPush(r1, "·")
     };
-    vecPush(out, KeySpec { label: "⌫", action: ActBackspace, keyClass: FuncClass, frame: cgRect(padX + r2Avail + gap, y2, bsW, kh) });
+    pushRow10(y0, r0);
+    pushRow10(y1, r1);
 
-    // Row 3: 返回 | 🌐 | 空格 | 换行
-    let y3 = y2 + kh + rg;
-    let backW = avail * 0.18;
-    let globeW = avail * 0.12;
-    let retW = avail * 0.22;
-    let spaceW = avail - backW - globeW - retW - gap * 3.0;
-    vecPush(out, KeySpec { label: "返回", action: ActToggleSymbols, keyClass: FuncClass, frame: cgRect(padX, y3, backW, kh) });
-    vecPush(out, KeySpec { label: "🌐", action: ActGlobe, keyClass: FuncClass, frame: cgRect(padX + backW + gap, y3, globeW, kh) });
-    vecPush(out, KeySpec { label: "空格", action: ActSpace, keyClass: FuncClass, frame: cgRect(padX + backW + globeW + gap * 2.0, y3, spaceW, kh) });
-    vecPush(out, KeySpec { label: "换行", action: ActReturn, keyClass: FuncClass, frame: cgRect(padX + backW + globeW + spaceW + gap * 3.0, y3, retW, kh) });
+    let sideKeyW = stdKeyW * 1.342;
+    let (swLbl, swMode) = if (!isSymbols) ("#+=", ModeSymbols) else ("123", ModeNumbers);
+    vecPush(out, makeFuncKey(swLbl, "", "", ActSwitchMode(swMode), cgRect(outerX, y2, sideKeyW, kh), false));
+
+    let mid: Vec String = vecNew();
+    if (!isSymbols) {
+        vecPush(mid, "。"); vecPush(mid, "，"); vecPush(mid, "、"); vecPush(mid, "？"); vecPush(mid, "！"); vecPush(mid, ".")
+    } else {
+        vecPush(mid, "…"); vecPush(mid, "‘"); vecPush(mid, "’"); vecPush(mid, "〈"); vecPush(mid, "〉")
+    };
+    let mn = vecLen(mid);
+    let minX = row1StartX + pitchX;
+    let maxX = row1StartX + pitchX * 7.0 + stdKeyW;
+    let spanW = maxX - minX;
+    let mw = (spanW - gapX * intToFloat(mn - 1)) / intToFloat(mn);
+    let mi = cellNew(0);
+    while (cellGet(mi) < mn) {
+        let idx = cellGet(mi);
+        let s = vecGetOr(mid, idx, "");
+        vecPush(out, makeCharKey(s, ActSymbol(s), cgRect(minX + intToFloat(idx) * (mw + gapX), y2, mw, kh)));
+        cellSet(mi, idx + 1)
+    };
+    vecPush(out, makeFuncKey("", "", "delete.backward", ActBackspace, cgRect(viewWidth - outerX - sideKeyW, y2, sideKeyW, kh), false));
+
+    let curMode = if (isSymbols) ModeSymbols else ModeNumbers;
+    appendBottomRow4Key(out, viewWidth, outerX, gapX, stdKeyW, pitchX, y3, curMode, asciiMode, showGlobe);
     out
 }
 
-pub def buildLayoutForMode(mode: KeyboardMode, viewWidth: Float): Vec KeySpec =
+/// Build the T9 9-key Pinyin portrait layout.
+pub def buildT9Layout(viewWidth: Float, asciiMode: Bool, showGlobe: Bool): Vec KeySpec = {
+    let out: Vec KeySpec = vecNew();
+    let (outerX, gapX, _, _) = computeRowMetrics(viewWidth);
+    let kh = keyHeight();
+    let rg = rowGap();
+    let pitchY = kh + rg;
+    let y0 = ribbonHeight();
+    let railW = t9SyllableRailWidth();
+    let rightW = 64.0;
+    let gridX = outerX + railW + gapX;
+    let gridW = viewWidth - outerX * 2.0 - railW - rightW - gapX * 2.0;
+    let cellW = (gridW - gapX * 2.0) / 3.0;
+    let rightX = gridX + gridW + gapX;
+
+    let addPad = (row: Int, col: Int, label: String, act: KeyAction) -> {
+        let x = gridX + intToFloat(col) * (cellW + gapX);
+        let y = y0 + intToFloat(row) * pitchY;
+        vecPush(out, makeCharKey(label, act, cgRect(x, y, cellW, kh)))
+    };
+
+    addPad(0, 0, "，。", ActSymbol("，"));
+    addPad(0, 1, "ABC", ActDigitT9(2));
+    addPad(0, 2, "DEF", ActDigitT9(3));
+    vecPush(out, makeFuncKey("", "", "delete.backward", ActBackspace, cgRect(rightX, y0, rightW, kh), false));
+
+    addPad(1, 0, "GHI", ActDigitT9(4));
+    addPad(1, 1, "JKL", ActDigitT9(5));
+    addPad(1, 2, "MNO", ActDigitT9(6));
+    let (pLbl, sLbl) = if (asciiMode) ("EN", "/中") else ("中", "/英");
+    vecPush(out, makeFuncKey(pLbl, sLbl, "", ActToggleAscii, cgRect(rightX, y0 + pitchY, rightW, kh), false));
+
+    addPad(2, 0, "PQRS", ActDigitT9(7));
+    addPad(2, 1, "TUV", ActDigitT9(8));
+    addPad(2, 2, "WXYZ", ActDigitT9(9));
+    vecPush(out, makeFuncKey("全键", "", "", ActSwitchMode(ModeQwerty), cgRect(rightX, y0 + pitchY * 2.0, rightW, kh), false));
+
+    let y3 = y0 + pitchY * 3.0;
+    vecPush(out, makeFuncKey("123", "", "", ActSwitchMode(ModeNumbers), cgRect(outerX, y3, railW, kh), false));
+    if (showGlobe) {
+        vecPush(out, makeFuncKey("", "", "globe", ActGlobe, cgRect(gridX, y3, cellW, kh), false));
+        vecPush(out, KeySpec {
+            label: "空格", secondaryLabel: "", sfSymbol: "",
+            action: ActSpace, keyClass: FuncClass, usesFuncFill: false, isBlueAccent: false,
+            frame: cgRect(gridX + cellW + gapX, y3, cellW * 2.0 + gapX, kh),
+        })
+    } else {
+        vecPush(out, KeySpec {
+            label: "空格", secondaryLabel: "", sfSymbol: "",
+            action: ActSpace, keyClass: FuncClass, usesFuncFill: false, isBlueAccent: false,
+            frame: cgRect(gridX, y3, gridW, kh),
+        })
+    };
+    vecPush(out, makeFuncKey("换行", "", "", ActReturn, cgRect(rightX, y3, rightW, kh), true));
+    out
+}
+
+pub def buildLayoutForMode(mode: KeyboardMode, viewWidth: Float, asciiMode: Bool, shifted: Bool, showGlobe: Bool): Vec KeySpec =
     match mode {
-        ModeQwerty -> buildQwertyLayout(viewWidth),
-        ModeT9 -> buildT9Layout(viewWidth),
-        ModeSymbols -> buildSymbolsLayout(viewWidth),
+        ModeQwerty -> buildQwertyLayout(viewWidth, asciiMode, shifted, showGlobe),
+        ModeT9 -> buildT9Layout(viewWidth, asciiMode, showGlobe),
+        ModeNumbers -> buildNumbersOrSymbolsLayout(viewWidth, false, asciiMode, showGlobe),
+        ModeSymbols -> buildNumbersOrSymbolsLayout(viewWidth, true, asciiMode, showGlobe),
     }
 
 /// Hit-test a touch point against `keys`.

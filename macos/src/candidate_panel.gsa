@@ -1,74 +1,93 @@
-/// Pure AppKit candidate panel (`NSPanel` + custom `NSView`, zero SwiftUI / `NSHostingView`).
-/// Preserves all Juxu macOS invariants:
-/// - `animationBehavior = NSWindowAnimationBehaviorNone` (2)
-/// - `level = NSFloatingWindowLevel + 2` (5)
-/// - Disables implicit `CATransaction` animations
-/// - Supports both horizontal and vertical (`snap.vertical`) candidate layouts
-/// - Clamps to `NSScreen.mainScreen.visibleFrame` (flips above cursor near bottom edge)
-/// - Supports direct mouse click-to-select (`mouseDown:`).
+/// Pixel-accurate macOS native candidate panel (`NSPanel` + Liquid Glass `NSGlassEffectView` + `JuxuCandidateView`).
+/// Calibrated 1:1 to `main`'s `CandidatePanel.swift`:
+/// - `outerCornerRadius = 11.0`, `inset = 4.0`, `pillHeight = 24.0`, `pillCornerRadius = 7.0`, `barHeight = 32.0`
+/// - Native `NSGlassEffectView` on macOS 26/27 (fallback `NSVisualEffectView` `.menu` material)
+/// - `NSColor.controlAccentColor` selection pill with white text / `0.84` guide digit / `0.76` note
+/// - Appearance-aware `labelColor` / `tertiaryLabelColor` / `secondaryLabelColor`
+/// - Exact `NSString.sizeWithAttributes:` single-line measurement (never wraps)
+/// - `animationBehavior = .none`, `level = .floatingWindow + 2`, `CATransaction setDisableActions:YES`
+/// - Horizontal & vertical layouts + direct mouse click-to-select.
 
 use std.option.{Option, Some, None}
 use std.vec.{Vec, vecNew, vecLen, vecPush, vecGetOr, vecClear}
 use std.str.{intToStr}
+use std.math.{ceil}
 use objc.{
     objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
-    msgSend0, msgSend1Ptr, msgSend1Int, msgSend1Float,
-    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1Int, msgSendVoid1I64, msgSendVoid1Bool,
+    msgSend0, msgSend1Ptr, msgSend1Float,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
 }
 use juxu_core.{EngineSnapshot, Candidate, emptyCandidate}
 use juxu_shared.{
-    CGRect, CGPoint, cgRect, cgPoint, rectContainsPoint, nsStr,
+    CGRect, CGPoint, CGSize, cgRect, rectContainsPoint, nsStr,
     msgSendRect0, msgSendPoint0, msgSendPoint1Point1Ptr,
-    msgSendInitFrame, msgSendVoid1Rect, msgSendVoid1Point,
-    msgSend1Rect1U64_1I64_1Bool, msgSend4Float, msgSend2Ptr, msgSendVoid1Ptr1Bool,
+    msgSendInitFrame, msgSendVoid1Rect,
+    msgSend1Rect1U64_1I64_1Bool, msgSend4Float, msgSend2Ptr,
 }
 
+def outerRadius(): Float = 11.0
+def panelInset(): Float = 4.0
+def pillHeight(): Float = 24.0
+def pillRadius(): Float = 7.0
+def barHeight(): Float = 32.0
+
 def gPanel: Cell Ptr = cellNew(ptrNull())
+def gBackdrop: Cell Ptr = cellNew(ptrNull())
 def gContentView: Cell Ptr = cellNew(ptrNull())
 def gCurrentSnap: Cell (Option EngineSnapshot) = cellNew(None)
 def gHitRects: Cell (Vec CGRect) = cellNew(vecNew())
 def gOnSelect: Cell (Option (Int -> Void)) = cellNew(None)
 
 extern "objc_msgSend" def msgSend2FloatPath(cls: Ptr, sel: Ptr, rect: CGRect, rx: Float, ry: Float): Ptr
-extern "objc_msgSend" def msgSendDrawAtPoint(str: Ptr, sel: Ptr, pt: CGRect, attrs: Ptr): Void
+extern "objc_msgSend" def msgSendDrawInRect(str: Ptr, sel: Ptr, rect: CGRect, attrs: Ptr): Void
+extern "objc_msgSend" def msgSendSizeAttrs(str: Ptr, sel: Ptr, attrs: Ptr): CGSize
 extern "objc_msgSend" def msgSendFont(cls: Ptr, sel: Ptr, size: Float, weight: Float): Ptr
 
-/// Register a callback invoked when the user clicks a candidate index (0-based on current page).
 pub def candidatePanelSetOnSelect(cb: Int -> Void): Void =
     cellSet(gOnSelect, Some(cb))
 
-def nsColorRgba(r: Float, g: Float, b: Float, a: Float): Ptr =
-    msgSend4Float(objcClass("NSColor"), objcSel("colorWithRed:green:blue:alpha:"), r, g, b, a)
+def nsColorWithAlpha(col: Ptr, alpha: Float): Ptr =
+    msgSend1Float(col, objcSel("colorWithAlphaComponent:"), alpha)
 
-def makeTextAttrs(size: Float, weight: Float, color: Ptr): Ptr = {
-    let font = msgSendFont(objcClass("NSFont"), objcSel("systemFontOfSize:weight:"), size, weight);
+def makeAttrs(font: Ptr, color: Ptr): Ptr = {
     let d = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
     let _ = msgSend2Ptr(d, objcSel("setObject:forKey:"), font, nsStr("NSFont"));
     let _ = msgSend2Ptr(d, objcSel("setObject:forKey:"), color, nsStr("NSColor"));
     d
 }
 
-def approxCandidateWidth(c: Candidate): Float = {
-    let base = intToFloat(strLen(c.text)) * 6.5 + 36.0;
-    let cmt = if (strLen(c.comment) > 0) intToFloat(strLen(c.comment)) * 5.0 + 8.0 else 0.0;
-    base + cmt
+def makeNumFont(): Ptr =
+    msgSendFont(objcClass("NSFont"), objcSel("monospacedDigitSystemFontOfSize:weight:"), 12.0, 0.0)
+
+def makeTextFont(): Ptr =
+    msgSendFont(objcClass("NSFont"), objcSel("systemFontOfSize:weight:"), 16.0, 0.0)
+
+def makeNoteFont(): Ptr =
+    msgSendFont(objcClass("NSFont"), objcSel("monospacedSystemFontOfSize:weight:"), 11.5, 0.0)
+
+def measureTextW(s: String, attrs: Ptr): Float =
+    if (strLen(s) == 0) 0.0
+    else msgSendSizeAttrs(nsStr(s), objcSel("sizeWithAttributes:"), attrs).width
+
+def measureCandidateCellW(c: Candidate, idx: Int, numAttrs: Ptr, txtAttrs: Ptr, noteAttrs: Ptr): Float = {
+    let nw = measureTextW(intToStr(idx + 1), numAttrs);
+    let tw = measureTextW(c.text, txtAttrs);
+    let cw = if (strLen(c.comment) > 0) 4.0 + measureTextW(c.comment, noteAttrs) else 0.0;
+    ceil(7.5 + nw + 4.0 + tw + cw + 8.0)
+}
+
+def fillPill(r: CGRect, radius: Float, col: Ptr): Void = {
+    msgSendVoid0(col, objcSel("setFill"));
+    let p = msgSend2FloatPath(
+        objcClass("NSBezierPath"),
+        objcSel("bezierPathWithRoundedRect:xRadius:yRadius:"),
+        r, radius, radius
+    );
+    msgSendVoid0(p, objcSel("fill"))
 }
 
 def candidateViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
     let bounds = msgSendRect0(self, objcSel("bounds"));
-    let bg = nsColorRgba(0.98, 0.98, 0.99, 0.97);
-    msgSendVoid0(bg, objcSel("setFill"));
-    let path = msgSend2FloatPath(
-        objcClass("NSBezierPath"),
-        objcSel("bezierPathWithRoundedRect:xRadius:yRadius:"),
-        bounds, 10.0, 10.0
-    );
-    msgSendVoid0(path, objcSel("fill"));
-
-    let border = nsColorRgba(0.0, 0.0, 0.0, 0.11);
-    msgSendVoid0(border, objcSel("setStroke"));
-    msgSendVoid0(path, objcSel("stroke"));
-
     let hits = cellGet(gHitRects);
     vecClear(hits);
 
@@ -78,73 +97,108 @@ def candidateViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
             let cands = snap.pageCandidates;
             let n = vecLen(cands);
             let dummy = emptyCandidate();
-            let fgMain = nsColorRgba(0.10, 0.11, 0.13, 1.0);
-            let fgIdx = nsColorRgba(0.45, 0.48, 0.54, 1.0);
-            let fgAccent = nsColorRgba(0.05, 0.42, 0.92, 1.0);
-            let pillBg = nsColorRgba(0.05, 0.42, 0.92, 0.10);
-            let attrsMain = makeTextAttrs(15.0, 0.0, fgMain);
-            let attrsAccent = makeTextAttrs(15.0, 0.23, fgAccent);
-            let attrsIdx = makeTextAttrs(12.0, 0.0, fgIdx);
+
+            let numFont = makeNumFont();
+            let textFont = makeTextFont();
+            let noteFont = makeNoteFont();
+
+            let nsCol = objcClass("NSColor");
+            let accent = msgSend0(nsCol, objcSel("controlAccentColor"));
+            let white = msgSend0(nsCol, objcSel("whiteColor"));
+            let white84 = nsColorWithAlpha(white, 0.84);
+            let white76 = nsColorWithAlpha(white, 0.76);
+            let lblCol = msgSend0(nsCol, objcSel("labelColor"));
+            let secCol = msgSend0(nsCol, objcSel("secondaryLabelColor"));
+            let terCol = msgSend0(nsCol, objcSel("tertiaryLabelColor"));
+
+            let selNumA = makeAttrs(numFont, white84);
+            let selTxtA = makeAttrs(textFont, white);
+            let selNoteA = makeAttrs(noteFont, white76);
+            let normNumA = makeAttrs(numFont, terCol);
+            let normTxtA = makeAttrs(textFont, lblCol);
+            let normNoteA = makeAttrs(noteFont, secCol);
 
             if (snap.vertical) {
-                let rowH = 30.0;
-                let y = cellNew(6.0);
+                let rowH = pillHeight() + 2.0;
+                let y = cellNew(panelInset());
                 let i = cellNew(0);
                 while (cellGet(i) < n) {
                     let idx = cellGet(i);
                     let c = vecGetOr(cands, idx, dummy);
-                    let rowRect = cgRect(6.0, cellGet(y), bounds.size.width - 12.0, rowH - 2.0);
+                    let rowRect = cgRect(panelInset(), cellGet(y), bounds.size.width - panelInset() * 2.0, pillHeight());
                     vecPush(hits, rowRect);
-                    if (idx == 0) {
-                        msgSendVoid0(pillBg, objcSel("setFill"));
-                        let pp = msgSend2FloatPath(
-                            objcClass("NSBezierPath"),
-                            objcSel("bezierPathWithRoundedRect:xRadius:yRadius:"),
-                            rowRect, 6.0, 6.0
-                        );
-                        msgSendVoid0(pp, objcSel("fill"))
+                    let isSel = idx == 0;
+                    if (isSel) fillPill(rowRect, pillRadius(), accent) else ();
+
+                    let na = if (isSel) selNumA else normNumA;
+                    let ta = if (isSel) selTxtA else normTxtA;
+                    let ca = if (isSel) selNoteA else normNoteA;
+
+                    let numStr = intToStr(idx + 1);
+                    let numSz = msgSendSizeAttrs(nsStr(numStr), objcSel("sizeWithAttributes:"), na);
+                    let txtSz = msgSendSizeAttrs(nsStr(c.text), objcSel("sizeWithAttributes:"), ta);
+                    let nx = rowRect.origin.x + 7.5;
+                    let ny = rowRect.origin.y + (pillHeight() - numSz.height) * 0.5;
+                    msgSendDrawInRect(nsStr(numStr), objcSel("drawInRect:withAttributes:"), cgRect(nx, ny, numSz.width + 2.0, numSz.height + 1.0), na);
+
+                    let tx = nx + numSz.width + 4.0;
+                    let ty = rowRect.origin.y + (pillHeight() - txtSz.height) * 0.5;
+                    msgSendDrawInRect(nsStr(c.text), objcSel("drawInRect:withAttributes:"), cgRect(tx, ty, txtSz.width + 2.0, txtSz.height + 1.0), ta);
+
+                    if (strLen(c.comment) > 0) {
+                        let cSz = msgSendSizeAttrs(nsStr(c.comment), objcSel("sizeWithAttributes:"), ca);
+                        let cx = tx + txtSz.width + 4.0;
+                        let cy = rowRect.origin.y + (pillHeight() - cSz.height) * 0.5;
+                        msgSendDrawInRect(nsStr(c.comment), objcSel("drawInRect:withAttributes:"), cgRect(cx, cy, cSz.width + 2.0, cSz.height + 1.0), ca)
                     } else ();
-                    let label = intToStr(idx + 1) + ". " + c.text
-                        + if (strLen(c.comment) > 0) " " + c.comment else "";
-                    let tr = cgRect(14.0, cellGet(y) + 4.0, bounds.size.width - 28.0, 22.0);
-                    msgSendDrawAtPoint(nsStr(label), objcSel("drawInRect:withAttributes:"), tr, if (idx == 0) attrsAccent else attrsMain);
                     cellSet(y, cellGet(y) + rowH);
                     cellSet(i, idx + 1)
-                };
-                if (snap.totalPages > 1) {
-                    let pg = intToStr(snap.page + 1) + "/" + intToStr(snap.totalPages);
-                    let pr = cgRect(bounds.size.width - 46.0, bounds.size.height - 22.0, 40.0, 18.0);
-                    msgSendDrawAtPoint(nsStr(pg), objcSel("drawInRect:withAttributes:"), pr, attrsIdx)
-                } else ()
+                }
             } else {
-                let x = cellNew(8.0);
+                let curX = cellNew(panelInset());
                 let i = cellNew(0);
                 while (cellGet(i) < n) {
                     let idx = cellGet(i);
                     let c = vecGetOr(cands, idx, dummy);
-                    let cw = approxCandidateWidth(c);
-                    let cellRect = cgRect(cellGet(x), 5.0, cw - 4.0, bounds.size.height - 10.0);
+                    let isSel = idx == 0;
+                    let na = if (isSel) selNumA else normNumA;
+                    let ta = if (isSel) selTxtA else normTxtA;
+                    let ca = if (isSel) selNoteA else normNoteA;
+
+                    let numStr = intToStr(idx + 1);
+                    let numSz = msgSendSizeAttrs(nsStr(numStr), objcSel("sizeWithAttributes:"), na);
+                    let txtSz = msgSendSizeAttrs(nsStr(c.text), objcSel("sizeWithAttributes:"), ta);
+                    let cmtW = if (strLen(c.comment) > 0) 4.0 + measureTextW(c.comment, ca) else 0.0;
+                    let cellW = ceil(7.5 + numSz.width + 4.0 + txtSz.width + cmtW + 8.0);
+                    let cellRect = cgRect(cellGet(curX), panelInset(), cellW, pillHeight());
                     vecPush(hits, cellRect);
-                    if (idx == 0) {
-                        msgSendVoid0(pillBg, objcSel("setFill"));
-                        let pp = msgSend2FloatPath(
-                            objcClass("NSBezierPath"),
-                            objcSel("bezierPathWithRoundedRect:xRadius:yRadius:"),
-                            cellRect, 6.0, 6.0
-                        );
-                        msgSendVoid0(pp, objcSel("fill"))
+
+                    if (isSel) fillPill(cellRect, pillRadius(), accent) else ();
+
+                    let nx = cellRect.origin.x + 7.5;
+                    let ny = cellRect.origin.y + (pillHeight() - numSz.height) * 0.5;
+                    msgSendDrawInRect(nsStr(numStr), objcSel("drawInRect:withAttributes:"), cgRect(nx, ny, numSz.width + 2.0, numSz.height + 1.0), na);
+
+                    let tx = nx + numSz.width + 4.0;
+                    let ty = cellRect.origin.y + (pillHeight() - txtSz.height) * 0.5;
+                    msgSendDrawInRect(nsStr(c.text), objcSel("drawInRect:withAttributes:"), cgRect(tx, ty, txtSz.width + 2.0, txtSz.height + 1.0), ta);
+
+                    if (strLen(c.comment) > 0) {
+                        let cSz = msgSendSizeAttrs(nsStr(c.comment), objcSel("sizeWithAttributes:"), ca);
+                        let cx = tx + txtSz.width + 4.0;
+                        let cy = cellRect.origin.y + (pillHeight() - cSz.height) * 0.5;
+                        msgSendDrawInRect(nsStr(c.comment), objcSel("drawInRect:withAttributes:"), cgRect(cx, cy, cSz.width + 2.0, cSz.height + 1.0), ca)
                     } else ();
-                    let label = intToStr(idx + 1) + ". " + c.text
-                        + if (strLen(c.comment) > 0) " " + c.comment else "";
-                    let tr = cgRect(cellGet(x) + 6.0, 9.0, cw, 24.0);
-                    msgSendDrawAtPoint(nsStr(label), objcSel("drawInRect:withAttributes:"), tr, if (idx == 0) attrsAccent else attrsMain);
-                    cellSet(x, cellGet(x) + cw);
+
+                    cellSet(curX, cellGet(curX) + cellW + 1.5);
                     cellSet(i, idx + 1)
                 };
                 if (snap.totalPages > 1) {
                     let pg = intToStr(snap.page + 1) + "/" + intToStr(snap.totalPages);
-                    let pr = cgRect(bounds.size.width - 44.0, 11.0, 38.0, 20.0);
-                    msgSendDrawAtPoint(nsStr(pg), objcSel("drawInRect:withAttributes:"), pr, attrsIdx)
+                    let pSz = msgSendSizeAttrs(nsStr(pg), objcSel("sizeWithAttributes:"), normNumA);
+                    let px = bounds.size.width - pSz.width - 8.0;
+                    let py = (barHeight() - pSz.height) * 0.5;
+                    msgSendDrawInRect(nsStr(pg), objcSel("drawInRect:withAttributes:"), cgRect(px, py, pSz.width + 2.0, pSz.height + 1.0), normNumA)
                 } else ()
             }
         },
@@ -190,25 +244,50 @@ def ensurePanel(): Ptr = {
     let existing = cellGet(gPanel);
     if (!ptrIsNull(existing)) existing
     else {
-        let frame = cgRect(0.0, 0.0, 320.0, 40.0);
+        let frame = cgRect(0.0, 0.0, 320.0, barHeight());
         let panelAlloc = msgSend0(objcClass("NSPanel"), objcSel("alloc"));
         let panel = msgSend1Rect1U64_1I64_1Bool(
             panelAlloc,
             objcSel("initWithContentRect:styleMask:backing:defer:"),
-            frame, intToI64(128), intToI64(2), false
+            frame, intToI64(128), intToI64(2), true
         );
         msgSendVoid1I64(panel, objcSel("setLevel:"), intToI64(5));
         msgSendVoid1I64(panel, objcSel("setAnimationBehavior:"), intToI64(2));
         msgSendVoid1Bool(panel, objcSel("setOpaque:"), false);
         msgSendVoid1Bool(panel, objcSel("setHasShadow:"), true);
+        msgSendVoid1Bool(panel, objcSel("setMovable:"), false);
+        msgSendVoid1Bool(panel, objcSel("setHidesOnDeactivate:"), false);
         msgSendVoid1Ptr(panel, objcSel("setBackgroundColor:"), msgSend0(objcClass("NSColor"), objcSel("clearColor")));
         msgSendVoid1I64(panel, objcSel("setCollectionBehavior:"), intToI64(257));
 
-        let viewAlloc = msgSend0(objcClass("JuxuCandidateView"), objcSel("alloc"));
-        let view = msgSendInitFrame(viewAlloc, objcSel("initWithFrame:"), frame);
-        msgSendVoid1Ptr(panel, objcSel("setContentView:"), view);
+        let view = msgSendInitFrame(msgSend0(objcClass("JuxuCandidateView"), objcSel("alloc")), objcSel("initWithFrame:"), frame);
+        msgSendVoid1Bool(view, objcSel("setWantsLayer:"), true);
 
+        // Native Liquid Glass (`NSGlassEffectView`) on macOS 26/27, fallback `NSVisualEffectView` (.menu)
+        let glassCls = objcClass("NSGlassEffectView");
+        let backdrop = if (!ptrIsNull(glassCls)) {
+            let g = msgSendInitFrame(msgSend0(glassCls, objcSel("alloc")), objcSel("initWithFrame:"), frame);
+            msgSendVoid1Float(g, objcSel("setCornerRadius:"), outerRadius());
+            msgSendVoid1Ptr(g, objcSel("setContentView:"), view);
+            g
+        } else {
+            let v = msgSendInitFrame(msgSend0(objcClass("NSVisualEffectView"), objcSel("alloc")), objcSel("initWithFrame:"), frame);
+            msgSendVoid1I64(v, objcSel("setMaterial:"), intToI64(5)); // NSVisualEffectMaterialMenu
+            msgSendVoid1I64(v, objcSel("setBlendingMode:"), intToI64(0)); // BehindWindow
+            msgSendVoid1I64(v, objcSel("setState:"), intToI64(1)); // Active
+            msgSendVoid1Bool(v, objcSel("setWantsLayer:"), true);
+            let lay = msgSend0(v, objcSel("layer"));
+            if (!ptrIsNull(lay)) {
+                msgSendVoid1Float(lay, objcSel("setCornerRadius:"), outerRadius());
+                msgSendVoid1Bool(lay, objcSel("setMasksToBounds:"), true)
+            } else ();
+            msgSendVoid1Ptr(v, objcSel("addSubview:"), view);
+            v
+        };
+
+        msgSendVoid1Ptr(panel, objcSel("setContentView:"), backdrop);
         cellSet(gPanel, panel);
+        cellSet(gBackdrop, backdrop);
         cellSet(gContentView, view);
         panel
     }
@@ -222,13 +301,13 @@ def clampPanelFrameToScreen(cursorRect: CGRect, w: Float, h: Float): CGRect = {
     let maxX = vis.origin.x + vis.size.width - w - 8.0;
     let rawX = cursorRect.origin.x;
     let x = if (rawX < minX) minX else if (rawX > maxX) maxX else rawX;
-    let belowY = cursorRect.origin.y - h - 6.0;
-    let aboveY = cursorRect.origin.y + cursorRect.size.height + 6.0;
-    let y = if (belowY < vis.origin.y + 8.0) aboveY else belowY;
+    let belowY = cursorRect.origin.y - h - 5.0;
+    let aboveY = cursorRect.origin.y + cursorRect.size.height + 5.0;
+    let y = if (belowY < vis.origin.y + 6.0) aboveY else belowY;
     cgRect(x, y, w, h)
 }
 
-/// Update and display the candidate panel near `cursorRect`, or hide it when empty.
+/// Update and display the Liquid Glass candidate panel near `cursorRect`, or hide it when empty.
 pub def candidatePanelUpdate(snap: EngineSnapshot, cursorRect: CGRect): Void = {
     let n = vecLen(snap.pageCandidates);
     if (n == 0) {
@@ -237,27 +316,31 @@ pub def candidatePanelUpdate(snap: EngineSnapshot, cursorRect: CGRect): Void = {
         cellSet(gCurrentSnap, Some(snap));
         let panel = ensurePanel();
         let dummy = emptyCandidate();
+        let lblCol = msgSend0(objcClass("NSColor"), objcSel("labelColor"));
+        let numA = makeAttrs(makeNumFont(), lblCol);
+        let txtA = makeAttrs(makeTextFont(), lblCol);
+        let noteA = makeAttrs(makeNoteFont(), lblCol);
+
         let (w, h) = if (snap.vertical) {
-            let maxW = cellNew(180.0);
+            let maxW = cellNew(160.0);
             let i = cellNew(0);
             while (cellGet(i) < n) {
-                let cw = approxCandidateWidth(vecGetOr(snap.pageCandidates, cellGet(i), dummy)) + 24.0;
+                let cw = measureCandidateCellW(vecGetOr(snap.pageCandidates, cellGet(i), dummy), cellGet(i), numA, txtA, noteA) + panelInset() * 2.0;
                 if (cw > cellGet(maxW)) cellSet(maxW, cw) else ();
                 cellSet(i, cellGet(i) + 1)
             };
-            let extraH = if (snap.totalPages > 1) 24.0 else 12.0;
-            (cellGet(maxW), intToFloat(n) * 30.0 + extraH)
+            (cellGet(maxW), intToFloat(n) * (pillHeight() + 2.0) + panelInset() * 2.0 - 2.0)
         } else {
-            let totalW = cellNew(16.0);
+            let totalW = cellNew(panelInset() * 2.0);
             let i = cellNew(0);
             while (cellGet(i) < n) {
                 let c = vecGetOr(snap.pageCandidates, cellGet(i), dummy);
-                cellSet(totalW, cellGet(totalW) + approxCandidateWidth(c));
+                cellSet(totalW, cellGet(totalW) + measureCandidateCellW(c, cellGet(i), numA, txtA, noteA) + 1.5);
                 cellSet(i, cellGet(i) + 1)
             };
-            let extraW = if (snap.totalPages > 1) 46.0 else 0.0;
-            let fw = if (cellGet(totalW) + extraW < 150.0) 150.0 else cellGet(totalW) + extraW;
-            (fw, 40.0)
+            let pagerW = if (snap.totalPages > 1) 42.0 else 0.0;
+            let fw = ceil(cellGet(totalW) + pagerW);
+            (if (fw < 80.0) 80.0 else fw, barHeight())
         };
         let frame = clampPanelFrameToScreen(cursorRect, w, h);
 
@@ -265,6 +348,8 @@ pub def candidatePanelUpdate(snap: EngineSnapshot, cursorRect: CGRect): Void = {
         msgSendVoid0(caCls, objcSel("begin"));
         msgSendVoid1Bool(caCls, objcSel("setDisableActions:"), true);
         msgSendVoid1Rect(panel, objcSel("setFrame:display:"), frame);
+        let bd = cellGet(gBackdrop);
+        if (!ptrIsNull(bd)) msgSendVoid1Rect(bd, objcSel("setFrame:"), cgRect(0.0, 0.0, w, h)) else ();
         let view = cellGet(gContentView);
         if (!ptrIsNull(view)) {
             msgSendVoid1Rect(view, objcSel("setFrame:"), cgRect(0.0, 0.0, w, h));
@@ -275,11 +360,15 @@ pub def candidatePanelUpdate(snap: EngineSnapshot, cursorRect: CGRect): Void = {
     }
 }
 
-/// Hide the candidate panel immediately.
+/// Hide the candidate panel immediately without animation.
 pub def candidatePanelHide(): Void = {
     cellSet(gCurrentSnap, None);
     let panel = cellGet(gPanel);
     if (!ptrIsNull(panel)) {
-        msgSendVoid1Ptr(panel, objcSel("orderOut:"), ptrNull())
+        let caCls = objcClass("CATransaction");
+        msgSendVoid0(caCls, objcSel("begin"));
+        msgSendVoid1Bool(caCls, objcSel("setDisableActions:"), true);
+        msgSendVoid1Ptr(panel, objcSel("orderOut:"), ptrNull());
+        msgSendVoid0(caCls, objcSel("commit"))
     } else ()
 }

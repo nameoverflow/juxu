@@ -1,41 +1,103 @@
-/// Pure AppKit floating mode HUD toast (`中` / `英` / schema switch).
+/// Liquid Glass floating mode HUD toast (`中` / `英` / schema switch) with 0.85s auto-hide timer.
 
 use objc.{
-    objcClass, objcSel, msgSend0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool,
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    msgSend0, msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
 }
 use juxu_shared.{
-    cgRect, nsStr, msgSend1Rect1U64_1I64_1Bool, msgSendVoid1Rect, objcAllocInitFrame,
+    CGRect, cgRect, nsStr, msgSendRect0, msgSendInitFrame,
+    msgSend1Rect1U64_1I64_1Bool, msgSendVoid1Rect, objcAllocInitFrame,
 }
+
+extern "objc_msgSend" def msgSendHudFont(cls: Ptr, sel: Ptr, size: Float, weight: Float): Ptr
+extern "objc_msgSend" def msgSendHudTimer(
+    cls: Ptr, sel: Ptr, interval: Float, target: Ptr, action: Ptr, userInfo: Ptr, repeats: Bool
+): Ptr
 
 def gHudPanel: Cell Ptr = cellNew(ptrNull())
 def gHudLabel: Cell Ptr = cellNew(ptrNull())
+def gHudTimer: Cell Ptr = cellNew(ptrNull())
+def gHudTarget: Cell Ptr = cellNew(ptrNull())
+
+def onHudAutoHide(_self: Ptr, _cmd: Ptr, _timer: Ptr): Void =
+    hudHide()
+
+extern init(103) def registerHudTargetClass(): Void = {
+    let cls = objcAllocateClass("NSObject", "JuxuHudTimerTarget");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "onHudAutoHide:", cFnPtr(onHudAutoHide), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}
 
 pub def hudShow(text: String): Void = {
+    let oldT = cellGet(gHudTimer);
+    if (!ptrIsNull(oldT)) {
+        msgSendVoid0(oldT, objcSel("invalidate"));
+        cellSet(gHudTimer, ptrNull())
+    } else ();
+
+    let screen = msgSend0(objcClass("NSScreen"), objcSel("mainScreen"));
+    let vis = if (!ptrIsNull(screen)) msgSendRect0(screen, objcSel("visibleFrame"))
+              else cgRect(0.0, 0.0, 1440.0, 900.0);
+    let w = 84.0;
+    let h = 44.0;
+    let x = vis.origin.x + (vis.size.width - w) * 0.5;
+    let y = vis.origin.y + 110.0;
+
     let panel = if (!ptrIsNull(cellGet(gHudPanel))) cellGet(gHudPanel)
     else {
-        let frame = cgRect(600.0, 120.0, 96.0, 44.0);
-        let pAlloc = msgSend0(objcClass("NSPanel"), objcSel("alloc"));
+        let frame = cgRect(x, y, w, h);
         let p = msgSend1Rect1U64_1I64_1Bool(
-            pAlloc,
+            msgSend0(objcClass("NSPanel"), objcSel("alloc")),
             objcSel("initWithContentRect:styleMask:backing:defer:"),
-            frame, intToI64(128), intToI64(2), false
+            frame, intToI64(128), intToI64(2), true
         );
         msgSendVoid1I64(p, objcSel("setLevel:"), intToI64(6));
         msgSendVoid1I64(p, objcSel("setAnimationBehavior:"), intToI64(2));
-        let lbl = objcAllocInitFrame("NSTextField", cgRect(8.0, 10.0, 80.0, 24.0));
+        msgSendVoid1Bool(p, objcSel("setOpaque:"), false);
+        msgSendVoid1Bool(p, objcSel("setHasShadow:"), true);
+        msgSendVoid1Bool(p, objcSel("setIgnoresMouseEvents:"), true);
+        msgSendVoid1Ptr(p, objcSel("setBackgroundColor:"), msgSend0(objcClass("NSColor"), objcSel("clearColor")));
+
+        let lbl = objcAllocInitFrame("NSTextField", cgRect(6.0, 9.0, w - 12.0, 26.0));
         msgSendVoid1Bool(lbl, objcSel("setBezeled:"), false);
         msgSendVoid1Bool(lbl, objcSel("setDrawsBackground:"), false);
         msgSendVoid1Bool(lbl, objcSel("setEditable:"), false);
         msgSendVoid1Bool(lbl, objcSel("setSelectable:"), false);
-        msgSendVoid1I64(lbl, objcSel("setAlignment:"), intToI64(1)); // NSTextAlignmentCenter
-        msgSendVoid1Ptr(p, objcSel("setContentView:"), lbl);
+        msgSendVoid1I64(lbl, objcSel("setAlignment:"), intToI64(1));
+        msgSendVoid1Ptr(lbl, objcSel("setFont:"), msgSendHudFont(objcClass("NSFont"), objcSel("systemFontOfSize:weight:"), 18.0, 0.23));
+        msgSendVoid1Ptr(lbl, objcSel("setTextColor:"), msgSend0(objcClass("NSColor"), objcSel("labelColor")));
+
+        let glassCls = objcClass("NSGlassEffectView");
+        let bd = if (!ptrIsNull(glassCls)) {
+            let g = msgSendInitFrame(msgSend0(glassCls, objcSel("alloc")), objcSel("initWithFrame:"), cgRect(0.0, 0.0, w, h));
+            msgSendVoid1Float(g, objcSel("setCornerRadius:"), 14.0);
+            msgSendVoid1Ptr(g, objcSel("setContentView:"), lbl);
+            g
+        } else {
+            let v = msgSendInitFrame(msgSend0(objcClass("NSVisualEffectView"), objcSel("alloc")), objcSel("initWithFrame:"), cgRect(0.0, 0.0, w, h));
+            msgSendVoid1I64(v, objcSel("setMaterial:"), intToI64(5));
+            msgSendVoid1I64(v, objcSel("setState:"), intToI64(1));
+            msgSendVoid1Ptr(v, objcSel("addSubview:"), lbl);
+            v
+        };
+        msgSendVoid1Ptr(p, objcSel("setContentView:"), bd);
+        let tgt = msgSend0(msgSend0(objcClass("JuxuHudTimerTarget"), objcSel("alloc")), objcSel("init"));
+        cellSet(gHudTarget, tgt);
         cellSet(gHudPanel, p);
         cellSet(gHudLabel, lbl);
         p
     };
-    let lbl = cellGet(gHudLabel);
-    msgSendVoid1Ptr(lbl, objcSel("setStringValue:"), nsStr(text));
-    msgSendVoid1Ptr(panel, objcSel("orderFrontRegardless"), ptrNull())
+    msgSendVoid1Rect(panel, objcSel("setFrame:display:"), cgRect(x, y, w, h));
+    msgSendVoid1Ptr(cellGet(gHudLabel), objcSel("setStringValue:"), nsStr(text));
+    msgSendVoid1Ptr(panel, objcSel("orderFrontRegardless"), ptrNull());
+    let timer = msgSendHudTimer(
+        objcClass("NSTimer"),
+        objcSel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+        0.85, cellGet(gHudTarget), objcSel("onHudAutoHide:"), ptrNull(), false
+    );
+    cellSet(gHudTimer, timer)
 }
 
 pub def hudHide(): Void = {
