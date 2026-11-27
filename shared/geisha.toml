@@ -7,3 +7,10 @@ tests = ["tests/shared_test.gsa"]
 [deps]
 juxu_core = { git = "https://github.com/nameoverflow/juxu-core.git", version = "0.1.9" }
 objc = { git = "https://github.com/geisha-lang/objc.gsa.git", version = "0.1.0" }
+
+[[target.native.when]]
+os = "macos"
+link_flags = ["-framework", "Security"]
+
+[target.ios]
+frameworks = ["Security"]

@@ -1,21 +1,37 @@
-/// Pure AppKit settings window for macOS (`NSWindow` + `NSPopUpButton` + `NSButton`),
-/// directly mutating `JuxuSession` (zero SwiftUI).
+/// Pure AppKit settings window for macOS (`NSWindow`), directly mutating `JuxuSession` (zero SwiftUI):
+/// - Input schema selector (9 schemas)
+/// - Candidate orientation (horizontal / vertical)
+/// - Page size (5 / 7 / 9)
+/// - Spaceless continuous typing toggle & ZH/EN auto-space toggle
+/// - Custom user phrase quick-add & count display.
 
 use std.option.{Option, Some, None}
+use std.vec.{vecLen}
+use std.str.{intToStr}
 use objc.{
     objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
-    msgSend0, msgSend1Ptr, msgSendInt0,
+    msgSend0, msgSend1Ptr, msgSendInt0, msgSendI64_0,
     msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool,
 }
-use juxu_core.{ConfigFormat, Toml, applyConfig, exportConfig, getSchema, schemaDisplayName}
+use juxu_core.{
+    ConfigFormat, Toml,
+    applyConfig, getConfig, addUserPhrase, listUserPhrases,
+}
 use juxu_shared.{
-    JuxuSession, sessionSaveConfig,
-    cgRect, nsStr, msgSend1Rect1U64_1I64_1Bool, objcAllocInitFrame,
+    JuxuSession, sessionSaveConfig, sessionFlushUserData,
+    AutoSpaceOptions,
+    CGRect, cgRect, nsStr, nsStrPtrToString, msgSend1Rect1U64_1I64_1Bool, objcAllocInitFrame,
 }
 
 def gSettingsWindow: Cell Ptr = cellNew(ptrNull())
 def gSettingsSession: Cell (Option JuxuSession) = cellNew(None)
 def gSchemaPopup: Cell Ptr = cellNew(ptrNull())
+def gPagePopup: Cell Ptr = cellNew(ptrNull())
+def gVerticalCheck: Cell Ptr = cellNew(ptrNull())
+def gSpacelessCheck: Cell Ptr = cellNew(ptrNull())
+def gAutoSpaceCheck: Cell Ptr = cellNew(ptrNull())
+def gPhraseField: Cell Ptr = cellNew(ptrNull())
+def gPhraseStatus: Cell Ptr = cellNew(ptrNull())
 def gSettingsTarget: Cell Ptr = cellNew(ptrNull())
 
 def schemaTagAtIndex(idx: Int): String =
@@ -29,53 +45,107 @@ def schemaTagAtIndex(idx: Int): String =
     else if (idx == 7) "cangjie5"
     else "cangjie6"
 
-def onSchemaChanged(_self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
-    let idx = msgSendInt0(sender, objcSel("indexOfSelectedItem"));
-    let tag = schemaTagAtIndex(idx);
+def pageSizeAtIndex(idx: Int): Int =
+    if (idx == 0) 5 else if (idx == 1) 7 else 9
+
+def applyControlsToSession(): Void =
     match cellGet(gSettingsSession) {
+        None -> (),
         Some(s) -> {
-            applyConfig(s.engine, Toml, "[general]\nschema = \"" + tag + "\"\n");
+            let sIdx = msgSendInt0(cellGet(gSchemaPopup), objcSel("indexOfSelectedItem"));
+            let pIdx = msgSendInt0(cellGet(gPagePopup), objcSel("indexOfSelectedItem"));
+            let verticalOn = msgSendI64_0(cellGet(gVerticalCheck), objcSel("state")) != intToI64(0);
+            let spacelessOn = msgSendI64_0(cellGet(gSpacelessCheck), objcSel("state")) != intToI64(0);
+            let autoSpaceOn = msgSendI64_0(cellGet(gAutoSpaceCheck), objcSel("state")) != intToI64(0);
+
+            let orientStr = if (verticalOn) "vertical" else "horizontal";
+            let slStr = if (spacelessOn) "true" else "false";
+            let toml = "[general]\nschema = \"" + schemaTagAtIndex(sIdx) + "\"\n"
+                + "page_size = " + intToStr(pageSizeAtIndex(pIdx)) + "\n"
+                + "orientation = \"" + orientStr + "\"\n"
+                + "[typing]\nspaceless = " + slStr + "\n";
+            applyConfig(s.engine, Toml, toml);
+            cellSet(s.autoSpace, AutoSpaceOptions { enabled: autoSpaceOn, spaceDigits: true });
             let _ = sessionSaveConfig(s);
             ()
         },
-        None -> (),
     }
-}
+
+def onSettingChanged(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    applyControlsToSession()
+
+def onAddPhrase(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    match cellGet(gSettingsSession) {
+        None -> (),
+        Some(s) -> {
+            let field = cellGet(gPhraseField);
+            let status = cellGet(gPhraseStatus);
+            let phrase = nsStrPtrToString(msgSend0(field, objcSel("stringValue")));
+            if (strLen(phrase) > 0) {
+                match addUserPhrase(s.engine, phrase) {
+                    Some(code) -> {
+                        let _ = sessionFlushUserData(s);
+                        msgSendVoid1Ptr(field, objcSel("setStringValue:"), nsStr(""));
+                        let cnt = vecLen(listUserPhrases(s.engine));
+                        msgSendVoid1Ptr(status, objcSel("setStringValue:"),
+                            nsStr("已添加「" + phrase + "」（编码 " + code + "），共 " + intToStr(cnt) + " 条"))
+                    },
+                    None -> msgSendVoid1Ptr(status, objcSel("setStringValue:"), nsStr("添加失败：请先加载对应词库")),
+                }
+            } else ()
+        },
+    }
 
 extern init(101) def registerSettingsTargetClass(): Void = {
     let cls = objcAllocateClass("NSObject", "JuxuSettingsTarget");
     if (!ptrIsNull(cls)) {
-        let _ = objcAddMethod(cls, "onSchemaChanged:", cFnPtr(onSchemaChanged), "v@:@");
+        let _ = objcAddMethod(cls, "onSettingChanged:", cFnPtr(onSettingChanged), "v@:@");
+        let _ = objcAddMethod(cls, "onAddPhrase:", cFnPtr(onAddPhrase), "v@:@");
         objcRegisterClass(cls)
     } else ()
+}
+
+def makeLabel(content: Ptr, frame: CGRect, text: String): Ptr = {
+    let lbl = objcAllocInitFrame("NSTextField", frame);
+    msgSendVoid1Bool(lbl, objcSel("setBezeled:"), false);
+    msgSendVoid1Bool(lbl, objcSel("setDrawsBackground:"), false);
+    msgSendVoid1Bool(lbl, objcSel("setEditable:"), false);
+    msgSendVoid1Ptr(lbl, objcSel("setStringValue:"), nsStr(text));
+    msgSendVoid1Ptr(content, objcSel("addSubview:"), lbl);
+    lbl
+}
+
+def makeCheckbox(content: Ptr, frame: CGRect, title: String, tgt: Ptr, initial: Bool): Ptr = {
+    let btn = objcAllocInitFrame("NSButton", frame);
+    // NSButtonTypeSwitch == 3
+    msgSendVoid1I64(btn, objcSel("setButtonType:"), intToI64(3));
+    msgSendVoid1Ptr(btn, objcSel("setTitle:"), nsStr(title));
+    msgSendVoid1I64(btn, objcSel("setState:"), if (initial) intToI64(1) else intToI64(0));
+    msgSendVoid1Ptr(btn, objcSel("setTarget:"), tgt);
+    msgSendVoid1Ptr(btn, objcSel("setAction:"), objcSel("onSettingChanged:"));
+    msgSendVoid1Ptr(content, objcSel("addSubview:"), btn);
+    btn
 }
 
 pub def settingsWindowShow(s: JuxuSession): Void = {
     cellSet(gSettingsSession, Some(s));
     let win = if (!ptrIsNull(cellGet(gSettingsWindow))) cellGet(gSettingsWindow)
     else {
-        // NSWindowStyleMaskTitled (1) | Closable (2) | Miniaturizable (4) = 7
         let wAlloc = msgSend0(objcClass("NSWindow"), objcSel("alloc"));
         let w = msgSend1Rect1U64_1I64_1Bool(
             wAlloc,
             objcSel("initWithContentRect:styleMask:backing:defer:"),
-            cgRect(320.0, 260.0, 420.0, 220.0),
-            intToI64(7),
-            intToI64(2),
-            false
+            cgRect(320.0, 220.0, 460.0, 320.0),
+            intToI64(7), intToI64(2), false
         );
         msgSendVoid1Ptr(w, objcSel("setTitle:"), nsStr("句序设置"));
         msgSendVoid1Bool(w, objcSel("setReleasedWhenClosed:"), false);
 
         let content = msgSend0(w, objcSel("contentView"));
-        let lbl = objcAllocInitFrame("NSTextField", cgRect(24.0, 150.0, 110.0, 24.0));
-        msgSendVoid1Bool(lbl, objcSel("setBezeled:"), false);
-        msgSendVoid1Bool(lbl, objcSel("setDrawsBackground:"), false);
-        msgSendVoid1Bool(lbl, objcSel("setEditable:"), false);
-        msgSendVoid1Ptr(lbl, objcSel("setStringValue:"), nsStr("输入方案："));
-        msgSendVoid1Ptr(content, objcSel("addSubview:"), lbl);
+        let tgt = msgSend0(msgSend0(objcClass("JuxuSettingsTarget"), objcSel("alloc")), objcSel("init"));
 
-        let popup = objcAllocInitFrame("NSPopUpButton", cgRect(140.0, 146.0, 240.0, 28.0));
+        let _ = makeLabel(content, cgRect(24.0, 268.0, 100.0, 22.0), "输入方案：");
+        let popup = objcAllocInitFrame("NSPopUpButton", cgRect(130.0, 264.0, 300.0, 28.0));
         let addOpt = (title: String) ->
             msgSendVoid1Ptr(popup, objcSel("addItemWithTitle:"), nsStr(title));
         addOpt("全拼");
@@ -87,17 +157,49 @@ pub def settingsWindowShow(s: JuxuSession): Void = {
         addOpt("仓颉三代");
         addOpt("仓颉五代");
         addOpt("仓颉六代");
-
-        let tgt = msgSend0(msgSend0(objcClass("JuxuSettingsTarget"), objcSel("alloc")), objcSel("init"));
         msgSendVoid1Ptr(popup, objcSel("setTarget:"), tgt);
-        msgSendVoid1Ptr(popup, objcSel("setAction:"), objcSel("onSchemaChanged:"));
+        msgSendVoid1Ptr(popup, objcSel("setAction:"), objcSel("onSettingChanged:"));
         msgSendVoid1Ptr(content, objcSel("addSubview:"), popup);
+
+        let _ = makeLabel(content, cgRect(24.0, 226.0, 100.0, 22.0), "每页候选数：");
+        let pagePop = objcAllocInitFrame("NSPopUpButton", cgRect(130.0, 222.0, 120.0, 28.0));
+        msgSendVoid1Ptr(pagePop, objcSel("addItemWithTitle:"), nsStr("5"));
+        msgSendVoid1Ptr(pagePop, objcSel("addItemWithTitle:"), nsStr("7"));
+        msgSendVoid1Ptr(pagePop, objcSel("addItemWithTitle:"), nsStr("9"));
+        msgSendVoid1Ptr(pagePop, objcSel("setTarget:"), tgt);
+        msgSendVoid1Ptr(pagePop, objcSel("setAction:"), objcSel("onSettingChanged:"));
+        msgSendVoid1Ptr(content, objcSel("addSubview:"), pagePop);
+
+        let vCheck = makeCheckbox(content, cgRect(24.0, 184.0, 200.0, 22.0), "纵排候选栏", tgt, false);
+        let slCheck = makeCheckbox(content, cgRect(24.0, 152.0, 260.0, 22.0), "无空格连打（Spaceless）", tgt, true);
+        let asCheck = makeCheckbox(content, cgRect(24.0, 120.0, 260.0, 22.0), "中英文自动空格", tgt, true);
+
+        let _ = makeLabel(content, cgRect(24.0, 76.0, 100.0, 22.0), "自定义词条：");
+        let pField = objcAllocInitFrame("NSTextField", cgRect(130.0, 74.0, 210.0, 24.0));
+        msgSendVoid1Ptr(pField, objcSel("setPlaceholderString:"), nsStr("输入要加入用户词库的词"));
+        msgSendVoid1Ptr(content, objcSel("addSubview:"), pField);
+
+        let addBtn = objcAllocInitFrame("NSButton", cgRect(350.0, 70.0, 80.0, 30.0));
+        msgSendVoid1Ptr(addBtn, objcSel("setTitle:"), nsStr("添加"));
+        msgSendVoid1Ptr(addBtn, objcSel("setTarget:"), tgt);
+        msgSendVoid1Ptr(addBtn, objcSel("setAction:"), objcSel("onAddPhrase:"));
+        msgSendVoid1Ptr(content, objcSel("addSubview:"), addBtn);
+
+        let pStatus = makeLabel(content, cgRect(24.0, 32.0, 406.0, 22.0), "已就绪");
 
         cellSet(gSettingsTarget, tgt);
         cellSet(gSchemaPopup, popup);
+        cellSet(gPagePopup, pagePop);
+        cellSet(gVerticalCheck, vCheck);
+        cellSet(gSpacelessCheck, slCheck);
+        cellSet(gAutoSpaceCheck, asCheck);
+        cellSet(gPhraseField, pField);
+        cellSet(gPhraseStatus, pStatus);
         cellSet(gSettingsWindow, w);
         w
     };
+    let cnt = vecLen(listUserPhrases(s.engine));
+    msgSendVoid1Ptr(cellGet(gPhraseStatus), objcSel("setStringValue:"), nsStr("当前用户词条：" + intToStr(cnt) + " 条"));
     msgSendVoid0(win, objcSel("center"));
     msgSendVoid1Ptr(win, objcSel("makeKeyAndOrderFront:"), ptrNull())
 }

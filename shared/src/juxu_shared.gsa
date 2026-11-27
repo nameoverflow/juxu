@@ -11,11 +11,21 @@ pub use apple_geom.{
     msgSendVoid1Rect, msgSendVoid1Point, msgSendVoid1Size,
     msgSendVoid1Ptr1Range, msgSendVoid1Ptr2Range,
     msgSend1Rect1U64_1I64_1Bool, msgSend4Float, msgSend2Float,
-    msgSend2Ptr, msgSend1Ptr1Bool, msgSendBool1Ptr, msgSendBool2Ptr,
+    msgSend2Ptr, msgSend1Ptr1Bool, msgSend1Ptr1I64, msgSend1I64_1Ptr, msgSend1Range,
+    msgSendBool1Ptr, msgSendBool2Ptr,
     msgSendVoid1Ptr1Bool, msgSendVoid1Int1Bool, msgSendVoid2I64,
     msgSendVoid1Ptr1I64, msgSendVoid1Ptr1Sel, msgSendVoid1Ptr1Sel1U64,
     mainBundleResourcePath, mainBundleIdentifier, nsStr, nsStrPtrToString,
-    objcAllocInit, objcAllocInitFrame,
+    readCGRectFromBuf, objcAllocInit, objcAllocInitFrame,
+}
+pub use keychain.{
+    kcAccountSettings, kcAccountTouchProfile, kcAccountEvalLog,
+    kcAccountUserDataZlib, kcAccountUserDataSeq,
+    keychainWriteData, keychainReadData,
+    keychainWriteString, keychainReadString,
+    keychainWriteZlibString, keychainReadZlibString,
+    keychainLoadEngineConfig, keychainSaveEngineConfig,
+    keychainLoadEngineUserData, keychainFlushEngineUserData,
 }
 pub use text_formatting.{
     utf8FirstScalar, firstCharStr, utf8LastScalar, lastCharStr,

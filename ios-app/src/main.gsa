@@ -1,36 +1,150 @@
 /// Pure Geisha iOS Host App (`Juxu.app`, embedding `JuxuKeyboard.appex`).
-/// Uses native UIKit (`UIApplicationMain`, `UIWindow`, `UIViewController`, `UILabel`, `UITextField`).
+/// Native UIKit `UITabBarController` with 3 tabs (设置 / 试打 / 词库),
+/// synchronized with `JuxuKeyboard.appex` via Keychain (`JuxuSettingsGroup` + `user-data-zlib`).
 
+use std.option.{Option, Some, None}
+use std.vec.{vecLen}
+use std.str.{intToStr}
 use objc.{
     objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
-    msgSend0, msgSend1Ptr, msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64,
+    msgSend0, msgSend1Ptr, msgSendInt0, msgSendI64_0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64,
+}
+use juxu_core.{
+    ConfigFormat, Toml,
+    applyConfig, addUserPhrase, listUserPhrases,
 }
 use juxu_shared.{
-    cgRect, nsStr, msgSendRect0, msgSendInitFrame, msgSend4Float, objcAllocInit, objcAllocInitFrame,
+    JuxuSession, sessionNew,
+    keychainLoadEngineConfig, keychainSaveEngineConfig,
+    keychainLoadEngineUserData, keychainFlushEngineUserData,
+    cgRect, nsStr, nsStrPtrToString,
+    msgSendRect0, msgSendInitFrame, msgSend4Float, msgSendVoid1Ptr1I64, msgSendVoid1Ptr1Sel1U64,
+    objcAllocInit, objcAllocInitFrame,
 }
 
 extern "UIApplicationMain" def c_UIApplicationMain(argc: Int, argv: Ptr, principal: Ptr, delegate: Ptr): Int
+extern "objc_msgSend" def msgSendVoid1Ptr1I64_1Bool(obj: Ptr, sel: Ptr, a0: Ptr, a1: Int64, a2: Bool): Void
 
 def gAppWindow: Cell Ptr = cellNew(ptrNull())
+def gHostSession: Cell (Option JuxuSession) = cellNew(None)
+def gHostPhraseField: Cell Ptr = cellNew(ptrNull())
+def gHostPhraseStatus: Cell Ptr = cellNew(ptrNull())
+def gHostSchemaStatus: Cell Ptr = cellNew(ptrNull())
 
-def mainVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
+def ensureHostSession(): JuxuSession =
+    match cellGet(gHostSession) {
+        Some(s) -> s,
+        None -> {
+            let s = sessionNew();
+            let _ = keychainLoadEngineConfig(s.engine);
+            let _ = keychainLoadEngineUserData(s.engine);
+            cellSet(gHostSession, Some(s));
+            s
+        },
+    }
+
+def hostSchemaTag(idx: Int): String =
+    if (idx == 0) "pinyin"
+    else if (idx == 1) "xiaohe_sp"
+    else if (idx == 2) "86"
+    else "cangjie5"
+
+def onHostSchemaChanged(_self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
+    let idx = msgSendInt0(sender, objcSel("selectedSegmentIndex"));
+    let tag = hostSchemaTag(idx);
+    let s = ensureHostSession();
+    applyConfig(s.engine, Toml, "[general]\nschema = \"" + tag + "\"\n");
+    let _ = keychainSaveEngineConfig(s.engine);
+    let lbl = cellGet(gHostSchemaStatus);
+    if (!ptrIsNull(lbl)) {
+        msgSendVoid1Ptr(lbl, objcSel("setText:"), nsStr("已同步方案：" + tag + "（Keychain）"))
+    } else ()
+}
+
+def onHostAddPhrase(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void = {
+    let s = ensureHostSession();
+    let tf = cellGet(gHostPhraseField);
+    let st = cellGet(gHostPhraseStatus);
+    let phrase = nsStrPtrToString(msgSend0(tf, objcSel("text")));
+    if (strLen(phrase) > 0) {
+        let _ = addUserPhrase(s.engine, phrase);
+        let _ = keychainFlushEngineUserData(s.engine);
+        msgSendVoid1Ptr(tf, objcSel("setText:"), nsStr(""));
+        let cnt = vecLen(listUserPhrases(s.engine));
+        msgSendVoid1Ptr(st, objcSel("setText:"), nsStr("已同步词条「" + phrase + "」，共 " + intToStr(cnt) + " 条"))
+    } else ()
+}
+
+def settingsVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
+    let _ = ensureHostSession();
     let view = msgSend0(self, objcSel("view"));
-    let bg = msgSend4Float(objcClass("UIColor"), objcSel("colorWithRed:green:blue:alpha:"), 0.97, 0.97, 0.98, 1.0);
-    msgSendVoid1Ptr(view, objcSel("setBackgroundColor:"), bg);
+    msgSendVoid1Ptr(view, objcSel("setBackgroundColor:"),
+        msgSend4Float(objcClass("UIColor"), objcSel("colorWithRed:green:blue:alpha:"), 0.97, 0.97, 0.98, 1.0));
 
-    let title = objcAllocInitFrame("UILabel", cgRect(24.0, 90.0, 340.0, 36.0));
-    msgSendVoid1Ptr(title, objcSel("setText:"), nsStr("句序输入法（纯 Geisha 版）"));
+    let title = objcAllocInitFrame("UILabel", cgRect(24.0, 80.0, 340.0, 34.0));
+    msgSendVoid1Ptr(title, objcSel("setText:"), nsStr("句序输入法设置"));
     msgSendVoid1Ptr(view, objcSel("addSubview:"), title);
 
-    let hint = objcAllocInitFrame("UILabel", cgRect(24.0, 134.0, 340.0, 56.0));
+    let seg = objcAllocInit("UISegmentedControl");
+    msgSendVoid1Ptr1I64_1Bool(seg, objcSel("insertSegmentWithTitle:atIndex:animated:"), nsStr("全拼"), intToI64(0), false);
+    msgSendVoid1Ptr1I64_1Bool(seg, objcSel("insertSegmentWithTitle:atIndex:animated:"), nsStr("双拼"), intToI64(1), false);
+    msgSendVoid1Ptr1I64_1Bool(seg, objcSel("insertSegmentWithTitle:atIndex:animated:"), nsStr("五笔86"), intToI64(2), false);
+    msgSendVoid1Ptr1I64_1Bool(seg, objcSel("insertSegmentWithTitle:atIndex:animated:"), nsStr("仓颉5"), intToI64(3), false);
+    msgSendVoid1I64(seg, objcSel("setSelectedSegmentIndex:"), intToI64(0));
+    let _ = msgSendInitFrame(seg, objcSel("setFrame:"), cgRect(24.0, 130.0, 340.0, 36.0));
+    // UIControlEventValueChanged == 1 << 12 = 4096
+    msgSendVoid1Ptr1Sel1U64(seg, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onHostSchemaChanged:"), intToI64(4096));
+    msgSendVoid1Ptr(view, objcSel("addSubview:"), seg);
+
+    let st = objcAllocInitFrame("UILabel", cgRect(24.0, 180.0, 340.0, 28.0));
+    msgSendVoid1Ptr(st, objcSel("setText:"), nsStr("选择方案后自动通过 Keychain 同步至键盘扩展"));
+    msgSendVoid1Ptr(view, objcSel("addSubview:"), st);
+    cellSet(gHostSchemaStatus, st)
+}
+
+def sandboxVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
+    let view = msgSend0(self, objcSel("view"));
+    msgSendVoid1Ptr(view, objcSel("setBackgroundColor:"),
+        msgSend4Float(objcClass("UIColor"), objcSel("colorWithRed:green:blue:alpha:"), 0.97, 0.97, 0.98, 1.0));
+
+    let hint = objcAllocInitFrame("UILabel", cgRect(24.0, 80.0, 340.0, 56.0));
     msgSendVoid1I64(hint, objcSel("setNumberOfLines:"), intToI64(0));
-    msgSendVoid1Ptr(hint, objcSel("setText:"), nsStr("在「设置 → 通用 → 键盘 → 添加新键盘」中启用「句序」，然后在下方输入框试打："));
+    msgSendVoid1Ptr(hint, objcSel("setText:"), nsStr("在「设置 → 通用 → 键盘 → 添加新键盘」中启用「句序」，然后在下方试打："));
     msgSendVoid1Ptr(view, objcSel("addSubview:"), hint);
 
-    let tf = objcAllocInitFrame("UITextField", cgRect(24.0, 206.0, 340.0, 44.0));
-    msgSendVoid1I64(tf, objcSel("setBorderStyle:"), intToI64(3)); // UITextBorderStyleRoundedRect
+    let tf = objcAllocInitFrame("UITextField", cgRect(24.0, 148.0, 340.0, 44.0));
+    msgSendVoid1I64(tf, objcSel("setBorderStyle:"), intToI64(3));
     msgSendVoid1Ptr(tf, objcSel("setPlaceholder:"), nsStr("点击此处体验句序键盘…"));
     msgSendVoid1Ptr(view, objcSel("addSubview:"), tf)
+}
+
+def phrasesVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
+    let s = ensureHostSession();
+    let view = msgSend0(self, objcSel("view"));
+    msgSendVoid1Ptr(view, objcSel("setBackgroundColor:"),
+        msgSend4Float(objcClass("UIColor"), objcSel("colorWithRed:green:blue:alpha:"), 0.97, 0.97, 0.98, 1.0));
+
+    let tf = objcAllocInitFrame("UITextField", cgRect(24.0, 96.0, 240.0, 40.0));
+    msgSendVoid1I64(tf, objcSel("setBorderStyle:"), intToI64(3));
+    msgSendVoid1Ptr(tf, objcSel("setPlaceholder:"), nsStr("输入自定义词条"));
+    msgSendVoid1Ptr(view, objcSel("addSubview:"), tf);
+
+    let btn = objcAllocInitFrame("UIButton", cgRect(274.0, 96.0, 90.0, 40.0));
+    msgSendVoid1Ptr(btn, objcSel("setBackgroundColor:"),
+        msgSend4Float(objcClass("UIColor"), objcSel("colorWithRed:green:blue:alpha:"), 0.05, 0.42, 0.92, 1.0));
+    // UIControlStateNormal == 0, UIControlEventTouchUpInside == 1 << 6 = 64
+    msgSendVoid1Ptr1I64(btn, objcSel("setTitle:forState:"), nsStr("添加"), intToI64(0));
+    msgSendVoid1Ptr1Sel1U64(btn, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onHostAddPhrase:"), intToI64(64));
+    msgSendVoid1Ptr(view, objcSel("addSubview:"), btn);
+
+    let st = objcAllocInitFrame("UILabel", cgRect(24.0, 152.0, 340.0, 30.0));
+    let cnt = vecLen(listUserPhrases(s.engine));
+    msgSendVoid1Ptr(st, objcSel("setText:"), nsStr("当前用户词条：" + intToStr(cnt) + " 条（Keychain zlib 同步）"));
+    msgSendVoid1Ptr(view, objcSel("addSubview:"), st);
+
+    cellSet(gHostPhraseField, tf);
+    cellSet(gHostPhraseStatus, st)
 }
 
 def appDidFinishLaunching(_self: Ptr, _cmd: Ptr, _app: Ptr, _opts: Ptr): Bool = {
@@ -38,18 +152,46 @@ def appDidFinishLaunching(_self: Ptr, _cmd: Ptr, _app: Ptr, _opts: Ptr): Bool = 
     let bounds = msgSendRect0(screen, objcSel("bounds"));
     let winAlloc = msgSend0(objcClass("UIWindow"), objcSel("alloc"));
     let win = msgSendInitFrame(winAlloc, objcSel("initWithFrame:"), bounds);
-    let vc = objcAllocInit("JuxuIOSMainVC");
-    msgSendVoid1Ptr(win, objcSel("setRootViewController:"), vc);
+
+    let vcSettings = objcAllocInit("JuxuIOSSettingsVC");
+    msgSendVoid1Ptr(vcSettings, objcSel("setTitle:"), nsStr("设置"));
+    let vcSandbox = objcAllocInit("JuxuIOSSandboxVC");
+    msgSendVoid1Ptr(vcSandbox, objcSel("setTitle:"), nsStr("试打"));
+    let vcPhrases = objcAllocInit("JuxuIOSPhrasesVC");
+    msgSendVoid1Ptr(vcPhrases, objcSel("setTitle:"), nsStr("词库"));
+
+    let arr = msgSend0(objcClass("NSMutableArray"), objcSel("array"));
+    msgSendVoid1Ptr(arr, objcSel("addObject:"), vcSettings);
+    msgSendVoid1Ptr(arr, objcSel("addObject:"), vcSandbox);
+    msgSendVoid1Ptr(arr, objcSel("addObject:"), vcPhrases);
+
+    let tabs = objcAllocInit("UITabBarController");
+    msgSendVoid1Ptr(tabs, objcSel("setViewControllers:"), arr);
+    msgSendVoid1Ptr(win, objcSel("setRootViewController:"), tabs);
     msgSendVoid0(win, objcSel("makeKeyAndVisible"));
     cellSet(gAppWindow, win);
     true
 }
 
 extern init(100) def registerIosHostAppClasses(): Void = {
-    let vcCls = objcAllocateClass("UIViewController", "JuxuIOSMainVC");
-    if (!ptrIsNull(vcCls)) {
-        let _ = objcAddMethod(vcCls, "viewDidLoad", cFnPtr(mainVcViewDidLoad), "v@:");
-        objcRegisterClass(vcCls)
+    let sCls = objcAllocateClass("UIViewController", "JuxuIOSSettingsVC");
+    if (!ptrIsNull(sCls)) {
+        let _ = objcAddMethod(sCls, "viewDidLoad", cFnPtr(settingsVcViewDidLoad), "v@:");
+        let _ = objcAddMethod(sCls, "onHostSchemaChanged:", cFnPtr(onHostSchemaChanged), "v@:@");
+        objcRegisterClass(sCls)
+    } else ();
+
+    let bCls = objcAllocateClass("UIViewController", "JuxuIOSSandboxVC");
+    if (!ptrIsNull(bCls)) {
+        let _ = objcAddMethod(bCls, "viewDidLoad", cFnPtr(sandboxVcViewDidLoad), "v@:");
+        objcRegisterClass(bCls)
+    } else ();
+
+    let pCls = objcAllocateClass("UIViewController", "JuxuIOSPhrasesVC");
+    if (!ptrIsNull(pCls)) {
+        let _ = objcAddMethod(pCls, "viewDidLoad", cFnPtr(phrasesVcViewDidLoad), "v@:");
+        let _ = objcAddMethod(pCls, "onHostAddPhrase:", cFnPtr(onHostAddPhrase), "v@:@");
+        objcRegisterClass(pCls)
     } else ();
 
     let appCls = objcAllocateClass("UIResponder", "JuxuIOSAppDelegate");

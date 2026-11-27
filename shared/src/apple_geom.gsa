@@ -76,6 +76,10 @@ pub extern "objc_msgSend" def msgSend4Float(
 pub extern "objc_msgSend" def msgSend2Float(obj: Ptr, sel: Ptr, a0: Float, a1: Float): Ptr
 pub extern "objc_msgSend" def msgSend2Ptr(obj: Ptr, sel: Ptr, a0: Ptr, a1: Ptr): Ptr
 pub extern "objc_msgSend" def msgSend1Ptr1Bool(obj: Ptr, sel: Ptr, a0: Ptr, a1: Bool): Ptr
+pub extern "objc_msgSend" def msgSend1Ptr1I64(obj: Ptr, sel: Ptr, a0: Ptr, a1: Int64): Ptr
+pub extern "objc_msgSend" def msgSend1I64_1Ptr(obj: Ptr, sel: Ptr, a0: Int64, a1: Ptr): Ptr
+pub extern "objc_msgSend" def msgSend1Range(obj: Ptr, sel: Ptr, r: NSRange): Ptr
+pub extern "objc_msgSend" def msgSendVoid1I64(obj: Ptr, sel: Ptr, a0: Int64): Void
 pub extern "objc_msgSend" def msgSendBool1Ptr(obj: Ptr, sel: Ptr, a0: Ptr): Bool
 pub extern "objc_msgSend" def msgSendBool2Ptr(obj: Ptr, sel: Ptr, a0: Ptr, a1: Ptr): Bool
 pub extern "objc_msgSend" def msgSendVoid1Ptr1Bool(obj: Ptr, sel: Ptr, a0: Ptr, a1: Bool): Void
@@ -135,6 +139,15 @@ pub def objcAllocInit(className: String): Ptr = {
     let obj = msgSend0(cls, objcSel("alloc"));
     msgSend0(obj, objcSel("init"))
 }
+
+/// Read a `CGRect` (4 IEEE-754 doubles = 32 bytes) from a raw C buffer `buf`.
+pub def readCGRectFromBuf(buf: Ptr): CGRect =
+    cgRect(
+        ptrReadF64Le(buf, 0),
+        ptrReadF64Le(buf, 8),
+        ptrReadF64Le(buf, 16),
+        ptrReadF64Le(buf, 24)
+    )
 
 /// Allocate and initialize an ObjC view with `[[cls alloc] initWithFrame:frame]`.
 pub def objcAllocInitFrame(className: String, frame: CGRect): Ptr = {

@@ -1,0 +1,168 @@
+/// Apple Keychain (`Security.framework`) + `NSData` zlib compression bridge for cross-process
+/// settings & user-data synchronization between iOS Host App (`Juxu.app`) and Keyboard Extension (`JuxuKeyboard.appex`).
+/// 100% pure Geisha — zero C shims required.
+
+use std.option.{Option, Some, None}
+use std.result.{Ok, Err}
+use std.str.{i64ToStr, parseInt64}
+use objc.{
+    objcClass, objcSel, msgSend0, msgSend1Ptr, msgSend1I64, msgSend1Bool,
+    msgSendVoid1Ptr, msgSendI64_0,
+}
+use apple_geom.{nsStr, nsStrPtrToString, msgSend2Ptr, msgSend1Ptr1I64}
+use juxu_core.{
+    JuxuEngine, ConfigFormat, Toml,
+    applyConfig, exportConfig, importUserDataTsv, exportUserDataTsv, userDataSeq, isUserDirty,
+}
+
+extern "SecItemCopyMatching" def c_SecItemCopyMatching(query: Ptr, resultOut: Ptr): Int
+extern "SecItemAdd" def c_SecItemAdd(attrs: Ptr, resultOut: Ptr): Int
+extern "SecItemUpdate" def c_SecItemUpdate(query: Ptr, attrsToUpdate: Ptr): Int
+extern "SecItemDelete" def c_SecItemDelete(query: Ptr): Int
+extern "objc_msgSend" def msgSendDataBytes(cls: Ptr, sel: Ptr, bytes: Ptr, len: Int64): Ptr
+extern "objc_msgSend" def msgSendCompress(nsData: Ptr, sel: Ptr, algo: Int64, errOut: Ptr): Ptr
+
+pub def kcAccountSettings(): String = "input-settings"
+pub def kcAccountTouchProfile(): String = "touch-profile"
+pub def kcAccountEvalLog(): String = "eval-log-ring"
+pub def kcAccountUserDataZlib(): String = "user-data-zlib"
+pub def kcAccountUserDataSeq(): String = "user-data-seq"
+
+def bundleAccessGroup(): Option String = {
+    let bundle = msgSend0(objcClass("NSBundle"), objcSel("mainBundle"));
+    if (ptrIsNull(bundle)) None
+    else {
+        let v = msgSend1Ptr(bundle, objcSel("objectForInfoDictionaryKey:"), nsStr("JuxuSettingsGroup"));
+        if (ptrIsNull(v)) None
+        else {
+            let s = nsStrPtrToString(v);
+            if (strLen(s) > 0) Some(s) else None
+        }
+    }
+}
+
+def makeKeychainQuery(account: String): Ptr = {
+    let q = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
+    let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsStr("genp"), nsStr("class"));
+    let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsStr("Juxu"), nsStr("svce"));
+    let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsStr(account), nsStr("acct"));
+    match bundleAccessGroup() {
+        Some(grp) -> {
+            let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsStr(grp), nsStr("agrp"));
+            ()
+        },
+        None -> (),
+    };
+    q
+}
+
+def stringToNsData(s: String): Ptr = {
+    let nss = nsStr(s);
+    // NSUTF8StringEncoding == 4
+    msgSend1I64(nss, objcSel("dataUsingEncoding:"), intToI64(4))
+}
+
+def nsDataToString(nsData: Ptr): Option String =
+    if (ptrIsNull(nsData)) None
+    else {
+        let alloc = msgSend0(objcClass("NSString"), objcSel("alloc"));
+        let nss = msgSend1Ptr1I64(alloc, objcSel("initWithData:encoding:"), nsData, intToI64(4));
+        if (ptrIsNull(nss)) None else Some(nsStrPtrToString(nss))
+    }
+
+/// Write raw `NSData*` into Keychain under `account` (insert or update).
+pub def keychainWriteData(account: String, nsData: Ptr): Bool =
+    if (ptrIsNull(nsData)) false
+    else {
+        let q = makeKeychainQuery(account);
+        let upd = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
+        let _ = msgSend2Ptr(upd, objcSel("setObject:forKey:"), nsData, nsStr("v_Data"));
+        let status = c_SecItemUpdate(q, upd);
+        if (status == 0) true
+        else {
+            let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsData, nsStr("v_Data"));
+            let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsStr("dku"), nsStr("pdmn"));
+            c_SecItemAdd(q, ptrNull()) == 0
+        }
+    }
+
+/// Read raw `NSData*` from Keychain under `account`.
+pub def keychainReadData(account: String): Ptr = {
+    let q = makeKeychainQuery(account);
+    let numTrue = msgSend1Bool(objcClass("NSNumber"), objcSel("numberWithBool:"), true);
+    let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), numTrue, nsStr("r_Data"));
+    let outSlot = ptrAllocBytes(8);
+    let status = c_SecItemCopyMatching(q, outSlot);
+    if (status == 0) ptrOffset64(ptrNull(), ptrReadI64Le(outSlot, 0)) else ptrNull()
+}
+
+/// Write a UTF-8 string to Keychain (`account`).
+pub def keychainWriteString(account: String, text: String): Bool =
+    keychainWriteData(account, stringToNsData(text))
+
+/// Read a UTF-8 string from Keychain (`account`).
+pub def keychainReadString(account: String): Option String =
+    nsDataToString(keychainReadData(account))
+
+/// Compress UTF-8 `text` with zlib (`NSDataCompressionAlgorithmZlib = 3`) and store in Keychain.
+pub def keychainWriteZlibString(account: String, text: String): Bool = {
+    let raw = stringToNsData(text);
+    if (ptrIsNull(raw)) false
+    else {
+        let comp = msgSendCompress(raw, objcSel("compressedDataUsingAlgorithm:error:"), intToI64(3), ptrNull());
+        if (ptrIsNull(comp)) keychainWriteData(account, raw)
+        else keychainWriteData(account, comp)
+    }
+}
+
+/// Read and zlib-decompress a UTF-8 string from Keychain (falls back to plain UTF-8 if uncompressed).
+pub def keychainReadZlibString(account: String): Option String = {
+    let nsData = keychainReadData(account);
+    if (ptrIsNull(nsData)) None
+    else {
+        let decomp = msgSendCompress(nsData, objcSel("decompressedDataUsingAlgorithm:error:"), intToI64(3), ptrNull());
+        if (!ptrIsNull(decomp)) nsDataToString(decomp)
+        else nsDataToString(nsData)
+    }
+}
+
+/// Sync engine configuration (TOML) from Keychain into `eng`.
+pub def keychainLoadEngineConfig(eng: JuxuEngine): Bool =
+    match keychainReadString(kcAccountSettings()) {
+        Some(toml) if (strLen(toml) > 0) -> {
+            applyConfig(eng, Toml, toml);
+            true
+        },
+        _ -> false,
+    }
+
+/// Save engine configuration (TOML) to Keychain.
+pub def keychainSaveEngineConfig(eng: JuxuEngine): Bool =
+    keychainWriteString(kcAccountSettings(), exportConfig(eng, Toml))
+
+/// Sync zlib-compressed user data TSV from Keychain into `eng` if remote seq > local seq.
+pub def keychainLoadEngineUserData(eng: JuxuEngine): Bool = {
+    let remoteSeq = match keychainReadString(kcAccountUserDataSeq()) {
+        Some(s) -> match parseInt64(s) { Ok(v) -> v, Err(_) -> intToI64(0) },
+        None -> intToI64(0),
+    };
+    let localSeq = userDataSeq(eng);
+    if (remoteSeq > localSeq || localSeq == intToI64(0)) {
+        match keychainReadZlibString(kcAccountUserDataZlib()) {
+            Some(tsv) if (strLen(tsv) > 0) -> {
+                importUserDataTsv(eng, tsv);
+                true
+            },
+            _ -> false,
+        }
+    } else false
+}
+
+/// Flush dirty engine user data TSV (zlib-compressed) + sequence counter to Keychain.
+pub def keychainFlushEngineUserData(eng: JuxuEngine): Bool =
+    if (isUserDirty(eng)) {
+        let tsv = exportUserDataTsv(eng);
+        let ok1 = keychainWriteZlibString(kcAccountUserDataZlib(), tsv);
+        let ok2 = keychainWriteString(kcAccountUserDataSeq(), i64ToStr(userDataSeq(eng)));
+        ok1 && ok2
+    } else false

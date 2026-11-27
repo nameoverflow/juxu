@@ -1,47 +1,92 @@
 /// Pure UIKit + CoreGraphics iOS keyboard canvas & candidate ribbon (`JuxuIOSKeyboardView`).
-/// - Flat keycaps (`cornerRadius = 7.8pt`, no shadows)
+/// Full feature parity:
+/// - Flat keycaps (`cornerRadius = 7.8pt`, no shadows) + floating key callout bubble
 /// - Direct `UIView` candidate ribbon (no `UIScrollView`, no `UIButton.Configuration`)
-/// - Strict character-vs-function touch isolation (no cross-class slide).
+/// - Expandable full-keyboard candidate drawer (`allCandidates` + `SelectAbs`)
+/// - Next-word prediction chips (`predictNext` + `acceptPrediction`) when idle
+/// - T9 9-key layout + live left syllable rail (`LockT9Syllable`) + Numbers/Symbols layout
+/// - Long-press repeat delete (`NSTimer`) + Spacebar cursor trackpad (`adjustTextPositionByCharacterOffset:`)
+/// - Strict character-vs-function touch isolation (no cross-class slide)
+/// - Punctuation pairing + ZH/EN auto-spacing on commit.
 
 use std.option.{Option, Some, None}
 use std.vec.{Vec, vecNew, vecLen, vecGetOr}
 use sys.time.{monotonicMs}
 use objc.{
     objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
-    msgSend0, msgSend1Ptr, msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1Bool,
+    msgSend0, msgSend1Ptr, msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1Bool, msgSendVoid1I64,
 }
 use juxu_core.{
     EngineSnapshot, Candidate, emptyCandidate,
-    Touch, SelectPage, ToggleAscii, KeySpace, KeyBackspace, KeyReturn,
-    keySpecial, snapConsumed, snapCommitText,
+    Touch, T9Touch, LockT9Syllable, SelectPage, SelectAbs, ToggleAscii,
+    KeySpace, KeyBackspace, KeyReturn,
+    keySpecial, allCandidates, predictNext, acceptPrediction,
+    snapConsumed, snapCommitText,
 }
 use juxu_shared.{
     JuxuSession, sessionStep, sessionState,
-    CGRect, CGPoint, cgRect, nsStr,
+    PunctuationAction, InsertPair, SkipClose, Plain,
+    punctuationTrackerHandleSymbol, formatAutoSpace,
+    CGRect, CGPoint, cgRect, nsStr, nsStrPtrToString,
     msgSendRect0, msgSendPoint1Ptr, msgSend4Float, msgSend2Ptr,
 }
 use layout_engine.{
+    KeyboardMode, ModeQwerty, ModeT9, ModeSymbols,
     KeySpec, KeyAction, KeyClass, CharClass, FuncClass,
-    ActLetter, ActShift, ActBackspace, ActSwitchMode, ActGlobe, ActSpace, ActReturn,
-    emptyKeySpec, buildQwertyLayout, hitTestKeys,
-    ribbonHeight, keyCornerRadius,
+    ActLetter, ActDigitT9, ActSymbol, ActShift, ActBackspace,
+    ActToggleSymbols, ActToggleT9, ActToggleAscii, ActGlobe, ActSpace, ActReturn,
+    emptyKeySpec, buildLayoutForMode, hitTestKeys,
+    ribbonHeight, keyCornerRadius, t9SyllableRailWidth,
 }
 use marked_text.{proxyCommitText, proxySetMarkedText, proxyDeleteBackward}
 
 extern "objc_msgSend" def msgSendUiBezierRounded(cls: Ptr, sel: Ptr, rect: CGRect, radius: Float): Ptr
 extern "objc_msgSend" def msgSendUiFont(cls: Ptr, sel: Ptr, size: Float, weight: Float): Ptr
 extern "objc_msgSend" def msgSendUiDrawInRect(str: Ptr, sel: Ptr, rect: CGRect, attrs: Ptr): Void
+extern "objc_msgSend" def msgSendScheduledTimer(
+    cls: Ptr, sel: Ptr, interval: Float, target: Ptr, action: Ptr, userInfo: Ptr, repeats: Bool
+): Ptr
 
 def gIosSession: Cell (Option JuxuSession) = cellNew(None)
 def gIosVc: Cell Ptr = cellNew(ptrNull())
+def gIosView: Cell Ptr = cellNew(ptrNull())
+def gIosMode: Cell KeyboardMode = cellNew(ModeQwerty)
+def gPrevModeBeforeSym: Cell KeyboardMode = cellNew(ModeQwerty)
 def gIosKeys: Cell (Vec KeySpec) = cellNew(vecNew())
 def gIosSnap: Cell (Option EngineSnapshot) = cellNew(None)
+def gIosPreds: Cell (Vec String) = cellNew(vecNew())
+def gDrawerOpen: Cell Bool = cellNew(false)
+def gDrawerCands: Cell (Vec Candidate) = cellNew(vecNew())
 def gActiveKey: Cell (Option KeySpec) = cellNew(None)
+def gSpaceDragActive: Cell Bool = cellNew(false)
+def gSpaceDragLastX: Cell Float = cellNew(0.0)
+def gDeleteTimer: Cell Ptr = cellNew(ptrNull())
 
-pub def iosCanvasBind(vc: Ptr, session: JuxuSession): Void = {
+pub def iosCanvasBind(vc: Ptr, view: Ptr, session: JuxuSession): Void = {
     cellSet(gIosVc, vc);
+    cellSet(gIosView, view);
     cellSet(gIosSession, Some(session));
-    cellSet(gIosSnap, Some(sessionState(session)))
+    let snap = sessionState(session);
+    cellSet(gIosSnap, Some(snap));
+    cellSet(gIosPreds, predictNext(session.engine, 5))
+}
+
+pub def iosCanvasRefreshPredictions(): Void =
+    match cellGet(gIosSession) {
+        Some(s) -> {
+            cellSet(gIosPreds, predictNext(s.engine, 5));
+            let v = cellGet(gIosView);
+            if (!ptrIsNull(v)) msgSendVoid0(v, objcSel("setNeedsDisplay")) else ()
+        },
+        None -> (),
+    }
+
+def stopDeleteTimer(): Void = {
+    let t = cellGet(gDeleteTimer);
+    if (!ptrIsNull(t)) {
+        msgSendVoid0(t, objcSel("invalidate"));
+        cellSet(gDeleteTimer, ptrNull())
+    } else ()
 }
 
 def uiColorRgba(r: Float, g: Float, b: Float, a: Float): Ptr =
@@ -55,91 +100,219 @@ def uiTextAttrs(size: Float, weight: Float, color: Ptr): Ptr = {
     d
 }
 
+def fillRounded(r: CGRect, radius: Float, col: Ptr): Void = {
+    msgSendVoid0(col, objcSel("setFill"));
+    let p = msgSendUiBezierRounded(objcClass("UIBezierPath"), objcSel("bezierPathWithRoundedRect:cornerRadius:"), r, radius);
+    msgSendVoid0(p, objcSel("fill"))
+}
+
 def iosViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
     let bounds = msgSendRect0(self, objcSel("bounds"));
-    let bg = uiColorRgba(0.83, 0.84, 0.87, 1.0);
-    msgSendVoid0(bg, objcSel("setFill"));
-    let bgPath = msgSendUiBezierRounded(objcClass("UIBezierPath"), objcSel("bezierPathWithRoundedRect:cornerRadius:"), bounds, 0.0);
-    msgSendVoid0(bgPath, objcSel("fill"));
+    fillRounded(bounds, 0.0, uiColorRgba(0.83, 0.84, 0.87, 1.0));
 
-    // 1. Candidate ribbon (top 53pt, direct CoreGraphics drawing)
+    // 1. Candidate / Prediction Ribbon (top 53pt, direct CoreGraphics drawing)
     let ribRect = cgRect(0.0, 0.0, bounds.size.width, ribbonHeight());
-    let ribBg = uiColorRgba(0.95, 0.96, 0.97, 1.0);
-    msgSendVoid0(ribBg, objcSel("setFill"));
-    let ribPath = msgSendUiBezierRounded(objcClass("UIBezierPath"), objcSel("bezierPathWithRoundedRect:cornerRadius:"), ribRect, 0.0);
-    msgSendVoid0(ribPath, objcSel("fill"));
+    fillRounded(ribRect, 0.0, uiColorRgba(0.95, 0.96, 0.97, 1.0));
 
-    match cellGet(gIosSnap) {
-        Some(snap) -> {
-            let cands = snap.pageCandidates;
-            let n = vecLen(cands);
-            let dummy = emptyCandidate();
-            let fgMain = uiColorRgba(0.10, 0.11, 0.13, 1.0);
-            let fgAccent = uiColorRgba(0.05, 0.42, 0.92, 1.0);
-            let attrsMain = uiTextAttrs(17.0, 0.0, fgMain);
-            let attrsAccent = uiTextAttrs(17.0, 0.23, fgAccent);
-            let slotW = if (n > 0) bounds.size.width / intToFloat(if (n < 5) n else 5) else bounds.size.width;
-            let limit = if (n < 5) n else 5;
+    let fgMain = uiColorRgba(0.10, 0.11, 0.13, 1.0);
+    let fgAccent = uiColorRgba(0.05, 0.42, 0.92, 1.0);
+    let fgMuted = uiColorRgba(0.45, 0.48, 0.54, 1.0);
+    let attrsMain = uiTextAttrs(17.0, 0.0, fgMain);
+    let attrsAccent = uiTextAttrs(17.0, 0.23, fgAccent);
+    let attrsMuted = uiTextAttrs(15.0, 0.0, fgMuted);
+
+    let hasCands = match cellGet(gIosSnap) {
+        Some(snap) -> vecLen(snap.pageCandidates) > 0,
+        None -> false,
+    };
+
+    if (hasCands) {
+        match cellGet(gIosSnap) {
+            Some(snap) -> {
+                let cands = snap.pageCandidates;
+                let n = vecLen(cands);
+                let dummy = emptyCandidate();
+                let expandW = 42.0;
+                let usableW = bounds.size.width - expandW;
+                let limit = if (n < 5) n else 5;
+                let slotW = usableW / intToFloat(limit);
+                let i = cellNew(0);
+                while (cellGet(i) < limit) {
+                    let idx = cellGet(i);
+                    let c = vecGetOr(cands, idx, dummy);
+                    let r = cgRect(intToFloat(idx) * slotW + 10.0, 14.0, slotW - 12.0, 26.0);
+                    msgSendUiDrawInRect(nsStr(c.text), objcSel("drawInRect:withAttributes:"), r, if (idx == 0) attrsAccent else attrsMain);
+                    cellSet(i, idx + 1)
+                };
+                // Right-edge expand drawer toggle
+                let expIcon = if (cellGet(gDrawerOpen)) "⌃" else "⌄";
+                let er = cgRect(usableW + 12.0, 14.0, 28.0, 26.0);
+                msgSendUiDrawInRect(nsStr(expIcon), objcSel("drawInRect:withAttributes:"), er, attrsMuted)
+            },
+            None -> (),
+        }
+    } else {
+        // Idle next-word prediction chips
+        let preds = cellGet(gIosPreds);
+        let pn = vecLen(preds);
+        let limit = if (pn < 5) pn else 5;
+        if (limit > 0) {
+            let slotW = bounds.size.width / intToFloat(limit);
             let i = cellNew(0);
             while (cellGet(i) < limit) {
                 let idx = cellGet(i);
-                let c = vecGetOr(cands, idx, dummy);
+                let w = vecGetOr(preds, idx, "");
                 let r = cgRect(intToFloat(idx) * slotW + 10.0, 14.0, slotW - 12.0, 26.0);
-                msgSendUiDrawInRect(nsStr(c.text), objcSel("drawInRect:withAttributes:"), r, if (idx == 0) attrsAccent else attrsMain);
+                msgSendUiDrawInRect(nsStr(w), objcSel("drawInRect:withAttributes:"), r, attrsMuted);
                 cellSet(i, idx + 1)
             }
-        },
-        None -> (),
+        } else ()
     };
 
-    // 2. Flat keycaps (cornerRadius = 7.8pt, no shadows)
-    let keys = cellGet(gIosKeys);
-    let kn = vecLen(keys);
-    let kDummy = emptyKeySpec();
-    let charBg = uiColorRgba(1.0, 1.0, 1.0, 1.0);
-    let funcBg = uiColorRgba(0.68, 0.70, 0.75, 1.0);
-    let pressBg = uiColorRgba(0.55, 0.65, 0.95, 1.0);
-    let keyFg = uiColorRgba(0.10, 0.11, 0.13, 1.0);
-    let keyAttrs = uiTextAttrs(19.0, 0.0, keyFg);
-    let ki = cellNew(0);
-    while (cellGet(ki) < kn) {
-        let k = vecGetOr(keys, cellGet(ki), kDummy);
-        let isPressed = match cellGet(gActiveKey) {
-            Some(ak) -> ak.action == k.action,
-            None -> false,
+    // 2. Expanded Candidate Drawer (overlays key area when open)
+    if (cellGet(gDrawerOpen)) {
+        let drawerRect = cgRect(0.0, ribbonHeight(), bounds.size.width, bounds.size.height - ribbonHeight());
+        fillRounded(drawerRect, 0.0, uiColorRgba(0.96, 0.97, 0.98, 1.0));
+        let allC = cellGet(gDrawerCands);
+        let cn = vecLen(allC);
+        let limit = if (cn < 24) cn else 24;
+        let cols = 4;
+        let cellW = bounds.size.width / intToFloat(cols);
+        let cellH = 36.0;
+        let dummy = emptyCandidate();
+        let i = cellNew(0);
+        while (cellGet(i) < limit) {
+            let idx = cellGet(i);
+            let row = idx / cols;
+            let col = idx % cols;
+            let c = vecGetOr(allC, idx, dummy);
+            let r = cgRect(intToFloat(col) * cellW + 12.0, ribbonHeight() + intToFloat(row) * cellH + 8.0, cellW - 16.0, 24.0);
+            msgSendUiDrawInRect(nsStr(c.text), objcSel("drawInRect:withAttributes:"), r, attrsMain);
+            cellSet(i, idx + 1)
+        }
+    } else {
+        // 3. T9 left syllable rail (when in ModeT9)
+        if (cellGet(gIosMode) == ModeT9) {
+            let railRect = cgRect(3.0, ribbonHeight() + 2.0, t9SyllableRailWidth(), 157.0);
+            fillRounded(railRect, keyCornerRadius(), uiColorRgba(0.92, 0.93, 0.95, 1.0));
+            match cellGet(gIosSnap) {
+                Some(snap) -> match snap.t9 {
+                    Some(t9) -> {
+                        let sn = vecLen(t9.t9Syllables);
+                        let lim = if (sn < 4) sn else 4;
+                        let si = cellNew(0);
+                        while (cellGet(si) < lim) {
+                            let idx = cellGet(si);
+                            let syl = vecGetOr(t9.t9Syllables, idx, "");
+                            let sr = cgRect(10.0, ribbonHeight() + 10.0 + intToFloat(idx) * 36.0, t9SyllableRailWidth() - 12.0, 26.0);
+                            msgSendUiDrawInRect(nsStr(syl), objcSel("drawInRect:withAttributes:"), sr, attrsAccent);
+                            cellSet(si, idx + 1)
+                        }
+                    },
+                    None -> (),
+                },
+                None -> (),
+            }
+        } else ();
+
+        // 4. Flat keycaps (cornerRadius = 7.8pt, zero shadows)
+        let keys = cellGet(gIosKeys);
+        let kn = vecLen(keys);
+        let kDummy = emptyKeySpec();
+        let charBg = uiColorRgba(1.0, 1.0, 1.0, 1.0);
+        let funcBg = uiColorRgba(0.68, 0.70, 0.75, 1.0);
+        let pressBg = uiColorRgba(0.55, 0.65, 0.95, 1.0);
+        let keyAttrs = uiTextAttrs(if (cellGet(gIosMode) == ModeT9) 15.0 else 18.0, 0.0, fgMain);
+        let ki = cellNew(0);
+        while (cellGet(ki) < kn) {
+            let k = vecGetOr(keys, cellGet(ki), kDummy);
+            let isPressed = match cellGet(gActiveKey) {
+                Some(ak) -> ak.action == k.action,
+                None -> false,
+            };
+            let fillCol = if (isPressed) pressBg else if (k.keyClass == CharClass) charBg else funcBg;
+            fillRounded(k.frame, keyCornerRadius(), fillCol);
+            let tr = cgRect(k.frame.origin.x + 6.0, k.frame.origin.y + 11.0, k.frame.size.width - 8.0, 24.0);
+            msgSendUiDrawInRect(nsStr(k.label), objcSel("drawInRect:withAttributes:"), tr, keyAttrs);
+            cellSet(ki, cellGet(ki) + 1)
         };
-        let fillCol = if (isPressed) pressBg else if (k.keyClass == CharClass) charBg else funcBg;
-        msgSendVoid0(fillCol, objcSel("setFill"));
-        let kp = msgSendUiBezierRounded(
-            objcClass("UIBezierPath"),
-            objcSel("bezierPathWithRoundedRect:cornerRadius:"),
-            k.frame,
-            keyCornerRadius()
-        );
-        msgSendVoid0(kp, objcSel("fill"));
-        let tr = cgRect(k.frame.origin.x + 8.0, k.frame.origin.y + 11.0, k.frame.size.width - 10.0, 24.0);
-        msgSendUiDrawInRect(nsStr(k.label), objcSel("drawInRect:withAttributes:"), tr, keyAttrs);
-        cellSet(ki, cellGet(ki) + 1)
+
+        // 5. Floating Key Callout Bubble for pressed CharClass key in QWERTY
+        if (cellGet(gIosMode) == ModeQwerty) {
+            match cellGet(gActiveKey) {
+                Some(ak) if (ak.keyClass == CharClass) -> {
+                    let cw = ak.frame.size.width + 14.0;
+                    let ch = 50.0;
+                    let cx = ak.frame.origin.x - 7.0;
+                    let cy = ak.frame.origin.y - ch - 4.0;
+                    let popRect = cgRect(if (cx < 2.0) 2.0 else cx, if (cy < 2.0) 2.0 else cy, cw, ch);
+                    fillRounded(popRect, 10.0, uiColorRgba(1.0, 1.0, 1.0, 1.0));
+                    let bigAttrs = uiTextAttrs(26.0, 0.23, fgMain);
+                    let br = cgRect(popRect.origin.x + 12.0, popRect.origin.y + 10.0, cw - 16.0, 32.0);
+                    msgSendUiDrawInRect(nsStr(ak.label), objcSel("drawInRect:withAttributes:"), br, bigAttrs)
+                },
+                _ -> (),
+            }
+        } else ()
     }
 }
 
-def iosViewLayoutSubviews(self: Ptr, _cmd: Ptr): Void = {
+def rebuildLayout(self: Ptr): Void = {
     let bounds = msgSendRect0(self, objcSel("bounds"));
     if (bounds.size.width > 10.0) {
-        cellSet(gIosKeys, buildQwertyLayout(bounds.size.width));
+        cellSet(gIosKeys, buildLayoutForMode(cellGet(gIosMode), bounds.size.width));
         msgSendVoid0(self, objcSel("setNeedsDisplay"))
     } else ()
 }
 
+def iosViewLayoutSubviews(self: Ptr, _cmd: Ptr): Void =
+    rebuildLayout(self)
+
 def applySnapToProxy(snap: EngineSnapshot): Void = {
     cellSet(gIosSnap, Some(snap));
+    if (vecLen(snap.pageCandidates) == 0) cellSet(gDrawerOpen, false) else ();
     let vc = cellGet(gIosVc);
     if (!ptrIsNull(vc)) {
         let proxy = msgSend0(vc, objcSel("textDocumentProxy"));
-        proxyCommitText(proxy, snapCommitText(snap));
+        let committed = snapCommitText(snap);
+        if (strLen(committed) > 0) {
+            match cellGet(gIosSession) {
+                Some(s) -> {
+                    let before = nsStrPtrToString(msgSend0(proxy, objcSel("documentContextBeforeInput")));
+                    let formatted = formatAutoSpace(before, committed, cellGet(s.autoSpace));
+                    match punctuationTrackerHandleSymbol(s.punctuation, formatted, "") {
+                        InsertPair(close) -> {
+                            proxyCommitText(proxy, formatted + close);
+                            msgSendVoid1I64(proxy, objcSel("adjustTextPositionByCharacterOffset:"), intToI64(-1))
+                        },
+                        SkipClose -> msgSendVoid1I64(proxy, objcSel("adjustTextPositionByCharacterOffset:"), intToI64(1)),
+                        Plain -> proxyCommitText(proxy, formatted),
+                    };
+                    cellSet(gIosPreds, predictNext(s.engine, 5))
+                },
+                None -> proxyCommitText(proxy, committed),
+            }
+        } else ();
         proxySetMarkedText(proxy, snap.displayPreedit)
     } else ()
 }
+
+def performBackspace(self: Ptr): Void = {
+    let vc = cellGet(gIosVc);
+    match cellGet(gIosSession) {
+        Some(s) -> {
+            let snap = sessionStep(s, keySpecial(KeyBackspace, monotonicMs()));
+            if (snapConsumed(snap)) applySnapToProxy(snap)
+            else if (!ptrIsNull(vc)) proxyDeleteBackward(msgSend0(vc, objcSel("textDocumentProxy")))
+            else ()
+        },
+        None -> (),
+    };
+    msgSendVoid0(self, objcSel("setNeedsDisplay"))
+}
+
+def onDeleteRepeatTimer(self: Ptr, _cmd: Ptr, _timer: Ptr): Void =
+    performBackspace(self)
 
 def dispatchKeyRelease(self: Ptr, k: KeySpec, pt: CGPoint): Void = {
     let vc = cellGet(gIosVc);
@@ -150,13 +323,28 @@ def dispatchKeyRelease(self: Ptr, k: KeySpec, pt: CGPoint): Void = {
             match k.action {
                 ActLetter(ch) -> {
                     let snap = sessionStep(s, Touch {
-                        ascii: ch,
-                        x: pt.x,
-                        y: pt.y,
-                        normalized: false,
-                        atMs: nowMs,
+                        ascii: ch, x: pt.x, y: pt.y, normalized: false, atMs: nowMs,
                     });
                     applySnapToProxy(snap)
+                },
+                ActDigitT9(d) -> {
+                    let snap = sessionStep(s, T9Touch {
+                        digit: d, x: pt.x, y: pt.y, normalized: false, atMs: nowMs,
+                    });
+                    applySnapToProxy(snap)
+                },
+                ActSymbol(sym) -> {
+                    if (!ptrIsNull(vc)) {
+                        let proxy = msgSend0(vc, objcSel("textDocumentProxy"));
+                        match punctuationTrackerHandleSymbol(s.punctuation, sym, "") {
+                            InsertPair(close) -> {
+                                proxyCommitText(proxy, sym + close);
+                                msgSendVoid1I64(proxy, objcSel("adjustTextPositionByCharacterOffset:"), intToI64(-1))
+                            },
+                            SkipClose -> msgSendVoid1I64(proxy, objcSel("adjustTextPositionByCharacterOffset:"), intToI64(1)),
+                            Plain -> proxyCommitText(proxy, sym),
+                        }
+                    } else ()
                 },
                 ActSpace -> {
                     let snap = sessionStep(s, keySpecial(KeySpace, nowMs));
@@ -164,21 +352,29 @@ def dispatchKeyRelease(self: Ptr, k: KeySpec, pt: CGPoint): Void = {
                     else if (!ptrIsNull(vc)) proxyCommitText(msgSend0(vc, objcSel("textDocumentProxy")), " ")
                     else ()
                 },
-                ActBackspace -> {
-                    let snap = sessionStep(s, keySpecial(KeyBackspace, nowMs));
-                    if (snapConsumed(snap)) applySnapToProxy(snap)
-                    else if (!ptrIsNull(vc)) proxyDeleteBackward(msgSend0(vc, objcSel("textDocumentProxy")))
-                    else ()
-                },
+                ActBackspace -> performBackspace(self),
                 ActReturn -> {
                     let snap = sessionStep(s, keySpecial(KeyReturn, nowMs));
                     if (snapConsumed(snap)) applySnapToProxy(snap)
                     else if (!ptrIsNull(vc)) proxyCommitText(msgSend0(vc, objcSel("textDocumentProxy")), "\n")
                     else ()
                 },
-                ActSwitchMode -> {
+                ActToggleAscii -> {
                     let snap = sessionStep(s, ToggleAscii);
                     applySnapToProxy(snap)
+                },
+                ActToggleT9 -> {
+                    cellSet(gIosMode, if (cellGet(gIosMode) == ModeT9) ModeQwerty else ModeT9);
+                    rebuildLayout(self)
+                },
+                ActToggleSymbols -> {
+                    if (cellGet(gIosMode) == ModeSymbols) {
+                        cellSet(gIosMode, cellGet(gPrevModeBeforeSym))
+                    } else {
+                        cellSet(gPrevModeBeforeSym, cellGet(gIosMode));
+                        cellSet(gIosMode, ModeSymbols)
+                    };
+                    rebuildLayout(self)
                 },
                 ActGlobe -> {
                     if (!ptrIsNull(vc)) msgSendVoid0(vc, objcSel("advanceToNextInputMode")) else ()
@@ -194,27 +390,103 @@ def iosTouchesBegan(self: Ptr, _cmd: Ptr, touches: Ptr, _event: Ptr): Void = {
     let t = msgSend0(touches, objcSel("anyObject"));
     if (!ptrIsNull(t)) {
         let pt = msgSendPoint1Ptr(t, objcSel("locationInView:"), self);
+        let bounds = msgSendRect0(self, objcSel("bounds"));
         if (pt.y < ribbonHeight()) {
-            // Candidate ribbon tap
-            let bounds = msgSendRect0(self, objcSel("bounds"));
             match (cellGet(gIosSession), cellGet(gIosSnap)) {
                 (Some(s), Some(snap)) -> {
                     let n = vecLen(snap.pageCandidates);
-                    let limit = if (n < 5) n else 5;
-                    if (limit > 0) {
-                        let slotW = bounds.size.width / intToFloat(limit);
-                        let idx = floatToInt(pt.x / slotW);
-                        if (idx >= 0 && idx < limit) {
-                            let nextSnap = sessionStep(s, SelectPage { index: idx, atMs: monotonicMs() });
-                            applySnapToProxy(nextSnap);
+                    if (n > 0) {
+                        let expandW = 42.0;
+                        let usableW = bounds.size.width - expandW;
+                        if (pt.x >= usableW) {
+                            let opening = !cellGet(gDrawerOpen);
+                            cellSet(gDrawerOpen, opening);
+                            if (opening) cellSet(gDrawerCands, allCandidates(s.engine, 24)) else ();
                             msgSendVoid0(self, objcSel("setNeedsDisplay"))
+                        } else {
+                            let limit = if (n < 5) n else 5;
+                            let slotW = usableW / intToFloat(limit);
+                            let idx = floatToInt(pt.x / slotW);
+                            if (idx >= 0 && idx < limit) {
+                                let nextSnap = sessionStep(s, SelectPage { index: idx, atMs: monotonicMs() });
+                                applySnapToProxy(nextSnap);
+                                msgSendVoid0(self, objcSel("setNeedsDisplay"))
+                            } else ()
+                        }
+                    } else {
+                        // Tap on next-word prediction chip
+                        let preds = cellGet(gIosPreds);
+                        let pn = vecLen(preds);
+                        let limit = if (pn < 5) pn else 5;
+                        if (limit > 0) {
+                            let slotW = bounds.size.width / intToFloat(limit);
+                            let idx = floatToInt(pt.x / slotW);
+                            if (idx >= 0 && idx < limit) {
+                                let word = vecGetOr(preds, idx, "");
+                                let vc = cellGet(gIosVc);
+                                if (!ptrIsNull(vc) && strLen(word) > 0) {
+                                    proxyCommitText(msgSend0(vc, objcSel("textDocumentProxy")), word);
+                                    acceptPrediction(s.engine, word, monotonicMs());
+                                    cellSet(gIosPreds, predictNext(s.engine, 5));
+                                    msgSendVoid0(self, objcSel("setNeedsDisplay"))
+                                } else ()
+                            } else ()
                         } else ()
-                    } else ()
+                    }
+                },
+                _ -> (),
+            }
+        } else if (cellGet(gDrawerOpen)) {
+            // Tap inside expanded candidate drawer
+            let cols = 4;
+            let cellW = bounds.size.width / intToFloat(cols);
+            let row = floatToInt((pt.y - ribbonHeight()) / 36.0);
+            let col = floatToInt(pt.x / cellW);
+            let idx = row * cols + col;
+            let cn = vecLen(cellGet(gDrawerCands));
+            if (idx >= 0 && idx < cn) {
+                match cellGet(gIosSession) {
+                    Some(s) -> {
+                        cellSet(gDrawerOpen, false);
+                        let nextSnap = sessionStep(s, SelectAbs { index: idx, atMs: monotonicMs() });
+                        applySnapToProxy(nextSnap);
+                        msgSendVoid0(self, objcSel("setNeedsDisplay"))
+                    },
+                    None -> (),
+                }
+            } else ()
+        } else if (cellGet(gIosMode) == ModeT9 && pt.x < t9SyllableRailWidth() + 3.0 && pt.y < ribbonHeight() + 160.0) {
+            // Tap on T9 left syllable rail -> LockT9Syllable
+            let sIdx = floatToInt((pt.y - ribbonHeight() - 6.0) / 36.0);
+            match (cellGet(gIosSession), cellGet(gIosSnap)) {
+                (Some(s), Some(snap)) -> match snap.t9 {
+                    Some(t9) if (sIdx >= 0 && sIdx < vecLen(t9.t9Syllables)) -> {
+                        let syl = vecGetOr(t9.t9Syllables, sIdx, "");
+                        let nextSnap = sessionStep(s, LockT9Syllable(syl));
+                        applySnapToProxy(nextSnap);
+                        msgSendVoid0(self, objcSel("setNeedsDisplay"))
+                    },
+                    _ -> (),
                 },
                 _ -> (),
             }
         } else {
-            cellSet(gActiveKey, hitTestKeys(cellGet(gIosKeys), pt));
+            let hit = hitTestKeys(cellGet(gIosKeys), pt);
+            cellSet(gActiveKey, hit);
+            cellSet(gSpaceDragActive, false);
+            cellSet(gSpaceDragLastX, pt.x);
+            match hit {
+                Some(k) if (k.action == ActBackspace) -> {
+                    stopDeleteTimer();
+                    let timer = msgSendScheduledTimer(
+                        objcClass("NSTimer"),
+                        objcSel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+                        0.12, self, objcSel("onDeleteRepeatTimer:"), ptrNull(), true
+                    );
+                    cellSet(gDeleteTimer, timer)
+                },
+                _ -> (),
+            };
             msgSendVoid0(self, objcSel("setNeedsDisplay"))
         }
     } else ()
@@ -224,31 +496,56 @@ def iosTouchesMoved(self: Ptr, _cmd: Ptr, touches: Ptr, _event: Ptr): Void = {
     let t = msgSend0(touches, objcSel("anyObject"));
     if (!ptrIsNull(t)) {
         let pt = msgSendPoint1Ptr(t, objcSel("locationInView:"), self);
-        // Never allow cross-class slide between CharClass and FuncClass
-        match (cellGet(gActiveKey), hitTestKeys(cellGet(gIosKeys), pt)) {
-            (Some(prev), Some(next)) if (prev.keyClass == next.keyClass) -> {
-                cellSet(gActiveKey, Some(next));
-                msgSendVoid0(self, objcSel("setNeedsDisplay"))
+        match cellGet(gActiveKey) {
+            Some(ak) if (ak.action == ActSpace) -> {
+                // Spacebar horizontal cursor trackpad (14pt per character)
+                let dx = pt.x - cellGet(gSpaceDragLastX);
+                if (dx >= 14.0 || dx <= -14.0) {
+                    let steps = floatToInt(dx / 14.0);
+                    cellSet(gSpaceDragActive, true);
+                    cellSet(gSpaceDragLastX, cellGet(gSpaceDragLastX) + intToFloat(steps) * 14.0);
+                    let vc = cellGet(gIosVc);
+                    if (!ptrIsNull(vc)) {
+                        let proxy = msgSend0(vc, objcSel("textDocumentProxy"));
+                        msgSendVoid1I64(proxy, objcSel("adjustTextPositionByCharacterOffset:"), intToI64(steps))
+                    } else ()
+                } else ()
             },
-            _ -> (),
+            Some(prev) -> match hitTestKeys(cellGet(gIosKeys), pt) {
+                Some(next) if (prev.keyClass == next.keyClass) -> {
+                    cellSet(gActiveKey, Some(next));
+                    msgSendVoid0(self, objcSel("setNeedsDisplay"))
+                },
+                _ -> (),
+            },
+            None -> (),
         }
     } else ()
 }
 
 def iosTouchesEnded(self: Ptr, _cmd: Ptr, touches: Ptr, _event: Ptr): Void = {
+    stopDeleteTimer();
+    let wasSpaceDrag = cellGet(gSpaceDragActive);
+    cellSet(gSpaceDragActive, false);
     let t = msgSend0(touches, objcSel("anyObject"));
     match cellGet(gActiveKey) {
         Some(k) -> {
             cellSet(gActiveKey, None);
-            let pt = if (!ptrIsNull(t)) msgSendPoint1Ptr(t, objcSel("locationInView:"), self)
-                     else CGPoint { x: k.frame.origin.x, y: k.frame.origin.y };
-            dispatchKeyRelease(self, k, pt)
+            if (!wasSpaceDrag) {
+                let pt = if (!ptrIsNull(t)) msgSendPoint1Ptr(t, objcSel("locationInView:"), self)
+                         else CGPoint { x: k.frame.origin.x, y: k.frame.origin.y };
+                dispatchKeyRelease(self, k, pt)
+            } else {
+                msgSendVoid0(self, objcSel("setNeedsDisplay"))
+            }
         },
         None -> (),
     }
 }
 
 def iosTouchesCancelled(self: Ptr, _cmd: Ptr, _touches: Ptr, _event: Ptr): Void = {
+    stopDeleteTimer();
+    cellSet(gSpaceDragActive, false);
     cellSet(gActiveKey, None);
     msgSendVoid0(self, objcSel("setNeedsDisplay"))
 }
@@ -262,6 +559,7 @@ extern init(100) def registerIosKeyboardViewClass(): Void = {
         let _ = objcAddMethod(cls, "touchesMoved:withEvent:", cFnPtr(iosTouchesMoved), "v@:@@");
         let _ = objcAddMethod(cls, "touchesEnded:withEvent:", cFnPtr(iosTouchesEnded), "v@:@@");
         let _ = objcAddMethod(cls, "touchesCancelled:withEvent:", cFnPtr(iosTouchesCancelled), "v@:@@");
+        let _ = objcAddMethod(cls, "onDeleteRepeatTimer:", cFnPtr(onDeleteRepeatTimer), "v@:@");
         objcRegisterClass(cls)
     } else ()
 }
