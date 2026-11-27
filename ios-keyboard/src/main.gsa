@@ -1,145 +1,2041 @@
-/// Pure Geisha iOS Keyboard Extension (`JuxuKeyboard.appex`).
-/// Dynamically registers `KeyboardViewController : UIInputViewController` in `extern init`
-/// before `_NSExtensionMain` instantiates it, with Keychain settings/user-data sync.
+/// Complete 1:1 port of `iOS/KeyboardExtension/KeyboardViewController.swift` (1,707 lines):
+/// - Dynamically registers `KeyboardViewController : UIInputViewController` in `extern init(102)`
+/// - Shares process-wide `bridgeShared()` (`JuxuSession`) across overlapping `UIInputViewController` lifecycles
+/// - `273pt` portrait (`53pt` ribbon + `220pt` 4-row canvas) / `204pt` landscape (`40pt` + `164pt`) height constraint
+///   at priority `999` (NEVER setting `preferredContentSize`)
+/// - Full `IOSInlineMarkedTextSession` turn-boundary XPC coalescing, cross-instance orphan sweep & TextKit 2 caret restore
+/// - `PunctuationPairingTracker`, `AutoSpaceContextTracker`, `IOSLineClear` & `IOSLineClearUndo`,
+///   `IOSClipboardSuggestionStore` + async `UIPasteboard` background probing, T9 sidebar, expanded candidate grid,
+///   floating/docked key callout, alternates strip, whole-keyboard trackpad, and `handleInputModeListFromView:withEvent:`.
 
 use std.option.{Option, Some, None}
-use std.path.{pathJoin}
-use sys.fs.{isDir}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGet, vecGetOr}
+use std.str.{strStartsWith, strEndsWith}
 use objc.{
     objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
-    msgSend0, msgSend1Ptr, msgSend1Float, msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1Bool, msgSendVoid1I64, msgSendVoid1Float,
+    objcSetAssocHandle, objcGetAssocHandle,
+    msgSend0, msgSend1Float, msgSendBool0, msgSendI64_0, msgSendFloat0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid2Ptr, msgSendVoid1Bool, msgSendVoid1I64, msgSendVoid1Float,
 }
-use juxu_core.{ConfigFormat, Toml, applyConfig, trimMemory, setContext}
+use juxu_core.{
+    Candidate, MkCandidate,
+}
 use juxu_shared.{
-    JuxuSession, sessionNew, sessionLoadDictsFromDir, sessionResetForFocusChange,
-    keychainLoadEngineConfig, keychainLoadEngineUserData, keychainFlushEngineUserData,
-    cgRect, mainBundleResourcePath, nsStrPtrToString, objcAllocInitFrame,
-    msgSendRect0, msgSendVoid1F32,
+    CGPoint, CGSize, cgSize, cgRect,
+    msgSendBool1Ptr, msgSendVoid1F32, msgSendVoid1Ptr1Sel2Ptr,
+    objcSendSuperVoid0, objcSendSuperVoid1Ptr, objcSendSuperVoid1Bool,
+    nsStr, nsStrPtrToOpt, objcAllocInitFrame,
+    systemUptimeSeconds, dispatchMainAsync, dispatchMainAfterMs,
+    dispatchQueueCreateSerial, dispatchAsync,
+    utf8ScalarCount, tailScalars, dropLastScalars,
+    JuxuActionState, activeInlinePreedit, configIsCangjieFamily,
+    PunctuationAction, Plain, InsertPair, SkipClose,
+    PunctuationPairingTracker, punctuationTrackerNew, punctuationTrackerReset,
+    punctuationTrackerPrune, punctuationTrackerHandleSymbol, punctuationTrackerConsumeBackspacePair,
+    AutoSpaceOptions, autoSpaceOptionsFromConfig, isAutoSpaceRightTrigger,
+    autoSpaceTrackerInvalidate, autoSpaceTrackerEffectiveBefore, autoSpaceTrackerWillDeleteBackward,
+    JuxuSession, bridgeShared, bridgeReloadConfigAndUserOnAppear,
+    bridgeFlushUserDataAsync, bridgeFlushPendingPersistence, bridgeHandleMemoryWarning,
+    bridgeSetKeyLayout52, bridgeSetT9Layout16,
+    bridgeHandleKey, bridgePushTouch, bridgePushT9Touch, bridgeLockT9Syllable,
+    bridgeSelectCandidate, bridgeSelectAbsCandidate, bridgeCommitPending, bridgeResetQuoteState,
+    bridgeAllCandidates, bridgeToggleAsciiMode, bridgeClearComposition,
+    bridgeAbandonComposition, bridgeNotifyPostCommitBackspace,
+    bridgeSetContext, bridgeAcceptPrediction, bridgePredictNextWords,
 }
-use layout_engine.{portraitTotalHeight, targetTrayHeight}
-use marked_text.{proxyCleanupOrphanIfNeeded}
-use keyboard_view.{iosCanvasBind, iosCanvasRefreshPredictions}
-use feedback.{feedbackPrepare}
+use layout_engine.{
+    IOSKeyPlane, PlaneLetters,
+    IOSShiftState, shiftIsUppercase,
+    IOSReturnKeyRole, mapUIReturnKeyType,
+    IOSKeyKind, KeyLetter, KeyT9, KeyT9Clear, KeySymbol, KeyShift, KeyBackspace,
+    KeyPlaneSwitch, KeyGlobe, KeyModeToggle, KeySpace, KeyReturn,
+    IOSKeySpec, rectEq, sizeEq, optStrEq,
+    IOSKeyboardLayoutEngine, layoutEngineNew,
+    trayTopCornerRadius, candidateBarHeight, landscapeCandidateBarHeight,
+    portraitTotalHeight, landscapeTotalHeight,
+    layoutTapShift, layoutConsumeOneShotShiftIfNeeded, layoutSwitchPlane,
+    shouldReturnToLettersAfterSymbol, computeLayout, compensatedLetterPoint,
+}
+use marked_text.{
+    IOSMarkedTextSink, makeProxyDocumentSink, proxyDocumentIdentifier,
+    IOSInlineMarkedTextSession, markedSessionNew,
+    markedSessionMarkedCode, markedSessionHasOrphanedMarked, markedSessionNeedsAppearanceSweep,
+    markedSessionCompositionBaseContext,
+    markedSessionReset, markedSessionResetForAppearance,
+    markedSessionRecordFocusLoss, markedSessionRecordKeyboardDisappear,
+    markedSessionSweepOrphanedMarkedText, markedSessionRestoreCaretAfterOrphanedSweepIfNeeded,
+    markedSessionReconcileExternalContext, markedSessionFlushTurnBoundary,
+    markedSessionCancelMarkedCode, markedSessionInsertTextWithAutoSpace,
+    markedSessionInsertPassthrough, markedSessionCommitPendingFirst,
+    markedSessionApplyEngineState,
+}
+use gestures_editing.{
+    isSingleNewlineString,
+    LineClearExpected, lineClearPlan, lineClearExpectedNew, lineClearExpectedIsSatisfied,
+    IOSLineClearUndo, lineClearUndoNew, lineClearUndoPush,
+    lineClearUndoRestorableIndex, lineClearUndoTake, lineClearUndoRemoveAll,
+    acceleratedDeleteCount,
+    backspaceShouldFireRepeat, backspaceShouldUseFastChunk,
+    verticalMoveOffset,
+    keyAlternatesOptions, keyAlternatesSymbolOptions,
+}
+use clipboard_suggestion.{
+    IOSClipboardSuggestion, optClipSuggestionEq,
+    ClipboardLookupResult, ClipNone, ClipCached, ClipNeedsRead,
+    IOSClipboardSuggestionStore, clipboardStoreDefault,
+    clipboardStoreSeenChangeCount, clipboardStoreHandledChangeCount,
+    clipboardStoreLookup, clipboardStoreRecordRead,
+    clipboardStoreConsume, clipboardStoreDismiss,
+    IOSClipboardVisibilityGate, clipboardGateNew, clipboardGateClone,
+    clipboardGateIsSuppressed, clipboardGateResetForAppearance,
+    clipboardGateMarkUserTyped, clipboardGateShouldAllowDisplay,
+}
+use feedback.{
+    IOSKeyboardFeedbackController, feedbackControllerNew,
+    feedbackPrepare, feedbackSuspend, feedbackFireKeyDown, feedbackFireSoftStep,
+}
+use callout_alternates.{
+    IOSKeyAlternatesView, alternatesViewNew, alternatesSelectedText,
+    alternatesPresent, alternatesUpdate, alternatesHide,
+    IOSKeyCalloutView, calloutViewNew,
+    calloutHideImmediately, calloutReleasePreview, calloutPresent,
+}
+use key_canvas_view.{
+    IOSKeyCanvasView, keyCanvasViewNew, keyCanvasClearCaches,
+    keyCanvasSetCoveredCalloutKeyId, keyCanvasApplyTheme, keyCanvasUpdateSnapshot,
+    keyCanvasResetAllTouches, keyCanvasFlushPendingTouches,
+    IOST9SidebarView, t9SidebarViewNew, t9SidebarUpdate,
+}
+use candidate_views.{
+    ribbonStarterWords,
+    IOSCandidateRibbonView, candidateRibbonViewNew,
+    candidateRibbonSetExpanded, candidateRibbonUpdate,
+    IOSExpandedCandidateView, expandedCandidateViewNew,
+    expandedCandidateReload, expandedCandidateTrimPool, expandedCandidateClearAndTrim,
+}
+use ios_ui_kit.{
+    setContinuousCorner, setTopMaskedCorners, uiColorClear,
+    registerUserInterfaceStyleObserver, uiPasteboardChangedNotificationName,
+    proxyIsOneTimeCode, proxyIsSensitiveEval, proxyIsAutoSpaceAllowed,
+    vcIsDarkAppearance, mainScreenWidth, nowSeconds1970, nowMs1970,
+    disableContainerTouchDelays, openHostSettingsURL,
+    viewLayer, setViewHidden, isViewHidden, viewBounds, viewFrame, setViewFrame,
+    setViewBgColor, setAccessibilityId, pinAnchorEqual,
+    convertRectToView, convertPointToView,
+}
 
-def gExtSession: Cell (Option JuxuSession) = cellNew(None)
-def gHeightConstraint: Cell Ptr = cellNew(ptrNull())
-def gLastTrayHeight: Cell Float = cellNew(273.0)
+// ============================================================================
+// Visual Layout Signature & Controller State
+// ============================================================================
 
-def ensureExtSession(): JuxuSession =
-    match cellGet(gExtSession) {
-        Some(s) -> s,
-        None -> {
-            let s = sessionNew();
-            let resDir = mainBundleResourcePath();
-            let dictDir = pathJoin(resDir, "Dicts");
-            if (strLen(resDir) > 0 && isDir(dictDir)) {
-                let _ = sessionLoadDictsFromDir(s, dictDir);
-                ()
-            } else ();
-            if (!keychainLoadEngineConfig(s.engine)) {
-                applyConfig(s.engine, Toml, "[general]\nschema = \"pinyin\"\n")
-            } else ();
-            let _ = keychainLoadEngineUserData(s.engine);
-            cellSet(gExtSession, Some(s));
-            s
-        },
+data VisualLayoutSignature {
+    vlsPlane: IOSKeyPlane,
+    vlsShiftState: IOSShiftState,
+    vlsAsciiMode: Bool,
+    vlsSchemaId: Int,
+    vlsPinyinT9Layout: Bool,
+    vlsCangjieRadicals: Bool,
+    vlsWubiRadicals: Bool,
+    vlsSwipeUpEnabled: Bool,
+    vlsSpaceCommaEnabled: Bool,
+    vlsIsZLookupActive: Bool,
+    vlsShowInlineGlobe: Bool,
+    vlsReturnRole: IOSReturnKeyRole,
+    vlsIsTrackpadActive: Bool,
+    vlsSize: CGSize,
+}
+
+def visualSigEq(a: VisualLayoutSignature, b: VisualLayoutSignature): Bool =
+    a.vlsPlane == b.vlsPlane
+        && a.vlsShiftState == b.vlsShiftState
+        && a.vlsAsciiMode == b.vlsAsciiMode
+        && a.vlsSchemaId == b.vlsSchemaId
+        && a.vlsPinyinT9Layout == b.vlsPinyinT9Layout
+        && a.vlsCangjieRadicals == b.vlsCangjieRadicals
+        && a.vlsWubiRadicals == b.vlsWubiRadicals
+        && a.vlsSwipeUpEnabled == b.vlsSwipeUpEnabled
+        && a.vlsSpaceCommaEnabled == b.vlsSpaceCommaEnabled
+        && a.vlsIsZLookupActive == b.vlsIsZLookupActive
+        && a.vlsShowInlineGlobe == b.vlsShowInlineGlobe
+        && a.vlsReturnRole == b.vlsReturnRole
+        && a.vlsIsTrackpadActive == b.vlsIsTrackpadActive
+        && sizeEq(a.vlsSize, b.vlsSize)
+
+data KeyboardVCState {
+    vcSelf: Ptr,
+    vcBridge: JuxuSession,
+    vcLayoutEngine: IOSKeyboardLayoutEngine,
+    vcGlassBackdrop: Ptr,
+    vcRibbonView: IOSCandidateRibbonView,
+    vcKeyCanvas: IOSKeyCanvasView,
+    vcT9Sidebar: IOST9SidebarView,
+    vcExpandedGrid: IOSExpandedCandidateView,
+    vcCalloutView: IOSKeyCalloutView,
+    vcAlternatesView: IOSKeyAlternatesView,
+    vcFeedback: IOSKeyboardFeedbackController,
+    vcHeightConstraint: Cell Ptr,
+    vcRibbonHeightConstraint: Cell Ptr,
+    vcSaveUserDataGen: Cell Int64,
+    vcBackspaceRepeatGen: Cell Int64,
+    vcBackspaceHoldStart: Cell Float,
+    vcLastVisualSig: Cell (Option VisualLayoutSignature),
+    vcPlaneBeforePress: Cell IOSKeyPlane,
+    vcInlineSession: IOSInlineMarkedTextSession,
+    vcPairingTracker: PunctuationPairingTracker,
+    vcTurnFlushScheduled: Cell Bool,
+    vcComposingDocId: Cell (Option String),
+    vcLastKnownDocId: Cell (Option String),
+    vcLastKeyboardEditUptime: Cell Float,
+    vcNilDocSweepGen: Cell Int64,
+    vcAppearanceSweepGen: Cell Int64,
+    vcAppearanceSweepArmed: Cell Bool,
+    vcIsPresentingOrVisible: Cell Bool,
+    vcClipboardStore: IOSClipboardSuggestionStore,
+    vcClipboardGate: IOSClipboardVisibilityGate,
+    vcClipboardQueue: Ptr,
+    vcActiveClipboard: Cell (Option IOSClipboardSuggestion),
+    vcClipboardProbeInFlight: Cell Bool,
+    vcClipboardProbeNeedsRerun: Cell Bool,
+    vcLastClipboardPrefersOTP: Cell Bool,
+    vcExpandedIdleWords: Cell (Option (Vec String)),
+    vcHasAppeared: Cell Bool,
+    vcLineClearUndo: IOSLineClearUndo,
+    vcBackspaceSessionDeleted: Cell String,
+    vcBackspaceTapDeferred: Cell Bool,
+    vcClearLineGen: Cell Int64,
+}
+
+def vcAssocKey(): Ptr = objcSel("__juxuKeyboardVCAssocKey")
+
+def nowMs(): Int64 =
+    nowMs1970()
+
+def vcProxy(st: KeyboardVCState): Ptr =
+    if (ptrIsNull(st.vcSelf)) ptrNull()
+    else msgSend0(st.vcSelf, objcSel("textDocumentProxy"))
+
+def vcInputView(st: KeyboardVCState): Ptr =
+    if (ptrIsNull(st.vcSelf)) ptrNull()
+    else {
+        let iv = msgSend0(st.vcSelf, objcSel("inputView"));
+        if (!ptrIsNull(iv)) iv else msgSend0(st.vcSelf, objcSel("view"))
     }
 
-def pinAnchor(a: Ptr, b: Ptr): Void = {
-    let c = msgSend1Ptr(a, objcSel("constraintEqualToAnchor:"), b);
-    msgSendVoid1Bool(c, objcSel("setActive:"), true)
-}
+def vcHasFullAccess(st: KeyboardVCState): Bool =
+    if (ptrIsNull(st.vcSelf)) false
+    else msgSendBool0(st.vcSelf, objcSel("hasFullAccess"))
 
-def kbViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
-    let session = ensureExtSession();
-    let rootView = msgSend0(self, objcSel("view"));
-    let clearCol = msgSend0(objcClass("UIColor"), objcSel("clearColor"));
-    msgSendVoid1Bool(rootView, objcSel("setOpaque:"), false);
-    msgSendVoid1Ptr(rootView, objcSel("setBackgroundColor:"), clearCol);
+def vcNeedsInputModeSwitchKey(st: KeyboardVCState): Bool =
+    if (ptrIsNull(st.vcSelf)) false
+    else msgSendBool0(st.vcSelf, objcSel("needsInputModeSwitchKey"))
 
-    let canvas = objcAllocInitFrame("JuxuIOSKeyboardView", cgRect(0.0, 0.0, 0.0, 0.0));
-    msgSendVoid1Bool(canvas, objcSel("setOpaque:"), false);
-    msgSendVoid1Ptr(canvas, objcSel("setBackgroundColor:"), clearCol);
-    msgSendVoid1Bool(canvas, objcSel("setTranslatesAutoresizingMaskIntoConstraints:"), false);
-    msgSendVoid1Bool(canvas, objcSel("setMultipleTouchEnabled:"), true);
-    msgSendVoid1Ptr(rootView, objcSel("addSubview:"), canvas);
+def vcProxySink(st: KeyboardVCState): IOSMarkedTextSink =
+    makeProxyDocumentSink(vcProxy(st))
 
-    // Pin canvas edges 1-to-1 to rootView so width always matches the real screen width
-    pinAnchor(msgSend0(canvas, objcSel("leadingAnchor")), msgSend0(rootView, objcSel("leadingAnchor")));
-    pinAnchor(msgSend0(canvas, objcSel("trailingAnchor")), msgSend0(rootView, objcSel("trailingAnchor")));
-    pinAnchor(msgSend0(canvas, objcSel("topAnchor")), msgSend0(rootView, objcSel("topAnchor")));
-    pinAnchor(msgSend0(canvas, objcSel("bottomAnchor")), msgSend0(rootView, objcSel("bottomAnchor")));
+def vcIsDark(st: KeyboardVCState): Bool =
+    vcIsDarkAppearance(st.vcSelf, vcProxy(st))
 
-    // Dynamic portrait (273pt) / landscape & iPad (204pt) height constraint with UILayoutPriority = 999
-    let heightAnchor = msgSend0(rootView, objcSel("heightAnchor"));
-    let constraint = msgSend1Float(heightAnchor, objcSel("constraintEqualToConstant:"), portraitTotalHeight());
-    msgSendVoid1F32(constraint, objcSel("setPriority:"), floatToF32(999.0));
-    msgSendVoid1Bool(constraint, objcSel("setActive:"), true);
-    cellSet(gHeightConstraint, constraint);
-    cellSet(gLastTrayHeight, portraitTotalHeight());
+def noteKeyboardProxyMutation(st: KeyboardVCState): Void =
+    cellSet(st.vcLastKeyboardEditUptime, systemUptimeSeconds())
 
-    iosCanvasBind(self, canvas, session);
-    feedbackPrepare()
-}
+def currentAutoSpaceOpts(st: KeyboardVCState): AutoSpaceOptions =
+    if (proxyIsAutoSpaceAllowed(vcProxy(st))) {
+        autoSpaceOptionsFromConfig(cellGet(st.vcBridge.jsConfig))
+    } else {
+        AutoSpaceOptions { asoEnabled: false, asoSpaceDigits: false }
+    }
 
-def kbViewDidLayoutSubviews(self: Ptr, _cmd: Ptr): Void = {
-    let rootView = msgSend0(self, objcSel("view"));
-    let bounds = msgSendRect0(rootView, objcSel("bounds"));
-    if (bounds.size.width > 10.0) {
-        let targetH = targetTrayHeight(bounds.size.width);
-        if (targetH != cellGet(gLastTrayHeight)) {
-            cellSet(gLastTrayHeight, targetH);
-            let hc = cellGet(gHeightConstraint);
-            if (!ptrIsNull(hc)) {
-                msgSendVoid1Float(hc, objcSel("setConstant:"), targetH);
-                msgSendVoid0(rootView, objcSel("setNeedsUpdateConstraints"))
-            } else ()
+def scheduleTurnBoundaryFlushIfNeeded(st: KeyboardVCState, needed: Bool): Void =
+    if (needed && !cellGet(st.vcTurnFlushScheduled)) {
+        cellSet(st.vcTurnFlushScheduled, true);
+        dispatchMainAsync(() -> {
+            cellSet(st.vcTurnFlushScheduled, false);
+            noteKeyboardProxyMutation(st);
+            markedSessionFlushTurnBoundary(st.vcInlineSession, vcProxySink(st))
+        })
+    } else ()
+
+def scheduleUserDataFlush(st: KeyboardVCState): Void = {
+    let gen = cellGet(st.vcSaveUserDataGen) + intToI64(1);
+    cellSet(st.vcSaveUserDataGen, gen);
+    dispatchMainAfterMs(1500, () -> {
+        if (cellGet(st.vcSaveUserDataGen) == gen) {
+            bridgeFlushUserDataAsync(st.vcBridge)
         } else ()
+    })
+}
+
+def stopBackspaceRepeat(st: KeyboardVCState): Void =
+    cellSet(st.vcBackspaceRepeatGen, cellGet(st.vcBackspaceRepeatGen) + intToI64(1))
+
+def syncContextFromProxyIfIdle(st: KeyboardVCState): Void =
+    if (strLen(cellGet(st.vcBridge.jsState).asPreedit) == 0) {
+        let proxy = vcProxy(st);
+        let hostBeforeOpt =
+            if (ptrIsNull(proxy)) None
+            else nsStrPtrToOpt(msgSend0(proxy, objcSel("documentContextBeforeInput")));
+        let before = autoSpaceTrackerEffectiveBefore(st.vcInlineSession.msAutoSpaceTracker, hostBeforeOpt, false);
+        bridgeSetContext(st.vcBridge, tailScalars(before, 32))
+    } else ()
+
+def currentIdlePredictions(st: KeyboardVCState, actionSt: JuxuActionState): Option (Vec String) =
+    if (strLen(actionSt.asPreedit) > 0) None
+    else if (actionSt.asAsciiMode) Some(vecNew())
+    else Some(bridgePredictNextWords(st.vcBridge, 8))
+
+def updateT9SidebarVisibility(st: KeyboardVCState): Void = {
+    let isT9Snap = match cellGet(st.vcKeyCanvas.kcSnapshot) {
+        Some(snap) -> snap.lsIsT9Layout,
+        None -> false,
+    };
+    let shouldShow =
+        isT9Snap
+            && !cellGet(st.vcLayoutEngine.leIsTrackpadActive)
+            && isViewHidden(st.vcExpandedGrid.egView)
+            && !isViewHidden(st.vcKeyCanvas.kcView);
+    setViewHidden(st.vcT9Sidebar.sbView, !shouldShow);
+    if (shouldShow) {
+        match cellGet(st.vcKeyCanvas.kcSnapshot) {
+            Some(snap) -> {
+                let f = convertRectToView(st.vcKeyCanvas.kcView, snap.lsT9SidebarFrame, vcInputView(st));
+                if (!rectEq(viewFrame(st.vcT9Sidebar.sbView), f)) {
+                    setViewFrame(st.vcT9Sidebar.sbView, f)
+                } else ()
+            },
+            None -> (),
+        }
     } else ()
 }
 
-def kbTextDidChange(self: Ptr, _cmd: Ptr, _textInput: Ptr): Void = {
-    let proxy = msgSend0(self, objcSel("textDocumentProxy"));
-    proxyCleanupOrphanIfNeeded(proxy);
-    match cellGet(gExtSession) {
-        Some(s) -> {
-            let _ = keychainLoadEngineConfig(s.engine);
-            let _ = keychainLoadEngineUserData(s.engine);
-            let before = nsStrPtrToString(msgSend0(proxy, objcSel("documentContextBeforeInput")));
-            if (strLen(before) > 0) setContext(s.engine, before) else ();
-            iosCanvasRefreshPredictions()
-        },
-        None -> (),
+def refreshKeyboardLayout(st: KeyboardVCState): Void = {
+    let cb = viewBounds(st.vcKeyCanvas.kcView);
+    if (cb.size.width > 10.0 && cb.size.height > 10.0) {
+        let le = st.vcLayoutEngine;
+        let sig = VisualLayoutSignature {
+            vlsPlane: cellGet(le.lePlane),
+            vlsShiftState: cellGet(le.leShiftState),
+            vlsAsciiMode: cellGet(le.leAsciiMode),
+            vlsSchemaId: cellGet(le.leSchemaId),
+            vlsPinyinT9Layout: cellGet(le.lePinyinT9Layout),
+            vlsCangjieRadicals: cellGet(le.leCangjieKeycapRadicals),
+            vlsWubiRadicals: cellGet(le.leWubiKeycapRadicals),
+            vlsSwipeUpEnabled: cellGet(le.leSwipeUpInputEnabled),
+            vlsSpaceCommaEnabled: cellGet(le.leSpaceCommaKeyEnabled),
+            vlsIsZLookupActive: cellGet(le.leIsZLookupActive),
+            vlsShowInlineGlobe: cellGet(le.leShowInlineGlobeKey),
+            vlsReturnRole: cellGet(le.leReturnRole),
+            vlsIsTrackpadActive: cellGet(le.leIsTrackpadActive),
+            vlsSize: cb.size,
+        };
+        let unchanged = match cellGet(st.vcLastVisualSig) {
+            Some(prev) -> visualSigEq(prev, sig),
+            None -> false,
+        };
+        if (unchanged) {
+            updateT9SidebarVisibility(st)
+        } else {
+            cellSet(st.vcLastVisualSig, Some(sig));
+            let snap = computeLayout(le, cb.size);
+            keyCanvasUpdateSnapshot(st.vcKeyCanvas, snap);
+            if (snap.lsIsT9Layout) {
+                bridgeSetT9Layout16(
+                    st.vcBridge,
+                    snap.lsT9Centers16,
+                    snap.lsT9OriginX,
+                    snap.lsT9OriginY,
+                    snap.lsT9PitchX,
+                    snap.lsT9PitchY
+                )
+            } else {
+                bridgeSetKeyLayout52(
+                    st.vcBridge,
+                    snap.lsCenters52,
+                    snap.lsOriginX,
+                    snap.lsOriginY,
+                    snap.lsPitchX,
+                    snap.lsPitchY
+                )
+            };
+            updateT9SidebarVisibility(st)
+        }
+    } else ()
+}
+
+def reloadExpandedGrid(st: KeyboardVCState): Void = {
+    let actionSt = cellGet(st.vcBridge.jsState);
+    let dark = vcIsDark(st);
+    if (strLen(actionSt.asPreedit) == 0) {
+        let predicted: Vec String =
+            if (actionSt.asAsciiMode) vecNew()
+            else bridgePredictNextWords(st.vcBridge, 24);
+        let words =
+            if (vecLen(predicted) == 0 && !actionSt.asAsciiMode) ribbonStarterWords()
+            else predicted;
+        cellSet(st.vcExpandedIdleWords, Some(words));
+        let items: Vec Candidate = vecWithCap(vecLen(words));
+        let i = cellNew(0);
+        while (cellGet(i) < vecLen(words)) {
+            let idx = cellGet(i);
+            vecPush(
+                items,
+                MkCandidate {
+                    text: vecGetOr(words, idx, ""),
+                    comment: "",
+                    badge: 0,
+                    confidence: 1.0,
+                    isExact: true,
+                }
+            );
+            cellSet(i, idx + 1)
+        };
+        expandedCandidateReload(st.vcExpandedGrid, items, dark)
+    } else {
+        cellSet(st.vcExpandedIdleWords, None);
+        let all = bridgeAllCandidates(st.vcBridge, 120);
+        expandedCandidateReload(st.vcExpandedGrid, all, dark)
     }
 }
 
-def kbTextWillChange(_self: Ptr, _cmd: Ptr, _textInput: Ptr): Void =
-    match cellGet(gExtSession) {
-        Some(s) -> {
-            sessionResetForFocusChange(s);
-            let _ = keychainFlushEngineUserData(s.engine);
-            ()
-        },
-        None -> (),
+def setExpandedGridVisible(st: KeyboardVCState, visible: Bool): Void = {
+    if (!visible) {
+        cellSet(st.vcExpandedIdleWords, None);
+        expandedCandidateClearAndTrim(st.vcExpandedGrid, 32)
+    } else ();
+    setViewHidden(st.vcExpandedGrid.egView, !visible);
+    setViewHidden(st.vcKeyCanvas.kcView, visible);
+    candidateRibbonSetExpanded(st.vcRibbonView, visible);
+    updateT9SidebarVisibility(st);
+    if (visible) reloadExpandedGrid(st) else ()
+}
+
+def syncEngineToUI(st: KeyboardVCState): Void = {
+    let actionSt = cellGet(st.vcBridge.jsState);
+    let cfg = cellGet(st.vcBridge.jsConfig);
+    if (strLen(actionSt.asPreedit) == 0) {
+        match cellGet(st.vcActiveClipboard) {
+            Some(_) ->
+                if (clipboardGateIsSuppressed(st.vcClipboardGate)
+                    || !cfg.clipboardSuggestion
+                    || !vcHasFullAccess(st)) {
+                    cellSet(st.vcActiveClipboard, None)
+                } else (),
+            None -> (),
+        }
+    } else ();
+
+    let le = st.vcLayoutEngine;
+    let kc = st.vcKeyCanvas;
+    let isComposing = strLen(actionSt.asPreedit) > 0;
+
+    cellSet(le.leAsciiMode, actionSt.asAsciiMode);
+    cellSet(le.leSchemaId, actionSt.asSchemaId);
+    cellSet(le.lePinyinT9Layout, cfg.pinyinT9Layout);
+    cellSet(le.leCangjieKeycapRadicals, cfg.cangjieKeycapRadicals);
+    cellSet(le.leWubiKeycapRadicals, cfg.wubiKeycapRadicals);
+    cellSet(le.leSwipeUpInputEnabled, cfg.keySwipeUpInput);
+    cellSet(le.leSpaceCommaKeyEnabled, cfg.spaceCommaKey);
+    cellSet(kc.kcLongPressAlternatesEnabled, cfg.keyLongPressAlternates);
+    cellSet(kc.kcAsciiMode, actionSt.asAsciiMode);
+    cellSet(kc.kcBackspaceSwipeClearEnabled, cfg.backspaceSwipeClear);
+    cellSet(kc.kcKeyboardHoldCursorEnabled, cfg.keyboardHoldCursor);
+    cellSet(
+        le.leIsZLookupActive,
+        configIsCangjieFamily(cfg) && cfg.zOmnipotent && strStartsWith(actionSt.asPreedit, "z")
+    );
+    cellSet(le.leIsComposing, isComposing);
+    cellSet(kc.kcIsComposing, isComposing);
+
+    cellSet(le.leValidNextMask, actionSt.asValidNextMask);
+    cellSet(le.leNextKeyPriors, actionSt.asNextKeyPriors);
+    cellSet(le.leTouchOffsets, actionSt.asTouchOffsets);
+    cellSet(le.leT9ValidNextMask, actionSt.asT9ValidNextMask);
+    cellSet(le.leT9NextKeyPriors, actionSt.asT9NextKeyPriors);
+    cellSet(le.leT9TouchOffsets, actionSt.asT9TouchOffsets);
+
+    cellSet(kc.kcValidNextMask, actionSt.asValidNextMask);
+    cellSet(kc.kcNextKeyPriors, actionSt.asNextKeyPriors);
+    cellSet(kc.kcTouchOffsets, actionSt.asTouchOffsets);
+    cellSet(kc.kcT9ValidNextMask, actionSt.asT9ValidNextMask);
+    cellSet(kc.kcT9NextKeyPriors, actionSt.asT9NextKeyPriors);
+    cellSet(kc.kcT9TouchOffsets, actionSt.asT9TouchOffsets);
+
+    let dark = vcIsDark(st);
+    t9SidebarUpdate(st.vcT9Sidebar, actionSt.asT9Syllables, isComposing, dark);
+    candidateRibbonUpdate(
+        st.vcRibbonView,
+        actionSt,
+        dark,
+        cellGet(st.vcActiveClipboard),
+        currentIdlePredictions(st, actionSt)
+    );
+    refreshKeyboardLayout(st)
+}
+
+def syncProxyTraits(st: KeyboardVCState): Void = {
+    let proxy = vcProxy(st);
+    cellSet(st.vcLayoutEngine.leShowInlineGlobeKey, vcNeedsInputModeSwitchKey(st));
+    let retType =
+        if (!ptrIsNull(proxy) && msgSendBool1Ptr(proxy, objcSel("respondsToSelector:"), objcSel("returnKeyType"))) {
+            msgSendI64_0(proxy, objcSel("returnKeyType"))
+        } else intToI64(0);
+    cellSet(st.vcLayoutEngine.leReturnRole, mapUIReturnKeyType(retType));
+
+    let dark = vcIsDark(st);
+    setViewBgColor(st.vcGlassBackdrop, uiColorClear());
+    msgSendVoid1Float(viewLayer(st.vcGlassBackdrop), objcSel("setBorderWidth:"), 0.0);
+
+    keyCanvasApplyTheme(st.vcKeyCanvas, dark);
+    let actionSt = cellGet(st.vcBridge.jsState);
+    candidateRibbonUpdate(
+        st.vcRibbonView,
+        actionSt,
+        dark,
+        cellGet(st.vcActiveClipboard),
+        currentIdlePredictions(st, actionSt)
+    );
+    if (!isViewHidden(st.vcExpandedGrid.egView)) {
+        reloadExpandedGrid(st)
+    } else ();
+    refreshKeyboardLayout(st)
+}
+
+def applyDesiredTrayDimensions(st: KeyboardVCState): Void = {
+    let rootView = msgSend0(st.vcSelf, objcSel("view"));
+    let vb = if (ptrIsNull(rootView)) cgRect(0.0, 0.0, 0.0, 0.0) else viewBounds(rootView);
+    let width = if (vb.size.width > 10.0) vb.size.width else mainScreenWidth();
+    let isLandscape = width > 540.0;
+    let targetH = if (isLandscape) landscapeTotalHeight() else portraitTotalHeight();
+    let targetRibbonH = if (isLandscape) landscapeCandidateBarHeight() else candidateBarHeight();
+
+    let changed = cellNew(false);
+    let hc = cellGet(st.vcHeightConstraint);
+    if (!ptrIsNull(hc) && msgSendFloat0(hc, objcSel("constant")) != targetH) {
+        msgSendVoid1Float(hc, objcSel("setConstant:"), targetH);
+        cellSet(changed, true)
+    } else ();
+
+    let rhc = cellGet(st.vcRibbonHeightConstraint);
+    if (!ptrIsNull(rhc) && msgSendFloat0(rhc, objcSel("constant")) != targetRibbonH) {
+        msgSendVoid1Float(rhc, objcSel("setConstant:"), targetRibbonH);
+        cellSet(changed, true)
+    } else ();
+
+    if (cellGet(changed)) {
+        let iv = vcInputView(st);
+        if (!ptrIsNull(iv)) msgSendVoid0(iv, objcSel("setNeedsUpdateConstraints")) else ()
+    } else ()
+}
+
+// ============================================================================
+// Orphaned MarkedText Sweep & Focus Transitions
+// ============================================================================
+
+def cancelMarkedCode(st: KeyboardVCState): Void =
+    markedSessionCancelMarkedCode(st.vcInlineSession, vcProxySink(st))
+
+def abandonCompositionForExternalFocusOrEdit(
+    st: KeyboardVCState,
+    clearHostMarked: Bool,
+    isDisappearing: Bool
+): Void = {
+    cellSet(st.vcNilDocSweepGen, cellGet(st.vcNilDocSweepGen) + intToI64(1));
+    if (isDisappearing) {
+        cellSet(st.vcAppearanceSweepGen, cellGet(st.vcAppearanceSweepGen) + intToI64(1));
+        cellSet(st.vcAppearanceSweepArmed, false)
+    } else ();
+
+    if (clearHostMarked) {
+        if (strLen(markedSessionMarkedCode(st.vcInlineSession)) > 0) {
+            noteKeyboardProxyMutation(st)
+        } else ();
+        cancelMarkedCode(st);
+        markedSessionReset(st.vcInlineSession)
+    } else if (isDisappearing) {
+        markedSessionRecordKeyboardDisappear(st.vcInlineSession)
+    } else {
+        let _ = markedSessionRecordFocusLoss(st.vcInlineSession);
+        ()
+    };
+
+    cellSet(st.vcComposingDocId, None);
+    punctuationTrackerReset(st.vcPairingTracker);
+    bridgeResetQuoteState(st.vcBridge);
+    if (strLen(cellGet(st.vcBridge.jsState).asPreedit) > 0) {
+        bridgeAbandonComposition(st.vcBridge, nowMs())
+    } else ();
+    if (!isViewHidden(st.vcExpandedGrid.egView)) {
+        setExpandedGridVisible(st, false)
+    } else ();
+    calloutHideImmediately(st.vcCalloutView);
+    keyCanvasSetCoveredCalloutKeyId(st.vcKeyCanvas, None);
+    alternatesHide(st.vcAlternatesView);
+    stopBackspaceRepeat(st)
+}
+
+def sweepOrphanedMarkedTextNow(st: KeyboardVCState): Void =
+    if (markedSessionHasOrphanedMarked(st.vcInlineSession)) {
+        noteKeyboardProxyMutation(st);
+        punctuationTrackerReset(st.vcPairingTracker);
+        bridgeResetQuoteState(st.vcBridge);
+        let (needsFlush, expectedTail) = markedSessionSweepOrphanedMarkedText(st.vcInlineSession, vcProxySink(st));
+        scheduleTurnBoundaryFlushIfNeeded(st, needsFlush);
+        if (strLen(expectedTail) > 0) {
+            dispatchMainAfterMs(40, () -> {
+                if (cellGet(st.vcIsPresentingOrVisible)) {
+                    noteKeyboardProxyMutation(st);
+                    markedSessionRestoreCaretAfterOrphanedSweepIfNeeded(
+                        st.vcInlineSession,
+                        expectedTail,
+                        vcProxySink(st)
+                    );
+                    syncContextFromProxyIfIdle(st);
+                    syncEngineToUI(st)
+                } else ()
+            })
+        } else ()
+    } else ()
+
+def scheduleAppearanceOrphanedSweepIfNeeded(st: KeyboardVCState): Void = {
+    let gen = cellGet(st.vcAppearanceSweepGen) + intToI64(1);
+    cellSet(st.vcAppearanceSweepGen, gen);
+    cellSet(st.vcAppearanceSweepArmed, false);
+    if (markedSessionNeedsAppearanceSweep(st.vcInlineSession) && cellGet(st.vcIsPresentingOrVisible)) {
+        cellSet(st.vcAppearanceSweepArmed, true);
+        dispatchMainAfterMs(60, () -> {
+            if (cellGet(st.vcAppearanceSweepGen) == gen) {
+                cellSet(st.vcAppearanceSweepArmed, false);
+                if (cellGet(st.vcIsPresentingOrVisible)
+                    && markedSessionNeedsAppearanceSweep(st.vcInlineSession)
+                    && strLen(cellGet(st.vcBridge.jsState).asPreedit) == 0
+                    && strLen(markedSessionMarkedCode(st.vcInlineSession)) == 0) {
+                    sweepOrphanedMarkedTextNow(st)
+                } else ()
+            } else ()
+        })
+    } else ()
+}
+
+def scheduleNilDocOrphanedSweepIfNeeded(st: KeyboardVCState): Void = {
+    let gen = cellGet(st.vcNilDocSweepGen) + intToI64(1);
+    cellSet(st.vcNilDocSweepGen, gen);
+    let docIdOpt = proxyDocumentIdentifier(vcProxy(st));
+    let isNilDoc = match docIdOpt { None -> true, Some(_) -> false };
+    if (markedSessionHasOrphanedMarked(st.vcInlineSession)
+        && !markedSessionNeedsAppearanceSweep(st.vcInlineSession)
+        && cellGet(st.vcIsPresentingOrVisible)
+        && isNilDoc) {
+        dispatchMainAfterMs(80, () -> {
+            if (cellGet(st.vcNilDocSweepGen) == gen) {
+                let curDoc = proxyDocumentIdentifier(vcProxy(st));
+                let stillNil = match curDoc { None -> true, Some(_) -> false };
+                if (cellGet(st.vcIsPresentingOrVisible)
+                    && stillNil
+                    && strLen(cellGet(st.vcBridge.jsState).asPreedit) == 0
+                    && strLen(markedSessionMarkedCode(st.vcInlineSession)) == 0) {
+                    sweepOrphanedMarkedTextNow(st)
+                } else ()
+            } else ()
+        })
+    } else ()
+}
+
+// ============================================================================
+// Async Clipboard Probing (`UIPasteboard.generalPasteboard` off Main Thread)
+// ============================================================================
+
+def markUserTypedForClipboard(st: KeyboardVCState): Void = {
+    clipboardGateMarkUserTyped(st.vcClipboardGate);
+    cellSet(st.vcActiveClipboard, None)
+}
+
+def optIntSame(opt: Option Int, val: Int): Bool =
+    match opt {
+        Some(v) -> v == val,
+        None -> false,
     }
 
-def kbDidReceiveMemoryWarning(_self: Ptr, _cmd: Ptr): Void =
-    match cellGet(gExtSession) {
-        Some(s) -> {
-            let _ = keychainFlushEngineUserData(s.engine);
-            trimMemory(s.engine)
-        },
-        None -> (),
+def refreshClipboardSuggestionAsync(st: KeyboardVCState): Void = {
+    let cfg = cellGet(st.vcBridge.jsConfig);
+    if (!(cellGet(st.vcHasAppeared)
+        && cellGet(st.vcIsPresentingOrVisible)
+        && cfg.clipboardSuggestion
+        && vcHasFullAccess(st))) {
+        match cellGet(st.vcActiveClipboard) {
+            Some(_) -> {
+                cellSet(st.vcActiveClipboard, None);
+                syncEngineToUI(st)
+            },
+            None -> (),
+        }
+    } else if (cellGet(st.vcClipboardProbeInFlight)) {
+        cellSet(st.vcClipboardProbeNeedsRerun, true)
+    } else {
+        cellSet(st.vcClipboardProbeInFlight, true);
+        cellSet(st.vcClipboardProbeNeedsRerun, false);
+
+        let gateSnapshot = clipboardGateClone(st.vcClipboardGate);
+        let seenCC = clipboardStoreSeenChangeCount(st.vcClipboardStore);
+        let handledCC = clipboardStoreHandledChangeCount(st.vcClipboardStore);
+
+        dispatchAsync(st.vcClipboardQueue, () -> {
+            let pbCls = objcClass("UIPasteboard");
+            let pb = if (ptrIsNull(pbCls)) ptrNull() else msgSend0(pbCls, objcSel("generalPasteboard"));
+            let cc = if (ptrIsNull(pb)) 0 else i64ToInt(msgSendI64_0(pb, objcSel("changeCount")));
+            let allowed = clipboardGateShouldAllowDisplay(gateSnapshot, cc) && !optIntSame(handledCC, cc);
+            let isUnseen = !optIntSame(seenCC, cc);
+
+            let (hasStrings, fetchedOpt) =
+                if (!allowed || ptrIsNull(pb)) (false, None)
+                else if (!isUnseen) (true, None)
+                else {
+                    let hs = msgSendBool0(pb, objcSel("hasStrings"));
+                    let strOpt = if (hs) nsStrPtrToOpt(msgSend0(pb, objcSel("string"))) else None;
+                    (hs, strOpt)
+                };
+
+            dispatchMainAsync(() -> {
+                cellSet(st.vcClipboardProbeInFlight, false);
+                let shouldRerun = cellGet(st.vcClipboardProbeNeedsRerun);
+                cellSet(st.vcClipboardProbeNeedsRerun, false);
+
+                let curCfg = cellGet(st.vcBridge.jsConfig);
+                if (!(cellGet(st.vcHasAppeared)
+                    && cellGet(st.vcIsPresentingOrVisible)
+                    && curCfg.clipboardSuggestion
+                    && vcHasFullAccess(st))) {
+                    match cellGet(st.vcActiveClipboard) {
+                        Some(_) -> {
+                            cellSet(st.vcActiveClipboard, None);
+                            syncEngineToUI(st)
+                        },
+                        None -> (),
+                    }
+                } else {
+                    let now = nowSeconds1970();
+                    let currentOTP = proxyIsOneTimeCode(vcProxy(st));
+                    let canShow = clipboardGateShouldAllowDisplay(st.vcClipboardGate, cc);
+                    let resolvedOpt: Option IOSClipboardSuggestion =
+                        if (!canShow) None
+                        else if (isUnseen && allowed) {
+                            clipboardStoreRecordRead(
+                                st.vcClipboardStore,
+                                cc,
+                                if (hasStrings) fetchedOpt else None,
+                                currentOTP,
+                                now
+                            )
+                        } else {
+                            match clipboardStoreLookup(
+                                st.vcClipboardStore,
+                                true,
+                                true,
+                                hasStrings,
+                                cc,
+                                currentOTP,
+                                now
+                            ) {
+                                ClipCached(s) -> Some(s),
+                                ClipNone -> None,
+                                ClipNeedsRead(_) -> None,
+                            }
+                        };
+
+                    if (!optClipSuggestionEq(cellGet(st.vcActiveClipboard), resolvedOpt)) {
+                        cellSet(st.vcActiveClipboard, resolvedOpt);
+                        syncEngineToUI(st)
+                    } else ();
+                    if (shouldRerun) {
+                        refreshClipboardSuggestionAsync(st)
+                    } else ()
+                }
+            })
+        })
     }
+}
+
+// ============================================================================
+// Editing, Engine Commit, Punctuation Pairing, Backspace & Line Clear
+// ============================================================================
+
+def insertTextWithAutoSpace(
+    st: KeyboardVCState,
+    text: String,
+    splitInternal: Bool,
+    overrideBeforeOpt: Option String
+): Void = {
+    noteKeyboardProxyMutation(st);
+    let needsFlush = markedSessionInsertTextWithAutoSpace(
+        st.vcInlineSession,
+        text,
+        splitInternal,
+        overrideBeforeOpt,
+        currentAutoSpaceOpts(st),
+        vcProxySink(st)
+    );
+    scheduleTurnBoundaryFlushIfNeeded(st, needsFlush)
+}
+
+def applyEngineState(st: KeyboardVCState, out: JuxuActionState): Void = {
+    noteKeyboardProxyMutation(st);
+    if (strLen(out.asPreedit) == 0) {
+        cellSet(st.vcComposingDocId, None)
+    } else {
+        match proxyDocumentIdentifier(vcProxy(st)) {
+            Some(docId) -> cellSet(st.vcComposingDocId, Some(docId)),
+            None -> (),
+        }
+    };
+    let (didCommit, needsFlush) = markedSessionApplyEngineState(
+        st.vcInlineSession,
+        out.asCommitText,
+        activeInlinePreedit(out),
+        currentAutoSpaceOpts(st),
+        vcProxySink(st)
+    );
+    scheduleTurnBoundaryFlushIfNeeded(st, needsFlush);
+    if (didCommit) {
+        scheduleUserDataFlush(st)
+    } else ();
+    if (strLen(out.asPreedit) == 0 && !isViewHidden(st.vcExpandedGrid.egView)) {
+        setExpandedGridVisible(st, false)
+    } else ();
+    syncEngineToUI(st)
+}
+
+def commitPendingFirstIfComposing(st: KeyboardVCState): Void =
+    if (strLen(cellGet(st.vcBridge.jsState).asPreedit) > 0) {
+        noteKeyboardProxyMutation(st);
+        cellSet(st.vcComposingDocId, None);
+        let out = bridgeCommitPending(st.vcBridge, nowMs());
+        let needsFlush = markedSessionCommitPendingFirst(
+            st.vcInlineSession,
+            out.asCommitText,
+            currentAutoSpaceOpts(st),
+            vcProxySink(st)
+        );
+        scheduleTurnBoundaryFlushIfNeeded(st, needsFlush);
+        if (strLen(out.asCommitText) > 0) {
+            bridgeFlushUserDataAsync(st.vcBridge)
+        } else ();
+        if (!isViewHidden(st.vcExpandedGrid.egView)) {
+            setExpandedGridVisible(st, false)
+        } else ()
+    } else ()
+
+def isPunctuationPairingActive(st: KeyboardVCState): Bool =
+    cellGet(st.vcBridge.jsConfig).smartPunctuation && !cellGet(st.vcLayoutEngine.leAsciiMode)
+
+def proxyAfterString(proxy: Ptr): String =
+    if (ptrIsNull(proxy)) ""
+    else match nsStrPtrToOpt(msgSend0(proxy, objcSel("documentContextAfterInput"))) {
+        Some(a) -> a,
+        None -> "",
+    }
+
+def proxyBeforeString(proxy: Ptr): String =
+    if (ptrIsNull(proxy)) ""
+    else match nsStrPtrToOpt(msgSend0(proxy, objcSel("documentContextBeforeInput"))) {
+        Some(b) -> b,
+        None -> "",
+    }
+
+def insertSymbol(st: KeyboardVCState, sym: String): Void = {
+    noteKeyboardProxyMutation(st);
+    commitPendingFirstIfComposing(st);
+    let proxy = vcProxy(st);
+    let skipTriggered = cellNew(false);
+    let pairCloserOpt: Cell (Option String) = cellNew(None);
+
+    if (isPunctuationPairingActive(st)) {
+        let after = proxyAfterString(proxy);
+        match punctuationTrackerHandleSymbol(st.vcPairingTracker, sym, after) {
+            SkipClose -> {
+                if (!ptrIsNull(proxy)) {
+                    msgSendVoid1I64(proxy, objcSel("adjustTextPositionByCharacterOffset:"), intToI64(1))
+                } else ();
+                autoSpaceTrackerInvalidate(st.vcInlineSession.msAutoSpaceTracker);
+                bridgeSetContext(st.vcBridge, "");
+                cellSet(skipTriggered, true)
+            },
+            InsertPair(close) -> cellSet(pairCloserOpt, Some(close)),
+            Plain -> (),
+        }
+    } else {
+        punctuationTrackerReset(st.vcPairingTracker)
+    };
+
+    if (!cellGet(skipTriggered)) {
+        let opts = autoSpaceOptionsFromConfig(cellGet(st.vcBridge.jsConfig));
+        if (isAutoSpaceRightTrigger(sym, opts)) {
+            insertTextWithAutoSpace(st, sym, false, None)
+        } else {
+            let needsFlush = markedSessionInsertPassthrough(st.vcInlineSession, sym, vcProxySink(st));
+            scheduleTurnBoundaryFlushIfNeeded(st, needsFlush)
+        };
+        match cellGet(pairCloserOpt) {
+            Some(closer) -> {
+                if (!ptrIsNull(proxy)) {
+                    msgSendVoid1Ptr(proxy, objcSel("insertText:"), nsStr(closer));
+                    msgSendVoid1I64(proxy, objcSel("adjustTextPositionByCharacterOffset:"), intToI64(-1))
+                } else ();
+                autoSpaceTrackerInvalidate(st.vcInlineSession.msAutoSpaceTracker);
+                bridgeSetContext(st.vcBridge, "")
+            },
+            None -> syncContextFromProxyIfIdle(st),
+        }
+    } else ()
+}
+
+def noteBackspaceDeleted(st: KeyboardVCState, text: String): Void =
+    cellSet(st.vcBackspaceSessionDeleted, text + cellGet(st.vcBackspaceSessionDeleted))
+
+def performBackspace(st: KeyboardVCState, acceleratedChunk: Bool): Void = {
+    cellSet(st.vcBackspaceTapDeferred, false);
+    markUserTypedForClipboard(st);
+    noteKeyboardProxyMutation(st);
+
+    if (strLen(cellGet(st.vcBridge.jsState).asPreedit) > 0) {
+        let out = bridgeHandleKey(st.vcBridge, 0x33, 0, false, nowMs());
+        applyEngineState(st, out)
+    } else {
+        let proxy = vcProxy(st);
+        let pairDeleted = cellNew(false);
+        if (isPunctuationPairingActive(st) && vecLen(st.vcPairingTracker.openClosers) > 0) {
+            let hostBefore = proxyBeforeString(proxy);
+            let hostAfter = proxyAfterString(proxy);
+            let nClosers = vecLen(st.vcPairingTracker.openClosers);
+            let closer = vecGetOr(st.vcPairingTracker.openClosers, nClosers - 1, "");
+            if (punctuationTrackerConsumeBackspacePair(st.vcPairingTracker, hostBefore, hostAfter)) {
+                noteBackspaceDeleted(st, tailScalars(hostBefore, 1) + closer);
+                if (!ptrIsNull(proxy)) {
+                    msgSendVoid1I64(proxy, objcSel("adjustTextPositionByCharacterOffset:"), intToI64(1));
+                    msgSendVoid0(proxy, objcSel("deleteBackward"));
+                    msgSendVoid0(proxy, objcSel("deleteBackward"))
+                } else ();
+                autoSpaceTrackerInvalidate(st.vcInlineSession.msAutoSpaceTracker);
+                bridgeSetContext(st.vcBridge, tailScalars(dropLastScalars(hostBefore, 1), 16));
+                syncEngineToUI(st);
+                cellSet(pairDeleted, true)
+            } else ()
+        } else ();
+
+        if (!cellGet(pairDeleted)) {
+            let before = proxyBeforeString(proxy);
+            if (!acceleratedChunk || strLen(before) == 0) {
+                if (strLen(before) > 0) {
+                    bridgeNotifyPostCommitBackspace(st.vcBridge, nowMs())
+                } else ();
+                autoSpaceTrackerWillDeleteBackward(st.vcInlineSession.msAutoSpaceTracker, Some(before), false);
+                noteBackspaceDeleted(st, tailScalars(before, 1));
+                if (!ptrIsNull(proxy)) {
+                    msgSendVoid0(proxy, objcSel("deleteBackward"))
+                } else ();
+                let afterDel = if (strLen(before) == 0) "" else dropLastScalars(before, 1);
+                bridgeSetContext(st.vcBridge, tailScalars(afterDel, 32));
+                syncEngineToUI(st)
+            } else {
+                autoSpaceTrackerInvalidate(st.vcInlineSession.msAutoSpaceTracker);
+                let nDel = acceleratedDeleteCount(before);
+                noteBackspaceDeleted(st, tailScalars(before, nDel));
+                let i = cellNew(0);
+                while (cellGet(i) < nDel) {
+                    if (!ptrIsNull(proxy)) msgSendVoid0(proxy, objcSel("deleteBackward")) else ();
+                    cellSet(i, cellGet(i) + 1)
+                };
+                let afterDel = dropLastScalars(before, nDel);
+                bridgeSetContext(st.vcBridge, tailScalars(afterDel, 32));
+                syncEngineToUI(st)
+            }
+        } else ()
+    }
+}
+
+def scheduleNextBackspaceRepeatTick(st: KeyboardVCState, gen: Int64): Void =
+    dispatchMainAfterMs(68, () -> {
+        if (cellGet(st.vcBackspaceRepeatGen) == gen) {
+            let held = systemUptimeSeconds() - cellGet(st.vcBackspaceHoldStart);
+            if (backspaceShouldFireRepeat(held)) {
+                let isComp = strLen(cellGet(st.vcBridge.jsState).asPreedit) > 0;
+                let fastMode = backspaceShouldUseFastChunk(held, isComp);
+                feedbackFireSoftStep(st.vcFeedback, true);
+                performBackspace(st, fastMode)
+            } else ();
+            scheduleNextBackspaceRepeatTick(st, gen)
+        } else ()
+    })
+
+def startBackspaceRepeat(st: KeyboardVCState): Void = {
+    let gen = cellGet(st.vcBackspaceRepeatGen) + intToI64(1);
+    cellSet(st.vcBackspaceRepeatGen, gen);
+    cellSet(st.vcBackspaceHoldStart, systemUptimeSeconds());
+    scheduleNextBackspaceRepeatTick(st, gen)
+}
+
+def finishLineClear(st: KeyboardVCState, collected: String, remaining: String): Void = {
+    lineClearUndoPush(
+        st.vcLineClearUndo,
+        collected,
+        remaining,
+        proxyDocumentIdentifier(vcProxy(st))
+    );
+    bridgeSetContext(st.vcBridge, tailScalars(remaining, 32));
+    syncEngineToUI(st)
+}
+
+def clearLineStep(
+    st: KeyboardVCState,
+    generation: Int64,
+    deleted: Int,
+    waitedTicks: Int,
+    expectedOpt: Option LineClearExpected,
+    collected: String,
+    remaining: String
+): Void =
+    if (generation == cellGet(st.vcClearLineGen)) {
+        let proxy = vcProxy(st);
+        let before = proxyBeforeString(proxy);
+        if (strLen(before) == 0 || deleted >= 50000) {
+            finishLineClear(st, collected, if (strLen(before) == 0) "" else remaining)
+        } else {
+            let unsatisfied = match expectedOpt {
+                Some(exp) -> !lineClearExpectedIsSatisfied(exp, before),
+                None -> false,
+            };
+            if (unsatisfied) {
+                if (waitedTicks >= 8) {
+                    finishLineClear(st, collected, remaining)
+                } else {
+                    dispatchMainAfterMs(24, () -> {
+                        clearLineStep(st, generation, deleted, waitedTicks + 1, expectedOpt, collected, remaining)
+                    })
+                }
+            } else {
+                noteKeyboardProxyMutation(st);
+                let plan = lineClearPlan(before, 128);
+                let nowCollected = tailScalars(before, plan.lcpDeleteCount) + collected;
+                let nowRemaining = dropLastScalars(before, plan.lcpDeleteCount);
+                let i = cellNew(0);
+                while (cellGet(i) < plan.lcpDeleteCount) {
+                    if (!ptrIsNull(proxy)) msgSendVoid0(proxy, objcSel("deleteBackward")) else ();
+                    cellSet(i, cellGet(i) + 1)
+                };
+                if (plan.lcpReachesLineStart) {
+                    finishLineClear(st, nowCollected, nowRemaining)
+                } else {
+                    let nextExp = lineClearExpectedNew(before, plan.lcpDeleteCount);
+                    dispatchMainAfterMs(24, () -> {
+                        clearLineStep(
+                            st,
+                            generation,
+                            deleted + plan.lcpDeleteCount,
+                            0,
+                            Some(nextExp),
+                            nowCollected,
+                            nowRemaining
+                        )
+                    })
+                }
+            }
+        }
+    } else ()
+
+def clearCurrentLineBeforeCursor(st: KeyboardVCState): Void = {
+    markUserTypedForClipboard(st);
+    if (strLen(cellGet(st.vcBridge.jsState).asPreedit) > 0) {
+        noteKeyboardProxyMutation(st);
+        cancelMarkedCode(st);
+        bridgeClearComposition(st.vcBridge);
+        syncEngineToUI(st)
+    } else {
+        noteKeyboardProxyMutation(st);
+        punctuationTrackerReset(st.vcPairingTracker);
+        bridgeResetQuoteState(st.vcBridge);
+        autoSpaceTrackerInvalidate(st.vcInlineSession.msAutoSpaceTracker);
+
+        let proxy = vcProxy(st);
+        let sessDel = cellGet(st.vcBackspaceSessionDeleted);
+        if (isSingleNewlineString(sessDel)) {
+            if (!ptrIsNull(proxy)) {
+                msgSendVoid1Ptr(proxy, objcSel("insertText:"), nsStr(sessDel))
+            } else ();
+            cellSet(st.vcBackspaceSessionDeleted, "");
+            bridgeSetContext(st.vcBridge, "");
+            syncEngineToUI(st)
+        } else {
+            let gen = cellGet(st.vcClearLineGen) + intToI64(1);
+            cellSet(st.vcClearLineGen, gen);
+            let initRemaining = proxyBeforeString(proxy);
+            cellSet(st.vcBackspaceSessionDeleted, "");
+            clearLineStep(st, gen, 0, 0, None, sessDel, initRemaining)
+        }
+    }
+}
+
+def restoreClearedLine(st: KeyboardVCState): Void =
+    if (strLen(cellGet(st.vcBridge.jsState).asPreedit) == 0) {
+        let proxy = vcProxy(st);
+        let before = proxyBeforeString(proxy);
+        match lineClearUndoTake(st.vcLineClearUndo, before, proxyDocumentIdentifier(proxy)) {
+            None -> (),
+            Some(text) -> {
+                noteKeyboardProxyMutation(st);
+                cellSet(st.vcClearLineGen, cellGet(st.vcClearLineGen) + intToI64(1));
+                punctuationTrackerReset(st.vcPairingTracker);
+                bridgeResetQuoteState(st.vcBridge);
+                autoSpaceTrackerInvalidate(st.vcInlineSession.msAutoSpaceTracker);
+                if (!ptrIsNull(proxy)) {
+                    msgSendVoid1Ptr(proxy, objcSel("insertText:"), nsStr(text))
+                } else ();
+                bridgeSetContext(st.vcBridge, tailScalars(text, 16));
+                syncEngineToUI(st)
+            },
+        }
+    } else ()
+
+def moveCursorVertically(st: KeyboardVCState, lines: Int): Bool = {
+    let proxy = vcProxy(st);
+    let before = proxyBeforeString(proxy);
+    let after = proxyAfterString(proxy);
+    match verticalMoveOffset(before, after, lines) {
+        None -> false,
+        Some(delta) -> {
+            noteKeyboardProxyMutation(st);
+            if (!ptrIsNull(proxy)) {
+                msgSendVoid1I64(proxy, objcSel("adjustTextPositionByCharacterOffset:"), intToI64(delta))
+            } else ();
+            true
+        },
+    }
+}
+
+// ============================================================================
+// Key Release & Callback Wiring (`KeyboardViewController.swift` lines 613–1156)
+// ============================================================================
+
+def presentCalloutIfAppropriate(st: KeyboardVCState, spec: IOSKeySpec): Void =
+    if (cellGet(st.vcLayoutEngine.leIsTrackpadActive)) {
+        calloutHideImmediately(st.vcCalloutView);
+        keyCanvasSetCoveredCalloutKeyId(st.vcKeyCanvas, None)
+    } else {
+        let show = match spec.ksKind {
+            KeyLetter(_) -> true,
+            KeySymbol(sym) -> utf8ScalarCount(sym) <= 3,
+            _ -> false,
+        };
+        if (show) {
+            let frameInRoot = convertRectToView(st.vcKeyCanvas.kcView, spec.ksFrame, vcInputView(st));
+            let isDocked = calloutPresent(
+                st.vcCalloutView,
+                spec.ksPrimaryLabel,
+                spec.ksId,
+                frameInRoot,
+                vcIsDark(st)
+            );
+            keyCanvasSetCoveredCalloutKeyId(st.vcKeyCanvas, if (isDocked) Some(spec.ksId) else None)
+        } else {
+            calloutHideImmediately(st.vcCalloutView);
+            keyCanvasSetCoveredCalloutKeyId(st.vcKeyCanvas, None)
+        }
+    }
+
+def asciiScalarStr(ascii: Int, upper: Bool): String = {
+    let lo = "abcdefghijklmnopqrstuvwxyz";
+    let hi = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let idx = if (ascii >= 97 && ascii <= 122) ascii - 97 else if (ascii >= 65 && ascii <= 90) ascii - 65 else -1;
+    if (idx >= 0 && idx < 26) {
+        if (upper) strSlice(hi, idx, idx + 1) else strSlice(lo, idx, idx + 1)
+    } else ""
+}
+
+def handleKeyRelease(st: KeyboardVCState, spec: IOSKeySpec, pointInCanvas: CGPoint): Void = {
+    let le = st.vcLayoutEngine;
+    match spec.ksKind {
+        KeyLetter(ascii) -> {
+            markUserTypedForClipboard(st);
+            let isUpper = shiftIsUppercase(cellGet(le.leShiftState));
+            if (cellGet(le.leAsciiMode)) {
+                commitPendingFirstIfComposing(st);
+                let outStr = asciiScalarStr(ascii, isUpper);
+                insertTextWithAutoSpace(st, outStr, false, None);
+                syncContextFromProxyIfIdle(st);
+                layoutConsumeOneShotShiftIfNeeded(le);
+                syncEngineToUI(st)
+            } else if (isUpper) {
+                let upperScalar = if (ascii >= 97 && ascii <= 122) ascii - 32 else ascii;
+                let out = bridgeHandleKey(st.vcBridge, 0, upperScalar, false, nowMs());
+                layoutConsumeOneShotShiftIfNeeded(le);
+                applyEngineState(st, out)
+            } else {
+                let sendPt = match cellGet(st.vcKeyCanvas.kcSnapshot) {
+                    Some(snap) -> compensatedLetterPoint(pointInCanvas, snap),
+                    None -> pointInCanvas,
+                };
+                let out = bridgePushTouch(st.vcBridge, ascii, sendPt.x, sendPt.y, false, nowMs());
+                applyEngineState(st, out)
+            }
+        },
+        KeyT9(digit) -> {
+            markUserTypedForClipboard(st);
+            if (digit == 49) {
+                if (strLen(cellGet(st.vcBridge.jsState).asPreedit) > 0) {
+                    // "'" == ASCII 39
+                    let out = bridgePushT9Touch(st.vcBridge, 39, 0.0, 0.0, true, nowMs());
+                    applyEngineState(st, out)
+                } else ()
+            } else {
+                let sendPt = match cellGet(st.vcKeyCanvas.kcSnapshot) {
+                    Some(snap) -> compensatedLetterPoint(pointInCanvas, snap),
+                    None -> pointInCanvas,
+                };
+                let out = bridgePushT9Touch(st.vcBridge, digit, sendPt.x, sendPt.y, false, nowMs());
+                applyEngineState(st, out)
+            }
+        },
+        KeyT9Clear -> {
+            markUserTypedForClipboard(st);
+            if (strLen(cellGet(st.vcBridge.jsState).asPreedit) > 0) {
+                cancelMarkedCode(st);
+                bridgeClearComposition(st.vcBridge);
+                syncEngineToUI(st)
+            } else ()
+        },
+        KeySymbol(sym) -> {
+            markUserTypedForClipboard(st);
+            insertSymbol(st, sym);
+            if (shouldReturnToLettersAfterSymbol(sym, cellGet(le.lePlane))) {
+                layoutSwitchPlane(le, PlaneLetters)
+            } else ();
+            syncEngineToUI(st)
+        },
+        KeyShift -> {
+            layoutTapShift(le, systemUptimeSeconds());
+            refreshKeyboardLayout(st)
+        },
+        KeyBackspace -> (),
+        KeyPlaneSwitch { targetPlane: tp, switchLabel: _ } -> {
+            commitPendingFirstIfComposing(st);
+            layoutSwitchPlane(le, tp);
+            syncEngineToUI(st)
+        },
+        KeyGlobe -> {
+            commitPendingFirstIfComposing(st);
+            if (!ptrIsNull(st.vcSelf)) {
+                msgSendVoid0(st.vcSelf, objcSel("advanceToNextInputMode"))
+            } else ()
+        },
+        KeyModeToggle -> {
+            if (!cellGet(st.vcBridge.jsConfig).spaceCommaKey && cellGet(le.lePlane) != PlaneLetters) {
+                layoutSwitchPlane(le, PlaneLetters)
+            } else ();
+            let out = bridgeToggleAsciiMode(st.vcBridge);
+            applyEngineState(st, out)
+        },
+        KeySpace -> {
+            markUserTypedForClipboard(st);
+            if (strLen(cellGet(st.vcBridge.jsState).asPreedit) == 0) {
+                noteKeyboardProxyMutation(st);
+                let needsFlush = markedSessionInsertPassthrough(st.vcInlineSession, " ", vcProxySink(st));
+                scheduleTurnBoundaryFlushIfNeeded(st, needsFlush);
+                syncContextFromProxyIfIdle(st);
+                syncEngineToUI(st)
+            } else {
+                let out = bridgeHandleKey(st.vcBridge, 0x31, 32, false, nowMs());
+                applyEngineState(st, out)
+            }
+        },
+        KeyReturn -> {
+            markUserTypedForClipboard(st);
+            if (strLen(cellGet(st.vcBridge.jsState).asPreedit) == 0) {
+                noteKeyboardProxyMutation(st);
+                let needsFlush = markedSessionInsertPassthrough(st.vcInlineSession, "\n", vcProxySink(st));
+                scheduleTurnBoundaryFlushIfNeeded(st, needsFlush);
+                syncContextFromProxyIfIdle(st);
+                syncEngineToUI(st)
+            } else {
+                let out = bridgeHandleKey(st.vcBridge, 0x24, 13, false, nowMs());
+                applyEngineState(st, out)
+            }
+        },
+    }
+}
+
+def wireControllerCallbacks(st: KeyboardVCState): Void = {
+    let kc = st.vcKeyCanvas;
+
+    cellSet(kc.kcOnKeyTouchDown, Some((spec: IOSKeySpec) -> {
+        cellSet(st.vcClearLineGen, cellGet(st.vcClearLineGen) + intToI64(1));
+        feedbackFireKeyDown(st.vcFeedback);
+        match spec.ksKind {
+            KeyLetter(_) -> presentCalloutIfAppropriate(st, spec),
+            KeySymbol(_) -> presentCalloutIfAppropriate(st, spec),
+            KeyPlaneSwitch { targetPlane: tp, switchLabel: _ } -> {
+                calloutHideImmediately(st.vcCalloutView);
+                keyCanvasSetCoveredCalloutKeyId(kc, None);
+                cellSet(st.vcPlaneBeforePress, cellGet(st.vcLayoutEngine.lePlane));
+                commitPendingFirstIfComposing(st);
+                layoutSwitchPlane(st.vcLayoutEngine, tp);
+                syncEngineToUI(st)
+            },
+            KeyGlobe -> {
+                calloutHideImmediately(st.vcCalloutView);
+                keyCanvasSetCoveredCalloutKeyId(kc, None);
+                commitPendingFirstIfComposing(st)
+            },
+            KeyBackspace -> {
+                calloutHideImmediately(st.vcCalloutView);
+                keyCanvasSetCoveredCalloutKeyId(kc, None);
+                cellSet(st.vcBackspaceSessionDeleted, "");
+                let proxy = vcProxy(st);
+                let canUndo =
+                    cellGet(st.vcBridge.jsConfig).backspaceSwipeClear
+                        && strLen(cellGet(st.vcBridge.jsState).asPreedit) == 0
+                        && (match lineClearUndoRestorableIndex(
+                            st.vcLineClearUndo,
+                            proxyBeforeString(proxy),
+                            proxyDocumentIdentifier(proxy)
+                        ) {
+                            Some(_) -> true,
+                            None -> false,
+                        });
+                cellSet(kc.kcCanUndoLineClear, canUndo);
+                cellSet(st.vcBackspaceTapDeferred, canUndo);
+                if (!canUndo) {
+                    performBackspace(st, false)
+                } else ();
+                startBackspaceRepeat(st)
+            },
+            _ -> {
+                calloutHideImmediately(st.vcCalloutView);
+                keyCanvasSetCoveredCalloutKeyId(kc, None)
+            },
+        }
+    }));
+
+    cellSet(kc.kcOnGlobeTouchEvent, Some((fromView: Ptr, event: Ptr) -> {
+        if (!ptrIsNull(st.vcSelf) && !ptrIsNull(fromView) && !ptrIsNull(event)) {
+            msgSendVoid2Ptr(st.vcSelf, objcSel("handleInputModeListFromView:withEvent:"), fromView, event)
+        } else ()
+    }));
+
+    cellSet(kc.kcOnKeySlidePreview, Some((specOpt: Option IOSKeySpec) -> {
+        match specOpt {
+            Some(spec) -> {
+                feedbackFireSoftStep(st.vcFeedback, false);
+                presentCalloutIfAppropriate(st, spec)
+            },
+            None -> {
+                calloutHideImmediately(st.vcCalloutView);
+                keyCanvasSetCoveredCalloutKeyId(kc, None)
+            },
+        }
+    }));
+
+    cellSet(kc.kcOnRestorePlane, Some(() -> {
+        layoutSwitchPlane(st.vcLayoutEngine, cellGet(st.vcPlaneBeforePress));
+        refreshKeyboardLayout(st)
+    }));
+
+    cellSet(kc.kcOnKeyTouchCancel, Some(() -> {
+        calloutHideImmediately(st.vcCalloutView);
+        keyCanvasSetCoveredCalloutKeyId(kc, None);
+        stopBackspaceRepeat(st);
+        cellSet(st.vcBackspaceTapDeferred, false)
+    }));
+
+    cellSet(kc.kcOnKeyTouchUp, Some((spec: IOSKeySpec, rawPt: CGPoint) -> {
+        keyCanvasSetCoveredCalloutKeyId(kc, None);
+        calloutReleasePreview(st.vcCalloutView, () -> ());
+        stopBackspaceRepeat(st);
+        if (spec.ksKind == KeyBackspace && cellGet(st.vcBackspaceTapDeferred)) {
+            performBackspace(st, false)
+        } else ();
+        handleKeyRelease(st, spec, rawPt)
+    }));
+
+    cellSet(kc.kcOnKeySwipeUp, Some((symbol: String) -> {
+        keyCanvasSetCoveredCalloutKeyId(kc, None);
+        calloutReleasePreview(st.vcCalloutView, () -> ());
+        stopBackspaceRepeat(st);
+        markUserTypedForClipboard(st);
+        insertSymbol(st, symbol);
+        layoutConsumeOneShotShiftIfNeeded(st.vcLayoutEngine);
+        syncEngineToUI(st)
+    }));
+
+    cellSet(kc.kcOnBackspaceSwipeArmed, Some((spec: IOSKeySpec, armed: Bool) -> {
+        if (armed) {
+            stopBackspaceRepeat(st);
+            feedbackFireSoftStep(st.vcFeedback, false);
+            let frameInRoot = convertRectToView(kc.kcView, spec.ksFrame, vcInputView(st));
+            let isDocked = calloutPresent(st.vcCalloutView, "清空", spec.ksId, frameInRoot, vcIsDark(st));
+            keyCanvasSetCoveredCalloutKeyId(kc, if (isDocked) Some(spec.ksId) else None)
+        } else {
+            calloutHideImmediately(st.vcCalloutView);
+            keyCanvasSetCoveredCalloutKeyId(kc, None)
+        }
+    }));
+
+    cellSet(kc.kcOnBackspaceSwipeUp, Some(() -> {
+        calloutHideImmediately(st.vcCalloutView);
+        keyCanvasSetCoveredCalloutKeyId(kc, None);
+        stopBackspaceRepeat(st);
+        feedbackFireSoftStep(st.vcFeedback, true);
+        cellSet(st.vcBackspaceTapDeferred, false);
+        clearCurrentLineBeforeCursor(st)
+    }));
+
+    cellSet(kc.kcOnBackspaceSwipeDownArmed, Some((spec: IOSKeySpec, armed: Bool) -> {
+        if (armed) {
+            stopBackspaceRepeat(st);
+            feedbackFireSoftStep(st.vcFeedback, false);
+            let frameInRoot = convertRectToView(kc.kcView, spec.ksFrame, vcInputView(st));
+            let isDocked = calloutPresent(st.vcCalloutView, "撤回", spec.ksId, frameInRoot, vcIsDark(st));
+            keyCanvasSetCoveredCalloutKeyId(kc, if (isDocked) Some(spec.ksId) else None)
+        } else {
+            calloutHideImmediately(st.vcCalloutView);
+            keyCanvasSetCoveredCalloutKeyId(kc, None)
+        }
+    }));
+
+    cellSet(kc.kcOnBackspaceSwipeDown, Some(() -> {
+        calloutHideImmediately(st.vcCalloutView);
+        keyCanvasSetCoveredCalloutKeyId(kc, None);
+        stopBackspaceRepeat(st);
+        cellSet(st.vcBackspaceTapDeferred, false);
+        feedbackFireSoftStep(st.vcFeedback, true);
+        restoreClearedLine(st)
+    }));
+
+    cellSet(kc.kcOnAlternatesBegin, Some((spec: IOSKeySpec) -> {
+        let optsOpt: Option (Vec String, Int) = match spec.ksKind {
+            KeyLetter(ascii) -> Some(keyAlternatesOptions(ascii, cellGet(st.vcLayoutEngine.leAsciiMode))),
+            KeySymbol(sym) -> keyAlternatesSymbolOptions(sym, cellGet(st.vcLayoutEngine.leAsciiMode)),
+            _ -> None,
+        };
+        match optsOpt {
+            None -> (),
+            Some((items, defIdx)) -> {
+                calloutHideImmediately(st.vcCalloutView);
+                keyCanvasSetCoveredCalloutKeyId(kc, None);
+                feedbackFireSoftStep(st.vcFeedback, false);
+                let iv = vcInputView(st);
+                let frameInRoot = convertRectToView(kc.kcView, spec.ksFrame, iv);
+                let contW =
+                    if (!ptrIsNull(iv) && viewBounds(iv).size.width > 0.0) viewBounds(iv).size.width
+                    else viewBounds(kc.kcView).size.width;
+                alternatesPresent(st.vcAlternatesView, items, defIdx, frameInRoot, contW, vcIsDark(st))
+            },
+        }
+    }));
+
+    cellSet(kc.kcOnAlternatesMove, Some((pt: CGPoint) -> {
+        let x = convertPointToView(kc.kcView, pt, vcInputView(st)).x;
+        if (alternatesUpdate(st.vcAlternatesView, x)) {
+            feedbackFireSoftStep(st.vcFeedback, false)
+        } else ()
+    }));
+
+    cellSet(kc.kcOnAlternatesEnd, Some((commit: Bool) -> {
+        let textOpt = alternatesSelectedText(st.vcAlternatesView);
+        alternatesHide(st.vcAlternatesView);
+        stopBackspaceRepeat(st);
+        if (commit) {
+            match textOpt {
+                Some(text) -> {
+                    markUserTypedForClipboard(st);
+                    insertSymbol(st, text);
+                    if (shouldReturnToLettersAfterSymbol(text, cellGet(st.vcLayoutEngine.lePlane))) {
+                        layoutSwitchPlane(st.vcLayoutEngine, PlaneLetters)
+                    } else ();
+                    layoutConsumeOneShotShiftIfNeeded(st.vcLayoutEngine);
+                    syncEngineToUI(st)
+                },
+                None -> (),
+            }
+        } else ()
+    }));
+
+    cellSet(kc.kcOnTrackpadStateChanged, Some((active: Bool) -> {
+        calloutHideImmediately(st.vcCalloutView);
+        keyCanvasSetCoveredCalloutKeyId(kc, None);
+        cellSet(st.vcLayoutEngine.leIsTrackpadActive, active);
+        if (active) {
+            commitPendingFirstIfComposing(st);
+            syncEngineToUI(st);
+            feedbackFireSoftStep(st.vcFeedback, false)
+        } else ();
+        refreshKeyboardLayout(st)
+    }));
+
+    cellSet(kc.kcOnTrackpadMove, Some((dxSteps: Int, dySteps: Int) -> {
+        if (strLen(cellGet(st.vcBridge.jsState).asPreedit) == 0) {
+            let moved = cellNew(false);
+            let proxy = vcProxy(st);
+            if (dxSteps != 0) {
+                noteKeyboardProxyMutation(st);
+                if (!ptrIsNull(proxy)) {
+                    msgSendVoid1I64(proxy, objcSel("adjustTextPositionByCharacterOffset:"), intToI64(dxSteps))
+                } else ();
+                cellSet(moved, true)
+            } else ();
+            if (dySteps != 0) {
+                if (moveCursorVertically(st, dySteps)) {
+                    cellSet(moved, true)
+                } else ()
+            } else ();
+            if (cellGet(moved)) {
+                punctuationTrackerReset(st.vcPairingTracker);
+                bridgeResetQuoteState(st.vcBridge);
+                markedSessionReset(st.vcInlineSession);
+                feedbackFireSoftStep(st.vcFeedback, false);
+                syncContextFromProxyIfIdle(st);
+                syncEngineToUI(st)
+            } else ()
+        } else ()
+    }));
+
+    // Ribbon callbacks
+    cellSet(st.vcRibbonView.rvOnSelectCandidate, Some((relIdx: Int) -> {
+        keyCanvasFlushPendingTouches(kc);
+        feedbackFireSoftStep(st.vcFeedback, true);
+        markUserTypedForClipboard(st);
+        let out = bridgeSelectCandidate(st.vcBridge, relIdx, nowMs());
+        applyEngineState(st, out)
+    }));
+
+    cellSet(st.vcRibbonView.rvOnSelectStarterWord, Some((word: String) -> {
+        keyCanvasFlushPendingTouches(kc);
+        feedbackFireSoftStep(st.vcFeedback, true);
+        markUserTypedForClipboard(st);
+        insertTextWithAutoSpace(st, word, true, None);
+        bridgeAcceptPrediction(st.vcBridge, word, nowMs());
+        scheduleUserDataFlush(st);
+        syncEngineToUI(st)
+    }));
+
+    cellSet(st.vcRibbonView.rvOnSelectClipboard, Some((suggestion: IOSClipboardSuggestion) -> {
+        keyCanvasFlushPendingTouches(kc);
+        feedbackFireSoftStep(st.vcFeedback, true);
+        markUserTypedForClipboard(st);
+        insertTextWithAutoSpace(st, suggestion.csInsertText, false, None);
+        clipboardStoreConsume(st.vcClipboardStore, suggestion.csChangeCount);
+        syncEngineToUI(st)
+    }));
+
+    cellSet(st.vcRibbonView.rvOnDismissClipboard, Some((suggestion: IOSClipboardSuggestion) -> {
+        keyCanvasFlushPendingTouches(kc);
+        feedbackFireSoftStep(st.vcFeedback, false);
+        clipboardStoreDismiss(st.vcClipboardStore, suggestion.csChangeCount);
+        cellSet(st.vcActiveClipboard, None);
+        syncEngineToUI(st)
+    }));
+
+    cellSet(st.vcRibbonView.rvOnTapChevron, Some(() -> {
+        keyCanvasFlushPendingTouches(kc);
+        feedbackFireSoftStep(st.vcFeedback, true);
+        setExpandedGridVisible(st, isViewHidden(st.vcExpandedGrid.egView))
+    }));
+
+    // T9 sidebar callbacks
+    cellSet(st.vcT9Sidebar.sbOnSelectPunctuation, Some((sym: String) -> {
+        keyCanvasFlushPendingTouches(kc);
+        feedbackFireSoftStep(st.vcFeedback, true);
+        markUserTypedForClipboard(st);
+        insertSymbol(st, sym);
+        syncEngineToUI(st)
+    }));
+
+    cellSet(st.vcT9Sidebar.sbOnSelectSyllable, Some((syl: String) -> {
+        keyCanvasFlushPendingTouches(kc);
+        feedbackFireSoftStep(st.vcFeedback, true);
+        let out = bridgeLockT9Syllable(st.vcBridge, syl);
+        applyEngineState(st, out)
+    }));
+
+    // Expanded grid callbacks
+    cellSet(st.vcExpandedGrid.egOnSelectAbsCandidate, Some((absIdx: Int) -> {
+        feedbackFireSoftStep(st.vcFeedback, true);
+        markUserTypedForClipboard(st);
+        let idleWordsOpt = cellGet(st.vcExpandedIdleWords);
+        setExpandedGridVisible(st, false);
+        match idleWordsOpt {
+            Some(idleWords) if (absIdx < vecLen(idleWords)) -> {
+                match vecGet(idleWords, absIdx) {
+                    Some(word) -> {
+                        insertTextWithAutoSpace(st, word, true, None);
+                        bridgeAcceptPrediction(st.vcBridge, word, nowMs());
+                        scheduleUserDataFlush(st);
+                        syncEngineToUI(st)
+                    },
+                    None -> (),
+                }
+            },
+            _ -> {
+                let out = bridgeSelectAbsCandidate(st.vcBridge, absIdx, nowMs());
+                applyEngineState(st, out)
+            },
+        }
+    }));
+
+    cellSet(st.vcExpandedGrid.egOnCollapse, Some(() -> {
+        feedbackFireSoftStep(st.vcFeedback, true);
+        setExpandedGridVisible(st, false)
+    }));
+
+    cellSet(st.vcExpandedGrid.egOnBackspace, Some(() -> {
+        let wasComposing = strLen(cellGet(st.vcBridge.jsState).asPreedit) > 0;
+        feedbackFireKeyDown(st.vcFeedback);
+        performBackspace(st, false);
+        if (!isViewHidden(st.vcExpandedGrid.egView)) {
+            if (wasComposing && strLen(cellGet(st.vcBridge.jsState).asPreedit) == 0) {
+                setExpandedGridVisible(st, false)
+            } else {
+                reloadExpandedGrid(st)
+            }
+        } else ()
+    }));
+
+    cellSet(st.vcExpandedGrid.egOnClear, Some(() -> {
+        feedbackFireSoftStep(st.vcFeedback, true);
+        cancelMarkedCode(st);
+        bridgeAbandonComposition(st.vcBridge, nowMs());
+        setExpandedGridVisible(st, false);
+        syncEngineToUI(st)
+    }));
+
+    cellSet(st.vcExpandedGrid.egOnOpenSettings, Some(() -> {
+        feedbackFireSoftStep(st.vcFeedback, true);
+        setExpandedGridVisible(st, false);
+        openHostSettingsURL(st.vcSelf)
+    }))
+}
+
+// ============================================================================
+// Setup Views & `KeyboardViewController` ObjC Methods
+// ============================================================================
+
+def getOrInitVCState(self: Ptr): KeyboardVCState = {
+    let existing = objcGetAssocHandle(self, vcAssocKey());
+    if (existing != intToI64(0)) {
+        gcHandleGet(existing)
+    } else {
+        let bridge = bridgeShared();
+        let backdrop = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 0.0, 0.0));
+        let ribbon = candidateRibbonViewNew();
+        let canvas = keyCanvasViewNew();
+        let t9Side = t9SidebarViewNew();
+        let expanded = expandedCandidateViewNew();
+        let callout = calloutViewNew();
+        let alts = alternatesViewNew();
+        let fb = feedbackControllerNew(canvas.kcView);
+
+        let st = KeyboardVCState {
+            vcSelf: self,
+            vcBridge: bridge,
+            vcLayoutEngine: layoutEngineNew(),
+            vcGlassBackdrop: backdrop,
+            vcRibbonView: ribbon,
+            vcKeyCanvas: canvas,
+            vcT9Sidebar: t9Side,
+            vcExpandedGrid: expanded,
+            vcCalloutView: callout,
+            vcAlternatesView: alts,
+            vcFeedback: fb,
+            vcHeightConstraint: cellNew(ptrNull()),
+            vcRibbonHeightConstraint: cellNew(ptrNull()),
+            vcSaveUserDataGen: cellNew(intToI64(0)),
+            vcBackspaceRepeatGen: cellNew(intToI64(0)),
+            vcBackspaceHoldStart: cellNew(0.0),
+            vcLastVisualSig: cellNew(None),
+            vcPlaneBeforePress: cellNew(PlaneLetters),
+            vcInlineSession: markedSessionNew(),
+            vcPairingTracker: punctuationTrackerNew(),
+            vcTurnFlushScheduled: cellNew(false),
+            vcComposingDocId: cellNew(None),
+            vcLastKnownDocId: cellNew(None),
+            vcLastKeyboardEditUptime: cellNew(0.0),
+            vcNilDocSweepGen: cellNew(intToI64(0)),
+            vcAppearanceSweepGen: cellNew(intToI64(0)),
+            vcAppearanceSweepArmed: cellNew(false),
+            vcIsPresentingOrVisible: cellNew(false),
+            vcClipboardStore: clipboardStoreDefault(),
+            vcClipboardGate: clipboardGateNew(),
+            vcClipboardQueue: dispatchQueueCreateSerial("im.juxu.clipboard"),
+            vcActiveClipboard: cellNew(None),
+            vcClipboardProbeInFlight: cellNew(false),
+            vcClipboardProbeNeedsRerun: cellNew(false),
+            vcLastClipboardPrefersOTP: cellNew(false),
+            vcExpandedIdleWords: cellNew(None),
+            vcHasAppeared: cellNew(false),
+            vcLineClearUndo: lineClearUndoNew(),
+            vcBackspaceSessionDeleted: cellNew(""),
+            vcBackspaceTapDeferred: cellNew(false),
+            vcClearLineGen: cellNew(intToI64(0)),
+        };
+        objcSetAssocHandle(self, vcAssocKey(), gcHandleNew(st));
+        st
+    }
+}
+
+def setupViews(st: KeyboardVCState): Void = {
+    let inputView = vcInputView(st);
+    let rootView = msgSend0(st.vcSelf, objcSel("view"));
+    if (!ptrIsNull(inputView)) {
+        if (msgSendBool1Ptr(inputView, objcSel("respondsToSelector:"), objcSel("setAllowsSelfSizing:"))) {
+            msgSendVoid1Bool(inputView, objcSel("setAllowsSelfSizing:"), true)
+        } else ();
+        msgSendVoid1Bool(inputView, objcSel("setClipsToBounds:"), false);
+        if (!ptrIsNull(rootView)) {
+            msgSendVoid1Bool(rootView, objcSel("setClipsToBounds:"), false)
+        } else ();
+
+        let gb = st.vcGlassBackdrop;
+        msgSendVoid1Bool(gb, objcSel("setTranslatesAutoresizingMaskIntoConstraints:"), false);
+        setContinuousCorner(viewLayer(gb), trayTopCornerRadius());
+        setTopMaskedCorners(viewLayer(gb));
+        msgSendVoid1Bool(gb, objcSel("setUserInteractionEnabled:"), false);
+
+        let rv = st.vcRibbonView.rvView;
+        let kc = st.vcKeyCanvas.kcView;
+        let sb = st.vcT9Sidebar.sbView;
+        let eg = st.vcExpandedGrid.egView;
+        let cv = st.vcCalloutView.cvView;
+        let av = st.vcAlternatesView.avView;
+
+        msgSendVoid1Bool(rv, objcSel("setTranslatesAutoresizingMaskIntoConstraints:"), false);
+        setAccessibilityId(rv, "JuxuRibbon");
+        msgSendVoid1Bool(kc, objcSel("setTranslatesAutoresizingMaskIntoConstraints:"), false);
+        setAccessibilityId(kc, "JuxuKeyCanvas");
+        msgSendVoid1Bool(eg, objcSel("setTranslatesAutoresizingMaskIntoConstraints:"), false);
+
+        setViewHidden(eg, true);
+        setViewHidden(sb, true);
+        setViewHidden(cv, true);
+
+        msgSendVoid1Ptr(inputView, objcSel("addSubview:"), gb);
+        msgSendVoid1Ptr(inputView, objcSel("addSubview:"), kc);
+        msgSendVoid1Ptr(inputView, objcSel("addSubview:"), sb);
+        msgSendVoid1Ptr(inputView, objcSel("addSubview:"), rv);
+        msgSendVoid1Ptr(inputView, objcSel("addSubview:"), eg);
+        msgSendVoid1Ptr(inputView, objcSel("addSubview:"), cv);
+        msgSendVoid1Ptr(inputView, objcSel("addSubview:"), av);
+        msgSendVoid0(gb, objcSel("release"));
+
+        let hc = msgSend1Float(msgSend0(inputView, objcSel("heightAnchor")), objcSel("constraintEqualToConstant:"), portraitTotalHeight());
+        msgSendVoid1F32(hc, objcSel("setPriority:"), floatToF32(999.0));
+        msgSendVoid1Bool(hc, objcSel("setActive:"), true);
+        cellSet(st.vcHeightConstraint, hc);
+
+        let rhc = msgSend1Float(msgSend0(rv, objcSel("heightAnchor")), objcSel("constraintEqualToConstant:"), candidateBarHeight());
+        msgSendVoid1Bool(rhc, objcSel("setActive:"), true);
+        cellSet(st.vcRibbonHeightConstraint, rhc);
+
+        let _ = pinAnchorEqual(msgSend0(gb, objcSel("topAnchor")), msgSend0(inputView, objcSel("topAnchor")));
+        let _ = pinAnchorEqual(msgSend0(gb, objcSel("leadingAnchor")), msgSend0(inputView, objcSel("leadingAnchor")));
+        let _ = pinAnchorEqual(msgSend0(gb, objcSel("trailingAnchor")), msgSend0(inputView, objcSel("trailingAnchor")));
+        let _ = pinAnchorEqual(msgSend0(gb, objcSel("bottomAnchor")), msgSend0(inputView, objcSel("bottomAnchor")));
+
+        let _ = pinAnchorEqual(msgSend0(rv, objcSel("topAnchor")), msgSend0(inputView, objcSel("topAnchor")));
+        let _ = pinAnchorEqual(msgSend0(rv, objcSel("leadingAnchor")), msgSend0(inputView, objcSel("leadingAnchor")));
+        let _ = pinAnchorEqual(msgSend0(rv, objcSel("trailingAnchor")), msgSend0(inputView, objcSel("trailingAnchor")));
+
+        let _ = pinAnchorEqual(msgSend0(kc, objcSel("topAnchor")), msgSend0(rv, objcSel("bottomAnchor")));
+        let _ = pinAnchorEqual(msgSend0(kc, objcSel("leadingAnchor")), msgSend0(inputView, objcSel("leadingAnchor")));
+        let _ = pinAnchorEqual(msgSend0(kc, objcSel("trailingAnchor")), msgSend0(inputView, objcSel("trailingAnchor")));
+        let _ = pinAnchorEqual(msgSend0(kc, objcSel("bottomAnchor")), msgSend0(inputView, objcSel("bottomAnchor")));
+
+        let _ = pinAnchorEqual(msgSend0(eg, objcSel("topAnchor")), msgSend0(rv, objcSel("bottomAnchor")));
+        let _ = pinAnchorEqual(msgSend0(eg, objcSel("leadingAnchor")), msgSend0(inputView, objcSel("leadingAnchor")));
+        let _ = pinAnchorEqual(msgSend0(eg, objcSel("trailingAnchor")), msgSend0(inputView, objcSel("trailingAnchor")));
+        let _ = pinAnchorEqual(msgSend0(eg, objcSel("bottomAnchor")), msgSend0(inputView, objcSel("bottomAnchor")));
+
+        wireControllerCallbacks(st);
+        syncProxyTraits(st)
+    } else ()
+}
+
+// ============================================================================
+// Objective-C Method Entrypoints (`KeyboardViewController`)
+// ============================================================================
+
+def kbViewDidLoad(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIInputViewController", cmd);
+    let st = getOrInitVCState(self);
+    setupViews(st);
+
+    let ncCls = objcClass("NSNotificationCenter");
+    let notifName = uiPasteboardChangedNotificationName();
+    if (!ptrIsNull(ncCls) && !ptrIsNull(notifName)) {
+        let nc = msgSend0(ncCls, objcSel("defaultCenter"));
+        if (!ptrIsNull(nc)) {
+            msgSendVoid1Ptr1Sel2Ptr(
+                nc,
+                objcSel("addObserver:selector:name:object:"),
+                self,
+                objcSel("handlePasteboardChanged:"),
+                notifName,
+                ptrNull()
+            )
+        } else ()
+    } else ();
+
+    registerUserInterfaceStyleObserver(self, () -> syncProxyTraits(st));
+    syncEngineToUI(st)
+}
+
+def kbPreferredScreenEdges(_self: Ptr, _cmd: Ptr): Int64 =
+    intToI64(15) // UIRectEdgeAll == 15
+
+def kbDidReceiveMemoryWarning(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIInputViewController", cmd);
+    let st = getOrInitVCState(self);
+    lineClearUndoRemoveAll(st.vcLineClearUndo);
+    if (isViewHidden(st.vcExpandedGrid.egView)) {
+        expandedCandidateClearAndTrim(st.vcExpandedGrid, 0)
+    } else {
+        expandedCandidateTrimPool(st.vcExpandedGrid, 48)
+    };
+    keyCanvasClearCaches(st.vcKeyCanvas);
+    bridgeHandleMemoryWarning(st.vcBridge)
+}
+
+def kbViewWillAppear(self: Ptr, cmd: Ptr, animated: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIInputViewController", cmd, animated);
+    let st = getOrInitVCState(self);
+    cellSet(st.vcIsPresentingOrVisible, true);
+    feedbackPrepare(st.vcFeedback);
+    let proxy = vcProxy(st);
+    cellSet(st.vcBridge.suppressEvalLogging, proxyIsSensitiveEval(proxy));
+    if (strLen(cellGet(st.vcBridge.jsState).asPreedit) > 0 && strLen(markedSessionMarkedCode(st.vcInlineSession)) == 0) {
+        bridgeAbandonComposition(st.vcBridge, nowMs())
+    } else ();
+    bridgeReloadConfigAndUserOnAppear(st.vcBridge, () -> syncEngineToUI(st));
+    punctuationTrackerReset(st.vcPairingTracker);
+    bridgeResetQuoteState(st.vcBridge);
+    cellSet(st.vcLastKnownDocId, proxyDocumentIdentifier(proxy));
+    cellSet(st.vcLastClipboardPrefersOTP, proxyIsOneTimeCode(proxy));
+    markedSessionResetForAppearance(st.vcInlineSession);
+    scheduleAppearanceOrphanedSweepIfNeeded(st);
+    clipboardGateResetForAppearance(st.vcClipboardGate);
+    cellSet(st.vcActiveClipboard, None);
+    applyDesiredTrayDimensions(st);
+    syncContextFromProxyIfIdle(st);
+    syncEngineToUI(st)
+}
+
+def kbViewDidAppear(self: Ptr, cmd: Ptr, animated: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIInputViewController", cmd, animated);
+    let st = getOrInitVCState(self);
+    cellSet(st.vcHasAppeared, true);
+    cellSet(st.vcIsPresentingOrVisible, true);
+    applyDesiredTrayDimensions(st);
+    refreshKeyboardLayout(st);
+    disableContainerTouchDelays(vcInputView(st));
+    if (markedSessionNeedsAppearanceSweep(st.vcInlineSession) && !cellGet(st.vcAppearanceSweepArmed)) {
+        sweepOrphanedMarkedTextNow(st)
+    } else {
+        scheduleNilDocOrphanedSweepIfNeeded(st)
+    };
+    dispatchMainAsync(() -> {
+        if (cellGet(st.vcHasAppeared)) {
+            refreshClipboardSuggestionAsync(st)
+        } else ()
+    })
+}
+
+def kbUpdateViewConstraints(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIInputViewController", cmd);
+    let st = getOrInitVCState(self);
+    applyDesiredTrayDimensions(st)
+}
+
+def kbViewWillDisappear(self: Ptr, cmd: Ptr, animated: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIInputViewController", cmd, animated);
+    let st = getOrInitVCState(self);
+    cellSet(st.vcClearLineGen, cellGet(st.vcClearLineGen) + intToI64(1));
+    lineClearUndoRemoveAll(st.vcLineClearUndo);
+    cellSet(st.vcBackspaceTapDeferred, false);
+    cellSet(st.vcHasAppeared, false);
+    cellSet(st.vcIsPresentingOrVisible, false);
+    keyCanvasResetAllTouches(st.vcKeyCanvas);
+    cellSet(st.vcSaveUserDataGen, cellGet(st.vcSaveUserDataGen) + intToI64(1));
+    abandonCompositionForExternalFocusOrEdit(st, false, true);
+    bridgeFlushUserDataAsync(st.vcBridge);
+    bridgeFlushPendingPersistence(st.vcBridge);
+    feedbackSuspend(st.vcFeedback)
+}
+
+def kbViewDidLayoutSubviews(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIInputViewController", cmd);
+    let st = getOrInitVCState(self);
+    applyDesiredTrayDimensions(st);
+    refreshKeyboardLayout(st)
+}
+
+def kbTraitCollectionDidChange(self: Ptr, cmd: Ptr, prevTraits: Ptr): Void = {
+    objcSendSuperVoid1Ptr(self, "UIInputViewController", cmd, prevTraits);
+    let st = getOrInitVCState(self);
+    syncProxyTraits(st)
+}
+
+def kbTextWillChange(self: Ptr, cmd: Ptr, textInput: Ptr): Void = {
+    objcSendSuperVoid1Ptr(self, "UIInputViewController", cmd, textInput);
+    let st = getOrInitVCState(self);
+    let elapsed = systemUptimeSeconds() - cellGet(st.vcLastKeyboardEditUptime);
+    if (elapsed > 0.08) {
+        punctuationTrackerReset(st.vcPairingTracker);
+        bridgeResetQuoteState(st.vcBridge)
+    } else ()
+}
+
+def kbSelectionDidChange(self: Ptr, cmd: Ptr, textInput: Ptr): Void = {
+    objcSendSuperVoid1Ptr(self, "UIInputViewController", cmd, textInput);
+    let st = getOrInitVCState(self);
+    let isComposing =
+        strLen(cellGet(st.vcBridge.jsState).asPreedit) > 0
+            || strLen(markedSessionMarkedCode(st.vcInlineSession)) > 0;
+    let elapsed = systemUptimeSeconds() - cellGet(st.vcLastKeyboardEditUptime);
+    let proxy = vcProxy(st);
+    if (!isComposing) {
+        punctuationTrackerPrune(st.vcPairingTracker, proxyAfterString(proxy));
+        if (elapsed > 0.08) {
+            punctuationTrackerReset(st.vcPairingTracker);
+            bridgeResetQuoteState(st.vcBridge)
+        } else ();
+        let beforeOpt = if (ptrIsNull(proxy)) None else nsStrPtrToOpt(msgSend0(proxy, objcSel("documentContextBeforeInput")));
+        markedSessionReconcileExternalContext(st.vcInlineSession, beforeOpt);
+        syncContextFromProxyIfIdle(st);
+        syncEngineToUI(st)
+    } else if (elapsed > 0.08) {
+        abandonCompositionForExternalFocusOrEdit(st, true, false);
+        syncContextFromProxyIfIdle(st);
+        syncEngineToUI(st)
+    } else ()
+}
+
+def kbTextDidChange(self: Ptr, cmd: Ptr, textInput: Ptr): Void = {
+    objcSendSuperVoid1Ptr(self, "UIInputViewController", cmd, textInput);
+    let st = getOrInitVCState(self);
+    let proxy = vcProxy(st);
+    let docIdOpt = proxyDocumentIdentifier(proxy);
+    let isComposing =
+        strLen(cellGet(st.vcBridge.jsState).asPreedit) > 0
+            || strLen(markedSessionMarkedCode(st.vcInlineSession)) > 0;
+
+    let docChanged = !optStrEq(docIdOpt, cellGet(st.vcLastKnownDocId));
+    if (docChanged) {
+        cellSet(st.vcLastKnownDocId, docIdOpt);
+        punctuationTrackerReset(st.vcPairingTracker);
+        bridgeResetQuoteState(st.vcBridge);
+        match docIdOpt {
+            Some(_) -> clipboardGateResetForAppearance(st.vcClipboardGate),
+            None -> (),
+        }
+    } else ();
+
+    if (isComposing) {
+        match docIdOpt {
+            None -> {
+                abandonCompositionForExternalFocusOrEdit(st, false, false);
+                syncEngineToUI(st)
+            },
+            Some(docId) -> match cellGet(st.vcComposingDocId) {
+                Some(compDoc) if (docId != compDoc) -> {
+                    abandonCompositionForExternalFocusOrEdit(st, false, false);
+                    syncEngineToUI(st)
+                },
+                _ -> {
+                    match cellGet(st.vcComposingDocId) {
+                        None -> cellSet(st.vcComposingDocId, Some(docId)),
+                        Some(_) -> (),
+                    };
+                    let elapsed = systemUptimeSeconds() - cellGet(st.vcLastKeyboardEditUptime);
+                    if (elapsed > 0.12) {
+                        match markedSessionCompositionBaseContext(st.vcInlineSession) {
+                            Some(base) -> {
+                                let currentBefore = proxyBeforeString(proxy);
+                                let mismatch =
+                                    (strLen(base) > 0 && strLen(currentBefore) == 0)
+                                        || (strLen(currentBefore) > 0
+                                            && !strEndsWith(base, currentBefore)
+                                            && !strEndsWith(currentBefore, base));
+                                if (mismatch) {
+                                    abandonCompositionForExternalFocusOrEdit(st, true, false);
+                                    syncEngineToUI(st)
+                                } else ()
+                            },
+                            None -> (),
+                        }
+                    } else ()
+                },
+            },
+        }
+    } else ();
+
+    match docIdOpt {
+        Some(_) -> cellSet(st.vcNilDocSweepGen, cellGet(st.vcNilDocSweepGen) + intToI64(1)),
+        None -> scheduleNilDocOrphanedSweepIfNeeded(st),
+    };
+
+    cellSet(st.vcBridge.suppressEvalLogging, proxyIsSensitiveEval(proxy));
+    let beforeOpt = if (ptrIsNull(proxy)) None else nsStrPtrToOpt(msgSend0(proxy, objcSel("documentContextBeforeInput")));
+    markedSessionReconcileExternalContext(st.vcInlineSession, beforeOpt);
+    syncContextFromProxyIfIdle(st);
+
+    let prefersOTP = proxyIsOneTimeCode(proxy);
+    let otpChanged = prefersOTP != cellGet(st.vcLastClipboardPrefersOTP);
+    cellSet(st.vcLastClipboardPrefersOTP, prefersOTP);
+    if (cellGet(st.vcHasAppeared) && (docChanged || otpChanged)) {
+        refreshClipboardSuggestionAsync(st)
+    } else ();
+    syncProxyTraits(st)
+}
+
+def kbHandlePasteboardChanged(self: Ptr, _cmd: Ptr, _notif: Ptr): Void = {
+    let st = getOrInitVCState(self);
+    if (cellGet(st.vcHasAppeared)) {
+        refreshClipboardSuggestionAsync(st)
+    } else ()
+}
+
+def kbDealloc(self: Ptr, cmd: Ptr): Void = {
+    let existing = objcGetAssocHandle(self, vcAssocKey());
+    if (existing != intToI64(0)) {
+        let st: KeyboardVCState = gcHandleGet(existing);
+        cellSet(st.vcSaveUserDataGen, cellGet(st.vcSaveUserDataGen) + intToI64(1));
+        cellSet(st.vcBackspaceRepeatGen, cellGet(st.vcBackspaceRepeatGen) + intToI64(1));
+        cellSet(st.vcNilDocSweepGen, cellGet(st.vcNilDocSweepGen) + intToI64(1));
+        cellSet(st.vcAppearanceSweepGen, cellGet(st.vcAppearanceSweepGen) + intToI64(1));
+        cellSet(st.vcClearLineGen, cellGet(st.vcClearLineGen) + intToI64(1));
+        feedbackSuspend(st.vcFeedback)
+    } else ();
+    let ncCls = objcClass("NSNotificationCenter");
+    if (!ptrIsNull(ncCls)) {
+        let nc = msgSend0(ncCls, objcSel("defaultCenter"));
+        if (!ptrIsNull(nc)) {
+            msgSendVoid1Ptr(nc, objcSel("removeObserver:"), self)
+        } else ()
+    } else ();
+    objcSendSuperVoid0(self, "UIInputViewController", cmd)
+}
 
 extern init(102) def registerKeyboardViewControllerClass(): Void = {
     let cls = objcAllocateClass("UIInputViewController", "KeyboardViewController");
     if (!ptrIsNull(cls)) {
         let _ = objcAddMethod(cls, "viewDidLoad", cFnPtr(kbViewDidLoad), "v@:");
-        let _ = objcAddMethod(cls, "viewDidLayoutSubviews", cFnPtr(kbViewDidLayoutSubviews), "v@:");
-        let _ = objcAddMethod(cls, "textWillChange:", cFnPtr(kbTextWillChange), "v@:@");
-        let _ = objcAddMethod(cls, "textDidChange:", cFnPtr(kbTextDidChange), "v@:@");
+        let _ = objcAddMethod(cls, "preferredScreenEdgesDeferringSystemGestures", cFnPtr(kbPreferredScreenEdges), "Q@:");
         let _ = objcAddMethod(cls, "didReceiveMemoryWarning", cFnPtr(kbDidReceiveMemoryWarning), "v@:");
+        let _ = objcAddMethod(cls, "viewWillAppear:", cFnPtr(kbViewWillAppear), "v@:B");
+        let _ = objcAddMethod(cls, "viewDidAppear:", cFnPtr(kbViewDidAppear), "v@:B");
+        let _ = objcAddMethod(cls, "updateViewConstraints", cFnPtr(kbUpdateViewConstraints), "v@:");
+        let _ = objcAddMethod(cls, "viewWillDisappear:", cFnPtr(kbViewWillDisappear), "v@:B");
+        let _ = objcAddMethod(cls, "viewDidLayoutSubviews", cFnPtr(kbViewDidLayoutSubviews), "v@:");
+        let _ = objcAddMethod(cls, "traitCollectionDidChange:", cFnPtr(kbTraitCollectionDidChange), "v@:@");
+        let _ = objcAddMethod(cls, "textWillChange:", cFnPtr(kbTextWillChange), "v@:@");
+        let _ = objcAddMethod(cls, "selectionDidChange:", cFnPtr(kbSelectionDidChange), "v@:@");
+        let _ = objcAddMethod(cls, "textDidChange:", cFnPtr(kbTextDidChange), "v@:@");
+        let _ = objcAddMethod(cls, "handlePasteboardChanged:", cFnPtr(kbHandlePasteboardChanged), "v@:@");
+        let _ = objcAddMethod(cls, "dealloc", cFnPtr(kbDealloc), "v@:");
         objcRegisterClass(cls)
     } else ()
 }

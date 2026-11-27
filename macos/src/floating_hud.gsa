@@ -1,106 +1,485 @@
-/// Liquid Glass floating mode HUD toast (`中` / `英` / schema switch) with 0.85s auto-hide timer.
+/// 1:1 port of `Sources/FloatingHUDPanel.swift` (193 lines) + `ModeIndicatorPanelController`
+/// (`Sources/CandidatePanel.swift` lines 634-719):
+/// - `FloatingHUDPanel` (`borderless | nonactivatingPanel`, `.floatingWindow + 2`, `animationBehavior = .none`,
+///   `hidesOnDeactivate = false`, `worksWhenModal = true`, `collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]`)
+/// - `HUDBackdropView` (`NSGlassEffectView` Liquid Glass on macOS 26+ with `NSVisualEffectView` `.menu` + 0.5pt hairline border fallback)
+/// - Caret positioning & screen clamping (`visibleScreenFrameForCaret`, `floatingPanelResolvedOrigin`)
+/// - Zero-animation `CATransaction.setDisableActions(true)` + `NSAnimationContext` presentation
+/// - `ModeIndicatorPanelController` (`34x30` pill, `10pt` radius, `14pt` PingFangSC-Medium, `0.85s` auto-hide).
 
+use std.option.{Option, Some, None}
 use objc.{
     objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
-    msgSend0, msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
+    objcSetAssocHandle, objcGetAssocHandle,
+    msgSend0, msgSendBool0, msgSendI64_0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
 }
 use juxu_shared.{
-    CGRect, cgRect, nsStr, msgSendRect0, msgSendInitFrame,
-    msgSend1Rect1U64_1I64_1Bool, msgSendVoid1Rect, objcAllocInitFrame,
+    CGPoint, CGSize, CGRect, cgPoint, cgSize, cgRect,
+    rectContainsPoint, rectIntersectsRect,
+    msgSendRect0, msgSendSize0, msgSendInitFrame, msgSend1Rect1U64_1I64_1Bool, msgSend1I64_1Ptr,
+    msgSendVoid1Rect, objcSendSuperVoid0, dispatchMainAfterMs,
+}
+use macos_ffi.{
+    floatingWindowBaseLevel, objcSendSuperVoid1Size, layerSetContinuousCorner, layerSetBorderRgba,
+    msgSendSetFrameDisplayAnimate, msgSendDrawAtPoint,
+    roundFloat, maxFloat,
+    fontWeightMedium, nsFontNamedOrSystem,
+    nsColorClear, nsColorLabel, makeTextAttrs, makeAttrString,
+    viewIsDarkAppearance, mouseScreenLocation,
 }
 
-extern "objc_msgSend" def msgSendHudFont(cls: Ptr, sel: Ptr, size: Float, weight: Float): Ptr
-extern "objc_msgSend" def msgSendHudTimer(
-    cls: Ptr, sel: Ptr, interval: Float, target: Ptr, action: Ptr, userInfo: Ptr, repeats: Bool
-): Ptr
+// ============================================================================
+// FloatingHUDPanel (`FloatingHUDPanel.swift` lines 8-110)
+// ============================================================================
 
-def gHudPanel: Cell Ptr = cellNew(ptrNull())
-def gHudLabel: Cell Ptr = cellNew(ptrNull())
-def gHudTimer: Cell Ptr = cellNew(ptrNull())
-def gHudTarget: Cell Ptr = cellNew(ptrNull())
+pub def floatingPanelBaseWindowLevel(): Int64 =
+    floatingWindowBaseLevel()
 
-def onHudAutoHide(_self: Ptr, _cmd: Ptr, _timer: Ptr): Void =
-    hudHide()
+pub def floatingPanelCreate(
+    contentRect: CGRect,
+    hasShadow: Bool,
+    ignoresMouseEvents: Bool
+): Ptr = {
+    let alloc = msgSend0(objcClass("NSPanel"), objcSel("alloc"));
+    // styleMask: [.borderless (0), .nonactivatingPanel (128)] = 128; backing: .buffered = 2; defer: true
+    let panel = msgSend1Rect1U64_1I64_1Bool(
+        alloc,
+        objcSel("initWithContentRect:styleMask:backing:defer:"),
+        contentRect,
+        intToI64(128),
+        intToI64(2),
+        true
+    );
+    // NSWindowAnimationBehaviorNone = 2
+    msgSendVoid1I64(panel, objcSel("setAnimationBehavior:"), intToI64(2));
+    msgSendVoid1I64(panel, objcSel("setLevel:"), floatingPanelBaseWindowLevel());
+    msgSendVoid1Bool(panel, objcSel("setOpaque:"), false);
+    msgSendVoid1Ptr(panel, objcSel("setBackgroundColor:"), nsColorClear());
+    msgSendVoid1Bool(panel, objcSel("setHasShadow:"), hasShadow);
+    msgSendVoid1Bool(panel, objcSel("setMovable:"), false);
+    msgSendVoid1Bool(panel, objcSel("setIgnoresMouseEvents:"), ignoresMouseEvents);
+    msgSendVoid1Bool(panel, objcSel("setHidesOnDeactivate:"), false);
+    msgSendVoid1Bool(panel, objcSel("setWorksWhenModal:"), true);
+    // [.canJoinAllSpaces (1), .transient (8), .ignoresCycle (64), .fullScreenAuxiliary (256)] = 329
+    msgSendVoid1I64(panel, objcSel("setCollectionBehavior:"), intToI64(329));
+    panel
+}
 
-extern init(103) def registerHudTargetClass(): Void = {
-    let cls = objcAllocateClass("NSObject", "JuxuHudTimerTarget");
-    if (!ptrIsNull(cls)) {
-        let _ = objcAddMethod(cls, "onHudAutoHide:", cFnPtr(onHudAutoHide), "v@:@");
-        objcRegisterClass(cls)
+/// Resolve the `visibleFrame` of the screen containing `caretRect` (`FloatingHUDPanel.visibleScreenFrame`).
+pub def visibleScreenFrameForCaret(caretRect: CGRect): CGRect = {
+    let scCls = objcClass("NSScreen");
+    let fallback = cgRect(0.0, 0.0, 1440.0, 900.0);
+    if (ptrIsNull(scCls)) fallback
+    else {
+        let screens = msgSend0(scCls, objcSel("screens"));
+        let targetScreen = cellNew(ptrNull());
+        if (!ptrIsNull(screens)) {
+            let n = i64ToInt(msgSendI64_0(screens, objcSel("count")));
+            let i = cellNew(0);
+            while (cellGet(i) < n && ptrIsNull(cellGet(targetScreen))) {
+                let sc = msgSend1I64_1Ptr(screens, objcSel("objectAtIndex:"), intToI64(cellGet(i)), ptrNull());
+                if (!ptrIsNull(sc)) {
+                    let f = msgSendRect0(sc, objcSel("frame"));
+                    if (rectIntersectsRect(f, caretRect) || rectContainsPoint(f, caretRect.origin)) {
+                        cellSet(targetScreen, sc)
+                    } else ()
+                } else ();
+                cellSet(i, cellGet(i) + 1)
+            }
+        } else ();
+
+        if (ptrIsNull(cellGet(targetScreen))) {
+            let mainSc = msgSend0(scCls, objcSel("mainScreen"));
+            if (!ptrIsNull(mainSc)) {
+                cellSet(targetScreen, mainSc)
+            } else if (!ptrIsNull(screens) && msgSendI64_0(screens, objcSel("count")) > intToI64(0)) {
+                cellSet(targetScreen, msgSend1I64_1Ptr(screens, objcSel("objectAtIndex:"), intToI64(0), ptrNull()))
+            } else ()
+        } else ();
+
+        let chosen = cellGet(targetScreen);
+        if (ptrIsNull(chosen)) fallback
+        else msgSendRect0(chosen, objcSel("visibleFrame"))
+    }
+}
+
+/// Compute clamped & flipped panel origin relative to `caretRect` (`FloatingHUDPanel.resolvedOrigin`).
+pub def floatingPanelResolvedOrigin(
+    size: CGSize,
+    caretRect: CGRect,
+    visibleFrameOpt: Option CGRect,
+    verticalGap: Float,
+    minBottomMargin: Float,
+    horizontalMargin: Float
+): CGPoint = {
+    let visible = match visibleFrameOpt {
+        Some(v) -> v,
+        None -> visibleScreenFrameForCaret(caretRect),
+    };
+    let originX0 = roundFloat(caretRect.origin.x);
+    let originY0 = roundFloat(caretRect.origin.y - size.height - verticalGap);
+
+    let originY =
+        if (originY0 < visible.origin.y + minBottomMargin) {
+            roundFloat(caretRect.origin.y + caretRect.size.height + verticalGap)
+        } else originY0;
+
+    let visMaxX = visible.origin.x + visible.size.width;
+    let originX1 =
+        if (originX0 + size.width > visMaxX - horizontalMargin) {
+            maxFloat(
+                visible.origin.x + horizontalMargin,
+                roundFloat(visMaxX - size.width - horizontalMargin)
+            )
+        } else originX0;
+
+    let originX =
+        if (originX1 < visible.origin.x + horizontalMargin) {
+            roundFloat(visible.origin.x + horizontalMargin)
+        } else originX1;
+
+    cgPoint(originX, originY)
+}
+
+/// Raise window level above `clientWindowLevel + 1` (minimum `baseWindowLevel`).
+pub def floatingPanelUpdateLevel(panel: Ptr, clientWindowLevelOpt: Option Int64): Void =
+    if (!ptrIsNull(panel)) {
+        let baseLvl = floatingPanelBaseWindowLevel();
+        let targetLvl = match clientWindowLevelOpt {
+            Some(cLvl) -> {
+                let raised = cLvl + intToI64(1);
+                if (raised > baseLvl) raised else baseLvl
+            },
+            None -> baseLvl,
+        };
+        if (msgSendI64_0(panel, objcSel("level")) != targetLvl) {
+            msgSendVoid1I64(panel, objcSel("setLevel:"), targetLvl)
+        } else ()
+    } else ()
+
+/// Present/reframe `panel` with zero implicit AppKit or CoreAnimation animation (`presentWithoutAnimation`).
+pub def floatingPanelPresentWithoutAnimation(
+    panel: Ptr,
+    targetFrame: CGRect,
+    prepareContent: () -> Void
+): Void =
+    if (!ptrIsNull(panel)) {
+        let animCls = objcClass("NSAnimationContext");
+        let caCls = objcClass("CATransaction");
+        msgSendVoid0(animCls, objcSel("beginGrouping"));
+        let curCtx = msgSend0(animCls, objcSel("currentContext"));
+        if (!ptrIsNull(curCtx)) {
+            msgSendVoid1Float(curCtx, objcSel("setDuration:"), 0.0)
+        } else ();
+        msgSendVoid0(caCls, objcSel("begin"));
+        msgSendVoid1Bool(caCls, objcSel("setDisableActions:"), true);
+
+        let isVis = msgSendBool0(panel, objcSel("isVisible"));
+        let curFrame = msgSendRect0(panel, objcSel("frame"));
+        let needsShadowRefresh = !isVis
+            || curFrame.size.width != targetFrame.size.width
+            || curFrame.size.height != targetFrame.size.height;
+
+        msgSendSetFrameDisplayAnimate(
+            panel,
+            objcSel("setFrame:display:animate:"),
+            targetFrame,
+            false,
+            false
+        );
+        prepareContent();
+        if (needsShadowRefresh) {
+            msgSendVoid0(panel, objcSel("invalidateShadow"))
+        } else ();
+        if (!isVis) {
+            msgSendVoid1Ptr(panel, objcSel("orderFrontRegardless"), ptrNull())
+        } else ();
+
+        msgSendVoid0(caCls, objcSel("commit"));
+        msgSendVoid0(animCls, objcSel("endGrouping"))
+    } else ()
+
+/// Hide `panel` immediately with zero implicit fade animation (`hideWithoutAnimation`).
+pub def floatingPanelHideWithoutAnimation(panel: Ptr): Void =
+    if (!ptrIsNull(panel) && msgSendBool0(panel, objcSel("isVisible"))) {
+        let animCls = objcClass("NSAnimationContext");
+        let caCls = objcClass("CATransaction");
+        msgSendVoid0(animCls, objcSel("beginGrouping"));
+        let curCtx = msgSend0(animCls, objcSel("currentContext"));
+        if (!ptrIsNull(curCtx)) {
+            msgSendVoid1Float(curCtx, objcSel("setDuration:"), 0.0)
+        } else ();
+        msgSendVoid0(caCls, objcSel("begin"));
+        msgSendVoid1Bool(caCls, objcSel("setDisableActions:"), true);
+        msgSendVoid1Ptr(panel, objcSel("orderOut:"), ptrNull());
+        msgSendVoid0(caCls, objcSel("commit"));
+        msgSendVoid0(animCls, objcSel("endGrouping"))
+    } else ()
+
+// ============================================================================
+// HUDBackdropView (`FloatingHUDPanel.swift` lines 115-193)
+// ============================================================================
+
+pub data HudBackdropState {
+    hbContentContainer: Ptr,
+    hbBackdrop: Ptr,
+    hbUsesGlass: Bool,
+    hbCornerRadius: Cell Float,
+    hbShowsHairlineBorder: Cell Bool,
+}
+
+def gHudBackdropKey: Cell Ptr = cellNew(ptrNull())
+
+def hudBackdropAssocKey(): Ptr = {
+    let k = cellGet(gHudBackdropKey);
+    if (!ptrIsNull(k)) k
+    else {
+        let nk = ptrAllocBytes(8);
+        cellSet(gHudBackdropKey, nk);
+        nk
+    }
+}
+
+def applyHudBackdropBorder(view: Ptr, st: HudBackdropState): Void =
+    if (!st.hbUsesGlass) {
+        let layer = msgSend0(st.hbBackdrop, objcSel("layer"));
+        if (!ptrIsNull(layer)) {
+            if (!cellGet(st.hbShowsHairlineBorder)) {
+                layerSetBorderRgba(layer, 0.0, 0.0, 0.0, 0.0, 0.0)
+            } else {
+                let isDark = viewIsDarkAppearance(view);
+                if (isDark) {
+                    layerSetBorderRgba(layer, 0.5, 1.0, 1.0, 1.0, 0.16)
+                } else {
+                    layerSetBorderRgba(layer, 0.5, 0.0, 0.0, 0.0, 0.11)
+                }
+            }
+        } else ()
+    } else ()
+
+def applyHudBackdropCornerRadius(st: HudBackdropState): Void = {
+    let r = cellGet(st.hbCornerRadius);
+    if (st.hbUsesGlass) {
+        msgSendVoid1Float(st.hbBackdrop, objcSel("setCornerRadius:"), r)
+    } else {
+        let layer = msgSend0(st.hbBackdrop, objcSel("layer"));
+        if (!ptrIsNull(layer)) {
+            layerSetContinuousCorner(layer, r, true)
+        } else ()
+    }
+}
+
+def syncHudBackdropSubframes(view: Ptr, st: HudBackdropState): Void = {
+    let b = msgSendRect0(view, objcSel("bounds"));
+    let full = cgRect(0.0, 0.0, b.size.width, b.size.height);
+    msgSendVoid1Rect(st.hbBackdrop, objcSel("setFrame:"), full);
+    msgSendVoid1Rect(st.hbContentContainer, objcSel("setFrame:"), full)
+}
+
+def hudBackdropLayout(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "NSView", cmd);
+    let h = objcGetAssocHandle(self, hudBackdropAssocKey());
+    if (h != intToI64(0)) {
+        let st: HudBackdropState = gcHandleGet(h);
+        syncHudBackdropSubframes(self, st)
     } else ()
 }
 
-pub def hudShow(text: String): Void = {
-    let oldT = cellGet(gHudTimer);
-    if (!ptrIsNull(oldT)) {
-        msgSendVoid0(oldT, objcSel("invalidate"));
-        cellSet(gHudTimer, ptrNull())
+def hudBackdropResizeSubviews(self: Ptr, cmd: Ptr, oldSz: CGSize): Void = {
+    objcSendSuperVoid1Size(self, "NSView", cmd, oldSz);
+    let h = objcGetAssocHandle(self, hudBackdropAssocKey());
+    if (h != intToI64(0)) {
+        let st: HudBackdropState = gcHandleGet(h);
+        syncHudBackdropSubframes(self, st)
+    } else ()
+}
+
+def hudBackdropDidChangeEffectiveAppearance(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "NSView", cmd);
+    let h = objcGetAssocHandle(self, hudBackdropAssocKey());
+    if (h != intToI64(0)) {
+        let st: HudBackdropState = gcHandleGet(h);
+        applyHudBackdropBorder(self, st)
+    } else ()
+}
+
+/// Create a `HUDBackdropView` (`blendingMode`: `0` = `.behindWindow`, `1` = `.withinWindow`);
+/// returns `(hudBackdropView, contentContainer)`.
+pub def hudBackdropCreate(
+    frameRect: CGRect,
+    cornerRadius: Float,
+    blendingMode: Int64,
+    showsHairlineBorder: Bool
+): (Ptr, Ptr) = {
+    let zeroBounds = cgRect(0.0, 0.0, frameRect.size.width, frameRect.size.height);
+    let container = msgSendInitFrame(msgSend0(objcClass("NSView"), objcSel("alloc")), objcSel("initWithFrame:"), zeroBounds);
+    // autoresizingMask: [.width (2), .height (16)] = 18
+    msgSendVoid1I64(container, objcSel("setAutoresizingMask:"), intToI64(18));
+
+    let glassCls = objcClass("NSGlassEffectView");
+    let (backdrop, usesGlass) =
+        if (!ptrIsNull(glassCls)) {
+            let g = msgSendInitFrame(msgSend0(glassCls, objcSel("alloc")), objcSel("initWithFrame:"), zeroBounds);
+            msgSendVoid1Ptr(g, objcSel("setContentView:"), container);
+            (g, true)
+        } else {
+            let eff = msgSendInitFrame(msgSend0(objcClass("NSVisualEffectView"), objcSel("alloc")), objcSel("initWithFrame:"), zeroBounds);
+            // material: .menu = 5; state: .active = 1
+            msgSendVoid1I64(eff, objcSel("setMaterial:"), intToI64(5));
+            msgSendVoid1I64(eff, objcSel("setBlendingMode:"), blendingMode);
+            msgSendVoid1I64(eff, objcSel("setState:"), intToI64(1));
+            msgSendVoid1Bool(eff, objcSel("setWantsLayer:"), true);
+            msgSendVoid1Ptr(eff, objcSel("addSubview:"), container);
+            (eff, false)
+        };
+
+    let wrapper = msgSendInitFrame(
+        msgSend0(objcClass("JuxuHudBackdropView"), objcSel("alloc")),
+        objcSel("initWithFrame:"),
+        frameRect
+    );
+    msgSendVoid1Bool(wrapper, objcSel("setWantsLayer:"), true);
+    msgSendVoid1I64(backdrop, objcSel("setAutoresizingMask:"), intToI64(18));
+    msgSendVoid1Ptr(wrapper, objcSel("addSubview:"), backdrop);
+
+    let st = HudBackdropState {
+        hbContentContainer: container,
+        hbBackdrop: backdrop,
+        hbUsesGlass: usesGlass,
+        hbCornerRadius: cellNew(cornerRadius),
+        hbShowsHairlineBorder: cellNew(showsHairlineBorder),
+    };
+    objcSetAssocHandle(wrapper, hudBackdropAssocKey(), gcHandleNew(st));
+    applyHudBackdropCornerRadius(st);
+    applyHudBackdropBorder(wrapper, st);
+    (wrapper, container)
+}
+
+// ============================================================================
+// ModeIndicatorContentView & ModeIndicatorPanelController (`CandidatePanel.swift` lines 634-719)
+// ============================================================================
+
+def modeIndicatorCornerRadius(): Float = 10.0
+def modeIndicatorPanelSize(): CGSize = cgSize(34.0, 30.0)
+def modeIndicatorAutoHideMs(): Int = 850
+
+def gModePanel: Cell Ptr = cellNew(ptrNull())
+def gModeView: Cell Ptr = cellNew(ptrNull())
+def gModeLabel: Cell String = cellNew("中")
+def gModeHideGen: Cell Int64 = cellNew(intToI64(0))
+
+def modeIndicatorIsFlipped(_self: Ptr, _cmd: Ptr): Bool = true
+
+def modeIndicatorDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let bounds = msgSendRect0(self, objcSel("bounds"));
+    let font = nsFontNamedOrSystem("PingFangSC-Medium", 14.0, fontWeightMedium());
+    let attrs = makeTextAttrs(font, nsColorLabel());
+    let attrStr = makeAttrString(cellGet(gModeLabel), attrs);
+    let textSz = msgSendSize0(attrStr, objcSel("size"));
+    let origin = cgPoint(
+        roundFloat((bounds.size.width - textSz.width) * 0.5),
+        roundFloat((bounds.size.height - textSz.height) * 0.5)
+    );
+    msgSendDrawAtPoint(attrStr, objcSel("drawAtPoint:"), origin)
+}
+
+extern init(103) def registerFloatingHudClasses(): Void = {
+    let bdCls = objcAllocateClass("NSView", "JuxuHudBackdropView");
+    if (!ptrIsNull(bdCls)) {
+        let _ = objcAddMethod(bdCls, "isFlipped", cFnPtr(modeIndicatorIsFlipped), "B@:");
+        let _ = objcAddMethod(bdCls, "layout", cFnPtr(hudBackdropLayout), "v@:");
+        let _ = objcAddMethod(bdCls, "resizeSubviewsWithOldSize:", cFnPtr(hudBackdropResizeSubviews), "v@:{CGSize=dd}");
+        let _ = objcAddMethod(
+            bdCls,
+            "viewDidChangeEffectiveAppearance",
+            cFnPtr(hudBackdropDidChangeEffectiveAppearance),
+            "v@:"
+        );
+        objcRegisterClass(bdCls)
     } else ();
 
-    let screen = msgSend0(objcClass("NSScreen"), objcSel("mainScreen"));
-    let vis = if (!ptrIsNull(screen)) msgSendRect0(screen, objcSel("visibleFrame"))
-              else cgRect(0.0, 0.0, 1440.0, 900.0);
-    let w = 84.0;
-    let h = 44.0;
-    let x = vis.origin.x + (vis.size.width - w) * 0.5;
-    let y = vis.origin.y + 110.0;
+    let miCls = objcAllocateClass("NSView", "JuxuModeIndicatorView");
+    if (!ptrIsNull(miCls)) {
+        let _ = objcAddMethod(miCls, "isFlipped", cFnPtr(modeIndicatorIsFlipped), "B@:");
+        let _ = objcAddMethod(miCls, "drawRect:", cFnPtr(modeIndicatorDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        objcRegisterClass(miCls)
+    } else ()
+}
 
-    let panel = if (!ptrIsNull(cellGet(gHudPanel))) cellGet(gHudPanel)
+def ensureModeIndicatorPanel(): (Ptr, Ptr) = {
+    let existing = cellGet(gModePanel);
+    if (!ptrIsNull(existing)) (existing, cellGet(gModeView))
     else {
-        let frame = cgRect(x, y, w, h);
-        let p = msgSend1Rect1U64_1I64_1Bool(
-            msgSend0(objcClass("NSPanel"), objcSel("alloc")),
-            objcSel("initWithContentRect:styleMask:backing:defer:"),
-            frame, intToI64(128), intToI64(2), true
+        let sz = modeIndicatorPanelSize();
+        let initRect = cgRect(0.0, 0.0, sz.width, sz.height);
+        let (effect, container) = hudBackdropCreate(initRect, modeIndicatorCornerRadius(), intToI64(0), true);
+        let content = msgSendInitFrame(
+            msgSend0(objcClass("JuxuModeIndicatorView"), objcSel("alloc")),
+            objcSel("initWithFrame:"),
+            cgRect(0.0, 0.0, sz.width, sz.height)
         );
-        msgSendVoid1I64(p, objcSel("setLevel:"), intToI64(6));
-        msgSendVoid1I64(p, objcSel("setAnimationBehavior:"), intToI64(2));
-        msgSendVoid1Bool(p, objcSel("setOpaque:"), false);
-        msgSendVoid1Bool(p, objcSel("setHasShadow:"), true);
-        msgSendVoid1Bool(p, objcSel("setIgnoresMouseEvents:"), true);
-        msgSendVoid1Ptr(p, objcSel("setBackgroundColor:"), msgSend0(objcClass("NSColor"), objcSel("clearColor")));
+        msgSendVoid1I64(content, objcSel("setAutoresizingMask:"), intToI64(18));
+        msgSendVoid1Ptr(container, objcSel("addSubview:"), content);
 
-        let lbl = objcAllocInitFrame("NSTextField", cgRect(6.0, 9.0, w - 12.0, 26.0));
-        msgSendVoid1Bool(lbl, objcSel("setBezeled:"), false);
-        msgSendVoid1Bool(lbl, objcSel("setDrawsBackground:"), false);
-        msgSendVoid1Bool(lbl, objcSel("setEditable:"), false);
-        msgSendVoid1Bool(lbl, objcSel("setSelectable:"), false);
-        msgSendVoid1I64(lbl, objcSel("setAlignment:"), intToI64(1));
-        msgSendVoid1Ptr(lbl, objcSel("setFont:"), msgSendHudFont(objcClass("NSFont"), objcSel("systemFontOfSize:weight:"), 18.0, 0.23));
-        msgSendVoid1Ptr(lbl, objcSel("setTextColor:"), msgSend0(objcClass("NSColor"), objcSel("labelColor")));
-
-        let glassCls = objcClass("NSGlassEffectView");
-        let bd = if (!ptrIsNull(glassCls)) {
-            let g = msgSendInitFrame(msgSend0(glassCls, objcSel("alloc")), objcSel("initWithFrame:"), cgRect(0.0, 0.0, w, h));
-            msgSendVoid1Float(g, objcSel("setCornerRadius:"), 14.0);
-            msgSendVoid1Ptr(g, objcSel("setContentView:"), lbl);
-            g
-        } else {
-            let v = msgSendInitFrame(msgSend0(objcClass("NSVisualEffectView"), objcSel("alloc")), objcSel("initWithFrame:"), cgRect(0.0, 0.0, w, h));
-            msgSendVoid1I64(v, objcSel("setMaterial:"), intToI64(5));
-            msgSendVoid1I64(v, objcSel("setState:"), intToI64(1));
-            msgSendVoid1Ptr(v, objcSel("addSubview:"), lbl);
-            v
-        };
-        msgSendVoid1Ptr(p, objcSel("setContentView:"), bd);
-        let tgt = msgSend0(msgSend0(objcClass("JuxuHudTimerTarget"), objcSel("alloc")), objcSel("init"));
-        cellSet(gHudTarget, tgt);
-        cellSet(gHudPanel, p);
-        cellSet(gHudLabel, lbl);
-        p
-    };
-    msgSendVoid1Rect(panel, objcSel("setFrame:display:"), cgRect(x, y, w, h));
-    msgSendVoid1Ptr(cellGet(gHudLabel), objcSel("setStringValue:"), nsStr(text));
-    msgSendVoid1Ptr(panel, objcSel("orderFrontRegardless"), ptrNull());
-    let timer = msgSendHudTimer(
-        objcClass("NSTimer"),
-        objcSel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
-        0.85, cellGet(gHudTarget), objcSel("onHudAutoHide:"), ptrNull(), false
-    );
-    cellSet(gHudTimer, timer)
+        let p = floatingPanelCreate(initRect, true, true);
+        msgSendVoid1Ptr(p, objcSel("setContentView:"), effect);
+        cellSet(gModePanel, p);
+        cellSet(gModeView, content);
+        (p, content)
+    }
 }
 
-pub def hudHide(): Void = {
-    let p = cellGet(gHudPanel);
-    if (!ptrIsNull(p)) msgSendVoid1Ptr(p, objcSel("orderOut:"), ptrNull()) else ()
+/// Show the mode indicator (`"中"` or `"英"`) anchored to `caretRect` and auto-hide after `0.85s`.
+pub def modeIndicatorShow(
+    asciiMode: Bool,
+    caretRect: CGRect,
+    clientWindowLevelOpt: Option Int64
+): Void = {
+    let text = if (asciiMode) "英" else "中";
+    modeIndicatorShowLabel(text, caretRect, clientWindowLevelOpt)
 }
+
+pub def modeIndicatorShowLabel(
+    label: String,
+    caretRect: CGRect,
+    clientWindowLevelOpt: Option Int64
+): Void = {
+    let gen = cellGet(gModeHideGen) + intToI64(1);
+    cellSet(gModeHideGen, gen);
+
+    let (panel, content) = ensureModeIndicatorPanel();
+    let sz = modeIndicatorPanelSize();
+    let origin = floatingPanelResolvedOrigin(sz, caretRect, None, 6.0, 6.0, 8.0);
+    floatingPanelUpdateLevel(panel, clientWindowLevelOpt);
+
+    if (cellGet(gModeLabel) != label) {
+        cellSet(gModeLabel, label);
+        msgSendVoid1Bool(content, objcSel("setNeedsDisplay:"), true)
+    } else ();
+
+    let targetFrame = cgRect(origin.x, origin.y, sz.width, sz.height);
+    floatingPanelPresentWithoutAnimation(panel, targetFrame, () -> {
+        msgSendVoid0(content, objcSel("displayIfNeeded"))
+    });
+
+    dispatchMainAfterMs(modeIndicatorAutoHideMs(), () -> {
+        if (cellGet(gModeHideGen) == gen) {
+            modeIndicatorHide()
+        } else ()
+    })
+}
+
+pub def modeIndicatorHide(): Void = {
+    cellSet(gModeHideGen, cellGet(gModeHideGen) + intToI64(1));
+    floatingPanelHideWithoutAnimation(cellGet(gModePanel))
+}
+
+/// Convenience HUD toast helper anchored at mouse/caret.
+pub def hudShow(text: String): Void = {
+    let m = mouseScreenLocation();
+    modeIndicatorShowLabel(text, cgRect(m.x, m.y, 1.0, 20.0), None)
+}
+
+pub def hudHide(): Void =
+    modeIndicatorHide()

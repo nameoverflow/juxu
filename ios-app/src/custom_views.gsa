@@ -1,0 +1,559 @@
+/// Custom CoreGraphics & UIKit views for Juxu iOS HostApp:
+/// - `JuxuHeroIconView`: 54x54 continuous rounded tile with linear gradient & fountain pen nib
+/// - `JuxuTouchKeyCellView` + `HitboxMapCard`: 26-key learned thumb-offset vector visualizer
+/// - `EvalMetricCell`: `SharedEvalMetricCell` (`valueFontSize: 15, cornerRadius: 8`)
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecWithCap, vecLen, vecPush, vecGetOr}
+use std.str.{intToStr}
+use std.buf.{bufWithCap, bufPushByte, bufToString}
+use objc.{
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    objcSetAssocHandle, objcGetAssocHandle,
+    msgSend0, msgSend2Ptr,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
+}
+use juxu_core.{KeyTouchSample, touchKeyOffsetZero}
+use juxu_shared.{
+    CGPoint, CGSize, CGRect,
+    cgPoint, cgSize, cgRect, rectInset,
+    msgSendRect0, msgSendSize1Ptr, msgSend1Rect1F,
+    msgSendVoid1Rect, msgSendVoid1Point, msgSendVoid1Point1Ptr,
+    msgSendVoid1Ptr1Sel1U64,
+    objcSendSuperVoid1Ptr,
+    nsStr, objcAllocInitFrame,
+    EvalLogMetricItem,
+}
+use uikit_kit.{
+    attrFontKey, attrForegroundColorKey,
+    colorLabel, colorSecondaryLabel, colorAccent, colorOrange, colorClear,
+    colorRgba, colorWithAlpha, colorPrimary08, colorEvalCellFill, resolveCgColor,
+    fontWeightRegular, fontWeightSemibold,
+    sysFont, sysFontRounded, sysFontMonospaced,
+    applyContinuousCorner, makeSettingsCard, makeLabel, measureViewSize, setButtonPlainTitle,
+    roundPx,
+}
+
+// ============================================================================
+// CoreGraphics Externs for Linear Gradient in `JuxuHeroIconView.drawRect:`
+// ============================================================================
+
+extern "UIGraphicsGetCurrentContext" def c_UIGraphicsGetCurrentContext(): Ptr
+extern "CGColorSpaceCreateDeviceRGB" def c_CGColorSpaceCreateDeviceRGB(): Ptr
+extern "CGColorSpaceRelease" def c_CGColorSpaceRelease(cs: Ptr): Void
+extern "CGGradientCreateWithColorComponents" def c_CGGradientCreateWithColorComponents(
+    space: Ptr, components: Ptr, locations: Ptr, count: Int64
+): Ptr
+extern "CGGradientRelease" def c_CGGradientRelease(grad: Ptr): Void
+extern "CGContextDrawLinearGradient" def c_CGContextDrawLinearGradient(
+    ctx: Ptr, grad: Ptr, startPt: CGPoint, endPt: CGPoint, options: Int
+): Void
+
+extern "objc_msgSend" def msgSend1RectOval(cls: Ptr, sel: Ptr, r: CGRect): Ptr
+
+def gHeroGradCompsBuf: Cell Ptr = cellNew(ptrNull())
+def gAssocTouchKeySlot: Cell Ptr = cellNew(ptrNull())
+
+def ensureHeroGradCompsBuf(): Ptr = {
+    let cur = cellGet(gHeroGradCompsBuf);
+    if (!ptrIsNull(cur)) cur
+    else {
+        // 8 IEEE-754 doubles (64 bytes): (0.98, 0.97, 0.94, 1.0) -> (0.91, 0.89, 0.85, 1.0)
+        let buf = ptrAllocBytes(64);
+        ptrWriteF64Le(buf, 0, 0.98);
+        ptrWriteF64Le(buf, 8, 0.97);
+        ptrWriteF64Le(buf, 16, 0.94);
+        ptrWriteF64Le(buf, 24, 1.0);
+        ptrWriteF64Le(buf, 32, 0.91);
+        ptrWriteF64Le(buf, 40, 0.89);
+        ptrWriteF64Le(buf, 48, 0.85);
+        ptrWriteF64Le(buf, 56, 1.0);
+        cellSet(gHeroGradCompsBuf, buf);
+        buf
+    }
+}
+
+def ensureTouchAssocKey(): Ptr = {
+    let cur = cellGet(gAssocTouchKeySlot);
+    if (!ptrIsNull(cur)) cur
+    else {
+        let k = ptrAllocBytes(8);
+        ptrWriteI64Le(k, 0, intToI64(0x4A555855));
+        cellSet(gAssocTouchKeySlot, k);
+        k
+    }
+}
+
+// ============================================================================
+// 1. `JuxuHeroIconView` (`HostAppViews.swift` lines 150-192)
+// ============================================================================
+
+def heroIconDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let bounds = msgSendRect0(self, objcSel("bounds"));
+    let w = bounds.size.width;
+    let h = bounds.size.height;
+    let ctx = c_UIGraphicsGetCurrentContext();
+    if (!ptrIsNull(ctx) && w > 1.0 && h > 1.0) {
+        // 1. Warm cream top-to-bottom linear gradient: (0.98, 0.97, 0.94) -> (0.91, 0.89, 0.85)
+        let space = c_CGColorSpaceCreateDeviceRGB();
+        if (!ptrIsNull(space)) {
+            let comps = ensureHeroGradCompsBuf();
+            let grad = c_CGGradientCreateWithColorComponents(space, comps, ptrNull(), intToI64(2));
+            if (!ptrIsNull(grad)) {
+                c_CGContextDrawLinearGradient(ctx, grad, cgPoint(w * 0.5, 0.0), cgPoint(w * 0.5, h), 0);
+                c_CGGradientRelease(grad)
+            } else ();
+            c_CGColorSpaceRelease(space)
+        } else ();
+
+        // 2. Centered 38x38 fountain pen nib inside 54x54 tile (`s = 38 / 100 = 0.38`)
+        let minDim = if (w < h) w else h;
+        let canvasSz = minDim * (38.0 / 54.0);
+        let ox = (w - canvasSz) * 0.5;
+        let oy = (h - canvasSz) * 0.5;
+        let s = canvasSz / 100.0;
+
+        let bpCls = objcClass("UIBezierPath");
+        let ink = colorRgba(0.11, 0.12, 0.15, 1.0);
+        let vermilion = colorRgba(0.86, 0.27, 0.21, 1.0);
+
+        // Nib polygon: (50,14) -> (78,54) -> (68,78) -> (32,78) -> (22,54) -> close
+        let nib = msgSend0(bpCls, objcSel("bezierPath"));
+        msgSendVoid1Point(nib, objcSel("moveToPoint:"), cgPoint(ox + 50.0 * s, oy + 14.0 * s));
+        msgSendVoid1Point(nib, objcSel("addLineToPoint:"), cgPoint(ox + 78.0 * s, oy + 54.0 * s));
+        msgSendVoid1Point(nib, objcSel("addLineToPoint:"), cgPoint(ox + 68.0 * s, oy + 78.0 * s));
+        msgSendVoid1Point(nib, objcSel("addLineToPoint:"), cgPoint(ox + 32.0 * s, oy + 78.0 * s));
+        msgSendVoid1Point(nib, objcSel("addLineToPoint:"), cgPoint(ox + 22.0 * s, oy + 54.0 * s));
+        msgSendVoid0(nib, objcSel("closePath"));
+        msgSendVoid0(ink, objcSel("setFill"));
+        msgSendVoid0(nib, objcSel("fill"));
+
+        // Vermilion slit: (50,15) -> (50,49), lineWidth = 4.5*s, lineCap = .round (1)
+        let slit = msgSend0(bpCls, objcSel("bezierPath"));
+        msgSendVoid1Point(slit, objcSel("moveToPoint:"), cgPoint(ox + 50.0 * s, oy + 15.0 * s));
+        msgSendVoid1Point(slit, objcSel("addLineToPoint:"), cgPoint(ox + 50.0 * s, oy + 49.0 * s));
+        msgSendVoid1Float(slit, objcSel("setLineWidth:"), 4.5 * s);
+        msgSendVoid1I64(slit, objcSel("setLineCapStyle:"), intToI64(1));
+        msgSendVoid0(vermilion, objcSel("setStroke"));
+        msgSendVoid0(slit, objcSel("stroke"));
+
+        // Vermilion breather eye ellipse: (43.5*s, 45.5*s, 13*s, 13*s)
+        let eye = msgSend1RectOval(
+            bpCls,
+            objcSel("bezierPathWithOvalInRect:"),
+            cgRect(ox + 43.5 * s, oy + 45.5 * s, 13.0 * s, 13.0 * s)
+        );
+        msgSendVoid0(vermilion, objcSel("setFill"));
+        msgSendVoid0(eye, objcSel("fill"));
+
+        // Ink base bar: roundedRect (30*s, 82*s, 40*s, 7*s), cornerRadius = 3.5*s
+        let bar = msgSend1Rect1F(
+            bpCls,
+            objcSel("bezierPathWithRoundedRect:cornerRadius:"),
+            cgRect(ox + 30.0 * s, oy + 82.0 * s, 40.0 * s, 7.0 * s),
+            3.5 * s
+        );
+        msgSendVoid0(ink, objcSel("setFill"));
+        msgSendVoid0(bar, objcSel("fill"))
+    } else ()
+}
+
+pub def makeHeroIconView(): Ptr = {
+    let v = objcAllocInitFrame("JuxuHeroIconView", cgRect(0.0, 0.0, 54.0, 54.0));
+    msgSendVoid1Ptr(v, objcSel("setBackgroundColor:"), colorClear());
+    msgSendVoid1Bool(v, objcSel("setOpaque:"), false);
+    // UIViewContentModeRedraw = 3
+    msgSendVoid1I64(v, objcSel("setContentMode:"), intToI64(3));
+    applyContinuousCorner(v, 13.0);
+    let layer = msgSend0(v, objcSel("layer"));
+    if (!ptrIsNull(layer)) {
+        msgSendVoid1Bool(layer, objcSel("setMasksToBounds:"), true);
+        msgSendVoid1Float(layer, objcSel("setBorderWidth:"), 0.7);
+        msgSendVoid1Ptr(layer, objcSel("setBorderColor:"), resolveCgColor(colorRgba(0.0, 0.0, 0.0, 0.08), v))
+    } else ();
+    msgSendVoid1Bool(v, objcSel("setIsAccessibilityElement:"), false);
+    v
+}
+
+// ============================================================================
+// 2. `JuxuTouchKeyCellView` + `HitboxMapCard` (`HostAppViews.swift` lines 852-969)
+// ============================================================================
+
+pub data TouchKeyCellData {
+    tkdView: Ptr,
+    tkdKeyLower: String,
+    tkdKeyUpper: String,
+    tkdRow: Int,
+    tkdCol: Int,
+    tkdIndent: Float,
+    tkdSamples: Cell Int,
+    tkdDx: Cell Float,
+    tkdDy: Cell Float,
+    tkdPitchX: Cell Float,
+    tkdPitchY: Cell Float,
+}
+
+def touchKeyCellDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let h = objcGetAssocHandle(self, ensureTouchAssocKey());
+    if (h != intToI64(0)) {
+        let d: TouchKeyCellData = gcHandleGet(h);
+        let bounds = msgSendRect0(self, objcSel("bounds"));
+        let keyW = bounds.size.width;
+        let keyH = bounds.size.height;
+        if (keyW > 2.0 && keyH > 2.0) {
+            let bpCls = objcClass("UIBezierPath");
+            let samples = cellGet(d.tkdSamples);
+            let hasSamples = samples > 0;
+
+            // 1. Continuous 5pt-radius rounded rect fill + border
+            let fillCol = colorWithAlpha(colorLabel(), if (hasSamples) 0.11 else 0.05);
+            let fillPath = msgSend1Rect1F(bpCls, objcSel("bezierPathWithRoundedRect:cornerRadius:"), bounds, 5.0);
+            msgSendVoid0(fillCol, objcSel("setFill"));
+            msgSendVoid0(fillPath, objcSel("fill"));
+
+            let lineW = if (hasSamples) 1.0 else 0.5;
+            let strokeCol =
+                if (hasSamples) colorWithAlpha(colorOrange(), 0.65)
+                else colorWithAlpha(colorLabel(), 0.10);
+            let strokeRect = rectInset(bounds, lineW * 0.5, lineW * 0.5);
+            let strokePath = msgSend1Rect1F(
+                bpCls,
+                objcSel("bezierPathWithRoundedRect:cornerRadius:"),
+                strokeRect,
+                5.0 - lineW * 0.5
+            );
+            msgSendVoid1Float(strokePath, objcSel("setLineWidth:"), lineW);
+            msgSendVoid0(strokeCol, objcSel("setStroke"));
+            msgSendVoid0(strokePath, objcSel("stroke"));
+
+            // 2. Uppercase key label (`11pt semibold rounded`, `.offset(y: -7)`)
+            let font = sysFontRounded(11.0, fontWeightSemibold());
+            let txtCol = if (hasSamples) colorLabel() else colorSecondaryLabel();
+            let attrs = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
+            let _ = msgSend2Ptr(attrs, objcSel("setObject:forKey:"), font, attrFontKey());
+            let _ = msgSend2Ptr(attrs, objcSel("setObject:forKey:"), txtCol, attrForegroundColorKey());
+            let nsKey = nsStr(d.tkdKeyUpper);
+            let sz = msgSendSize1Ptr(nsKey, objcSel("sizeWithAttributes:"), attrs);
+            let tx = (keyW - sz.width) * 0.5;
+            let ty = (keyH * 0.5 - 7.0) - sz.height * 0.5;
+            msgSendVoid1Point1Ptr(nsKey, objcSel("drawAtPoint:withAttributes:"), cgPoint(tx, ty), attrs);
+
+            // 3. Center reference grey dot (`3.5x3.5pt`, `.offset(y: 6)`)
+            let startPt = cgPoint(keyW * 0.5, keyH * 0.5 + 6.0);
+            let refDot = msgSend1RectOval(
+                bpCls,
+                objcSel("bezierPathWithOvalInRect:"),
+                cgRect(startPt.x - 1.75, startPt.y - 1.75, 3.5, 3.5)
+            );
+            msgSendVoid0(colorWithAlpha(colorSecondaryLabel(), 0.45), objcSel("setFill"));
+            msgSendVoid0(refDot, objcSel("fill"));
+
+            // 4. Learned personal thumb-offset vector & orange dot (`dx * pitchX * 3, dy * pitchY * 3`)
+            if (hasSamples) {
+                let dxPt = cellGet(d.tkdDx) * cellGet(d.tkdPitchX) * 3.0;
+                let dyPt = cellGet(d.tkdDy) * cellGet(d.tkdPitchY) * 3.0;
+                let endPt = cgPoint(startPt.x + dxPt, startPt.y + dyPt);
+
+                let vecLine = msgSend0(bpCls, objcSel("bezierPath"));
+                msgSendVoid1Point(vecLine, objcSel("moveToPoint:"), startPt);
+                msgSendVoid1Point(vecLine, objcSel("addLineToPoint:"), endPt);
+                msgSendVoid1Float(vecLine, objcSel("setLineWidth:"), 1.4);
+                msgSendVoid0(colorWithAlpha(colorOrange(), 0.85), objcSel("setStroke"));
+                msgSendVoid0(vecLine, objcSel("stroke"));
+
+                let orangeDot = msgSend1RectOval(
+                    bpCls,
+                    objcSel("bezierPathWithOvalInRect:"),
+                    cgRect(endPt.x - 3.0, endPt.y - 3.0, 6.0, 6.0)
+                );
+                msgSendVoid0(colorOrange(), objcSel("setFill"));
+                msgSendVoid0(orangeDot, objcSel("fill"))
+            } else ()
+        } else ()
+    } else ()
+}
+
+def touchKeyCellTraitChanged(self: Ptr, _cmd: Ptr, prevTraits: Ptr): Void = {
+    objcSendSuperVoid1Ptr(self, "UIView", objcSel("traitCollectionDidChange:"), prevTraits);
+    msgSendVoid0(self, objcSel("setNeedsDisplay"))
+}
+
+pub data HitboxMapCard {
+    hmcCardView: Ptr,
+    hmcTitleLbl: Ptr,
+    hmcSubLbl: Ptr,
+    hmcResetBtn: Ptr,
+    hmcMapContainer: Ptr,
+    hmcCells: Vec TouchKeyCellData,
+}
+
+def singleAsciiChar(b: Int): String = {
+    let buf = bufWithCap(1);
+    bufPushByte(buf, b);
+    bufToString(buf)
+}
+
+pub def buildHitboxMapCard(target: Ptr, resetActionSel: Ptr): HitboxMapCard = {
+    let card = makeSettingsCard();
+    let titleLbl = makeLabel(
+        "26 键个人触控热区偏移图",
+        sysFont(14.5, fontWeightSemibold()),
+        colorLabel(),
+        0
+    );
+    let subLbl = makeLabel(
+        "用句序键盘选词后自动采样。橙点表示已学习的触点中心，偏移会参与误触纠正。",
+        sysFont(11.0, fontWeightRegular()),
+        colorSecondaryLabel(),
+        0
+    );
+    let resetBtn = objcAllocInitFrame("UIButton", cgRect(0.0, 0.0, 52.0, 28.0));
+    msgSendVoid1Ptr(resetBtn, objcSel("setBackgroundColor:"), colorPrimary08());
+    applyContinuousCorner(resetBtn, 7.0);
+    setButtonPlainTitle(resetBtn, "重置", sysFont(12.0, fontWeightSemibold()), colorAccent());
+    // UIControlEventTouchUpInside = 64
+    msgSendVoid1Ptr1Sel1U64(resetBtn, objcSel("addTarget:action:forControlEvents:"), target, resetActionSel, intToI64(64));
+
+    let mapContainer = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 320.0, 124.0));
+    msgSendVoid1Ptr(mapContainer, objcSel("setBackgroundColor:"), colorClear());
+    msgSendVoid1Bool(mapContainer, objcSel("setClipsToBounds:"), false);
+
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), titleLbl);
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), subLbl);
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), resetBtn);
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), mapContainer);
+
+    let cells: Vec TouchKeyCellData = vecWithCap(26);
+    let rowChars: Vec String = vecWithCap(3);
+    vecPush(rowChars, "qwertyuiop");
+    vecPush(rowChars, "asdfghjkl");
+    vecPush(rowChars, "zxcvbnm");
+    let rowIndents: Vec Float = vecWithCap(3);
+    vecPush(rowIndents, 0.0);
+    vecPush(rowIndents, 0.5);
+    vecPush(rowIndents, 1.5);
+
+    let assocKey = ensureTouchAssocKey();
+    let r = cellNew(0);
+    while (cellGet(r) < 3) {
+        let ri = cellGet(r);
+        let chars = vecGetOr(rowChars, ri, "");
+        let indent = vecGetOr(rowIndents, ri, 0.0);
+        let cn = strLen(chars);
+        let c = cellNew(0);
+        while (cellGet(c) < cn) {
+            let ci = cellGet(c);
+            let chByte = strByteAt(chars, ci);
+            let lower = singleAsciiChar(chByte);
+            let upper = singleAsciiChar(chByte - 32);
+            let kv = objcAllocInitFrame("JuxuTouchKeyCellView", cgRect(0.0, 0.0, 28.0, 34.0));
+            msgSendVoid1Ptr(kv, objcSel("setBackgroundColor:"), colorClear());
+            msgSendVoid1Bool(kv, objcSel("setOpaque:"), false);
+            msgSendVoid1Bool(kv, objcSel("setClipsToBounds:"), false);
+            // UIViewContentModeRedraw = 3
+            msgSendVoid1I64(kv, objcSel("setContentMode:"), intToI64(3));
+            msgSendVoid1Bool(kv, objcSel("setIsAccessibilityElement:"), true);
+            msgSendVoid1Ptr(kv, objcSel("setAccessibilityIdentifier:"), nsStr("TouchCalibration-" + lower));
+            msgSendVoid1Ptr(kv, objcSel("setAccessibilityLabel:"), nsStr(upper));
+            msgSendVoid1Ptr(kv, objcSel("setAccessibilityValue:"), nsStr("尚未采样"));
+
+            let cellData = TouchKeyCellData {
+                tkdView: kv,
+                tkdKeyLower: lower,
+                tkdKeyUpper: upper,
+                tkdRow: ri,
+                tkdCol: ci,
+                tkdIndent: indent,
+                tkdSamples: cellNew(0),
+                tkdDx: cellNew(0.0),
+                tkdDy: cellNew(0.0),
+                tkdPitchX: cellNew(32.0),
+                tkdPitchY: cellNew(40.0),
+            };
+            objcSetAssocHandle(kv, assocKey, gcHandleNew(cellData));
+            msgSendVoid1Ptr(mapContainer, objcSel("addSubview:"), kv);
+            vecPush(cells, cellData);
+            cellSet(c, ci + 1)
+        };
+        cellSet(r, ri + 1)
+    };
+
+    HitboxMapCard {
+        hmcCardView: card,
+        hmcTitleLbl: titleLbl,
+        hmcSubLbl: subLbl,
+        hmcResetBtn: resetBtn,
+        hmcMapContainer: mapContainer,
+        hmcCells: cells,
+    }
+}
+
+def findCalibrationForKey(samples: Vec KeyTouchSample, keyLower: String): Option KeyTouchSample = {
+    let dummy = KeyTouchSample { keyLabel: "a", offset: touchKeyOffsetZero() };
+    let n = vecLen(samples);
+    let i = cellNew(0);
+    let found: Cell (Option KeyTouchSample) = cellNew(None);
+    while (cellGet(i) < n) {
+        let item = vecGetOr(samples, cellGet(i), dummy);
+        if (item.keyLabel == keyLower) {
+            cellSet(found, Some(item))
+        } else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+pub def updateHitboxMapCard(hmc: HitboxMapCard, samples: Vec KeyTouchSample): Void = {
+    let n = vecLen(hmc.hmcCells);
+    let dummyCell = vecGetOr(hmc.hmcCells, 0, TouchKeyCellData {
+        tkdView: ptrNull(),
+        tkdKeyLower: "a",
+        tkdKeyUpper: "A",
+        tkdRow: 0,
+        tkdCol: 0,
+        tkdIndent: 0.0,
+        tkdSamples: cellNew(0),
+        tkdDx: cellNew(0.0),
+        tkdDy: cellNew(0.0),
+        tkdPitchX: cellNew(32.0),
+        tkdPitchY: cellNew(40.0),
+    });
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let cell = vecGetOr(hmc.hmcCells, cellGet(i), dummyCell);
+        let (cnt, dx, dy) = match findCalibrationForKey(samples, cell.tkdKeyLower) {
+            Some(cal) -> (cal.offset.samples, cal.offset.dx, cal.offset.dy),
+            None -> (0, 0.0, 0.0),
+        };
+        cellSet(cell.tkdSamples, cnt);
+        cellSet(cell.tkdDx, dx);
+        cellSet(cell.tkdDy, dy);
+        let accVal = if (cnt > 0) intToStr(cnt) + " 次采样" else "尚未采样";
+        if (!ptrIsNull(cell.tkdView)) {
+            msgSendVoid1Ptr(cell.tkdView, objcSel("setAccessibilityValue:"), nsStr(accVal));
+            msgSendVoid0(cell.tkdView, objcSel("setNeedsDisplay"))
+        } else ();
+        cellSet(i, cellGet(i) + 1)
+    }
+}
+
+/// Lay out `HitboxMapCard` at `(cardX, cardY)` with `cardW`; returns card height.
+pub def layoutHitboxMapCard(hmc: HitboxMapCard, cardX: Float, cardY: Float, cardW: Float): Float = {
+    let pad = 14.0;
+    let innerW = cardW - pad * 2.0;
+    let resetW = 50.0;
+    let resetH = 28.0;
+    let textW = innerW - resetW - 10.0;
+    let tSz = measureViewSize(hmc.hmcTitleLbl, textW);
+    let sSz = measureViewSize(hmc.hmcSubLbl, textW);
+    let textH = tSz.height + 2.0 + sSz.height;
+    let hdrH = if (textH > resetH) textH else resetH;
+    let textTop = pad + roundPx((hdrH - textH) * 0.5);
+    msgSendVoid1Rect(hmc.hmcTitleLbl, objcSel("setFrame:"), cgRect(pad, textTop, textW, tSz.height));
+    msgSendVoid1Rect(hmc.hmcSubLbl, objcSel("setFrame:"), cgRect(pad, textTop + tSz.height + 2.0, textW, sSz.height));
+    let btnTop = pad + roundPx((hdrH - resetH) * 0.5);
+    msgSendVoid1Rect(hmc.hmcResetBtn, objcSel("setFrame:"), cgRect(pad + innerW - resetW, btnTop, resetW, resetH));
+
+    let mapY = pad + hdrH + 10.0;
+    let mapH = 124.0;
+    msgSendVoid1Rect(hmc.hmcMapContainer, objcSel("setFrame:"), cgRect(pad, mapY, innerW, mapH));
+
+    let pitchX = innerW / 10.0;
+    let keyW = if (pitchX - 4.0 > 4.0) pitchX - 4.0 else 4.0;
+    let keyH = 34.0;
+    let pitchY = 40.0;
+
+    let dummyCell = vecGetOr(hmc.hmcCells, 0, TouchKeyCellData {
+        tkdView: ptrNull(),
+        tkdKeyLower: "a",
+        tkdKeyUpper: "A",
+        tkdRow: 0,
+        tkdCol: 0,
+        tkdIndent: 0.0,
+        tkdSamples: cellNew(0),
+        tkdDx: cellNew(0.0),
+        tkdDy: cellNew(0.0),
+        tkdPitchX: cellNew(32.0),
+        tkdPitchY: cellNew(40.0),
+    });
+    let n = vecLen(hmc.hmcCells);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let cell = vecGetOr(hmc.hmcCells, cellGet(i), dummyCell);
+        cellSet(cell.tkdPitchX, pitchX);
+        cellSet(cell.tkdPitchY, pitchY);
+        let cx = (intToFloat(cell.tkdCol) + cell.tkdIndent + 0.5) * pitchX;
+        let topY = 4.0 + intToFloat(cell.tkdRow) * pitchY;
+        if (!ptrIsNull(cell.tkdView)) {
+            msgSendVoid1Rect(cell.tkdView, objcSel("setFrame:"), cgRect(cx - keyW * 0.5, topY, keyW, keyH));
+            msgSendVoid0(cell.tkdView, objcSel("setNeedsDisplay"))
+        } else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+
+    let cardH = mapY + mapH + pad;
+    msgSendVoid1Rect(hmc.hmcCardView, objcSel("setFrame:"), cgRect(cardX, cardY, cardW, cardH));
+    cardH
+}
+
+// ============================================================================
+// 3. `EvalMetricCell` (`SharedEvalMetricCell`, `valueFontSize: 15, cornerRadius: 8`)
+// ============================================================================
+
+pub data EvalMetricCell {
+    emcBox: Ptr,
+    emcTitleLbl: Ptr,
+    emcValueLbl: Ptr,
+}
+
+pub def buildEvalMetricCell(title: String, val: String): EvalMetricCell = {
+    let box = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 90.0, 46.0));
+    msgSendVoid1Ptr(box, objcSel("setBackgroundColor:"), colorEvalCellFill());
+    applyContinuousCorner(box, 8.0);
+    let tLbl = makeLabel(title, sysFont(10.5, fontWeightRegular()), colorSecondaryLabel(), 1);
+    let vLbl = makeLabel(val, sysFontMonospaced(15.0, fontWeightSemibold()), colorLabel(), 1);
+    msgSendVoid1Ptr(box, objcSel("addSubview:"), tLbl);
+    msgSendVoid1Ptr(box, objcSel("addSubview:"), vLbl);
+    EvalMetricCell {
+        emcBox: box,
+        emcTitleLbl: tLbl,
+        emcValueLbl: vLbl,
+    }
+}
+
+pub def updateEvalMetricCell(cell: EvalMetricCell, item: EvalLogMetricItem): Void = {
+    msgSendVoid1Ptr(cell.emcTitleLbl, objcSel("setText:"), nsStr(item.elmTitle));
+    msgSendVoid1Ptr(cell.emcValueLbl, objcSel("setText:"), nsStr(item.elmValue))
+}
+
+pub def layoutEvalMetricCell(cell: EvalMetricCell, x: Float, y: Float, w: Float): Float = {
+    let padX = 8.0;
+    let padY = 6.0;
+    let innerW = if (w - padX * 2.0 > 4.0) w - padX * 2.0 else 4.0;
+    let tSz = measureViewSize(cell.emcTitleLbl, innerW);
+    let vSz = measureViewSize(cell.emcValueLbl, innerW);
+    msgSendVoid1Rect(cell.emcTitleLbl, objcSel("setFrame:"), cgRect(padX, padY, innerW, tSz.height));
+    msgSendVoid1Rect(cell.emcValueLbl, objcSel("setFrame:"), cgRect(padX, padY + tSz.height + 2.0, innerW, vSz.height));
+    let h = padY + tSz.height + 2.0 + vSz.height + padY;
+    msgSendVoid1Rect(cell.emcBox, objcSel("setFrame:"), cgRect(x, y, w, h));
+    h
+}
+
+// ============================================================================
+// Class Registration Helper Called by `main.gsa` `init(100)`
+// ============================================================================
+
+pub def registerCustomViewClasses(): Void = {
+    let heroCls = objcAllocateClass("UIView", "JuxuHeroIconView");
+    if (!ptrIsNull(heroCls)) {
+        let _ = objcAddMethod(heroCls, "drawRect:", cFnPtr(heroIconDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        objcRegisterClass(heroCls)
+    } else ();
+
+    let keyCls = objcAllocateClass("UIView", "JuxuTouchKeyCellView");
+    if (!ptrIsNull(keyCls)) {
+        let _ = objcAddMethod(keyCls, "drawRect:", cFnPtr(touchKeyCellDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        let _ = objcAddMethod(keyCls, "traitCollectionDidChange:", cFnPtr(touchKeyCellTraitChanged), "v@:@");
+        objcRegisterClass(keyCls)
+    } else ()
+}

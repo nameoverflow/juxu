@@ -2,11 +2,41 @@ name = "juxu_macos"
 version = "0.2.0"
 entry = "src/main.gsa"
 src_dir = "src"
+tests = [
+    "tests/macos_test.gsa",
+    "tests/voice_test.gsa",
+    "tests/voice_ui_test.gsa",
+]
 
 [deps]
 juxu_shared = { path = "../shared" }
 juxu_core = { git = "https://github.com/nameoverflow/juxu-core.git", version = "0.1.9" }
 objc = { git = "https://github.com/geisha-lang/objc.gsa.git", version = "0.1.0" }
+
+[target.native]
+c_sources = [
+    "csrc/macos_tis.c",
+    "csrc/voice_keychain.c",
+    "csrc/voice_fft.c",
+    "csrc/macos_voice_audio_asr.m",
+    "csrc/macos_voice_ax_hotkey.m",
+]
+c_flags = ["-O2", "-fobjc-arc", "-Wno-unused-command-line-argument"]
+link_flags = [
+    "-framework", "Cocoa",
+    "-framework", "InputMethodKit",
+    "-framework", "Carbon",
+    "-framework", "QuartzCore",
+    "-framework", "ApplicationServices",
+    "-framework", "AVFoundation",
+    "-framework", "Speech",
+    "-framework", "Vision",
+    "-framework", "ScreenCaptureKit",
+    "-framework", "CoreMedia",
+    "-framework", "CoreVideo",
+    "-framework", "Security",
+    "-framework", "Accelerate",
+]
 
 [target.macos]
 bundle_id    = "im.juxu.inputmethod.Juxu"
@@ -14,7 +44,30 @@ bundle_name  = "Juxu"
 version      = "0.2.0"
 min_os       = "14.0"
 lsui_element = true
+icon         = "../Resources/AppIcon.icns"
 info_plist   = "../Resources/Info.plist"
-frameworks   = ["Cocoa", "InputMethodKit", "Carbon", "QuartzCore"]
-resources    = ["../Resources/zh-Hans.lproj"]
+c_sources    = [
+    "csrc/macos_tis.c",
+    "csrc/voice_keychain.c",
+    "csrc/voice_fft.c",
+    "csrc/macos_voice_audio_asr.m",
+    "csrc/macos_voice_ax_hotkey.m",
+]
+c_flags      = ["-O2", "-fobjc-arc", "-Wno-unused-command-line-argument"]
+frameworks   = [
+    "Cocoa",
+    "InputMethodKit",
+    "Carbon",
+    "QuartzCore",
+    "ApplicationServices",
+    "AVFoundation",
+    "Speech",
+    "Vision",
+    "ScreenCaptureKit",
+    "CoreMedia",
+    "CoreVideo",
+    "Security",
+    "Accelerate",
+]
+resources    = ["../Resources/zh-Hans.lproj", "../Resources/menu_icon.pdf", "../Resources/Dicts"]
 codesign     = "-"

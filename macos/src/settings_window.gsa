@@ -1,205 +1,3116 @@
-/// Pure AppKit settings window for macOS (`NSWindow`), directly mutating `JuxuSession` (zero SwiftUI):
-/// - Input schema selector (9 schemas)
-/// - Candidate orientation (horizontal / vertical)
-/// - Page size (5 / 7 / 9)
-/// - Spaceless continuous typing toggle & ZH/EN auto-space toggle
-/// - Custom user phrase quick-add & count display.
+/// Complete 1:1 pure-AppKit port of `Sources/SettingsWindow.swift` (1,056 lines)
+/// + `Scripts/RenderPreviews.swift` (321 lines):
+/// - `SettingsSection` (`schema`, `typo`, `lexicon`, `voice`, `appearance`)
+/// - `SettingsWindow : NSWindow` overriding `performKeyEquivalent:` + `isCloseWindowShortcut(nsEvent)`
+///   handling `Cmd+W` (including CapsLock and non-Latin layouts `keyCode == 13`, rejecting Shift/Opt/Ctrl)
+/// - 200pt translucent `NSVisualEffectView` (`.sidebar`) left navigation pane + right scrollable grouped-form pane
+/// - Section 1 (`方案与输入`): 3 category radio cards + 3 version radio cards + fixed-code commit rules + spaceless/shortcode/z-lookup/rare-charset
+/// - Section 2 (`误触与热区`): Bayesian typo switches + threshold sliders + calibration count/reset + interactive 26-key iOS touch simulator + `EvalLogSummary` 6-metric grid & Finder/Clear actions
+/// - Section 3 (`组词与词库`): auto-phrase switches/threshold + phrase input & add + user phrase list (`SharedUserPhraseCodePill`, teal `"自动组词"`, count, trash delete) + `"打开配置目录"`
+/// - Section 4 (`语音输入`): embeds `voiceBuildSettingsPageView(session, contentWidth)`
+/// - Section 5 (`外观与标点`): horizontal/vertical segmented control, page size stepper (`3..9`), Shift toggle mode popup, smart punctuation, emoji, auto-space + digits, `;`/`'` quick select, live `CandidateBarView` preview
+/// - `windowWillClose:` cleanup + `voiceOnSettingsWindowClosed()`
+/// - `--render-previews <outDir>` 2x Retina PNG preview renderer (`candidates-light.png`, `candidates-dark.png`, `settings-*-*.png`).
 
 use std.option.{Option, Some, None}
-use std.vec.{vecLen}
-use std.str.{intToStr}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGetOr}
+use std.str.{intToStr, strTrim}
+use std.path.{pathJoin, pathDirname, pathBasename}
+use sys.fs.{fileExists, mkdirAll}
 use objc.{
+    Id, NSObject,
     objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
-    msgSend0, msgSend1Ptr, msgSendInt0, msgSendI64_0,
-    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool,
+    objcSetAssocHandle, objcGetAssocHandle, objcReleaseRaw, idAdopt,
+    msgSend0, msgSend1Ptr, msgSendInt0, msgSendI64_0, msgSendFloat0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
 }
 use juxu_core.{
-    ConfigFormat, Toml,
-    applyConfig, getConfig, addUserPhrase, listUserPhrases,
+    schemaId, JuxuConfig,
+    Candidate, MkCandidate, emptyCandidate,
+    UserPhraseInfo, UserPhrase, MkUserPhrase,
+    KeyTouchSample, touchKeyOffsetZero,
 }
 use juxu_shared.{
-    JuxuSession, sessionSaveConfig, sessionFlushUserData,
-    AutoSpaceOptions,
-    CGRect, cgRect, nsStr, nsStrPtrToString, msgSend1Rect1U64_1I64_1Bool, objcAllocInitFrame,
+    MkJuxuConfig, TypoConfig, MkTypoConfig,
+    FourthEmptyBehavior, FourthBlock, FourthClear,
+    ShiftToggleMode, CommitCode, CommitFirst, ShiftClear,
+    CandidateOrientation, Horizontal, Vertical,
+    JuxuSession, JuxuActionState, emptyActionState,
+    bridgeNew, bridgeApplyAndSaveConfig, bridgeSwitchSchema,
+    bridgeRefreshUserPhrases, bridgeRefreshTouchProfile,
+    bridgeHandleKey, bridgePushTouch, bridgeSelectCandidate, bridgeTurnPage, bridgeClearComposition,
+    bridgeSetContext, bridgeAddUserPhrase, bridgeRemoveUserPhrase,
+    bridgeResetTouchCalibration, bridgeApplyTouchCalibrations,
+    bridgeReloadEvalLogSummary, bridgeClearEvalLog,
+    InputSchemaCategory, CatWubi, allSchemaCategories,
+    categoryRawValue, categorySubtitle, categorySymbolName, categoryDefaultSchemaId, configSchemaCategory,
+    InputSchemaOption, schemaOptionsForCategory,
+    configIsPinyinFamily, configIsCangjieFamily, configIsWubiFamily,
+    calibratedProgressText, formatFixed2Signed, EvalLogMetricItem, evalLogMetrics,
+    maxCodeChineseNumeral, pushCodeChineseNumeral, maxCodeDigits, pushCodeDigits,
+    CGPoint, CGSize, CGRect, cgPoint, cgSize, cgRect, rectContainsPoint,
+    ptrToI64, nsStr, nsStrPtrToString, objcAllocInit, objcAllocInitFrame,
+    utf8ScalarCount, tailScalars, scalarToString,
+    msgSendRect0, msgSendPoint0, msgSendSize0, msgSendPoint1Point1Ptr,
+    msgSendInitFrame, msgSend1Rect1U64_1I64_1Bool,
+    msgSendVoid1Rect, msgSendVoid1Size, msgSendVoid1Ptr1Sel, msgSend2Ptr, msgSend1Ptr1I64,
+    objcSendSuperBool1Ptr, dispatchMainAsync,
+}
+use macos_ffi.{
+    wallNowMs, objcSendSuperVoid1Size, msgSendDrawInRectImg, msgSendSizeWithAttrs,
+    msgSendBitmapInit, msgSendCacheDisplay, msgSendRepUsingType, msgSendWriteToFile,
+    msgSendGradInit, msgSendGradDrawInRect,
+    roundFloat, maxFloat, clampFloat,
+    fontWeightRegular, fontWeightMedium, fontWeightSemibold,
+    nsFontSystem, nsFontMono, nsFontRounded,
+    nsColorRgba, nsColorAlpha, nsColorClear, nsColorWhite,
+    nsColorLabel, nsColorSecondaryLabel, nsColorTertiaryLabel,
+    nsColorSeparator, nsColorAccent, nsColorWindowBg, nsColorTeal, nsColorOrange,
+    viewIsDarkAppearance, fillRoundedRect, strokeRoundedRect, fillHairlineRect,
+    makeTextAttrs, nsSymbolImage, makeSymbolImageView, makeStaticLabel,
+}
+use candidate_panel.{candidateBarHeight, candidateBarCreate}
+use voice_facade.{voiceBuildSettingsPageView, voiceOnSettingsWindowClosed, voiceConfigurePreviewState}
+
+extern "objc_msgSend" def msgSendDrawAtPointAttrsSw(
+    nsStrObj: Ptr, sel: Ptr, pt: CGPoint, attrs: Ptr
+): Void
+extern "objc_msgSend" def msgSendToolbarInit(obj: Ptr, sel: Ptr, ident: Ptr): Ptr
+extern "objc_msgSend" def msgSendSetToolbarStyle(win: Ptr, sel: Ptr, style: Int64): Void
+extern "objc_msgSend" def msgSendRunUntilDate(rl: Ptr, sel: Ptr, dt: Ptr): Void
+
+// ============================================================================
+// SettingsSection (`SettingsWindow.swift` lines 4-22)
+// ============================================================================
+
+pub data SettingsSection : Eq {
+    SecSchema,
+    SecTypo,
+    SecLexicon,
+    SecVoice,
+    SecAppearance,
 }
 
-def gSettingsWindow: Cell Ptr = cellNew(ptrNull())
-def gSettingsSession: Cell (Option JuxuSession) = cellNew(None)
-def gSchemaPopup: Cell Ptr = cellNew(ptrNull())
-def gPagePopup: Cell Ptr = cellNew(ptrNull())
-def gVerticalCheck: Cell Ptr = cellNew(ptrNull())
-def gSpacelessCheck: Cell Ptr = cellNew(ptrNull())
-def gAutoSpaceCheck: Cell Ptr = cellNew(ptrNull())
-def gPhraseField: Cell Ptr = cellNew(ptrNull())
-def gPhraseStatus: Cell Ptr = cellNew(ptrNull())
-def gSettingsTarget: Cell Ptr = cellNew(ptrNull())
-
-def schemaTagAtIndex(idx: Int): String =
-    if (idx == 0) "pinyin"
-    else if (idx == 1) "xiaohe_sp"
-    else if (idx == 2) "86"
-    else if (idx == 3) "98"
-    else if (idx == 4) "06"
-    else if (idx == 5) "xiaohe"
-    else if (idx == 6) "cangjie3"
-    else if (idx == 7) "cangjie5"
-    else "cangjie6"
-
-def pageSizeAtIndex(idx: Int): Int =
-    if (idx == 0) 5 else if (idx == 1) 7 else 9
-
-def applyControlsToSession(): Void =
-    match cellGet(gSettingsSession) {
-        None -> (),
-        Some(s) -> {
-            let sIdx = msgSendInt0(cellGet(gSchemaPopup), objcSel("indexOfSelectedItem"));
-            let pIdx = msgSendInt0(cellGet(gPagePopup), objcSel("indexOfSelectedItem"));
-            let verticalOn = msgSendI64_0(cellGet(gVerticalCheck), objcSel("state")) != intToI64(0);
-            let spacelessOn = msgSendI64_0(cellGet(gSpacelessCheck), objcSel("state")) != intToI64(0);
-            let autoSpaceOn = msgSendI64_0(cellGet(gAutoSpaceCheck), objcSel("state")) != intToI64(0);
-
-            let orientStr = if (verticalOn) "vertical" else "horizontal";
-            let slStr = if (spacelessOn) "true" else "false";
-            let toml = "[general]\nschema = \"" + schemaTagAtIndex(sIdx) + "\"\n"
-                + "page_size = " + intToStr(pageSizeAtIndex(pIdx)) + "\n"
-                + "orientation = \"" + orientStr + "\"\n"
-                + "[typing]\nspaceless = " + slStr + "\n";
-            applyConfig(s.engine, Toml, toml);
-            cellSet(s.autoSpace, AutoSpaceOptions { enabled: autoSpaceOn, spaceDigits: true });
-            let _ = sessionSaveConfig(s);
-            ()
-        },
+pub def sectionTitle(sec: SettingsSection): String =
+    match sec {
+        SecSchema -> "方案与输入",
+        SecTypo -> "误触与热区",
+        SecLexicon -> "组词与词库",
+        SecVoice -> "语音输入",
+        SecAppearance -> "外观与标点",
     }
 
-def onSettingChanged(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
-    applyControlsToSession()
-
-def onAddPhrase(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
-    match cellGet(gSettingsSession) {
-        None -> (),
-        Some(s) -> {
-            let field = cellGet(gPhraseField);
-            let status = cellGet(gPhraseStatus);
-            let phrase = nsStrPtrToString(msgSend0(field, objcSel("stringValue")));
-            if (strLen(phrase) > 0) {
-                match addUserPhrase(s.engine, phrase) {
-                    Some(code) -> {
-                        let _ = sessionFlushUserData(s);
-                        msgSendVoid1Ptr(field, objcSel("setStringValue:"), nsStr(""));
-                        let cnt = vecLen(listUserPhrases(s.engine));
-                        msgSendVoid1Ptr(status, objcSel("setStringValue:"),
-                            nsStr("已添加「" + phrase + "」（编码 " + code + "），共 " + intToStr(cnt) + " 条"))
-                    },
-                    None -> msgSendVoid1Ptr(status, objcSel("setStringValue:"), nsStr("添加失败：请先加载对应词库")),
-                }
-            } else ()
-        },
+pub def sectionSymbolName(sec: SettingsSection): String =
+    match sec {
+        SecSchema -> "keyboard",
+        SecTypo -> "hand.tap",
+        SecLexicon -> "character.book.closed",
+        SecVoice -> "waveform",
+        SecAppearance -> "sparkles.rectangle.stack",
     }
 
-extern init(101) def registerSettingsTargetClass(): Void = {
-    let cls = objcAllocateClass("NSObject", "JuxuSettingsTarget");
-    if (!ptrIsNull(cls)) {
-        let _ = objcAddMethod(cls, "onSettingChanged:", cFnPtr(onSettingChanged), "v@:@");
-        let _ = objcAddMethod(cls, "onAddPhrase:", cFnPtr(onAddPhrase), "v@:@");
-        objcRegisterClass(cls)
+pub def allSettingsSections(): Vec SettingsSection = {
+    let v: Vec SettingsSection = vecWithCap(5);
+    vecPush(v, SecSchema);
+    vecPush(v, SecTypo);
+    vecPush(v, SecLexicon);
+    vecPush(v, SecVoice);
+    vecPush(v, SecAppearance);
+    v
+}
+
+pub def parseSettingsSection(raw: String): SettingsSection =
+    if (raw == "typo" || raw == "误触与热区") SecTypo
+    else if (raw == "lexicon" || raw == "组词与词库") SecLexicon
+    else if (raw == "voice" || raw == "语音输入") SecVoice
+    else if (raw == "appearance" || raw == "外观与标点") SecAppearance
+    else SecSchema
+
+// ============================================================================
+// SettingsWindow & `Cmd+W` Close Shortcut (`SettingsWindow.swift` lines 970-992)
+// ============================================================================
+
+def asciiLowerStr(s: String): String = {
+    let n = strLen(s);
+    if (n != 1) s
+    else {
+        let b = strByteAt(s, 0);
+        if (b >= 65 && b <= 90) scalarToString(b + 32) else s
+    }
+}
+
+/// Exact `SettingsWindow.isCloseWindowShortcut(_ event: NSEvent) -> Bool` (`SwiftBridgeTests` section 10):
+/// - Accepts `Cmd+W`, `Cmd+CapsLock+W`, and non-Latin keyboard layouts on physical W (`keyCode == 13` or `"w"`)
+/// - Rejects `Cmd+Shift+W`, `Cmd+Opt+W`, `Cmd+Ctrl+W`, plain `W`, `Cmd+A`, and `keyUp` events!
+pub def isCloseWindowShortcut(nsEvent: Ptr): Bool =
+    if (ptrIsNull(nsEvent)) false
+    else {
+        // NSEventTypeKeyDown == 10
+        let evType = msgSendI64_0(nsEvent, objcSel("type"));
+        if (evType != intToI64(10)) false
+        else {
+            // Intersect deviceIndependentFlagsMask (0xFFFF0000) with [.command, .option, .control, .shift] (0x1E0000)
+            let rawMods = msgSendI64_0(nsEvent, objcSel("modifierFlags"));
+            let relevantMods = rawMods & intToI64(0xFFFF0000) & intToI64(0x1E0000);
+            if (relevantMods != intToI64(0x100000)) false
+            else {
+                let ign = asciiLowerStr(nsStrPtrToString(msgSend0(nsEvent, objcSel("charactersIgnoringModifiers"))));
+                let chs = asciiLowerStr(nsStrPtrToString(msgSend0(nsEvent, objcSel("characters"))));
+                let kc = msgSendInt0(nsEvent, objcSel("keyCode"));
+                ign == "w" || chs == "w" || (kc == 13 && strLen(chs) > 0 && chs != "a")
+            }
+        }
+    }
+
+def settingsWindowPerformKeyEquivalent(self: Ptr, cmd: Ptr, event: Ptr): Bool =
+    if (objcSendSuperBool1Ptr(self, "NSWindow", cmd, event)) true
+    else if (isCloseWindowShortcut(event)) {
+        msgSendVoid1Ptr(self, objcSel("performClose:"), ptrNull());
+        true
+    } else false
+
+/// Allocate & init a `SettingsWindow` (`JuxuSettingsWindow : NSWindow`).
+pub def settingsWindowCreate(contentRect: CGRect, styleMask: Int64, deferFlag: Bool): Ptr = {
+    let alloc = msgSend0(objcClass("SettingsWindow"), objcSel("alloc"));
+    msgSend1Rect1U64_1I64_1Bool(
+        alloc,
+        objcSel("initWithContentRect:styleMask:backing:defer:"),
+        contentRect,
+        styleMask,
+        intToI64(2),
+        deferFlag
+    )
+}
+
+// ============================================================================
+// Reusable AppKit Control Action Closure Trampoline (`JuxuActionTarget`)
+// ============================================================================
+
+def gActionTargetKey: Cell Ptr = cellNew(ptrNull())
+def gControlKeepAliveKey: Cell Ptr = cellNew(ptrNull())
+
+def actionTargetAssocKey(): Ptr = {
+    let k = cellGet(gActionTargetKey);
+    if (!ptrIsNull(k)) k
+    else {
+        let nk = ptrAllocBytes(8);
+        cellSet(gActionTargetKey, nk);
+        nk
+    }
+}
+
+def controlKeepAliveAssocKey(): Ptr = {
+    let k = cellGet(gControlKeepAliveKey);
+    if (!ptrIsNull(k)) k
+    else {
+        let nk = ptrAllocBytes(8);
+        cellSet(gControlKeepAliveKey, nk);
+        nk
+    }
+}
+
+def actionTargetInvoke(self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
+    let h = objcGetAssocHandle(self, actionTargetAssocKey());
+    if (h != intToI64(0)) {
+        let cb: (Ptr) -> Void = gcHandleGet(h);
+        cb(sender)
     } else ()
 }
 
-def makeLabel(content: Ptr, frame: CGRect, text: String): Ptr = {
-    let lbl = objcAllocInitFrame("NSTextField", frame);
-    msgSendVoid1Bool(lbl, objcSel("setBezeled:"), false);
-    msgSendVoid1Bool(lbl, objcSel("setDrawsBackground:"), false);
-    msgSendVoid1Bool(lbl, objcSel("setEditable:"), false);
-    msgSendVoid1Ptr(lbl, objcSel("setStringValue:"), nsStr(text));
-    msgSendVoid1Ptr(content, objcSel("addSubview:"), lbl);
-    lbl
+def bindControlAction(control: Ptr, cb: (Ptr) -> Void): Void = {
+    let tgt = objcAllocInit("JuxuActionTarget");
+    objcSetAssocHandle(tgt, actionTargetAssocKey(), gcHandleNew(cb));
+    msgSendVoid1Ptr(control, objcSel("setTarget:"), tgt);
+    msgSendVoid1Ptr(control, objcSel("setAction:"), objcSel("invokeAction:"));
+    let retained: Id NSObject = idAdopt(tgt);
+    objcSetAssocHandle(control, controlKeepAliveAssocKey(), gcHandleNew(retained))
 }
 
-def makeCheckbox(content: Ptr, frame: CGRect, title: String, tgt: Ptr, initial: Bool): Ptr = {
+// ============================================================================
+// Custom Drawn AppKit Views (Flipped Container, Card, Sidebar Row, Radio Card, Switch, Metric, Pill, Touch Sim)
+// ============================================================================
+
+def flippedIsFlipped(_self: Ptr, _cmd: Ptr): Bool = true
+
+def makeFlippedView(frame: CGRect): Ptr =
+    objcAllocInitFrame("JuxuFlippedView", frame)
+
+// ---- 1. Grouped Form Card (`JuxuCardView`) ----
+
+data CardViewState {
+    cardDividerYs: Vec Float,
+}
+
+def gCardKey: Cell Ptr = cellNew(ptrNull())
+def cardAssocKey(): Ptr = {
+    let k = cellGet(gCardKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gCardKey, nk); nk }
+}
+
+def cardViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let bounds = msgSendRect0(self, objcSel("bounds"));
+    let isDark = viewIsDarkAppearance(self);
+    let fillCol =
+        if (isDark) nsColorRgba(1.0, 1.0, 1.0, 0.048)
+        else nsColorRgba(0.0, 0.0, 0.0, 0.028);
+    let borderCol =
+        if (isDark) nsColorRgba(1.0, 1.0, 1.0, 0.085)
+        else nsColorRgba(0.0, 0.0, 0.0, 0.065);
+    fillRoundedRect(bounds, 10.0, fillCol);
+    strokeRoundedRect(bounds, 10.0, 0.6, borderCol);
+
+    let h = objcGetAssocHandle(self, cardAssocKey());
+    if (h != intToI64(0)) {
+        let st: CardViewState = gcHandleGet(h);
+        let sep = nsColorSeparator();
+        let n = vecLen(st.cardDividerYs);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let dy = vecGetOr(st.cardDividerYs, cellGet(i), 0.0);
+            fillHairlineRect(cgRect(14.0, dy, maxFloat(0.0, bounds.size.width - 28.0), 0.5), sep);
+            cellSet(i, cellGet(i) + 1)
+        }
+    } else ()
+}
+
+def makeCardView(frame: CGRect, dividerYs: Vec Float): Ptr = {
+    let v = objcAllocInitFrame("JuxuCardView", frame);
+    objcSetAssocHandle(v, cardAssocKey(), gcHandleNew(CardViewState { cardDividerYs: dividerYs }));
+    v
+}
+
+// ---- 2. Sidebar Navigation Item (`JuxuSidebarRowView`) ----
+
+data SidebarRowState {
+    sbrTitle: String,
+    sbrSymbol: String,
+    sbrSelected: Bool,
+    sbrOnClick: () -> Void,
+}
+
+def gSidebarRowKey: Cell Ptr = cellNew(ptrNull())
+def sidebarRowAssocKey(): Ptr = {
+    let k = cellGet(gSidebarRowKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gSidebarRowKey, nk); nk }
+}
+
+def drawTintedSymbol(symbolName: String, ptSize: Float, weight: Float, tint: Ptr, dstRect: CGRect): Void = {
+    let base = nsSymbolImage(symbolName, ptSize, weight);
+    if (!ptrIsNull(base)) {
+        let tinted = msgSend1Ptr(base, objcSel("imageWithSymbolConfiguration:"),
+            msgSend1Ptr(objcClass("NSImageSymbolConfiguration"), objcSel("configurationWithHierarchicalColor:"), tint));
+        let img = if (!ptrIsNull(tinted)) tinted else base;
+        let sz = msgSendSize0(img, objcSel("size"));
+        let dx = dstRect.origin.x + (dstRect.size.width - sz.width) * 0.5;
+        let dy = dstRect.origin.y + (dstRect.size.height - sz.height) * 0.5;
+        // NSCompositingOperationSourceOver == 2
+        msgSendDrawInRectImg(
+            img,
+            objcSel("drawInRect:fromRect:operation:fraction:respectFlipped:hints:"),
+            cgRect(dx, dy, sz.width, sz.height),
+            cgRect(0.0, 0.0, 0.0, 0.0),
+            intToI64(2),
+            1.0,
+            true,
+            ptrNull()
+        )
+    } else ()
+}
+
+def sidebarRowDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let h = objcGetAssocHandle(self, sidebarRowAssocKey());
+    if (h != intToI64(0)) {
+        let st: SidebarRowState = gcHandleGet(h);
+        let bounds = msgSendRect0(self, objcSel("bounds"));
+        let isDark = viewIsDarkAppearance(self);
+        if (st.sbrSelected) {
+            fillRoundedRect(bounds, 7.0, nsColorAlpha(nsColorAccent(), if (isDark) 0.24 else 0.14))
+        } else ();
+
+        let iconTint = if (st.sbrSelected) nsColorAccent() else nsColorSecondaryLabel();
+        drawTintedSymbol(st.sbrSymbol, 13.0, fontWeightMedium(), iconTint, cgRect(10.0, (bounds.size.height - 18.0) * 0.5, 18.0, 18.0));
+
+        let font = nsFontSystem(13.0, if (st.sbrSelected) fontWeightSemibold() else fontWeightRegular());
+        let attrs = makeTextAttrs(font, nsColorLabel());
+        let sz = msgSendSizeWithAttrs(nsStr(st.sbrTitle), objcSel("sizeWithAttributes:"), attrs);
+        msgSendDrawAtPointAttrsSw(
+            nsStr(st.sbrTitle),
+            objcSel("drawAtPoint:withAttributes:"),
+            cgPoint(34.0, roundFloat((bounds.size.height - sz.height) * 0.5)),
+            attrs
+        )
+    } else ()
+}
+
+def sidebarRowMouseDown(self: Ptr, _cmd: Ptr, _ev: Ptr): Void = {
+    let h = objcGetAssocHandle(self, sidebarRowAssocKey());
+    if (h != intToI64(0)) {
+        let st: SidebarRowState = gcHandleGet(h);
+        let f = st.sbrOnClick;
+        f()
+    } else ()
+}
+
+def makeSidebarRowView(frame: CGRect, title: String, symbol: String, selected: Bool, onClick: () -> Void): Ptr = {
+    let v = objcAllocInitFrame("JuxuSidebarRowView", frame);
+    objcSetAssocHandle(v, sidebarRowAssocKey(), gcHandleNew(SidebarRowState {
+        sbrTitle: title,
+        sbrSymbol: symbol,
+        sbrSelected: selected,
+        sbrOnClick: onClick,
+    }));
+    v
+}
+
+// ---- 3. Schema Category / Version Radio Card (`JuxuRadioCardView`) ----
+
+data RadioCardState {
+    rcsSymbolOpt: Option String,
+    rcsTitle: String,
+    rcsSubtitle: String,
+    rcsSelected: Bool,
+    rcsRadius: Float,
+    rcsOnClick: () -> Void,
+}
+
+def gRadioCardKey: Cell Ptr = cellNew(ptrNull())
+def radioCardAssocKey(): Ptr = {
+    let k = cellGet(gRadioCardKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gRadioCardKey, nk); nk }
+}
+
+def radioCardDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let h = objcGetAssocHandle(self, radioCardAssocKey());
+    if (h != intToI64(0)) {
+        let st: RadioCardState = gcHandleGet(h);
+        let bounds = msgSendRect0(self, objcSel("bounds"));
+        let isDark = viewIsDarkAppearance(self);
+        let fillCol =
+            if (st.rcsSelected) nsColorAlpha(nsColorAccent(), 0.11)
+            else nsColorAlpha(nsColorLabel(), if (isDark) 0.04 else 0.03);
+        fillRoundedRect(bounds, st.rcsRadius, fillCol);
+        if (st.rcsSelected) {
+            strokeRoundedRect(bounds, st.rcsRadius, 1.25, nsColorAccent())
+        } else {
+            strokeRoundedRect(bounds, st.rcsRadius, 0.65, nsColorAlpha(nsColorLabel(), 0.11))
+        };
+
+        let titleX = match st.rcsSymbolOpt {
+            Some(sym) -> {
+                drawTintedSymbol(sym, 12.5, fontWeightSemibold(), nsColorAccent(), cgRect(10.0, 10.0, 16.0, 16.0));
+                31.0
+            },
+            None -> 10.0,
+        };
+
+        let titleFont = nsFontSystem(13.0, fontWeightSemibold());
+        let titleAttrs = makeTextAttrs(titleFont, nsColorLabel());
+        msgSendDrawAtPointAttrsSw(
+            nsStr(st.rcsTitle),
+            objcSel("drawAtPoint:withAttributes:"),
+            cgPoint(titleX, 9.5),
+            titleAttrs
+        );
+
+        // Right radio indicator (`checkmark.circle.fill` when selected, stroked circle when unselected)
+        let indRect = cgRect(bounds.size.width - 24.0, 10.5, 14.0, 14.0);
+        if (st.rcsSelected) {
+            drawTintedSymbol("checkmark.circle.fill", 13.0, fontWeightSemibold(), nsColorAccent(), indRect)
+        } else {
+            strokeRoundedRect(indRect, 7.0, 1.1, nsColorAlpha(nsColorSecondaryLabel(), 0.50))
+        };
+
+        let subFont = nsFontSystem(11.0, fontWeightRegular());
+        let subAttrs = makeTextAttrs(subFont, nsColorSecondaryLabel());
+        msgSendDrawAtPointAttrsSw(
+            nsStr(st.rcsSubtitle),
+            objcSel("drawAtPoint:withAttributes:"),
+            cgPoint(10.0, 31.5),
+            subAttrs
+        )
+    } else ()
+}
+
+def radioCardMouseDown(self: Ptr, _cmd: Ptr, _ev: Ptr): Void = {
+    let h = objcGetAssocHandle(self, radioCardAssocKey());
+    if (h != intToI64(0)) {
+        let st: RadioCardState = gcHandleGet(h);
+        let f = st.rcsOnClick;
+        f()
+    } else ()
+}
+
+def makeRadioCardView(
+    frame: CGRect,
+    symbolOpt: Option String,
+    title: String,
+    subtitle: String,
+    selected: Bool,
+    radius: Float,
+    onClick: () -> Void
+): Ptr = {
+    let v = objcAllocInitFrame("JuxuRadioCardView", frame);
+    objcSetAssocHandle(v, radioCardAssocKey(), gcHandleNew(RadioCardState {
+        rcsSymbolOpt: symbolOpt,
+        rcsTitle: title,
+        rcsSubtitle: subtitle,
+        rcsSelected: selected,
+        rcsRadius: radius,
+        rcsOnClick: onClick,
+    }));
+    v
+}
+
+// ---- 4. Native Accent Capsule Switch (`JuxuCapsuleSwitchView`, `SettingsWindow.swift` lines 726-744) ----
+
+data CapsuleSwitchState {
+    cssIsOn: Cell Bool,
+    cssOnToggle: (Bool) -> Void,
+}
+
+def gSwitchKey: Cell Ptr = cellNew(ptrNull())
+def switchAssocKey(): Ptr = {
+    let k = cellGet(gSwitchKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gSwitchKey, nk); nk }
+}
+
+def capsuleSwitchDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let h = objcGetAssocHandle(self, switchAssocKey());
+    if (h != intToI64(0)) {
+        let st: CapsuleSwitchState = gcHandleGet(h);
+        let on = cellGet(st.cssIsOn);
+        let trackRect = cgRect(0.0, 0.0, 36.0, 20.0);
+        let trackCol = if (on) nsColorAccent() else nsColorAlpha(nsColorLabel(), 0.16);
+        fillRoundedRect(trackRect, 10.0, trackCol);
+
+        let knobX = if (on) 18.0 else 2.0;
+        fillRoundedRect(cgRect(knobX, 2.8, 16.0, 16.0), 8.0, nsColorRgba(0.0, 0.0, 0.0, 0.18));
+        fillRoundedRect(cgRect(knobX, 2.0, 16.0, 16.0), 8.0, nsColorWhite())
+    } else ()
+}
+
+def capsuleSwitchMouseDown(self: Ptr, _cmd: Ptr, _ev: Ptr): Void = {
+    let h = objcGetAssocHandle(self, switchAssocKey());
+    if (h != intToI64(0)) {
+        let st: CapsuleSwitchState = gcHandleGet(h);
+        let nextVal = !cellGet(st.cssIsOn);
+        cellSet(st.cssIsOn, nextVal);
+        msgSendVoid1Bool(self, objcSel("setNeedsDisplay:"), true);
+        let cb = st.cssOnToggle;
+        cb(nextVal)
+    } else ()
+}
+
+def makeCapsuleSwitch(origin: CGPoint, initialOn: Bool, onToggle: (Bool) -> Void): Ptr = {
+    let v = objcAllocInitFrame("JuxuCapsuleSwitchView", cgRect(origin.x, origin.y, 36.0, 20.0));
+    objcSetAssocHandle(v, switchAssocKey(), gcHandleNew(CapsuleSwitchState {
+        cssIsOn: cellNew(initialOn),
+        cssOnToggle: onToggle,
+    }));
+    v
+}
+
+// ---- 5. `SharedEvalMetricCell` (`JuxuEvalMetricView`) ----
+
+data EvalMetricState {
+    emsTitle: String,
+    emsValue: String,
+}
+
+def gMetricKey: Cell Ptr = cellNew(ptrNull())
+def metricAssocKey(): Ptr = {
+    let k = cellGet(gMetricKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gMetricKey, nk); nk }
+}
+
+def evalMetricDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let h = objcGetAssocHandle(self, metricAssocKey());
+    if (h != intToI64(0)) {
+        let st: EvalMetricState = gcHandleGet(h);
+        let bounds = msgSendRect0(self, objcSel("bounds"));
+        fillRoundedRect(bounds, 6.0, nsColorAlpha(nsColorLabel(), 0.045));
+        let tAttrs = makeTextAttrs(nsFontSystem(10.5, fontWeightRegular()), nsColorSecondaryLabel());
+        let vAttrs = makeTextAttrs(nsFontMono(14.0, fontWeightSemibold()), nsColorLabel());
+        msgSendDrawAtPointAttrsSw(nsStr(st.emsTitle), objcSel("drawAtPoint:withAttributes:"), cgPoint(8.0, 6.0), tAttrs);
+        msgSendDrawAtPointAttrsSw(nsStr(st.emsValue), objcSel("drawAtPoint:withAttributes:"), cgPoint(8.0, 22.0), vAttrs)
+    } else ()
+}
+
+def makeEvalMetricCellView(frame: CGRect, item: EvalLogMetricItem): Ptr = {
+    let v = objcAllocInitFrame("JuxuEvalMetricView", frame);
+    objcSetAssocHandle(v, metricAssocKey(), gcHandleNew(EvalMetricState {
+        emsTitle: item.elmTitle,
+        emsValue: item.elmValue,
+    }));
+    v
+}
+
+// ---- 6. `SharedUserPhraseCodePill` (`JuxuPhrasePillView`) ----
+
+data PhrasePillState {
+    ppsCode: String,
+    ppsAuto: Bool,
+}
+
+def gPillKey: Cell Ptr = cellNew(ptrNull())
+def pillAssocKey(): Ptr = {
+    let k = cellGet(gPillKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gPillKey, nk); nk }
+}
+
+def phrasePillDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let h = objcGetAssocHandle(self, pillAssocKey());
+    if (h != intToI64(0)) {
+        let st: PhrasePillState = gcHandleGet(h);
+        let codeFont = nsFontMono(11.5, fontWeightRegular());
+        let codeAttrs = makeTextAttrs(codeFont, nsColorSecondaryLabel());
+        let cSz = msgSendSizeWithAttrs(nsStr(st.ppsCode), objcSel("sizeWithAttributes:"), codeAttrs);
+        let pillW = cSz.width + 12.0;
+        let pillH = 18.0;
+        fillRoundedRect(cgRect(0.0, 1.0, pillW, pillH), 9.0, nsColorAlpha(nsColorLabel(), 0.06));
+        msgSendDrawAtPointAttrsSw(
+            nsStr(st.ppsCode),
+            objcSel("drawAtPoint:withAttributes:"),
+            cgPoint(6.0, 1.0 + (pillH - cSz.height) * 0.5),
+            codeAttrs
+        );
+        if (st.ppsAuto) {
+            let autoAttrs = makeTextAttrs(nsFontSystem(10.0, fontWeightRegular()), nsColorTeal());
+            let aSz = msgSendSizeWithAttrs(nsStr("自动组词"), objcSel("sizeWithAttributes:"), autoAttrs);
+            msgSendDrawAtPointAttrsSw(
+                nsStr("自动组词"),
+                objcSel("drawAtPoint:withAttributes:"),
+                cgPoint(pillW + 6.0, 1.0 + (pillH - aSz.height) * 0.5),
+                autoAttrs
+            )
+        } else ()
+    } else ()
+}
+
+def makePhrasePillView(origin: CGPoint, code: String, isAuto: Bool): Ptr = {
+    let v = objcAllocInitFrame("JuxuPhrasePillView", cgRect(origin.x, origin.y, 190.0, 20.0));
+    objcSetAssocHandle(v, pillAssocKey(), gcHandleNew(PhrasePillState { ppsCode: code, ppsAuto: isAuto }));
+    v
+}
+
+// ---- 7. Interactive 26-Key Touch Hitbox Simulator (`TouchKeyboardSimulatorView`, lines 853-968) ----
+
+data TouchSimKeyState {
+    tskCalibrations: Vec KeyTouchSample,
+    tskLastDot: Cell (Option CGPoint),
+    tskOnTouch: (Int, Float, Float) -> Void,
+    tskOnSpace: () -> Void,
+    tskOnBackspace: () -> Void,
+}
+
+def gTouchSimKey: Cell Ptr = cellNew(ptrNull())
+def touchSimAssocKey(): Ptr = {
+    let k = cellGet(gTouchSimKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gTouchSimKey, nk); nk }
+}
+
+def rowStringForIdx(r: Int): String =
+    if (r == 0) "qwertyuiop"
+    else if (r == 1) "asdfghjkl"
+    else "zxcvbnm"
+
+def rowIndentForIdx(r: Int): Float =
+    if (r == 0) 0.0 else if (r == 1) 0.5 else 1.5
+
+def nearestRawQwertyKey(nx: Float, ny: Float): Int = {
+    let bestKey = cellNew(97);
+    let bestDist = cellNew(1.0e12);
+    let r = cellNew(0);
+    while (cellGet(r) < 3) {
+        let rowIdx = cellGet(r);
+        let rowStr = rowStringForIdx(rowIdx);
+        let indent = rowIndentForIdx(rowIdx);
+        let ry = intToFloat(rowIdx);
+        let c = cellNew(0);
+        while (cellGet(c) < strLen(rowStr)) {
+            let colIdx = cellGet(c);
+            let rx = intToFloat(colIdx) + indent;
+            let dx = nx - rx;
+            let dy = ny - ry;
+            let d = dx * dx + dy * dy;
+            if (d < cellGet(bestDist)) {
+                cellSet(bestDist, d);
+                cellSet(bestKey, strByteAt(rowStr, colIdx))
+            } else ();
+            cellSet(c, colIdx + 1)
+        };
+        cellSet(r, rowIdx + 1)
+    };
+    cellGet(bestKey)
+}
+
+def touchSimDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let h = objcGetAssocHandle(self, touchSimAssocKey());
+    if (h != intToI64(0)) {
+        let st: TouchSimKeyState = gcHandleGet(h);
+        let bounds = msgSendRect0(self, objcSel("bounds"));
+        let w = bounds.size.width;
+        let isDark = viewIsDarkAppearance(self);
+
+        fillRoundedRect(bounds, 10.0, nsColorAlpha(nsColorLabel(), 0.06));
+
+        let pitchX = w / 10.0;
+        let keyW = pitchX - 5.0;
+        let keyH = 36.0;
+        let pitchY = 42.0;
+        let keyBg = if (isDark) nsColorRgba(0.18, 0.18, 0.20, 1.0) else nsColorWhite();
+        let shadowCol = nsColorRgba(0.0, 0.0, 0.0, if (isDark) 0.34 else 0.14);
+        let keyFont = nsFontRounded(14.0, fontWeightRegular());
+        let keyAttrs = makeTextAttrs(keyFont, nsColorLabel());
+        let dummySample = KeyTouchSample { keyLabel: "a", offset: touchKeyOffsetZero() };
+
+        let r = cellNew(0);
+        while (cellGet(r) < 3) {
+            let rowIdx = cellGet(r);
+            let rowStr = rowStringForIdx(rowIdx);
+            let indent = rowIndentForIdx(rowIdx);
+            let c = cellNew(0);
+            while (cellGet(c) < strLen(rowStr)) {
+                let colIdx = cellGet(c);
+                let chByte = strByteAt(rowStr, colIdx);
+                let cx = (intToFloat(colIdx) + indent + 0.5) * pitchX;
+                let cy = 8.0 + intToFloat(rowIdx) * pitchY + keyH * 0.5;
+                let kr = cgRect(cx - keyW * 0.5, cy - keyH * 0.5, keyW, keyH);
+
+                fillRoundedRect(cgRect(kr.origin.x, kr.origin.y + 1.0, keyW, keyH), 5.5, shadowCol);
+                fillRoundedRect(kr, 5.5, keyBg);
+
+                let upperStr = scalarToString(chByte - 32);
+                let lSz = msgSendSizeWithAttrs(nsStr(upperStr), objcSel("sizeWithAttributes:"), keyAttrs);
+                msgSendDrawAtPointAttrsSw(
+                    nsStr(upperStr),
+                    objcSel("drawAtPoint:withAttributes:"),
+                    cgPoint(cx - lSz.width * 0.5, cy - lSz.height * 0.5),
+                    keyAttrs
+                );
+                let _ = dummySample;
+
+                cellSet(c, colIdx + 1)
+            };
+            cellSet(r, rowIdx + 1)
+        };
+
+        // Bottom row: Space (`空格确认`) & Backspace (`delete.left`)
+        let botY = 8.0 + 3.0 * pitchY;
+        let spaceRect = cgRect(12.0, botY, maxFloat(80.0, w - 88.0), 32.0);
+        let bsRect = cgRect(w - 68.0, botY, 56.0, 32.0);
+
+        fillRoundedRect(cgRect(spaceRect.origin.x, spaceRect.origin.y + 1.0, spaceRect.size.width, 32.0), 5.5, shadowCol);
+        fillRoundedRect(spaceRect, 5.5, keyBg);
+        let spAttrs = makeTextAttrs(nsFontSystem(12.5, fontWeightRegular()), nsColorLabel());
+        let spSz = msgSendSizeWithAttrs(nsStr("空格确认"), objcSel("sizeWithAttributes:"), spAttrs);
+        msgSendDrawAtPointAttrsSw(
+            nsStr("空格确认"),
+            objcSel("drawAtPoint:withAttributes:"),
+            cgPoint(spaceRect.origin.x + (spaceRect.size.width - spSz.width) * 0.5, botY + (32.0 - spSz.height) * 0.5),
+            spAttrs
+        );
+
+        fillRoundedRect(bsRect, 5.5, nsColorAlpha(nsColorLabel(), 0.10));
+        drawTintedSymbol("delete.left", 13.0, fontWeightRegular(), nsColorLabel(), bsRect);
+
+        match cellGet(st.tskLastDot) {
+            Some(dot) -> fillRoundedRect(cgRect(dot.x - 4.5, dot.y - 4.5, 9.0, 9.0), 4.5, nsColorAlpha(nsColorOrange(), 0.85)),
+            None -> (),
+        }
+    } else ()
+}
+
+def touchSimMouseDown(self: Ptr, _cmd: Ptr, event: Ptr): Void = {
+    let h = objcGetAssocHandle(self, touchSimAssocKey());
+    if (!ptrIsNull(event) && h != intToI64(0)) {
+        let st: TouchSimKeyState = gcHandleGet(h);
+        let bounds = msgSendRect0(self, objcSel("bounds"));
+        let w = bounds.size.width;
+        let winPt = msgSendPoint0(event, objcSel("locationInWindow"));
+        let pt = msgSendPoint1Point1Ptr(self, objcSel("convertPoint:fromView:"), winPt, ptrNull());
+
+        let botY = 8.0 + 3.0 * 42.0;
+        let spaceRect = cgRect(12.0, botY, maxFloat(80.0, w - 88.0), 32.0);
+        let bsRect = cgRect(w - 68.0, botY, 56.0, 32.0);
+
+        if (rectContainsPoint(spaceRect, pt)) {
+            let f = st.tskOnSpace;
+            f()
+        } else if (rectContainsPoint(bsRect, pt)) {
+            let f = st.tskOnBackspace;
+            f()
+        } else if (pt.y >= 0.0 && pt.y <= botY - 4.0) {
+            cellSet(st.tskLastDot, Some(pt));
+            msgSendVoid1Bool(self, objcSel("setNeedsDisplay:"), true);
+            let pitchX = w / 10.0;
+            let keyH = 36.0;
+            let pitchY = 42.0;
+            let normX = (pt.x - pitchX * 0.5) / pitchX;
+            let normY = (pt.y - (8.0 + keyH * 0.5)) / pitchY;
+            let nearest = nearestRawQwertyKey(normX, normY);
+            let cb = st.tskOnTouch;
+            cb(nearest, normX, normY)
+        } else ()
+    } else ()
+}
+
+// ============================================================================
+// Settings Controller State & Config Mutation Helpers
+// ============================================================================
+
+data SettingsUiState {
+    susSession: JuxuSession,
+    susSection: Cell SettingsSection,
+    susIsPreviewChrome: Bool,
+    susSidebarContainer: Ptr,
+    susScrollView: Ptr,
+    susLastContentW: Cell Float,
+    susPhraseInputText: Cell String,
+    susPhraseBanner: Cell String,
+    susSimSessionOpt: Cell (Option JuxuSession),
+    susLabCommitted: Cell String,
+    susLastTouchInfo: Cell String,
+    susLastSimDot: Cell (Option CGPoint),
+}
+
+def gSplitKey: Cell Ptr = cellNew(ptrNull())
+def splitAssocKey(): Ptr = {
+    let k = cellGet(gSplitKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gSplitKey, nk); nk }
+}
+
+def ensureSimSession(ui: SettingsUiState): JuxuSession =
+    match cellGet(ui.susSimSessionOpt) {
+        Some(sim) -> {
+            bridgeApplyAndSaveConfig(sim, cellGet(ui.susSession.jsConfig), false);
+            bridgeApplyTouchCalibrations(sim, cellGet(ui.susSession.touchCalibrations));
+            sim
+        },
+        None -> {
+            let dictDir = cellGet(ui.susSession.dictDir);
+            let dirOpt = if (strLen(dictDir) > 0) Some(dictDir) else None;
+            let sim = bridgeNew(dirOpt, true);
+            bridgeApplyAndSaveConfig(sim, cellGet(ui.susSession.jsConfig), false);
+            let _ = bridgeRefreshTouchProfile(ui.susSession);
+            bridgeApplyTouchCalibrations(sim, cellGet(ui.susSession.touchCalibrations));
+            bridgeSetContext(sim, tailScalars(cellGet(ui.susLabCommitted), 32));
+            cellSet(ui.susSimSessionOpt, Some(sim));
+            sim
+        },
+    }
+
+def clearSubviews(container: Ptr): Void =
+    if (!ptrIsNull(container)) {
+        let emptyArr = msgSend0(objcClass("NSArray"), objcSel("array"));
+        msgSendVoid1Ptr(container, objcSel("setSubviews:"), emptyArr)
+    } else ()
+
+// ============================================================================
+// Form Row & Section Builders (`SettingsWindow.swift` Sections 1..5)
+// ============================================================================
+
+def addFormHeader(parent: Ptr, y: Float, width: Float, title: String, subtitle: String): Float = {
+    let tLbl = makeStaticLabel(
+        cgRect(0.0, y, width, 24.0),
+        title,
+        nsFontSystem(17.0, fontWeightSemibold()),
+        nsColorLabel(),
+        false
+    );
+    msgSendVoid1Ptr(parent, objcSel("addSubview:"), tLbl);
+    objcReleaseRaw(tLbl);
+
+    let subLines = if (utf8ScalarCount(subtitle) > 36) 36.0 else 19.0;
+    let sLbl = makeStaticLabel(
+        cgRect(0.0, y + 25.0, width, subLines),
+        subtitle,
+        nsFontSystem(12.5, fontWeightRegular()),
+        nsColorSecondaryLabel(),
+        true
+    );
+    msgSendVoid1Ptr(parent, objcSel("addSubview:"), sLbl);
+    objcReleaseRaw(sLbl);
+    y + 25.0 + subLines + 12.0
+}
+
+def addToggleRow(
+    card: Ptr,
+    y: Float,
+    cardW: Float,
+    title: String,
+    subtitle: String,
+    isOn: Bool,
+    onToggle: (Bool) -> Void
+): Float = {
+    let textMaxW = cardW - 76.0;
+    let multiLine = utf8ScalarCount(subtitle) > 34;
+    let subH = if (multiLine) 32.0 else 16.0;
+    let rowH = if (multiLine) 66.0 else 52.0;
+
+    let tLbl = makeStaticLabel(
+        cgRect(14.0, y + 9.0, textMaxW, 18.0),
+        title,
+        nsFontSystem(13.0, fontWeightMedium()),
+        nsColorLabel(),
+        false
+    );
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), tLbl);
+    objcReleaseRaw(tLbl);
+
+    let sLbl = makeStaticLabel(
+        cgRect(14.0, y + 28.0, textMaxW, subH),
+        subtitle,
+        nsFontSystem(11.5, fontWeightRegular()),
+        nsColorSecondaryLabel(),
+        true
+    );
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), sLbl);
+    objcReleaseRaw(sLbl);
+
+    let sw = makeCapsuleSwitch(cgPoint(cardW - 50.0, y + (rowH - 20.0) * 0.5), isOn, onToggle);
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), sw);
+    objcReleaseRaw(sw);
+    y + rowH
+}
+
+def makeSmallButton(frame: CGRect, title: String, enabled: Bool, onClick: () -> Void): Ptr = {
     let btn = objcAllocInitFrame("NSButton", frame);
-    // NSButtonTypeSwitch == 3
-    msgSendVoid1I64(btn, objcSel("setButtonType:"), intToI64(3));
+    // NSBezelStyleRounded = 1, NSControlSizeSmall = 1
+    msgSendVoid1I64(btn, objcSel("setBezelStyle:"), intToI64(1));
+    msgSendVoid1I64(btn, objcSel("setControlSize:"), intToI64(1));
+    msgSendVoid1Ptr(btn, objcSel("setFont:"), nsFontSystem(11.5, fontWeightRegular()));
     msgSendVoid1Ptr(btn, objcSel("setTitle:"), nsStr(title));
-    msgSendVoid1I64(btn, objcSel("setState:"), if (initial) intToI64(1) else intToI64(0));
-    msgSendVoid1Ptr(btn, objcSel("setTarget:"), tgt);
-    msgSendVoid1Ptr(btn, objcSel("setAction:"), objcSel("onSettingChanged:"));
-    msgSendVoid1Ptr(content, objcSel("addSubview:"), btn);
+    msgSendVoid1Bool(btn, objcSel("setEnabled:"), enabled);
+    bindControlAction(btn, (_s: Ptr) -> onClick());
     btn
 }
 
-pub def settingsWindowShow(s: JuxuSession): Void = {
-    cellSet(gSettingsSession, Some(s));
-    let win = if (!ptrIsNull(cellGet(gSettingsWindow))) cellGet(gSettingsWindow)
-    else {
-        let wAlloc = msgSend0(objcClass("NSWindow"), objcSel("alloc"));
-        let w = msgSend1Rect1U64_1I64_1Bool(
-            wAlloc,
-            objcSel("initWithContentRect:styleMask:backing:defer:"),
-            cgRect(320.0, 220.0, 460.0, 320.0),
-            intToI64(7), intToI64(2), false
+def buildSchemaPage(ui: SettingsUiState, docView: Ptr, padX: Float, startY: Float, contentW: Float): Float = {
+    let s = ui.susSession;
+    let cfg = cellGet(s.jsConfig);
+    let st = cellGet(s.jsState);
+    let activeCat = configSchemaCategory(cfg);
+    let isCangjie = configIsCangjieFamily(cfg);
+    let isPinyin = configIsPinyinFamily(cfg);
+    let isWubi = configIsWubiFamily(cfg);
+    let maxCodeLbl = maxCodeChineseNumeral(isCangjie);
+    let pushCodeLbl = pushCodeChineseNumeral(isCangjie);
+    let maxCodeNum = maxCodeDigits(isCangjie);
+    let pushCodeNum = pushCodeDigits(isCangjie);
+
+    let curY = cellNew(addFormHeader(
+        docView,
+        startY,
+        contentW,
+        "输入方案与编码规则",
+        "内置拼音、五笔、仓颉三大类零拷贝词典，共用 RWKV-7 语言模型与触点纠错"
+    ));
+
+    // Card 1: Category & Schema Version Radio Grids
+    let card1Divs: Vec Float = vecWithCap(1);
+    vecPush(card1Divs, 108.0);
+    let card1H = 216.0;
+    let card1 = makeCardView(cgRect(padX, cellGet(curY), contentW, card1H), card1Divs);
+
+    let h1Left = makeStaticLabel(cgRect(14.0, 12.0, 200.0, 18.0), "1. 选择方案大类", nsFontSystem(13.0, fontWeightSemibold()), nsColorLabel(), false);
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), h1Left);
+    objcReleaseRaw(h1Left);
+
+    let curSummary = "当前：" + categoryRawValue(activeCat) + " · " + st.asSchemaName;
+    let sFont = nsFontSystem(11.5, fontWeightRegular());
+    let sSz = msgSendSizeWithAttrs(nsStr(curSummary), objcSel("sizeWithAttributes:"), makeTextAttrs(sFont, nsColorSecondaryLabel()));
+    let h1Right = makeStaticLabel(cgRect(contentW - 14.0 - sSz.width - 4.0, 13.0, sSz.width + 4.0, 16.0), curSummary, sFont, nsColorSecondaryLabel(), false);
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), h1Right);
+    objcReleaseRaw(h1Right);
+
+    let gridGap = 10.0;
+    let itemW = (contentW - 28.0 - gridGap * 2.0) / 3.0;
+    let cats = allSchemaCategories();
+    let iCat = cellNew(0);
+    while (cellGet(iCat) < vecLen(cats)) {
+        let idx = cellGet(iCat);
+        let cat: InputSchemaCategory = vecGetOr(cats, idx, CatWubi);
+        let sel = cat == activeCat;
+        let rc = makeRadioCardView(
+            cgRect(14.0 + intToFloat(idx) * (itemW + gridGap), 36.0, itemW, 58.0),
+            Some(categorySymbolName(cat)),
+            categoryRawValue(cat),
+            categorySubtitle(cat),
+            sel,
+            9.0,
+            () -> {
+                if (!sel) {
+                    bridgeSwitchSchema(s, categoryDefaultSchemaId(cat), true);
+                    rebuildSettingsDetail(ui, true)
+                } else ()
+            }
         );
-        msgSendVoid1Ptr(w, objcSel("setTitle:"), nsStr("句序设置"));
+        msgSendVoid1Ptr(card1, objcSel("addSubview:"), rc);
+        objcReleaseRaw(rc);
+        cellSet(iCat, idx + 1)
+    };
+
+    let h2Left = makeStaticLabel(
+        cgRect(14.0, 118.0, 260.0, 18.0),
+        "2. 选择" + categoryRawValue(activeCat) + "方案版本",
+        nsFontSystem(13.0, fontWeightSemibold()),
+        nsColorLabel(),
+        false
+    );
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), h2Left);
+    objcReleaseRaw(h2Left);
+
+    let opts = schemaOptionsForCategory(activeCat);
+    let dummyOpt = InputSchemaOption { isoId: 86, isoCategory: CatWubi, isoTitle: "", isoShortTitle: "", isoTag: "", isoDesc: "" };
+    let curSid = schemaId(cfg.schema);
+    let iOpt = cellNew(0);
+    while (cellGet(iOpt) < vecLen(opts)) {
+        let idx = cellGet(iOpt);
+        let opt: InputSchemaOption = vecGetOr(opts, idx, dummyOpt);
+        let sel = curSid == opt.isoId;
+        let targetSid = opt.isoId;
+        let rc = makeRadioCardView(
+            cgRect(14.0 + intToFloat(idx) * (itemW + gridGap), 144.0, itemW, 58.0),
+            None,
+            opt.isoTitle,
+            opt.isoDesc,
+            sel,
+            8.0,
+            () -> {
+                if (!sel) {
+                    bridgeSwitchSchema(s, targetSid, true);
+                    rebuildSettingsDetail(ui, true)
+                } else ()
+            }
+        );
+        msgSendVoid1Ptr(card1, objcSel("addSubview:"), rc);
+        objcReleaseRaw(rc);
+        cellSet(iOpt, idx + 1)
+    };
+
+    msgSendVoid1Ptr(docView, objcSel("addSubview:"), card1);
+    objcReleaseRaw(card1);
+    cellSet(curY, cellGet(curY) + card1H + 14.0);
+
+    // Card 2: Fixed-Code Auto-Commit / Push-Commit / Empty Behavior (non-Pinyin)
+    if (!isPinyin) {
+        let c2Divs: Vec Float = vecNew();
+        let tmpCard = makeFlippedView(cgRect(0.0, 0.0, contentW, 300.0));
+        let y2 = cellNew(0.0);
+
+        cellSet(y2, addToggleRow(
+            tmpCard,
+            cellGet(y2),
+            contentW,
+            maxCodeLbl + "码唯一自动上屏",
+            "输满" + maxCodeLbl + "码且精确匹配唯一候选时免按空格直接上屏",
+            cfg.fourthCodeAutoCommit,
+            (v: Bool) -> {
+                let c = cellGet(s.jsConfig);
+                bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                    schema: c.schema, fourthCodeAutoCommit: v, fifthCodePushCommit: c.fifthCodePushCommit,
+                    fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                    strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                    dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                    autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                    zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                    smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                    autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                    cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                    keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                    keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                    keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                    pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                    shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                    evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+                }, true)
+            }
+        ));
+        vecPush(c2Divs, cellGet(y2));
+
+        cellSet(y2, addToggleRow(
+            tmpCard,
+            cellGet(y2),
+            contentW,
+            "第" + pushCodeLbl + "码顶字上屏",
+            maxCodeLbl + "码存在重码时，继续敲第 " + intToStr(pushCodeNum) + " 码自动将首选词顶上屏并开始新编码",
+            cfg.fifthCodePushCommit,
+            (v: Bool) -> {
+                let c = cellGet(s.jsConfig);
+                bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                    schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: v,
+                    fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                    strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                    dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                    autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                    zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                    smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                    autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                    cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                    keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                    keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                    keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                    pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                    shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                    evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+                }, true)
+            }
+        ));
+        vecPush(c2Divs, cellGet(y2));
+
+        // Popup row: `<四/五>码空码处理`
+        let popY = cellGet(y2);
+        let ptLbl = makeStaticLabel(cgRect(14.0, popY + 9.0, contentW - 210.0, 18.0), maxCodeLbl + "码空码处理", nsFontSystem(13.0, fontWeightMedium()), nsColorLabel(), false);
+        let psLbl = makeStaticLabel(cgRect(14.0, popY + 28.0, contentW - 210.0, 16.0), "第" + maxCodeLbl + "码无匹配且无高置信度纠错项时的行为", nsFontSystem(11.5, fontWeightRegular()), nsColorSecondaryLabel(), false);
+        msgSendVoid1Ptr(tmpCard, objcSel("addSubview:"), ptLbl);
+        msgSendVoid1Ptr(tmpCard, objcSel("addSubview:"), psLbl);
+        objcReleaseRaw(ptLbl);
+        objcReleaseRaw(psLbl);
+
+        let popup = objcAllocInitFrame("NSPopUpButton", cgRect(contentW - 182.0, popY + 13.0, 168.0, 26.0));
+        msgSendVoid1Ptr(popup, objcSel("addItemWithTitle:"), nsStr("阻断第 " + intToStr(maxCodeNum) + " 码并提示"));
+        msgSendVoid1Ptr(popup, objcSel("addItemWithTitle:"), nsStr("自动清空重输"));
+        msgSendVoid1I64(popup, objcSel("selectItemAtIndex:"), if (cfg.fourthEmptyBehavior == FourthClear) intToI64(1) else intToI64(0));
+        bindControlAction(popup, (p: Ptr) -> {
+            let selIdx = msgSendInt0(p, objcSel("indexOfSelectedItem"));
+            let beh: FourthEmptyBehavior = if (selIdx == 1) FourthClear else FourthBlock;
+            let c = cellGet(s.jsConfig);
+            bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                fourthEmptyBehavior: beh, shortestCodeFirst: c.shortestCodeFirst,
+                strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+            }, true)
+        });
+        msgSendVoid1Ptr(tmpCard, objcSel("addSubview:"), popup);
+        objcReleaseRaw(popup);
+        cellSet(y2, popY + 52.0);
+
+        let card2H = cellGet(y2);
+        let card2 = makeCardView(cgRect(padX, cellGet(curY), contentW, card2H), c2Divs);
+        msgSendVoid1Rect(tmpCard, objcSel("setFrame:"), cgRect(0.0, 0.0, contentW, card2H));
+        msgSendVoid1Ptr(card2, objcSel("addSubview:"), tmpCard);
+        objcReleaseRaw(tmpCard);
+        msgSendVoid1Ptr(docView, objcSel("addSubview:"), card2);
+        objcReleaseRaw(card2);
+        cellSet(curY, cellGet(curY) + card2H + 14.0)
+    } else ();
+
+    // Card 3: Decoding / Shortcode / Z-Lookup / Rare Charset
+    let c3Divs: Vec Float = vecNew();
+    let tmp3 = makeFlippedView(cgRect(0.0, 0.0, contentW, 420.0));
+    let y3 = cellNew(0.0);
+
+    if (isPinyin) {
+        let pySub =
+            if (curSid == 21) "支持单键声母简拼（如 u/i/v 分别对应 sh/ch/zh，urf → 输入法）"
+            else "支持首字母简拼与全简混拼（如 srf / shurf → 输入法）";
+        cellSet(y3, addToggleRow(tmp3, cellGet(y3), contentW, "声母简拼", pySub, cfg.pinyinInitialAbbr, (v: Bool) -> {
+            let c = cellGet(s.jsConfig);
+            bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                pinyinInitialAbbr: v, pinyinT9Layout: c.pinyinT9Layout,
+                shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+            }, true)
+        }));
+        vecPush(c3Divs, cellGet(y3))
+    } else {
+        cellSet(y3, addToggleRow(
+            tmp3, cellGet(y3), contentW,
+            "流式无空格连打（实验）",
+            "连续输入词组和简码。标点确认中文，回车输入原始字母",
+            cfg.spaceless,
+            (v: Bool) -> {
+                let c = cellGet(s.jsConfig);
+                bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                    schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                    fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                    strictShortcode: c.strictShortcode, spaceless: v, showShortcodeHint: c.showShortcodeHint,
+                    dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                    autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                    zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                    smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                    autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                    cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                    keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                    keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                    keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                    pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                    shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                    evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+                }, true);
+                rebuildSettingsDetail(ui, false)
+            }
+        ));
+        vecPush(c3Divs, cellGet(y3));
+
+        cellSet(y3, addToggleRow(
+            tmp3, cellGet(y3), contentW,
+            "最短编码（简码）优先",
+            if (isCangjie) "输入 1–4 码时精确匹配字词始终优先于长码前缀补全" else "输入 1–3 码时简码字词始终优先于长码前缀补全",
+            cfg.shortestCodeFirst,
+            (v: Bool) -> {
+                let c = cellGet(s.jsConfig);
+                bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                    schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                    fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: v,
+                    strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                    dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                    autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                    zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                    smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                    autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                    cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                    keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                    keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                    keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                    pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                    shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                    evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+                }, true)
+            }
+        ));
+        vecPush(c3Divs, cellGet(y3));
+
+        cellSet(y3, addToggleRow(
+            tmp3, cellGet(y3), contentW,
+            "全码显示简码提示",
+            if (isCangjie) "打较长编码时在候选旁标注更短编码" else "打全码时在候选旁标注最短简码（如打 khk 在“中”旁轻提示 k）",
+            cfg.showShortcodeHint,
+            (v: Bool) -> {
+                let c = cellGet(s.jsConfig);
+                bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                    schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                    fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                    strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: v,
+                    dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                    autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                    zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                    smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                    autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                    cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                    keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                    keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                    keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                    pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                    shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                    evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+                }, true)
+            }
+        ));
+        vecPush(c3Divs, cellGet(y3));
+
+        cellSet(y3, addToggleRow(
+            tmp3, cellGet(y3), contentW,
+            "出简不出全",
+            if (cfg.spaceless) "优先按首选简码切分单字，较长的编码仍可出字" else "拥有首选简码的单字在输入" + maxCodeLbl + "码全码时后置",
+            cfg.strictShortcode,
+            (v: Bool) -> {
+                let c = cellGet(s.jsConfig);
+                bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                    schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                    fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                    strictShortcode: v, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                    dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                    autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                    zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                    smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                    autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                    cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                    keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                    keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                    keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                    pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                    shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                    evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+                }, true)
+            }
+        ));
+        vecPush(c3Divs, cellGet(y3));
+
+        if (isWubi || isCangjie) {
+            cellSet(y3, addToggleRow(
+                tmp3, cellGet(y3), contentW,
+                if (isCangjie) "z 键拼音反查" else "z 键万能通配与拼音反查",
+                if (isCangjie) "首字母输 z 接拼音反查当前仓颉版本的字根与编码（如 zmian → 面 一田尸中 mwsl）"
+                else "第 2–4 位输 z 通配任意码元；首字母输 z 接拼音反查当前版本的五笔码",
+                cfg.zOmnipotent,
+                (v: Bool) -> {
+                    let c = cellGet(s.jsConfig);
+                    bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                        schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                        fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                        strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                        dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                        autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                        zOmnipotent: v, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                        smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                        autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                        cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                        keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                        keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                        keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                        pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                        shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                        evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+                    }, true)
+                }
+            ));
+            vecPush(c3Divs, cellGet(y3))
+        } else ()
+    };
+
+    cellSet(y3, addToggleRow(
+        tmp3, cellGet(y3), contentW,
+        "启用 Unicode 扩展区大字集",
+        "包含 CJK 扩展 B–I 生僻古籍字（日常盲打建议关闭以保持重码精简）",
+        cfg.enableRareCharset,
+        (v: Bool) -> {
+            let c = cellGet(s.jsConfig);
+            bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: v,
+                pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+            }, true)
+        }
+    ));
+
+    let card3H = cellGet(y3);
+    let card3 = makeCardView(cgRect(padX, cellGet(curY), contentW, card3H), c3Divs);
+    msgSendVoid1Rect(tmp3, objcSel("setFrame:"), cgRect(0.0, 0.0, contentW, card3H));
+    msgSendVoid1Ptr(card3, objcSel("addSubview:"), tmp3);
+    objcReleaseRaw(tmp3);
+    msgSendVoid1Ptr(docView, objcSel("addSubview:"), card3);
+    objcReleaseRaw(card3);
+    cellGet(curY) + card3H + 20.0
+}
+
+def updateTypoInSession(s: JuxuSession, newTypo: TypoConfig): Void = {
+    let c = cellGet(s.jsConfig);
+    bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+        schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+        fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+        strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+        dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+        autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+        zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+        smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+        autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+        cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+        keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+        keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+        keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+        pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+        shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+        evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: newTypo,
+    }, true)
+}
+
+def buildTypoPage(ui: SettingsUiState, docView: Ptr, padX: Float, startY: Float, contentW: Float): Float = {
+    let s = ui.susSession;
+    let _ = bridgeRefreshTouchProfile(s);
+    let summary = bridgeReloadEvalLogSummary(s);
+    let cfg = cellGet(s.jsConfig);
+    let st = cellGet(s.jsState);
+    let t = cfg.typo;
+
+    let curY = cellNew(addFormHeader(
+        docView,
+        startY,
+        contentW,
+        "统计置信度误触纠正与动态触控热区",
+        "融合连续二维触点高斯似然、语料 N-gram、RWKV-7 与个人输入历史，专为解决打字滑偏与错键痛点设计"
+    ));
+
+    // Card 1: Bayesian Typo Toggles + Promote/Suggest Sliders + Calibrated Count & Reset
+    let c1Divs: Vec Float = vecNew();
+    let tmp1 = makeFlippedView(cgRect(0.0, 0.0, contentW, 440.0));
+    let y1 = cellNew(0.0);
+
+    cellSet(y1, addToggleRow(
+        tmp1, cellGet(y1), contentW,
+        "启用贝叶斯误触纠正解码器",
+        "对空码滑偏、键边缘误触与双指快速换位产出归一化置信度",
+        t.enabled,
+        (v: Bool) -> {
+            let ct = cellGet(s.jsConfig).typo;
+            updateTypoInSession(s, MkTypoConfig {
+                enabled: v, touchHitboxAdapt: ct.touchHitboxAdapt,
+                promoteThreshold: ct.promoteThreshold, suggestThreshold: ct.suggestThreshold,
+                suppressAutoCommitOnCorrection: ct.suppressAutoCommitOnCorrection,
+                missedSpaceCorrection: ct.missedSpaceCorrection,
+            })
+        }
+    ));
+    vecPush(c1Divs, cellGet(y1));
+
+    cellSet(y1, addToggleRow(
+        tmp1, cellGet(y1), contentW,
+        "纠错救回项抑制「四码自动上屏」",
+        "纠错产生的非精确首选词满四码时留待空格/第五码确认，绝不盲目顶错字",
+        t.suppressAutoCommitOnCorrection,
+        (v: Bool) -> {
+            let ct = cellGet(s.jsConfig).typo;
+            updateTypoInSession(s, MkTypoConfig {
+                enabled: ct.enabled, touchHitboxAdapt: ct.touchHitboxAdapt,
+                promoteThreshold: ct.promoteThreshold, suggestThreshold: ct.suggestThreshold,
+                suppressAutoCommitOnCorrection: v,
+                missedSpaceCorrection: ct.missedSpaceCorrection,
+            })
+        }
+    ));
+    vecPush(c1Divs, cellGet(y1));
+
+    cellSet(y1, addToggleRow(
+        tmp1, cellGet(y1), contentW,
+        "语言模型漏空格切分纠错",
+        "打完简码或三码字漏按空格续打下一字时，结合 Micro-RWKV-7 智能顶屏或提示切分候选",
+        t.missedSpaceCorrection,
+        (v: Bool) -> {
+            let ct = cellGet(s.jsConfig).typo;
+            updateTypoInSession(s, MkTypoConfig {
+                enabled: ct.enabled, touchHitboxAdapt: ct.touchHitboxAdapt,
+                promoteThreshold: ct.promoteThreshold, suggestThreshold: ct.suggestThreshold,
+                suppressAutoCommitOnCorrection: ct.suppressAutoCommitOnCorrection,
+                missedSpaceCorrection: v,
+            })
+        }
+    ));
+    vecPush(c1Divs, cellGet(y1));
+
+    cellSet(y1, addToggleRow(
+        tmp1, cellGet(y1), contentW,
+        "触屏个人热区动态校准（EMA 自适应）",
+        "根据历史触点残差微调每个按键判定中心（限幅 ±0.20 键宽），适配个人拇指习惯",
+        t.touchHitboxAdapt,
+        (v: Bool) -> {
+            let ct = cellGet(s.jsConfig).typo;
+            updateTypoInSession(s, MkTypoConfig {
+                enabled: ct.enabled, touchHitboxAdapt: v,
+                promoteThreshold: ct.promoteThreshold, suggestThreshold: ct.suggestThreshold,
+                suppressAutoCommitOnCorrection: ct.suppressAutoCommitOnCorrection,
+                missedSpaceCorrection: ct.missedSpaceCorrection,
+            })
+        }
+    ));
+    vecPush(c1Divs, cellGet(y1));
+
+    // Slider 1: Promote Threshold (`0.60...0.96`, step `0.02`)
+    let sl1Y = cellGet(y1);
+    let promPct = floatToInt(t.promoteThreshold * 100.0 + 0.5);
+    let promTitleLbl = makeStaticLabel(
+        cgRect(14.0, sl1Y + 9.0, contentW - 204.0, 18.0),
+        "空码 / 边缘滑偏直推首选阈值：" + intToStr(promPct) + "%",
+        nsFontSystem(13.0, fontWeightMedium()), nsColorLabel(), false
+    );
+    let promSubLbl = makeStaticLabel(
+        cgRect(14.0, sl1Y + 28.0, contentW - 204.0, 16.0),
+        "置信度达到该阈值时直接救回至 1 号候选位",
+        nsFontSystem(11.5, fontWeightRegular()), nsColorSecondaryLabel(), false
+    );
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), promTitleLbl);
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), promSubLbl);
+    objcReleaseRaw(promTitleLbl);
+    objcReleaseRaw(promSubLbl);
+
+    let sl1 = objcAllocInitFrame("NSSlider", cgRect(contentW - 184.0, sl1Y + 15.0, 170.0, 22.0));
+    msgSendVoid1Float(sl1, objcSel("setMinValue:"), 0.60);
+    msgSendVoid1Float(sl1, objcSel("setMaxValue:"), 0.96);
+    msgSendVoid1I64(sl1, objcSel("setNumberOfTickMarks:"), intToI64(19));
+    msgSendVoid1Bool(sl1, objcSel("setAllowsTickMarkValuesOnly:"), true);
+    msgSendVoid1Float(sl1, objcSel("setDoubleValue:"), t.promoteThreshold);
+    bindControlAction(sl1, (ctrl: Ptr) -> {
+        let raw = clampFloat(msgSendFloat0(ctrl, objcSel("doubleValue")), 0.60, 0.96);
+        let stepped = roundFloat(raw * 50.0) / 50.0;
+        msgSendVoid1Ptr(promTitleLbl, objcSel("setStringValue:"),
+            nsStr("空码 / 边缘滑偏直推首选阈值：" + intToStr(floatToInt(stepped * 100.0 + 0.5)) + "%"));
+        let ct = cellGet(s.jsConfig).typo;
+        updateTypoInSession(s, MkTypoConfig {
+            enabled: ct.enabled, touchHitboxAdapt: ct.touchHitboxAdapt,
+            promoteThreshold: stepped, suggestThreshold: ct.suggestThreshold,
+            suppressAutoCommitOnCorrection: ct.suppressAutoCommitOnCorrection,
+            missedSpaceCorrection: ct.missedSpaceCorrection,
+        })
+    });
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), sl1);
+    objcReleaseRaw(sl1);
+    cellSet(y1, sl1Y + 52.0);
+    vecPush(c1Divs, cellGet(y1));
+
+    // Slider 2: Suggest Threshold (`0.15...0.70`, step `0.05`)
+    let sl2Y = cellGet(y1);
+    let sugPct = floatToInt(t.suggestThreshold * 100.0 + 0.5);
+    let sugTitleLbl = makeStaticLabel(
+        cgRect(14.0, sl2Y + 9.0, contentW - 200.0, 18.0),
+        "精确码有效时次选纠错提示阈值：" + intToStr(sugPct) + "%",
+        nsFontSystem(13.0, fontWeightMedium()), nsColorLabel(), false
+    );
+    let sugRowH = 66.0;
+    let sugSubLbl = makeStaticLabel(
+        cgRect(14.0, sl2Y + 28.0, contentW - 196.0, 32.0),
+        "精确首选不动，将高于该置信度的邻键常用词放在 2 号位备选",
+        nsFontSystem(11.5, fontWeightRegular()), nsColorSecondaryLabel(), true
+    );
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), sugTitleLbl);
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), sugSubLbl);
+    objcReleaseRaw(sugTitleLbl);
+    objcReleaseRaw(sugSubLbl);
+
+    let sl2 = objcAllocInitFrame("NSSlider", cgRect(contentW - 184.0, sl2Y + (sugRowH - 22.0) * 0.5, 170.0, 22.0));
+    msgSendVoid1Float(sl2, objcSel("setMinValue:"), 0.15);
+    msgSendVoid1Float(sl2, objcSel("setMaxValue:"), 0.70);
+    msgSendVoid1I64(sl2, objcSel("setNumberOfTickMarks:"), intToI64(12));
+    msgSendVoid1Bool(sl2, objcSel("setAllowsTickMarkValuesOnly:"), true);
+    msgSendVoid1Float(sl2, objcSel("setDoubleValue:"), t.suggestThreshold);
+    bindControlAction(sl2, (ctrl: Ptr) -> {
+        let raw = clampFloat(msgSendFloat0(ctrl, objcSel("doubleValue")), 0.15, 0.70);
+        let stepped = roundFloat(raw * 20.0) / 20.0;
+        msgSendVoid1Ptr(sugTitleLbl, objcSel("setStringValue:"),
+            nsStr("精确码有效时次选纠错提示阈值：" + intToStr(floatToInt(stepped * 100.0 + 0.5)) + "%"));
+        let ct = cellGet(s.jsConfig).typo;
+        updateTypoInSession(s, MkTypoConfig {
+            enabled: ct.enabled, touchHitboxAdapt: ct.touchHitboxAdapt,
+            promoteThreshold: ct.promoteThreshold, suggestThreshold: stepped,
+            suppressAutoCommitOnCorrection: ct.suppressAutoCommitOnCorrection,
+            missedSpaceCorrection: ct.missedSpaceCorrection,
+        })
+    });
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), sl2);
+    objcReleaseRaw(sl2);
+    cellSet(y1, sl2Y + sugRowH);
+    vecPush(c1Divs, cellGet(y1));
+
+    // Calibrated Key Count + Reset Button Row
+    let calY = cellGet(y1);
+    let calLbl = makeStaticLabel(
+        cgRect(14.0, calY + 12.0, contentW - 140.0, 18.0),
+        "已学习热区偏移按键数：" + calibratedProgressText(st.asCalibratedKeyCount, 26),
+        nsFontSystem(12.0, fontWeightRegular()), nsColorSecondaryLabel(), false
+    );
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), calLbl);
+    objcReleaseRaw(calLbl);
+
+    let resetBtn = makeSmallButton(cgRect(contentW - 108.0, calY + 9.0, 94.0, 24.0), "重置热区校准", true, () -> {
+        bridgeResetTouchCalibration(s, true);
+        match cellGet(ui.susSimSessionOpt) {
+            Some(sim) -> bridgeResetTouchCalibration(sim, false),
+            None -> (),
+        };
+        cellSet(ui.susLastTouchInfo, "已清空全部按键的个人热区偏移校准记录");
+        cellSet(ui.susLastSimDot, None);
+        rebuildSettingsDetail(ui, false)
+    });
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), resetBtn);
+    objcReleaseRaw(resetBtn);
+    cellSet(y1, calY + 42.0);
+
+    let card1H = cellGet(y1);
+    let card1 = makeCardView(cgRect(padX, cellGet(curY), contentW, card1H), c1Divs);
+    msgSendVoid1Rect(tmp1, objcSel("setFrame:"), cgRect(0.0, 0.0, contentW, card1H));
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), tmp1);
+    objcReleaseRaw(tmp1);
+    msgSendVoid1Ptr(docView, objcSel("addSubview:"), card1);
+    objcReleaseRaw(card1);
+    cellSet(curY, cellGet(curY) + card1H + 14.0);
+
+    // Card 2: Interactive 26-Key Touch Hitbox Simulator (`TypoTouchSimulatorContentView`)
+    let sim = ensureSimSession(ui);
+    let simSt = cellGet(sim.jsState);
+    let card2H = 296.0;
+    let card2 = makeCardView(cgRect(padX, cellGet(curY), contentW, card2H), vecNew());
+
+    let simIcon = makeSymbolImageView(cgRect(14.0, 13.0, 16.0, 16.0), "iphone.gen3", 12.5, fontWeightSemibold(), nsColorLabel());
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), simIcon);
+    objcReleaseRaw(simIcon);
+
+    let simHdr = makeStaticLabel(cgRect(34.0, 12.0, 230.0, 18.0), "触屏热区与误触纠正实时演练台", nsFontSystem(13.0, fontWeightSemibold()), nsColorLabel(), false);
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), simHdr);
+    objcReleaseRaw(simHdr);
+
+    let ctxTxt = "前文语境：" + (if (strLen(cellGet(ui.susLabCommitted)) == 0) "（无）" else cellGet(ui.susLabCommitted));
+    let ctxFont = nsFontSystem(11.5, fontWeightRegular());
+    let ctxSz = msgSendSizeWithAttrs(nsStr(ctxTxt), objcSel("sizeWithAttributes:"), makeTextAttrs(ctxFont, nsColorSecondaryLabel()));
+    let ctxLbl = makeStaticLabel(
+        cgRect(maxFloat(260.0, contentW - 60.0 - ctxSz.width - 8.0), 13.0, ctxSz.width + 6.0, 16.0),
+        ctxTxt, ctxFont, nsColorSecondaryLabel(), false
+    );
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), ctxLbl);
+    objcReleaseRaw(ctxLbl);
+
+    let clrSimBtn = makeSmallButton(cgRect(contentW - 54.0, 10.0, 40.0, 22.0), "清空", true, () -> {
+        bridgeClearComposition(sim);
+        cellSet(ui.susLabCommitted, "");
+        bridgeSetContext(sim, "");
+        cellSet(ui.susLastSimDot, None);
+        rebuildSettingsDetail(ui, false)
+    });
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), clrSimBtn);
+    objcReleaseRaw(clrSimBtn);
+
+    let touchInfoLbl = makeStaticLabel(
+        cgRect(14.0, 36.0, contentW - 28.0, 16.0),
+        cellGet(ui.susLastTouchInfo),
+        nsFontMono(11.5, fontWeightRegular()),
+        nsColorSecondaryLabel(),
+        false
+    );
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), touchInfoLbl);
+    objcReleaseRaw(touchInfoLbl);
+
+    if (strLen(simSt.asPreedit) > 0) {
+        let (barView, _, barSz) = candidateBarCreate(
+            simSt,
+            Some((idx: Int) -> {
+                let res = bridgeSelectCandidate(sim, idx, wallNowMs());
+                if (strLen(res.asCommitText) > 0) {
+                    let nextCtx = cellGet(ui.susLabCommitted) + res.asCommitText;
+                    cellSet(ui.susLabCommitted, nextCtx);
+                    bridgeSetContext(sim, tailScalars(nextCtx, 32))
+                } else ();
+                rebuildSettingsDetail(ui, false)
+            }),
+            Some((d: Int) -> {
+                let _ = bridgeTurnPage(sim, d);
+                rebuildSettingsDetail(ui, false)
+            })
+        );
+        msgSendVoid1Rect(barView, objcSel("setFrame:"), cgRect(14.0, 58.0, barSz.width, barSz.height));
+        msgSendVoid1Ptr(card2, objcSel("addSubview:"), barView);
+        objcReleaseRaw(barView)
+    } else {
+        let hintLbl = makeStaticLabel(
+            cgRect(14.0, 58.0, contentW - 28.0, 32.0),
+            "试着点偏 T/Y 交界输入 y-r-w-u（救回「我们」），或在「输入」后点偏 U/I 交界输入 u-f-c-y（救回「法」）",
+            nsFontSystem(11.5, fontWeightRegular()),
+            nsColorTertiaryLabel(),
+            true
+        );
+        msgSendVoid1Ptr(card2, objcSel("addSubview:"), hintLbl);
+        objcReleaseRaw(hintLbl)
+    };
+
+    let kbView = objcAllocInitFrame("JuxuTouchSimKeyboardView", cgRect(14.0, 102.0, contentW - 28.0, 178.0));
+    objcSetAssocHandle(kbView, touchSimAssocKey(), gcHandleNew(TouchSimKeyState {
+        tskCalibrations: cellGet(s.touchCalibrations),
+        tskLastDot: ui.susLastSimDot,
+        tskOnTouch: (chByte: Int, nx: Float, ny: Float) -> {
+            let out = bridgePushTouch(sim, chByte, nx, ny, true, wallNowMs());
+            if (strLen(out.asCommitText) > 0) {
+                let nextCtx = cellGet(ui.susLabCommitted) + out.asCommitText;
+                cellSet(ui.susLabCommitted, nextCtx);
+                bridgeSetContext(sim, tailScalars(nextCtx, 32))
+            } else ();
+            let info = "触点 (" + formatFixed2Signed(nx) + ", " + formatFixed2Signed(ny)
+                + ") 落入 [" + scalarToString(chByte) + "] 键区 → 编码 \"" + out.asPreedit + "\"";
+            cellSet(ui.susLastTouchInfo, info);
+            rebuildSettingsDetail(ui, false)
+        },
+        tskOnSpace: () -> {
+            let out = bridgeHandleKey(sim, 0x31, 32, false, wallNowMs());
+            if (strLen(out.asCommitText) > 0) {
+                let nextCtx = cellGet(ui.susLabCommitted) + out.asCommitText;
+                cellSet(ui.susLabCommitted, nextCtx);
+                bridgeSetContext(sim, tailScalars(nextCtx, 32))
+            } else ();
+            rebuildSettingsDetail(ui, false)
+        },
+        tskOnBackspace: () -> {
+            let _ = bridgeHandleKey(sim, 0x33, 0, false, wallNowMs());
+            rebuildSettingsDetail(ui, false)
+        },
+    }));
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), kbView);
+    objcReleaseRaw(kbView);
+
+    msgSendVoid1Ptr(docView, objcSel("addSubview:"), card2);
+    objcReleaseRaw(card2);
+    cellSet(curY, cellGet(curY) + card2H + 14.0);
+
+    // Card 3: EvalLogSummary 6-Metric Grid + Refresh / Show in Finder / Clear
+    let c3Divs: Vec Float = vecWithCap(1);
+    let tmp3 = makeFlippedView(cgRect(0.0, 0.0, contentW, 180.0));
+    let y3 = cellNew(0.0);
+
+    cellSet(y3, addToggleRow(
+        tmp3, cellGet(y3), contentW,
+        "记录输入与选词诊断日志（本地 Eval Set）",
+        "保存手选非首选、RWKV 策略压制标记、纠错与退格重打到 ~/Library/Application Support/Juxu/eval_log.jsonl",
+        cfg.evalLogging,
+        (v: Bool) -> {
+            let c = cellGet(s.jsConfig);
+            bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                evalLogging: v, emojiCandidates: c.emojiCandidates, typo: c.typo,
+            }, true)
+        }
+    ));
+    vecPush(c3Divs, cellGet(y3));
+
+    let metricsY = cellGet(y3) + 10.0;
+    let metrics = evalLogMetrics(summary, false);
+    let mGap = 8.0;
+    let mW = (contentW - 28.0 - mGap * 5.0) / 6.0;
+    let dummyMetric = EvalLogMetricItem { elmId: "", elmTitle: "", elmValue: "0" };
+    let mIdx = cellNew(0);
+    while (cellGet(mIdx) < vecLen(metrics)) {
+        let idx = cellGet(mIdx);
+        let item: EvalLogMetricItem = vecGetOr(metrics, idx, dummyMetric);
+        let mv = makeEvalMetricCellView(cgRect(14.0 + intToFloat(idx) * (mW + mGap), metricsY, mW, 46.0), item);
+        msgSendVoid1Ptr(tmp3, objcSel("addSubview:"), mv);
+        objcReleaseRaw(mv);
+        cellSet(mIdx, idx + 1)
+    };
+
+    let btnRowY = metricsY + 56.0;
+    let refBtn = makeSmallButton(cgRect(14.0, btnRowY, 76.0, 24.0), "刷新统计", true, () -> {
+        let _ = bridgeReloadEvalLogSummary(s);
+        rebuildSettingsDetail(ui, false)
+    });
+    let finderBtn = makeSmallButton(cgRect(98.0, btnRowY, 132.0, 24.0), "在 Finder 中显示日志", true, () -> {
+        let logP = cellGet(s.evalLogPath);
+        let ws = msgSend0(objcClass("NSWorkspace"), objcSel("sharedWorkspace"));
+        let urlCls = objcClass("NSURL");
+        if (strLen(logP) > 0 && fileExists(logP)) {
+            let fUrl = msgSend1Ptr(urlCls, objcSel("fileURLWithPath:"), nsStr(logP));
+            let arr = msgSend1Ptr(objcClass("NSArray"), objcSel("arrayWithObject:"), fUrl);
+            msgSendVoid1Ptr(ws, objcSel("activateFileViewerSelectingURLs:"), arr)
+        } else if (strLen(logP) > 0) {
+            let dirUrl = msgSend1Ptr(urlCls, objcSel("fileURLWithPath:"), nsStr(pathDirname(logP)));
+            let _ = msgSend1Ptr(ws, objcSel("openURL:"), dirUrl);
+            ()
+        } else ()
+    });
+    let clrLogBtn = makeSmallButton(cgRect(contentW - 90.0, btnRowY, 76.0, 24.0), "清空日志", summary.elsTotalEvents > 0, () -> {
+        bridgeClearEvalLog(s);
+        rebuildSettingsDetail(ui, false)
+    });
+    msgSendVoid1Ptr(tmp3, objcSel("addSubview:"), refBtn);
+    msgSendVoid1Ptr(tmp3, objcSel("addSubview:"), finderBtn);
+    msgSendVoid1Ptr(tmp3, objcSel("addSubview:"), clrLogBtn);
+    objcReleaseRaw(refBtn);
+    objcReleaseRaw(finderBtn);
+    objcReleaseRaw(clrLogBtn);
+
+    let card3H = btnRowY + 34.0;
+    let card3 = makeCardView(cgRect(padX, cellGet(curY), contentW, card3H), c3Divs);
+    msgSendVoid1Rect(tmp3, objcSel("setFrame:"), cgRect(0.0, 0.0, contentW, card3H));
+    msgSendVoid1Ptr(card3, objcSel("addSubview:"), tmp3);
+    objcReleaseRaw(tmp3);
+    msgSendVoid1Ptr(docView, objcSel("addSubview:"), card3);
+    objcReleaseRaw(card3);
+    cellGet(curY) + card3H + 20.0
+}
+
+def buildLexiconPage(ui: SettingsUiState, docView: Ptr, padX: Float, startY: Float, contentW: Float): Float = {
+    let s = ui.susSession;
+    let phrases = bridgeRefreshUserPhrases(s);
+    let cfg = cellGet(s.jsConfig);
+    let st = cellGet(s.jsState);
+
+    let curY = cellNew(addFormHeader(
+        docView,
+        startY,
+        contentW,
+        "自动组词、动态调频与跨版本个人词库",
+        "自造词仅存词条文本，切换 86 / 98 / 新世纪时实时按目标方案字根重算四码"
+    ));
+
+    // Card 1: Auto-Phrase & Dynamic Frequency
+    let c1Divs: Vec Float = vecNew();
+    let tmp1 = makeFlippedView(cgRect(0.0, 0.0, contentW, 260.0));
+    let y1 = cellNew(0.0);
+
+    cellSet(y1, addToggleRow(
+        tmp1, cellGet(y1), contentW,
+        "连打单字自动组词",
+        "连续单字输入同一双字/三字组合达到阈值后自动收录进个人词库（打字时也可按 Ctrl + = 手动造词）",
+        cfg.autoPhrase,
+        (v: Bool) -> {
+            let c = cellGet(s.jsConfig);
+            bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                autoPhrase: v, autoPhraseThreshold: c.autoPhraseThreshold,
+                zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+            }, true)
+        }
+    ));
+    vecPush(c1Divs, cellGet(y1));
+
+    // Threshold Popup (`1`, `2`, `3`)
+    let thY = cellGet(y1);
+    let thTitle = makeStaticLabel(cgRect(14.0, thY + 9.0, contentW - 200.0, 18.0), "自动成词触发次数", nsFontSystem(13.0, fontWeightMedium()), nsColorLabel(), false);
+    let thSub = makeStaticLabel(cgRect(14.0, thY + 28.0, contentW - 200.0, 16.0), "默认重复 2 次自动成词，避免偶然相邻单字污染词库", nsFontSystem(11.5, fontWeightRegular()), nsColorSecondaryLabel(), false);
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), thTitle);
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), thSub);
+    objcReleaseRaw(thTitle);
+    objcReleaseRaw(thSub);
+
+    let thPop = objcAllocInitFrame("NSPopUpButton", cgRect(contentW - 180.0, thY + 13.0, 166.0, 26.0));
+    msgSendVoid1Ptr(thPop, objcSel("addItemWithTitle:"), nsStr("连打 1 次即成词"));
+    msgSendVoid1Ptr(thPop, objcSel("addItemWithTitle:"), nsStr("连打 2 次成词（推荐）"));
+    msgSendVoid1Ptr(thPop, objcSel("addItemWithTitle:"), nsStr("连打 3 次成词"));
+    let thSel = if (cfg.autoPhraseThreshold <= 1) 0 else if (cfg.autoPhraseThreshold >= 3) 2 else 1;
+    msgSendVoid1I64(thPop, objcSel("selectItemAtIndex:"), intToI64(thSel));
+    bindControlAction(thPop, (p: Ptr) -> {
+        let idx = msgSendInt0(p, objcSel("indexOfSelectedItem"));
+        let newTh = if (idx == 0) 1 else if (idx == 2) 3 else 2;
+        let c = cellGet(s.jsConfig);
+        bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+            schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+            fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+            strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+            dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+            autoPhrase: c.autoPhrase, autoPhraseThreshold: newTh,
+            zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+            smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+            autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+            cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+            keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+            keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+            keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+            pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+            shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+            evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+        }, true)
+    });
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), thPop);
+    objcReleaseRaw(thPop);
+    cellSet(y1, thY + 52.0);
+    vecPush(c1Divs, cellGet(y1));
+
+    cellSet(y1, addToggleRow(
+        tmp1, cellGet(y1), contentW,
+        "词组动态调频",
+        "常用词组与上下文连贯词组自动前移",
+        cfg.dynamicWordFreq,
+        (v: Bool) -> {
+            let c = cellGet(s.jsConfig);
+            bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                dynamicWordFreq: v, dynamicCharFreq: c.dynamicCharFreq,
+                autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+            }, true)
+        }
+    ));
+    vecPush(c1Divs, cellGet(y1));
+
+    cellSet(y1, addToggleRow(
+        tmp1, cellGet(y1), contentW,
+        "单字动态调频",
+        "默认关闭以保持单字固定重码顺序，保护五笔盲打肌肉记忆",
+        cfg.dynamicCharFreq,
+        (v: Bool) -> {
+            let c = cellGet(s.jsConfig);
+            bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: v,
+                autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+            }, true)
+        }
+    ));
+
+    let card1H = cellGet(y1);
+    let card1 = makeCardView(cgRect(padX, cellGet(curY), contentW, card1H), c1Divs);
+    msgSendVoid1Rect(tmp1, objcSel("setFrame:"), cgRect(0.0, 0.0, contentW, card1H));
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), tmp1);
+    objcReleaseRaw(tmp1);
+    msgSendVoid1Ptr(docView, objcSel("addSubview:"), card1);
+    objcReleaseRaw(card1);
+    cellSet(curY, cellGet(curY) + card1H + 18.0);
+
+    // Section Header + `打开配置目录` Button
+    let secHdr = makeStaticLabel(
+        cgRect(padX + 4.0, cellGet(curY), contentW - 120.0, 18.0),
+        "添加个人词条（自动按当前 " + st.asSchemaName + " 推导编码）",
+        nsFontSystem(12.0, fontWeightSemibold()),
+        nsColorSecondaryLabel(),
+        false
+    );
+    msgSendVoid1Ptr(docView, objcSel("addSubview:"), secHdr);
+    objcReleaseRaw(secHdr);
+
+    let openDirBtn = makeSmallButton(cgRect(padX + contentW - 102.0, cellGet(curY) - 3.0, 102.0, 22.0), "打开配置目录", true, () -> {
+        let cfgP = cellGet(s.configPath);
+        if (strLen(cfgP) > 0) {
+            let dirUrl = msgSend1Ptr(objcClass("NSURL"), objcSel("fileURLWithPath:"), nsStr(pathDirname(cfgP)));
+            let ws = msgSend0(objcClass("NSWorkspace"), objcSel("sharedWorkspace"));
+            let _ = msgSend1Ptr(ws, objcSel("openURL:"), dirUrl);
+            ()
+        } else ()
+    });
+    msgSendVoid1Ptr(docView, objcSel("addSubview:"), openDirBtn);
+    objcReleaseRaw(openDirBtn);
+    cellSet(curY, cellGet(curY) + 24.0);
+
+    // Card 2: Add Custom Phrase Field + Banner + Phrase Rows
+    let c2Divs: Vec Float = vecNew();
+    let maxShow = if (vecLen(phrases) > 30) 30 else vecLen(phrases);
+    let tmp2 = makeFlippedView(cgRect(0.0, 0.0, contentW, 120.0 + intToFloat(maxShow) * 38.0));
+    let y2 = cellNew(12.0);
+
+    let field = objcAllocInitFrame("NSTextField", cgRect(14.0, cellGet(y2), contentW - 110.0, 24.0));
+    msgSendVoid1Bool(field, objcSel("setBezeled:"), true);
+    msgSendVoid1I64(field, objcSel("setBezelStyle:"), intToI64(1));
+    msgSendVoid1Ptr(field, objcSel("setFont:"), nsFontSystem(13.0, fontWeightRegular()));
+    msgSendVoid1Ptr(field, objcSel("setPlaceholderString:"), nsStr("输入 2–12 字中文词条，如：句序"));
+    msgSendVoid1Ptr(field, objcSel("setStringValue:"), nsStr(cellGet(ui.susPhraseInputText)));
+    msgSendVoid1Ptr(tmp2, objcSel("addSubview:"), field);
+    objcReleaseRaw(field);
+
+    let addBtn = makeSmallButton(cgRect(contentW - 88.0, cellGet(y2), 74.0, 24.0), "添加词条", true, () -> {
+        let rawIn = strTrim(nsStrPtrToString(msgSend0(field, objcSel("stringValue"))));
+        if (utf8ScalarCount(rawIn) >= 2) {
+            let code = bridgeAddUserPhrase(s, rawIn, true);
+            if (strLen(code) > 0) {
+                cellSet(ui.susPhraseBanner, "✓ 已收录「" + rawIn + "」，当前方案编码：" + code);
+                cellSet(ui.susPhraseInputText, "")
+            } else {
+                cellSet(ui.susPhraseBanner, "请输入至少 2 个规范汉字");
+                cellSet(ui.susPhraseInputText, rawIn)
+            }
+        } else {
+            cellSet(ui.susPhraseBanner, "请输入至少 2 个规范汉字");
+            cellSet(ui.susPhraseInputText, rawIn)
+        };
+        rebuildSettingsDetail(ui, false)
+    });
+    msgSendVoid1Ptr(tmp2, objcSel("addSubview:"), addBtn);
+    objcReleaseRaw(addBtn);
+    cellSet(y2, cellGet(y2) + 34.0);
+
+    let banner = cellGet(ui.susPhraseBanner);
+    if (strLen(banner) > 0) {
+        let bLbl = makeStaticLabel(cgRect(14.0, cellGet(y2), contentW - 28.0, 18.0), banner, nsFontSystem(11.5, fontWeightRegular()), nsColorAccent(), false);
+        msgSendVoid1Ptr(tmp2, objcSel("addSubview:"), bLbl);
+        objcReleaseRaw(bLbl);
+        cellSet(y2, cellGet(y2) + 22.0)
+    } else ();
+
+    vecPush(c2Divs, cellGet(y2));
+
+    if (maxShow == 0) {
+        let emptyLbl = makeStaticLabel(
+            cgRect(14.0, cellGet(y2) + 12.0, contentW - 28.0, 20.0),
+            "暂无个人词条。日常连打单字会自动学习常用新词，也可在上方手动添加。",
+            nsFontSystem(12.0, fontWeightRegular()),
+            nsColorSecondaryLabel(),
+            false
+        );
+        msgSendVoid1Ptr(tmp2, objcSel("addSubview:"), emptyLbl);
+        objcReleaseRaw(emptyLbl);
+        cellSet(y2, cellGet(y2) + 44.0)
+    } else {
+        let dummyInfo = UserPhraseInfo {
+            phrase: MkUserPhrase { text: "", count: 0, lastSeq: intToI64(0), autoComposed: false },
+            encodedCode: "",
+        };
+        let pIdx = cellNew(0);
+        while (cellGet(pIdx) < maxShow) {
+            let idx = cellGet(pIdx);
+            let item: UserPhraseInfo = vecGetOr(phrases, idx, dummyInfo);
+            let ry = cellGet(y2);
+            let phText = item.phrase.text;
+
+            let pFont = nsFontSystem(13.5, fontWeightMedium());
+            let pSz = msgSendSizeWithAttrs(nsStr(phText), objcSel("sizeWithAttributes:"), makeTextAttrs(pFont, nsColorLabel()));
+            let pLbl = makeStaticLabel(cgRect(14.0, ry + 9.0, pSz.width + 6.0, 20.0), phText, pFont, nsColorLabel(), false);
+            msgSendVoid1Ptr(tmp2, objcSel("addSubview:"), pLbl);
+            objcReleaseRaw(pLbl);
+
+            let pill = makePhrasePillView(cgPoint(22.0 + pSz.width, ry + 9.0), item.encodedCode, item.phrase.autoComposed);
+            msgSendVoid1Ptr(tmp2, objcSel("addSubview:"), pill);
+            objcReleaseRaw(pill);
+
+            let cntTxt = "频次 " + intToStr(item.phrase.count);
+            let cFont = nsFontSystem(11.0, fontWeightRegular());
+            let cSz = msgSendSizeWithAttrs(nsStr(cntTxt), objcSel("sizeWithAttributes:"), makeTextAttrs(cFont, nsColorSecondaryLabel()));
+            let cLbl = makeStaticLabel(cgRect(contentW - 44.0 - cSz.width - 4.0, ry + 11.0, cSz.width + 4.0, 16.0), cntTxt, cFont, nsColorSecondaryLabel(), false);
+            msgSendVoid1Ptr(tmp2, objcSel("addSubview:"), cLbl);
+            objcReleaseRaw(cLbl);
+
+            let delBtn = objcAllocInitFrame("NSButton", cgRect(contentW - 36.0, ry + 7.0, 22.0, 22.0));
+            msgSendVoid1Bool(delBtn, objcSel("setBordered:"), false);
+            let trashImg = nsSymbolImage("trash", 11.5, fontWeightRegular());
+            if (!ptrIsNull(trashImg)) msgSendVoid1Ptr(delBtn, objcSel("setImage:"), trashImg) else ();
+            msgSendVoid1Ptr(delBtn, objcSel("setContentTintColor:"), nsColorSecondaryLabel());
+            bindControlAction(delBtn, (_b: Ptr) -> {
+                bridgeRemoveUserPhrase(s, phText, true);
+                rebuildSettingsDetail(ui, false)
+            });
+            msgSendVoid1Ptr(tmp2, objcSel("addSubview:"), delBtn);
+            objcReleaseRaw(delBtn);
+
+            cellSet(y2, ry + 36.0);
+            if (idx + 1 < maxShow) vecPush(c2Divs, cellGet(y2)) else ();
+            cellSet(pIdx, idx + 1)
+        }
+    };
+
+    let card2H = cellGet(y2);
+    let card2 = makeCardView(cgRect(padX, cellGet(curY), contentW, card2H), c2Divs);
+    msgSendVoid1Rect(tmp2, objcSel("setFrame:"), cgRect(0.0, 0.0, contentW, card2H));
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), tmp2);
+    objcReleaseRaw(tmp2);
+    msgSendVoid1Ptr(docView, objcSel("addSubview:"), card2);
+    objcReleaseRaw(card2);
+    cellGet(curY) + card2H + 20.0
+}
+
+def sampleAppearancePreviewState(s: JuxuSession, vertical: Bool): JuxuActionState = {
+    let base = cellGet(s.jsState);
+    let cands: Vec Candidate = vecWithCap(4);
+    vecPush(cands, MkCandidate { text: "我们", comment: "⌖trwu 96%", badge: 2, confidence: 0.96, isExact: false });
+    vecPush(cands, MkCandidate { text: "句序", comment: "", badge: 5, confidence: 0.02, isExact: true });
+    vecPush(cands, MkCandidate { text: "国", comment: "⚡l", badge: 1, confidence: 0.01, isExact: true });
+    vecPush(cands, MkCandidate { text: "语言", comment: "", badge: 0, confidence: 0.01, isExact: true });
+    JuxuActionState {
+        asConsumed: true,
+        asBell: false,
+        asAsciiMode: false,
+        asSchemaId: schemaId(cellGet(s.jsConfig).schema),
+        asPage: 0,
+        asTotalPages: 2,
+        asVertical: vertical,
+        asSchemaName: base.asSchemaName,
+        asCommitText: "",
+        asPreedit: "yrwu",
+        asSegmentedCode: "",
+        asNotice: "",
+        asUserPhraseCount: vecLen(cellGet(s.userPhrases)),
+        asCalibratedKeyCount: base.asCalibratedKeyCount,
+        asValidNextMask: base.asValidNextMask,
+        asNextKeyPriors: base.asNextKeyPriors,
+        asTouchOffsets: base.asTouchOffsets,
+        asT9Mode: false,
+        asT9ValidNextMask: base.asT9ValidNextMask,
+        asT9NextKeyPriors: base.asT9NextKeyPriors,
+        asT9TouchOffsets: base.asT9TouchOffsets,
+        asT9LockedPrefix: "",
+        asT9Syllables: vecNew(),
+        asCandidates: cands,
+        asHasDecodedTouchOffsets: true,
+        asHasDecodedT9TouchOffsets: true,
+    }
+}
+
+def buildAppearancePage(ui: SettingsUiState, docView: Ptr, padX: Float, startY: Float, contentW: Float): Float = {
+    let s = ui.susSession;
+    let cfg = cellGet(s.jsConfig);
+    let cfgFile = {
+        let p = cellGet(s.configPath);
+        if (strLen(p) > 0) pathBasename(p) else "config.toml"
+    };
+
+    let curY = cellNew(addFormHeader(
+        docView,
+        startY,
+        contentW,
+        "原生候选栏外观、中英切换与标点",
+        "对齐 macOS 原生毛玻璃材质与深浅色自适应，配置文件保存于 " + cfgFile
+    ));
+
+    // Card 1: Orientation, Page Size, Shift Toggle, Smart Punctuation, Emoji, Auto-Space, `;`/`'` Select
+    let c1Divs: Vec Float = vecNew();
+    let tmp1 = makeFlippedView(cgRect(0.0, 0.0, contentW, 480.0));
+    let y1 = cellNew(0.0);
+
+    // Row 1: Segmented Orientation (`横排候选窗` / `竖排候选窗`)
+    let r1Y = cellGet(y1);
+    let oTitle = makeStaticLabel(cgRect(14.0, r1Y + 9.0, contentW - 210.0, 18.0), "候选词排列方向", nsFontSystem(13.0, fontWeightMedium()), nsColorLabel(), false);
+    let oSub = makeStaticLabel(cgRect(14.0, r1Y + 28.0, contentW - 210.0, 16.0), "横排贴近苹果原生中文输入法，竖排适合快速扫视多行重码", nsFontSystem(11.5, fontWeightRegular()), nsColorSecondaryLabel(), false);
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), oTitle);
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), oSub);
+    objcReleaseRaw(oTitle);
+    objcReleaseRaw(oSub);
+
+    let seg = objcAllocInitFrame("NSSegmentedControl", cgRect(contentW - 194.0, r1Y + 14.0, 180.0, 24.0));
+    msgSendVoid1I64(seg, objcSel("setSegmentCount:"), intToI64(2));
+    let _ = msgSend1Ptr1I64(seg, objcSel("setLabel:forSegment:"), nsStr("横排候选窗"), intToI64(0));
+    let _ = msgSend1Ptr1I64(seg, objcSel("setLabel:forSegment:"), nsStr("竖排候选窗"), intToI64(1));
+    msgSendVoid1I64(seg, objcSel("setSelectedSegment:"), if (cfg.orientation == Vertical) intToI64(1) else intToI64(0));
+    bindControlAction(seg, (ctrl: Ptr) -> {
+        let selIdx = msgSendI64_0(ctrl, objcSel("selectedSegment"));
+        let nextOr: CandidateOrientation = if (selIdx == intToI64(1)) Vertical else Horizontal;
+        let c = cellGet(s.jsConfig);
+        bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+            schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+            fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+            strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+            dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+            autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+            zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+            smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+            autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+            cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+            keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+            keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+            keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+            pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+            shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: nextOr,
+            evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+        }, true);
+        rebuildSettingsDetail(ui, false)
+    });
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), seg);
+    objcReleaseRaw(seg);
+    cellSet(y1, r1Y + 52.0);
+    vecPush(c1Divs, cellGet(y1));
+
+    // Row 2: Page Size Stepper (`3...9`)
+    let r2Y = cellGet(y1);
+    let psLbl = makeStaticLabel(
+        cgRect(14.0, r2Y + 12.0, 260.0, 18.0),
+        "每页候选词数量：" + intToStr(cfg.pageSize) + " 个",
+        nsFontSystem(13.0, fontWeightMedium()), nsColorLabel(), false
+    );
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), psLbl);
+    objcReleaseRaw(psLbl);
+
+    let stepper = objcAllocInitFrame("NSStepper", cgRect(contentW - 34.0, r2Y + 9.0, 20.0, 24.0));
+    msgSendVoid1Float(stepper, objcSel("setMinValue:"), 3.0);
+    msgSendVoid1Float(stepper, objcSel("setMaxValue:"), 9.0);
+    msgSendVoid1Float(stepper, objcSel("setIncrement:"), 1.0);
+    msgSendVoid1Bool(stepper, objcSel("setValueWraps:"), false);
+    msgSendVoid1I64(stepper, objcSel("setIntegerValue:"), intToI64(cfg.pageSize));
+    bindControlAction(stepper, (ctrl: Ptr) -> {
+        let nextPs = i64ToInt(msgSendI64_0(ctrl, objcSel("integerValue")));
+        msgSendVoid1Ptr(psLbl, objcSel("setStringValue:"), nsStr("每页候选词数量：" + intToStr(nextPs) + " 个"));
+        let c = cellGet(s.jsConfig);
+        bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+            schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+            fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+            strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+            dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+            autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+            zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+            smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+            autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+            cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+            keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+            keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+            keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+            pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+            shiftToggleMode: c.shiftToggleMode, pageSize: nextPs, orientation: c.orientation,
+            evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+        }, true)
+    });
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), stepper);
+    objcReleaseRaw(stepper);
+    cellSet(y1, r2Y + 42.0);
+    vecPush(c1Divs, cellGet(y1));
+
+    // Row 3: Shift Toggle Mode (`commit_code` / `commit_first` / `clear`)
+    let r3Y = cellGet(y1);
+    let shTitle = makeStaticLabel(cgRect(14.0, r3Y + 9.0, contentW - 196.0, 18.0), "Shift 键切换中/英时行为", nsFontSystem(13.0, fontWeightMedium()), nsColorLabel(), false);
+    let shSub = makeStaticLabel(cgRect(14.0, r3Y + 28.0, contentW - 196.0, 16.0), "正在输入五笔编码时点按 Shift 键如何处理已敲字母", nsFontSystem(11.5, fontWeightRegular()), nsColorSecondaryLabel(), false);
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), shTitle);
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), shSub);
+    objcReleaseRaw(shTitle);
+    objcReleaseRaw(shSub);
+
+    let shPop = objcAllocInitFrame("NSPopUpButton", cgRect(contentW - 172.0, r3Y + 13.0, 158.0, 26.0));
+    msgSendVoid1Ptr(shPop, objcSel("addItemWithTitle:"), nsStr("原样上屏英文编码"));
+    msgSendVoid1Ptr(shPop, objcSel("addItemWithTitle:"), nsStr("上屏首选中文词"));
+    msgSendVoid1Ptr(shPop, objcSel("addItemWithTitle:"), nsStr("清空未上屏编码"));
+    let shIdx = match cfg.shiftToggleMode {
+        CommitCode -> 0,
+        CommitFirst -> 1,
+        ShiftClear -> 2,
+    };
+    msgSendVoid1I64(shPop, objcSel("selectItemAtIndex:"), intToI64(shIdx));
+    bindControlAction(shPop, (p: Ptr) -> {
+        let idx = msgSendInt0(p, objcSel("indexOfSelectedItem"));
+        let nextMode: ShiftToggleMode = if (idx == 1) CommitFirst else if (idx == 2) ShiftClear else CommitCode;
+        let c = cellGet(s.jsConfig);
+        bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+            schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+            fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+            strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+            dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+            autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+            zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+            smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+            autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+            cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+            keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+            keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+            keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+            pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+            shiftToggleMode: nextMode, pageSize: c.pageSize, orientation: c.orientation,
+            evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+        }, true)
+    });
+    msgSendVoid1Ptr(tmp1, objcSel("addSubview:"), shPop);
+    objcReleaseRaw(shPop);
+    cellSet(y1, r3Y + 52.0);
+    vecPush(c1Divs, cellGet(y1));
+
+    cellSet(y1, addToggleRow(
+        tmp1, cellGet(y1), contentW,
+        "中文标点与引号智能配对",
+        "中文模式下自动转换全角标点，并成对输入引号、括号、直角引号与书名号",
+        cfg.smartPunctuation,
+        (v: Bool) -> {
+            let c = cellGet(s.jsConfig);
+            bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                smartPunctuation: v, autoSpaceZhEn: c.autoSpaceZhEn,
+                autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+            }, true)
+        }
+    ));
+    vecPush(c1Divs, cellGet(y1));
+
+    cellSet(y1, addToggleRow(
+        tmp1, cellGet(y1), contentW,
+        "Emoji 候选",
+        "输入时，在匹配的词语后显示 Emoji 作为次要候选（如 思考 → 🤔）",
+        cfg.emojiCandidates,
+        (v: Bool) -> {
+            let c = cellGet(s.jsConfig);
+            bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                evalLogging: c.evalLogging, emojiCandidates: v, typo: c.typo,
+            }, true)
+        }
+    ));
+    vecPush(c1Divs, cellGet(y1));
+
+    cellSet(y1, addToggleRow(
+        tmp1, cellGet(y1), contentW,
+        "中英文之间自动加空格",
+        "中英混输或切换上屏时自动在汉字与英文边界补全空格（保留 URL 及退格删去的空格）",
+        cfg.autoSpaceZhEn,
+        (v: Bool) -> {
+            let c = cellGet(s.jsConfig);
+            bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                smartPunctuation: c.smartPunctuation, autoSpaceZhEn: v,
+                autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+            }, true);
+            rebuildSettingsDetail(ui, false)
+        }
+    ));
+    vecPush(c1Divs, cellGet(y1));
+
+    if (cfg.autoSpaceZhEn) {
+        cellSet(y1, addToggleRow(
+            tmp1, cellGet(y1), contentW,
+            "数字与中文之间也加空格",
+            "在汉字与数字边界自动加空格（如「第 2 候选词」；关闭后仅对英文词加空格）",
+            cfg.autoSpaceDigits,
+            (v: Bool) -> {
+                let c = cellGet(s.jsConfig);
+                bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                    schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                    fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                    strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                    dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                    autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                    zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: c.semicolonQuoteSelect,
+                    smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                    autoSpaceDigits: v, clipboardSuggestion: c.clipboardSuggestion,
+                    cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                    keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                    keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                    keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                    pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                    shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                    evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+                }, true)
+            }
+        ));
+        vecPush(c1Divs, cellGet(y1))
+    } else ();
+
+    cellSet(y1, addToggleRow(
+        tmp1, cellGet(y1), contentW,
+        "分号 (;) 与引号 (') 快捷选重",
+        "编码输入中按 ; 直接上屏第 2 候选词、按 ' 上屏第 3 候选词",
+        cfg.semicolonQuoteSelect,
+        (v: Bool) -> {
+            let c = cellGet(s.jsConfig);
+            bridgeApplyAndSaveConfig(s, MkJuxuConfig {
+                schema: c.schema, fourthCodeAutoCommit: c.fourthCodeAutoCommit, fifthCodePushCommit: c.fifthCodePushCommit,
+                fourthEmptyBehavior: c.fourthEmptyBehavior, shortestCodeFirst: c.shortestCodeFirst,
+                strictShortcode: c.strictShortcode, spaceless: c.spaceless, showShortcodeHint: c.showShortcodeHint,
+                dynamicWordFreq: c.dynamicWordFreq, dynamicCharFreq: c.dynamicCharFreq,
+                autoPhrase: c.autoPhrase, autoPhraseThreshold: c.autoPhraseThreshold,
+                zOmnipotent: c.zOmnipotent, semicolonQuoteSelect: v,
+                smartPunctuation: c.smartPunctuation, autoSpaceZhEn: c.autoSpaceZhEn,
+                autoSpaceDigits: c.autoSpaceDigits, clipboardSuggestion: c.clipboardSuggestion,
+                cangjieKeycapRadicals: c.cangjieKeycapRadicals, wubiKeycapRadicals: c.wubiKeycapRadicals,
+                keySwipeUpInput: c.keySwipeUpInput, spaceCommaKey: c.spaceCommaKey,
+                keyLongPressAlternates: c.keyLongPressAlternates, backspaceSwipeClear: c.backspaceSwipeClear,
+                keyboardHoldCursor: c.keyboardHoldCursor, enableRareCharset: c.enableRareCharset,
+                pinyinInitialAbbr: c.pinyinInitialAbbr, pinyinT9Layout: c.pinyinT9Layout,
+                shiftToggleMode: c.shiftToggleMode, pageSize: c.pageSize, orientation: c.orientation,
+                evalLogging: c.evalLogging, emojiCandidates: c.emojiCandidates, typo: c.typo,
+            }, true)
+        }
+    ));
+
+    let card1H = cellGet(y1);
+    let card1 = makeCardView(cgRect(padX, cellGet(curY), contentW, card1H), c1Divs);
+    msgSendVoid1Rect(tmp1, objcSel("setFrame:"), cgRect(0.0, 0.0, contentW, card1H));
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), tmp1);
+    objcReleaseRaw(tmp1);
+    msgSendVoid1Ptr(docView, objcSel("addSubview:"), card1);
+    objcReleaseRaw(card1);
+    cellSet(curY, cellGet(curY) + card1H + 14.0);
+
+    // Card 2: Live Appearance Preview Card (`CandidateBarView`)
+    let sampleSt = sampleAppearancePreviewState(s, cfg.orientation == Vertical);
+    let (barView, _, barSz) = candidateBarCreate(sampleSt, None, None);
+    let card2H = 44.0 + barSz.height + 14.0;
+    let card2 = makeCardView(cgRect(padX, cellGet(curY), contentW, card2H), vecNew());
+
+    let pvHdr = makeStaticLabel(cgRect(14.0, 12.0, 200.0, 18.0), "候选窗实时预览", nsFontSystem(12.5, fontWeightMedium()), nsColorSecondaryLabel(), false);
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), pvHdr);
+    objcReleaseRaw(pvHdr);
+
+    msgSendVoid1Rect(barView, objcSel("setFrame:"), cgRect(14.0, 38.0, barSz.width, barSz.height));
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), barView);
+    objcReleaseRaw(barView);
+
+    msgSendVoid1Ptr(docView, objcSel("addSubview:"), card2);
+    objcReleaseRaw(card2);
+    cellGet(curY) + card2H + 20.0
+}
+
+// ============================================================================
+// Sidebar & Detail Split Assembly
+// ============================================================================
+
+def rebuildSidebarItems(ui: SettingsUiState): Void = {
+    clearSubviews(ui.susSidebarContainer);
+    let secs = allSettingsSections();
+    let curSec = cellGet(ui.susSection);
+    let topY = if (ui.susIsPreviewChrome) 14.0 else 50.0;
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(secs)) {
+        let idx = cellGet(i);
+        let sec: SettingsSection = vecGetOr(secs, idx, SecSchema);
+        let row = makeSidebarRowView(
+            cgRect(10.0, topY + intToFloat(idx) * 36.0, 180.0, 32.0),
+            sectionTitle(sec),
+            sectionSymbolName(sec),
+            sec == curSec,
+            () -> {
+                if (cellGet(ui.susSection) != sec) {
+                    cellSet(ui.susSection, sec);
+                    rebuildSidebarItems(ui);
+                    rebuildSettingsDetail(ui, true)
+                } else ()
+            }
+        );
+        msgSendVoid1Ptr(ui.susSidebarContainer, objcSel("addSubview:"), row);
+        objcReleaseRaw(row);
+        cellSet(i, idx + 1)
+    }
+}
+
+def rebuildSettingsDetail(ui: SettingsUiState, resetScrollTop: Bool): Void = {
+    let scrollBounds = msgSendRect0(ui.susScrollView, objcSel("bounds"));
+    let scrollW = maxFloat(480.0, scrollBounds.size.width);
+    cellSet(ui.susLastContentW, scrollW);
+
+    let padX = 22.0;
+    let topPad = if (ui.susIsPreviewChrome) 20.0 else 50.0;
+    let contentW = scrollW - padX * 2.0;
+
+    let oldScrollY = {
+        let clip = msgSend0(ui.susScrollView, objcSel("contentView"));
+        if (ptrIsNull(clip)) 0.0 else msgSendRect0(clip, objcSel("bounds")).origin.y
+    };
+
+    let docView = makeFlippedView(cgRect(0.0, 0.0, scrollW, scrollBounds.size.height));
+    let curSec = cellGet(ui.susSection);
+
+    let finalH = match curSec {
+        SecSchema -> buildSchemaPage(ui, docView, padX, topPad, contentW),
+        SecTypo -> buildTypoPage(ui, docView, padX, topPad, contentW),
+        SecLexicon -> buildLexiconPage(ui, docView, padX, topPad, contentW),
+        SecVoice -> {
+            let voicePage = voiceBuildSettingsPageView(ui.susSession, contentW);
+            let vpFrame = msgSendRect0(voicePage, objcSel("frame"));
+            let vpH = maxFloat(420.0, vpFrame.size.height);
+            msgSendVoid1Rect(voicePage, objcSel("setFrame:"), cgRect(padX, topPad, contentW, vpH));
+            msgSendVoid1Ptr(docView, objcSel("addSubview:"), voicePage);
+            topPad + vpH + 24.0
+        },
+        SecAppearance -> buildAppearancePage(ui, docView, padX, topPad, contentW),
+    };
+
+    let docH = maxFloat(scrollBounds.size.height, finalH);
+    msgSendVoid1Rect(docView, objcSel("setFrame:"), cgRect(0.0, 0.0, scrollW, docH));
+    msgSendVoid1Ptr(ui.susScrollView, objcSel("setDocumentView:"), docView);
+    objcReleaseRaw(docView);
+
+    let clip = msgSend0(ui.susScrollView, objcSel("contentView"));
+    if (!ptrIsNull(clip)) {
+        let targetY = if (resetScrollTop) 0.0 else clampFloat(oldScrollY, 0.0, maxFloat(0.0, docH - scrollBounds.size.height));
+        msgSendVoid1Rect(clip, objcSel("setBoundsOrigin:"), cgRect(0.0, targetY, 0.0, 0.0))
+    } else ()
+}
+
+def splitViewResizeSubviews(self: Ptr, cmd: Ptr, oldSz: CGSize): Void = {
+    objcSendSuperVoid1Size(self, "NSView", cmd, oldSz);
+    let h = objcGetAssocHandle(self, splitAssocKey());
+    if (h != intToI64(0)) {
+        let ui: SettingsUiState = gcHandleGet(h);
+        let b = msgSendRect0(self, objcSel("bounds"));
+        let sideW = 200.0;
+        let rightW = maxFloat(300.0, b.size.width - sideW - 1.0);
+        msgSendVoid1Rect(ui.susSidebarContainer, objcSel("setFrame:"), cgRect(0.0, 0.0, sideW, b.size.height));
+        msgSendVoid1Rect(ui.susScrollView, objcSel("setFrame:"), cgRect(sideW + 1.0, 0.0, rightW, b.size.height));
+        if (std.math.abs(rightW - cellGet(ui.susLastContentW)) > 1.0) {
+            rebuildSettingsDetail(ui, false)
+        } else ()
+    } else ()
+}
+
+def splitViewDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let b = msgSendRect0(self, objcSel("bounds"));
+    fillHairlineRect(cgRect(200.0, 0.0, b.size.width - 200.0, b.size.height), nsColorWindowBg());
+    fillHairlineRect(cgRect(200.0, 0.0, 1.0, b.size.height), nsColorSeparator())
+}
+
+pub def buildSettingsRootView(
+    session: JuxuSession,
+    frame: CGRect,
+    initialSection: SettingsSection,
+    isPreviewChrome: Bool
+): (Ptr, SettingsUiState) = {
+    let root = objcAllocInitFrame("JuxuSettingsSplitView", frame);
+    msgSendVoid1I64(root, objcSel("setAutoresizingMask:"), intToI64(18));
+
+    let sideW = 200.0;
+    let sidebarFx = objcAllocInitFrame("NSVisualEffectView", cgRect(0.0, 0.0, sideW, frame.size.height));
+    // NSVisualEffectMaterialSidebar = 7, WithinWindow/BehindWindow, Active = 1
+    msgSendVoid1I64(sidebarFx, objcSel("setMaterial:"), intToI64(7));
+    msgSendVoid1I64(sidebarFx, objcSel("setBlendingMode:"), if (isPreviewChrome) intToI64(1) else intToI64(0));
+    msgSendVoid1I64(sidebarFx, objcSel("setState:"), intToI64(1));
+    msgSendVoid1I64(sidebarFx, objcSel("setAutoresizingMask:"), intToI64(16));
+
+    let sidebarFlipped = makeFlippedView(cgRect(0.0, 0.0, sideW, frame.size.height));
+    msgSendVoid1I64(sidebarFlipped, objcSel("setAutoresizingMask:"), intToI64(18));
+    msgSendVoid1Ptr(sidebarFx, objcSel("addSubview:"), sidebarFlipped);
+    msgSendVoid1Ptr(root, objcSel("addSubview:"), sidebarFx);
+    objcReleaseRaw(sidebarFx);
+
+    let scroll = objcAllocInitFrame("NSScrollView", cgRect(sideW + 1.0, 0.0, frame.size.width - sideW - 1.0, frame.size.height));
+    msgSendVoid1Bool(scroll, objcSel("setHasVerticalScroller:"), !isPreviewChrome);
+    msgSendVoid1Bool(scroll, objcSel("setDrawsBackground:"), true);
+    msgSendVoid1Ptr(scroll, objcSel("setBackgroundColor:"), nsColorWindowBg());
+    msgSendVoid1Ptr(root, objcSel("addSubview:"), scroll);
+
+    let ui = SettingsUiState {
+        susSession: session,
+        susSection: cellNew(initialSection),
+        susIsPreviewChrome: isPreviewChrome,
+        susSidebarContainer: sidebarFlipped,
+        susScrollView: scroll,
+        susLastContentW: cellNew(frame.size.width - sideW - 1.0),
+        susPhraseInputText: cellNew(""),
+        susPhraseBanner: cellNew(""),
+        susSimSessionOpt: cellNew(None),
+        susLabCommitted: cellNew("输入"),
+        susLastTouchInfo: cellNew("点按下方键帽或两键交界处体验连续高斯热区与 N-gram 置信度纠错"),
+        susLastSimDot: cellNew(None),
+    };
+    objcSetAssocHandle(root, splitAssocKey(), gcHandleNew(ui));
+    objcReleaseRaw(sidebarFlipped);
+    objcReleaseRaw(scroll);
+
+    rebuildSidebarItems(ui);
+    rebuildSettingsDetail(ui, true);
+    (root, ui)
+}
+
+// ============================================================================
+// SettingsWindowController Singleton (`SettingsWindow.swift` lines 995-1056)
+// ============================================================================
+
+def gSettingsWin: Cell Ptr = cellNew(ptrNull())
+def gSettingsDel: Cell Ptr = cellNew(ptrNull())
+def gSettingsUi: Cell (Option SettingsUiState) = cellNew(None)
+
+def settingsWindowWillClose(_self: Ptr, _cmd: Ptr, notif: Ptr): Void = {
+    let curWin = cellGet(gSettingsWin);
+    let closing = if (ptrIsNull(notif)) curWin else msgSend0(notif, objcSel("object"));
+    if (!ptrIsNull(curWin) && (ptrIsNull(closing) || ptrToI64(closing) == ptrToI64(curWin))) {
+        msgSendVoid1Ptr(curWin, objcSel("setDelegate:"), ptrNull());
+        msgSendVoid1Ptr(curWin, objcSel("setContentView:"), ptrNull());
+        objcReleaseRaw(curWin);
+        cellSet(gSettingsWin, ptrNull());
+        cellSet(gSettingsUi, None);
+        voiceOnSettingsWindowClosed()
+    } else ()
+}
+
+pub def settingsWindowShowSection(session: JuxuSession, section: SettingsSection): Void = {
+    let existingWin = cellGet(gSettingsWin);
+    let win = if (!ptrIsNull(existingWin)) {
+        match cellGet(gSettingsUi) {
+            Some(ui) -> {
+                cellSet(ui.susSection, section);
+                rebuildSidebarItems(ui);
+                rebuildSettingsDetail(ui, true)
+            },
+            None -> (),
+        };
+        existingWin
+    } else {
+        let initRect = cgRect(0.0, 0.0, 780.0, 620.0);
+        // [.titled (1), .closable (2), .miniaturizable (4), .resizable (8), .fullSizeContentView (32768)] = 32783
+        let w = settingsWindowCreate(initRect, intToI64(32783), false);
+        msgSendVoid1Ptr(w, objcSel("setTitle:"), nsStr("句序 (Juxu) 偏好设置"));
+        msgSendVoid1Size(w, objcSel("setContentMinSize:"), cgSize(740.0, 600.0));
+
+        let tb = msgSendToolbarInit(
+            msgSend0(objcClass("NSToolbar"), objcSel("alloc")),
+            objcSel("initWithIdentifier:"),
+            nsStr("JuxuSettingsToolbar")
+        );
+        // NSToolbarDisplayModeIconOnly = 2, NSWindowToolbarStyleUnified = 3
+        msgSendVoid1I64(tb, objcSel("setDisplayMode:"), intToI64(2));
+        msgSendVoid1Ptr(w, objcSel("setToolbar:"), tb);
+        objcReleaseRaw(tb);
+        msgSendSetToolbarStyle(w, objcSel("setToolbarStyle:"), intToI64(3));
+
+        msgSendVoid0(w, objcSel("center"));
         msgSendVoid1Bool(w, objcSel("setReleasedWhenClosed:"), false);
 
-        let content = msgSend0(w, objcSel("contentView"));
-        let tgt = msgSend0(msgSend0(objcClass("JuxuSettingsTarget"), objcSel("alloc")), objcSel("init"));
+        let del = if (!ptrIsNull(cellGet(gSettingsDel))) cellGet(gSettingsDel)
+                  else {
+                      let d = objcAllocInit("JuxuSettingsWindowDelegate");
+                      cellSet(gSettingsDel, d);
+                      d
+                  };
+        msgSendVoid1Ptr(w, objcSel("setDelegate:"), del);
 
-        let _ = makeLabel(content, cgRect(24.0, 268.0, 100.0, 22.0), "输入方案：");
-        let popup = objcAllocInitFrame("NSPopUpButton", cgRect(130.0, 264.0, 300.0, 28.0));
-        let addOpt = (title: String) ->
-            msgSendVoid1Ptr(popup, objcSel("addItemWithTitle:"), nsStr(title));
-        addOpt("全拼");
-        addOpt("小鹤双拼");
-        addOpt("86版五笔");
-        addOpt("98版五笔");
-        addOpt("新世纪五笔");
-        addOpt("小鹤音形");
-        addOpt("仓颉三代");
-        addOpt("仓颉五代");
-        addOpt("仓颉六代");
-        msgSendVoid1Ptr(popup, objcSel("setTarget:"), tgt);
-        msgSendVoid1Ptr(popup, objcSel("setAction:"), objcSel("onSettingChanged:"));
-        msgSendVoid1Ptr(content, objcSel("addSubview:"), popup);
+        let (rootView, ui) = buildSettingsRootView(session, initRect, section, false);
+        msgSendVoid1Ptr(w, objcSel("setContentView:"), rootView);
+        objcReleaseRaw(rootView);
 
-        let _ = makeLabel(content, cgRect(24.0, 226.0, 100.0, 22.0), "每页候选数：");
-        let pagePop = objcAllocInitFrame("NSPopUpButton", cgRect(130.0, 222.0, 120.0, 28.0));
-        msgSendVoid1Ptr(pagePop, objcSel("addItemWithTitle:"), nsStr("5"));
-        msgSendVoid1Ptr(pagePop, objcSel("addItemWithTitle:"), nsStr("7"));
-        msgSendVoid1Ptr(pagePop, objcSel("addItemWithTitle:"), nsStr("9"));
-        msgSendVoid1Ptr(pagePop, objcSel("setTarget:"), tgt);
-        msgSendVoid1Ptr(pagePop, objcSel("setAction:"), objcSel("onSettingChanged:"));
-        msgSendVoid1Ptr(content, objcSel("addSubview:"), pagePop);
-
-        let vCheck = makeCheckbox(content, cgRect(24.0, 184.0, 200.0, 22.0), "纵排候选栏", tgt, false);
-        let slCheck = makeCheckbox(content, cgRect(24.0, 152.0, 260.0, 22.0), "无空格连打（Spaceless）", tgt, true);
-        let asCheck = makeCheckbox(content, cgRect(24.0, 120.0, 260.0, 22.0), "中英文自动空格", tgt, true);
-
-        let _ = makeLabel(content, cgRect(24.0, 76.0, 100.0, 22.0), "自定义词条：");
-        let pField = objcAllocInitFrame("NSTextField", cgRect(130.0, 74.0, 210.0, 24.0));
-        msgSendVoid1Ptr(pField, objcSel("setPlaceholderString:"), nsStr("输入要加入用户词库的词"));
-        msgSendVoid1Ptr(content, objcSel("addSubview:"), pField);
-
-        let addBtn = objcAllocInitFrame("NSButton", cgRect(350.0, 70.0, 80.0, 30.0));
-        msgSendVoid1Ptr(addBtn, objcSel("setTitle:"), nsStr("添加"));
-        msgSendVoid1Ptr(addBtn, objcSel("setTarget:"), tgt);
-        msgSendVoid1Ptr(addBtn, objcSel("setAction:"), objcSel("onAddPhrase:"));
-        msgSendVoid1Ptr(content, objcSel("addSubview:"), addBtn);
-
-        let pStatus = makeLabel(content, cgRect(24.0, 32.0, 406.0, 22.0), "已就绪");
-
-        cellSet(gSettingsTarget, tgt);
-        cellSet(gSchemaPopup, popup);
-        cellSet(gPagePopup, pagePop);
-        cellSet(gVerticalCheck, vCheck);
-        cellSet(gSpacelessCheck, slCheck);
-        cellSet(gAutoSpaceCheck, asCheck);
-        cellSet(gPhraseField, pField);
-        cellSet(gPhraseStatus, pStatus);
-        cellSet(gSettingsWindow, w);
+        cellSet(gSettingsWin, w);
+        cellSet(gSettingsUi, Some(ui));
         w
     };
-    let cnt = vecLen(listUserPhrases(s.engine));
-    msgSendVoid1Ptr(cellGet(gPhraseStatus), objcSel("setStringValue:"), nsStr("当前用户词条：" + intToStr(cnt) + " 条"));
-    msgSendVoid0(win, objcSel("center"));
-    msgSendVoid1Ptr(win, objcSel("makeKeyAndOrderFront:"), ptrNull())
+
+    let bringToFront = () -> {
+        let wNow = cellGet(gSettingsWin);
+        if (!ptrIsNull(wNow)) {
+            let app = msgSend0(objcClass("NSApplication"), objcSel("sharedApplication"));
+            msgSendVoid1Bool(app, objcSel("activateIgnoringOtherApps:"), true);
+            msgSendVoid1Ptr(wNow, objcSel("makeKeyAndOrderFront:"), ptrNull());
+            msgSendVoid1Ptr(wNow, objcSel("orderFrontRegardless"), ptrNull())
+        } else ()
+    };
+    let _ = win;
+    bringToFront();
+    dispatchMainAsync(bringToFront)
+}
+
+pub def settingsWindowShow(session: JuxuSession): Void =
+    settingsWindowShowSection(session, SecSchema)
+
+// ============================================================================
+// 2x Retina Offscreen Preview Renderer (`--render-previews <outDir>`)
+// ============================================================================
+
+def previewKeyCanBecomeKey(_self: Ptr, _cmd: Ptr): Bool = true
+def previewKeyIsKey(_self: Ptr, _cmd: Ptr): Bool = true
+
+data ShowcaseData {
+    scdIsDark: Bool,
+    scdTypoState: JuxuActionState,
+    scdShortcodeState: JuxuActionState,
+    scdVertPinyinState: JuxuActionState,
+}
+
+def gShowcaseKey: Cell Ptr = cellNew(ptrNull())
+def showcaseAssocKey(): Ptr = {
+    let k = cellGet(gShowcaseKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gShowcaseKey, nk); nk }
+}
+
+def showcaseBgDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let h = objcGetAssocHandle(self, showcaseAssocKey());
+    if (h != intToI64(0)) {
+        let d: ShowcaseData = gcHandleGet(h);
+        let bounds = msgSendRect0(self, objcSel("bounds"));
+        let (cStart, cEnd) =
+            if (d.scdIsDark) (nsColorRgba(0.12, 0.13, 0.16, 1.0), nsColorRgba(0.08, 0.09, 0.11, 1.0))
+            else (nsColorRgba(0.94, 0.95, 0.97, 1.0), nsColorRgba(0.89, 0.91, 0.94, 1.0));
+        let grad = msgSendGradInit(
+            msgSend0(objcClass("NSGradient"), objcSel("alloc")),
+            objcSel("initWithStartingColor:endingColor:"),
+            cStart, cEnd
+        );
+        let clipPath = macos_ffi.msgSendBezRoundedRect(
+            objcClass("NSBezierPath"),
+            objcSel("bezierPathWithRoundedRect:xRadius:yRadius:"),
+            bounds, 14.0, 14.0
+        );
+        msgSendVoid0(clipPath, objcSel("addClip"));
+        msgSendGradDrawInRect(grad, objcSel("drawInRect:angle:"), bounds, 35.0);
+        objcReleaseRaw(grad)
+    } else ()
+}
+
+data InlineEditorData {
+    iedIsDark: Bool,
+    iedPrefix: String,
+    iedMarked: String,
+}
+
+def gInlineEdKey: Cell Ptr = cellNew(ptrNull())
+def inlineEdAssocKey(): Ptr = {
+    let k = cellGet(gInlineEdKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gInlineEdKey, nk); nk }
+}
+
+def inlineEditorBoxDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let h = objcGetAssocHandle(self, inlineEdAssocKey());
+    if (h != intToI64(0)) {
+        let d: InlineEditorData = gcHandleGet(h);
+        let bounds = msgSendRect0(self, objcSel("bounds"));
+        let bg = if (d.iedIsDark) nsColorRgba(0.14, 0.14, 0.14, 1.0) else nsColorWhite();
+        fillRoundedRect(bounds, 7.0, bg);
+        strokeRoundedRect(bounds, 7.0, 0.6, nsColorAlpha(nsColorLabel(), 0.10));
+
+        let font = nsFontSystem(15.0, fontWeightRegular());
+        let pAttrs = makeTextAttrs(font, nsColorLabel());
+        let pSz = msgSendSizeWithAttrs(nsStr(d.iedPrefix), objcSel("sizeWithAttributes:"), pAttrs);
+        let ty = roundFloat((bounds.size.height - pSz.height) * 0.5);
+        msgSendDrawAtPointAttrsSw(nsStr(d.iedPrefix), objcSel("drawAtPoint:withAttributes:"), cgPoint(12.0, ty), pAttrs);
+
+        let mx = 12.0 + pSz.width;
+        let mSz = msgSendSizeWithAttrs(nsStr(d.iedMarked), objcSel("sizeWithAttributes:"), pAttrs);
+        msgSendDrawAtPointAttrsSw(nsStr(d.iedMarked), objcSel("drawAtPoint:withAttributes:"), cgPoint(mx, ty), pAttrs);
+        fillHairlineRect(cgRect(mx, ty + mSz.height - 1.5, mSz.width, 1.0), nsColorAlpha(nsColorLabel(), 0.65));
+        fillHairlineRect(cgRect(mx + mSz.width + 0.5, (bounds.size.height - 17.0) * 0.5, 1.5, 17.0), nsColorAccent())
+    } else ()
+}
+
+def makeWindowChromeMockView(title: String, width: Float, height: Float, contentView: Ptr): Ptr = {
+    let chrome = objcAllocInitFrame("JuxuWindowChromeView", cgRect(0.0, 0.0, width, height));
+    let titleLbl = makeStaticLabel(
+        cgRect(0.0, 8.0, width, 18.0),
+        title,
+        nsFontSystem(12.5, fontWeightMedium()),
+        nsColorSecondaryLabel(),
+        false
+    );
+    msgSendVoid1I64(titleLbl, objcSel("setAlignment:"), intToI64(1));
+    msgSendVoid1Ptr(chrome, objcSel("addSubview:"), titleLbl);
+    objcReleaseRaw(titleLbl);
+
+    msgSendVoid1Rect(contentView, objcSel("setFrame:"), cgRect(0.0, 35.0, width, height - 35.0));
+    msgSendVoid1Ptr(chrome, objcSel("addSubview:"), contentView);
+    chrome
+}
+
+def windowChromeDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let b = msgSendRect0(self, objcSel("bounds"));
+    let clipPath = macos_ffi.msgSendBezRoundedRect(
+        objcClass("NSBezierPath"),
+        objcSel("bezierPathWithRoundedRect:xRadius:yRadius:"),
+        b, 12.0, 12.0
+    );
+    msgSendVoid0(clipPath, objcSel("addClip"));
+    fillHairlineRect(b, nsColorWindowBg());
+    // Traffic light circles
+    fillRoundedRect(cgRect(14.0, 11.0, 12.0, 12.0), 6.0, nsColorRgba(1.0, 0.37, 0.34, 1.0));
+    fillRoundedRect(cgRect(34.0, 11.0, 12.0, 12.0), 6.0, nsColorRgba(1.0, 0.74, 0.18, 1.0));
+    fillRoundedRect(cgRect(54.0, 11.0, 12.0, 12.0), 6.0, nsColorRgba(0.16, 0.78, 0.25, 1.0));
+    fillHairlineRect(cgRect(0.0, 34.0, b.size.width, 1.0), nsColorSeparator());
+    strokeRoundedRect(b, 12.0, 0.8, nsColorAlpha(nsColorLabel(), 0.15))
+}
+
+def renderViewToRetinaPng(rootView: Ptr, width: Float, height: Float, isDark: Bool, outPath: String): Bool = {
+    let appName = if (isDark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
+    let appearance = msgSend1Ptr(objcClass("NSAppearance"), objcSel("appearanceNamed:"), nsStr(appName));
+
+    let win = msgSend1Rect1U64_1I64_1Bool(
+        msgSend0(objcClass("PreviewKeyWindow"), objcSel("alloc")),
+        objcSel("initWithContentRect:styleMask:backing:defer:"),
+        cgRect(0.0, 0.0, width, height),
+        intToI64(0),
+        intToI64(2),
+        false
+    );
+    if (!ptrIsNull(appearance)) {
+        msgSendVoid1Ptr(win, objcSel("setAppearance:"), appearance);
+        msgSendVoid1Ptr(rootView, objcSel("setAppearance:"), appearance)
+    } else ();
+    msgSendVoid1Bool(win, objcSel("setOpaque:"), false);
+    msgSendVoid1Ptr(win, objcSel("setBackgroundColor:"), nsColorClear());
+    msgSendVoid1Rect(rootView, objcSel("setFrame:"), cgRect(0.0, 0.0, width, height));
+    msgSendVoid1Ptr(win, objcSel("setContentView:"), rootView);
+
+    msgSendVoid0(rootView, objcSel("layoutSubtreeIfNeeded"));
+    let rl = msgSend0(objcClass("NSRunLoop"), objcSel("mainRunLoop"));
+    let dt = msgSend1Ptr1FloatSw(objcClass("NSDate"), objcSel("dateWithTimeIntervalSinceNow:"), 0.05);
+    msgSendRunUntilDate(rl, objcSel("runUntilDate:"), dt);
+    msgSendVoid0(rootView, objcSel("layoutSubtreeIfNeeded"));
+
+    let rep = msgSendBitmapInit(
+        msgSend0(objcClass("NSBitmapImageRep"), objcSel("alloc")),
+        objcSel("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:"),
+        ptrNull(),
+        intToI64(floatToInt(width * 2.0)),
+        intToI64(floatToInt(height * 2.0)),
+        intToI64(8),
+        intToI64(4),
+        true,
+        false,
+        nsStr("NSDeviceRGBColorSpace"),
+        intToI64(0),
+        intToI64(0)
+    );
+    let ok = if (ptrIsNull(rep)) false
+    else {
+        msgSendVoid1Size(rep, objcSel("setSize:"), cgSize(width, height));
+        msgSendCacheDisplay(rootView, objcSel("cacheDisplayInRect:toBitmapImageRep:"), cgRect(0.0, 0.0, width, height), rep);
+        let emptyDict = msgSend0(objcClass("NSDictionary"), objcSel("dictionary"));
+        // NSBitmapImageFileTypePNG == 4
+        let pngData = msgSendRepUsingType(rep, objcSel("representationUsingType:properties:"), intToI64(4), emptyDict);
+        let wrote = if (ptrIsNull(pngData)) false
+                    else msgSendWriteToFile(pngData, objcSel("writeToFile:atomically:"), nsStr(outPath), true);
+        objcReleaseRaw(rep);
+        wrote
+    };
+    msgSendVoid1Ptr(win, objcSel("setContentView:"), ptrNull());
+    objcReleaseRaw(win);
+    ok
+}
+
+extern "objc_msgSend" def msgSend1Ptr1FloatSw(cls: Ptr, sel: Ptr, secs: Float): Ptr
+
+def buildCandidateShowcaseView(
+    isDark: Bool,
+    typoSt: JuxuActionState,
+    shortSt: JuxuActionState,
+    vertSt: JuxuActionState
+): Ptr = {
+    let canvas = objcAllocInitFrame("JuxuCandidateShowcaseView", cgRect(0.0, 0.0, 740.0, 410.0));
+    objcSetAssocHandle(canvas, showcaseAssocKey(), gcHandleNew(ShowcaseData {
+        scdIsDark: isDark,
+        scdTypoState: typoSt,
+        scdShortcodeState: shortSt,
+        scdVertPinyinState: vertSt,
+    }));
+
+    // 1. Typo rescue horizontal bar
+    let cap1 = makeStaticLabel(
+        cgRect(24.0, 24.0, 692.0, 18.0),
+        "1. 原生单行横排 · 触点/邻键纠错轻提示（行内下划线预编辑，零弹出缩放动画、绝不折行）",
+        nsFontSystem(12.0, fontWeightMedium()), nsColorSecondaryLabel(), false
+    );
+    msgSendVoid1Ptr(canvas, objcSel("addSubview:"), cap1);
+    objcReleaseRaw(cap1);
+
+    let ed1 = objcAllocInitFrame("JuxuInlineEditorMockView", cgRect(24.0, 48.0, 692.0, 36.0));
+    let pref1 = "正在体验苹果原生风格五笔：";
+    objcSetAssocHandle(ed1, inlineEdAssocKey(), gcHandleNew(InlineEditorData {
+        iedIsDark: isDark, iedPrefix: pref1, iedMarked: "yrwu",
+    }));
+    msgSendVoid1Ptr(canvas, objcSel("addSubview:"), ed1);
+    objcReleaseRaw(ed1);
+
+    let (bar1, _, sz1) = candidateBarCreate(typoSt, None, None);
+    msgSendVoid1Rect(bar1, objcSel("setFrame:"), cgRect(24.0 + intToFloat(utf8ScalarCount(pref1)) * 15.0 + 12.0, 90.0, sz1.width, sz1.height));
+    msgSendVoid1Ptr(canvas, objcSel("addSubview:"), bar1);
+    objcReleaseRaw(bar1);
+
+    // 2. Shortcode hint horizontal bar
+    let cap2 = makeStaticLabel(
+        cgRect(24.0, 142.0, 456.0, 18.0),
+        "2. 全码输入 · 简码轻提示（khk → 中 k）",
+        nsFontSystem(12.0, fontWeightMedium()), nsColorSecondaryLabel(), false
+    );
+    msgSendVoid1Ptr(canvas, objcSel("addSubview:"), cap2);
+    objcReleaseRaw(cap2);
+
+    let ed2 = objcAllocInitFrame("JuxuInlineEditorMockView", cgRect(24.0, 166.0, 464.0, 36.0));
+    objcSetAssocHandle(ed2, inlineEdAssocKey(), gcHandleNew(InlineEditorData {
+        iedIsDark: isDark, iedPrefix: "中国", iedMarked: "khk",
+    }));
+    msgSendVoid1Ptr(canvas, objcSel("addSubview:"), ed2);
+    objcReleaseRaw(ed2);
+
+    let (bar2, _, sz2) = candidateBarCreate(shortSt, None, None);
+    msgSendVoid1Rect(bar2, objcSel("setFrame:"), cgRect(24.0 + 42.0, 208.0, sz2.width, sz2.height));
+    msgSendVoid1Ptr(canvas, objcSel("addSubview:"), bar2);
+    objcReleaseRaw(bar2);
+
+    // 3. Vertical z-lookup candidate bar
+    let cap3 = makeStaticLabel(
+        cgRect(514.0, 142.0, 202.0, 18.0),
+        "3. 竖排候选栏 · z 键拼音反查",
+        nsFontSystem(12.0, fontWeightMedium()), nsColorSecondaryLabel(), false
+    );
+    msgSendVoid1Ptr(canvas, objcSel("addSubview:"), cap3);
+    objcReleaseRaw(cap3);
+
+    let (bar3, _, sz3) = candidateBarCreate(vertSt, None, None);
+    msgSendVoid1Rect(bar3, objcSel("setFrame:"), cgRect(514.0, 166.0, sz3.width, sz3.height));
+    msgSendVoid1Ptr(canvas, objcSel("addSubview:"), bar3);
+    objcReleaseRaw(bar3);
+
+    let _ = candidateBarHeight();
+    canvas
+}
+
+/// Render all 2x Retina PNG previews (`--render-previews <outDir>`, matching `Scripts/RenderPreviews.swift`).
+pub def renderAllMacosPreviews(outDir: String): Bool = {
+    let _ = mkdirAll(outDir);
+    let app = msgSend0(objcClass("NSApplication"), objcSel("sharedApplication"));
+    // NSApplicationActivationPolicyAccessory == 1
+    let _ = msgSendVoid1I64(app, objcSel("setActivationPolicy:"), intToI64(1));
+
+    let b = bridgeNew(None, true);
+    let _ = bridgeAddUserPhrase(b, "棱五笔", false);
+
+    // State A: Touch boundary typo rescue (`yrwu` -> `"我们"`)
+    let _ = bridgePushTouch(b, 121, 4.54, 0.02, true, intToI64(100));
+    let _ = bridgePushTouch(b, 114, 3.01, 0.01, true, intToI64(160));
+    let _ = bridgePushTouch(b, 119, 1.00, 0.00, true, intToI64(220));
+    let typoSt = bridgePushTouch(b, 117, 6.00, 0.00, true, intToI64(280));
+    let _ = bridgeHandleKey(b, 0x31, 32, false, intToI64(320));
+
+    // State B: 3-code input with shortcode hint (`khk` -> `"中 k"`)
+    bridgeClearComposition(b);
+    let _ = bridgeHandleKey(b, 0, 107, false, intToI64(400));
+    let _ = bridgeHandleKey(b, 0, 104, false, intToI64(410));
+    let shortSt = bridgeHandleKey(b, 0, 107, false, intToI64(420));
+
+    // State C: Vertical z-lookup (`zguo`)
+    bridgeClearComposition(b);
+    let _ = bridgeHandleKey(b, 0, 122, false, intToI64(500));
+    let _ = bridgeHandleKey(b, 0, 103, false, intToI64(510));
+    let _ = bridgeHandleKey(b, 0, 117, false, intToI64(520));
+    let rawZ = bridgeHandleKey(b, 0, 111, false, intToI64(530));
+    let top5: Vec Candidate = vecWithCap(5);
+    let dummyC = emptyCandidate();
+    let k = cellNew(0);
+    while (cellGet(k) < 5 && cellGet(k) < vecLen(rawZ.asCandidates)) {
+        vecPush(top5, vecGetOr(rawZ.asCandidates, cellGet(k), dummyC));
+        cellSet(k, cellGet(k) + 1)
+    };
+    let vertSt = JuxuActionState {
+        asConsumed: rawZ.asConsumed,
+        asBell: false,
+        asAsciiMode: false,
+        asSchemaId: 98,
+        asPage: 0,
+        asTotalPages: rawZ.asTotalPages,
+        asVertical: true,
+        asSchemaName: "98版五笔",
+        asCommitText: "",
+        asPreedit: rawZ.asPreedit,
+        asSegmentedCode: rawZ.asSegmentedCode,
+        asNotice: "",
+        asUserPhraseCount: 1,
+        asCalibratedKeyCount: 4,
+        asValidNextMask: rawZ.asValidNextMask,
+        asNextKeyPriors: rawZ.asNextKeyPriors,
+        asTouchOffsets: rawZ.asTouchOffsets,
+        asT9Mode: false,
+        asT9ValidNextMask: rawZ.asT9ValidNextMask,
+        asT9NextKeyPriors: rawZ.asT9NextKeyPriors,
+        asT9TouchOffsets: rawZ.asT9TouchOffsets,
+        asT9LockedPrefix: "",
+        asT9Syllables: vecNew(),
+        asCandidates: top5,
+        asHasDecodedTouchOffsets: true,
+        asHasDecodedT9TouchOffsets: true,
+    };
+
+    let scLight = buildCandidateShowcaseView(false, typoSt, shortSt, vertSt);
+    let ok1 = renderViewToRetinaPng(scLight, 740.0, 410.0, false, pathJoin(outDir, "candidates-light.png"));
+    objcReleaseRaw(scLight);
+
+    let scDark = buildCandidateShowcaseView(true, typoSt, shortSt, vertSt);
+    let ok2 = renderViewToRetinaPng(scDark, 740.0, 410.0, true, pathJoin(outDir, "candidates-dark.png"));
+    objcReleaseRaw(scDark);
+
+    // Prime `b` with active touch typo state (`yrwu`)
+    bridgeClearComposition(b);
+    let _ = bridgePushTouch(b, 121, 4.54, 0.02, true, intToI64(700));
+    let _ = bridgePushTouch(b, 114, 3.01, 0.01, true, intToI64(760));
+    let _ = bridgePushTouch(b, 119, 1.00, 0.00, true, intToI64(820));
+    let _ = bridgePushTouch(b, 117, 6.00, 0.00, true, intToI64(880));
+
+    let (schemaRoot, _) = buildSettingsRootView(b, cgRect(0.0, 0.0, 740.0, 585.0), SecSchema, true);
+    let chromeSchema = makeWindowChromeMockView("句序 (Juxu) 偏好设置", 740.0, 620.0, schemaRoot);
+    objcReleaseRaw(schemaRoot);
+    let ok3 = renderViewToRetinaPng(chromeSchema, 740.0, 620.0, false, pathJoin(outDir, "settings-schema-light.png"));
+    objcReleaseRaw(chromeSchema);
+
+    let (typoRoot, _) = buildSettingsRootView(b, cgRect(0.0, 0.0, 740.0, 735.0), SecTypo, true);
+    let chromeTypo = makeWindowChromeMockView("句序 (Juxu) 偏好设置", 740.0, 770.0, typoRoot);
+    objcReleaseRaw(typoRoot);
+    let ok4 = renderViewToRetinaPng(chromeTypo, 740.0, 770.0, true, pathJoin(outDir, "settings-typo-dark.png"));
+    objcReleaseRaw(chromeTypo);
+
+    voiceConfigurePreviewState(true);
+    let (voiceCloudRoot, _) = buildSettingsRootView(b, cgRect(0.0, 0.0, 740.0, 725.0), SecVoice, true);
+    let chromeVoiceCloud = makeWindowChromeMockView("句序 (Juxu) 偏好设置", 740.0, 760.0, voiceCloudRoot);
+    objcReleaseRaw(voiceCloudRoot);
+    let ok5 = renderViewToRetinaPng(chromeVoiceCloud, 740.0, 760.0, false, pathJoin(outDir, "settings-voice-cloud.png"));
+    objcReleaseRaw(chromeVoiceCloud);
+
+    voiceConfigurePreviewState(false);
+    let (voiceRoot, _) = buildSettingsRootView(b, cgRect(0.0, 0.0, 740.0, 725.0), SecVoice, true);
+    let chromeVoice = makeWindowChromeMockView("句序 (Juxu) 偏好设置", 740.0, 760.0, voiceRoot);
+    objcReleaseRaw(voiceRoot);
+    let ok6 = renderViewToRetinaPng(chromeVoice, 740.0, 760.0, false, pathJoin(outDir, "settings-voice-local.png"));
+    objcReleaseRaw(chromeVoice);
+
+    ok1 && ok2 && ok3 && ok4 && ok5 && ok6
+}
+
+// ============================================================================
+// Objective-C Dynamic Subclass Registrations (`extern init(101)`)
+// ============================================================================
+
+extern init(101) def registerSettingsClasses(): Void = {
+    let winCls = objcAllocateClass("NSWindow", "SettingsWindow");
+    if (!ptrIsNull(winCls)) {
+        let _ = objcAddMethod(winCls, "performKeyEquivalent:", cFnPtr(settingsWindowPerformKeyEquivalent), "B@:@");
+        objcRegisterClass(winCls)
+    } else ();
+
+    let pkCls = objcAllocateClass("NSWindow", "PreviewKeyWindow");
+    if (!ptrIsNull(pkCls)) {
+        let _ = objcAddMethod(pkCls, "canBecomeKeyWindow", cFnPtr(previewKeyCanBecomeKey), "B@:");
+        let _ = objcAddMethod(pkCls, "isKeyWindow", cFnPtr(previewKeyIsKey), "B@:");
+        objcRegisterClass(pkCls)
+    } else ();
+
+    let tgtCls = objcAllocateClass("NSObject", "JuxuActionTarget");
+    if (!ptrIsNull(tgtCls)) {
+        let _ = objcAddMethod(tgtCls, "invokeAction:", cFnPtr(actionTargetInvoke), "v@:@");
+        objcRegisterClass(tgtCls)
+    } else ();
+
+    let delCls = objcAllocateClass("NSObject", "JuxuSettingsWindowDelegate");
+    if (!ptrIsNull(delCls)) {
+        let _ = objcAddMethod(delCls, "windowWillClose:", cFnPtr(settingsWindowWillClose), "v@:@");
+        objcRegisterClass(delCls)
+    } else ();
+
+    let flipCls = objcAllocateClass("NSView", "JuxuFlippedView");
+    if (!ptrIsNull(flipCls)) {
+        let _ = objcAddMethod(flipCls, "isFlipped", cFnPtr(flippedIsFlipped), "B@:");
+        objcRegisterClass(flipCls)
+    } else ();
+
+    let cardCls = objcAllocateClass("NSView", "JuxuCardView");
+    if (!ptrIsNull(cardCls)) {
+        let _ = objcAddMethod(cardCls, "isFlipped", cFnPtr(flippedIsFlipped), "B@:");
+        let _ = objcAddMethod(cardCls, "drawRect:", cFnPtr(cardViewDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        objcRegisterClass(cardCls)
+    } else ();
+
+    let sbrCls = objcAllocateClass("NSView", "JuxuSidebarRowView");
+    if (!ptrIsNull(sbrCls)) {
+        let _ = objcAddMethod(sbrCls, "isFlipped", cFnPtr(flippedIsFlipped), "B@:");
+        let _ = objcAddMethod(sbrCls, "drawRect:", cFnPtr(sidebarRowDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        let _ = objcAddMethod(sbrCls, "mouseDown:", cFnPtr(sidebarRowMouseDown), "v@:@");
+        objcRegisterClass(sbrCls)
+    } else ();
+
+    let rcCls = objcAllocateClass("NSView", "JuxuRadioCardView");
+    if (!ptrIsNull(rcCls)) {
+        let _ = objcAddMethod(rcCls, "isFlipped", cFnPtr(flippedIsFlipped), "B@:");
+        let _ = objcAddMethod(rcCls, "drawRect:", cFnPtr(radioCardDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        let _ = objcAddMethod(rcCls, "mouseDown:", cFnPtr(radioCardMouseDown), "v@:@");
+        objcRegisterClass(rcCls)
+    } else ();
+
+    let swCls = objcAllocateClass("NSView", "JuxuCapsuleSwitchView");
+    if (!ptrIsNull(swCls)) {
+        let _ = objcAddMethod(swCls, "isFlipped", cFnPtr(flippedIsFlipped), "B@:");
+        let _ = objcAddMethod(swCls, "drawRect:", cFnPtr(capsuleSwitchDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        let _ = objcAddMethod(swCls, "mouseDown:", cFnPtr(capsuleSwitchMouseDown), "v@:@");
+        objcRegisterClass(swCls)
+    } else ();
+
+    let emCls = objcAllocateClass("NSView", "JuxuEvalMetricView");
+    if (!ptrIsNull(emCls)) {
+        let _ = objcAddMethod(emCls, "isFlipped", cFnPtr(flippedIsFlipped), "B@:");
+        let _ = objcAddMethod(emCls, "drawRect:", cFnPtr(evalMetricDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        objcRegisterClass(emCls)
+    } else ();
+
+    let ppCls = objcAllocateClass("NSView", "JuxuPhrasePillView");
+    if (!ptrIsNull(ppCls)) {
+        let _ = objcAddMethod(ppCls, "isFlipped", cFnPtr(flippedIsFlipped), "B@:");
+        let _ = objcAddMethod(ppCls, "drawRect:", cFnPtr(phrasePillDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        objcRegisterClass(ppCls)
+    } else ();
+
+    let tkCls = objcAllocateClass("NSView", "JuxuTouchSimKeyboardView");
+    if (!ptrIsNull(tkCls)) {
+        let _ = objcAddMethod(tkCls, "isFlipped", cFnPtr(flippedIsFlipped), "B@:");
+        let _ = objcAddMethod(tkCls, "drawRect:", cFnPtr(touchSimDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        let _ = objcAddMethod(tkCls, "mouseDown:", cFnPtr(touchSimMouseDown), "v@:@");
+        objcRegisterClass(tkCls)
+    } else ();
+
+    let spCls = objcAllocateClass("NSView", "JuxuSettingsSplitView");
+    if (!ptrIsNull(spCls)) {
+        let _ = objcAddMethod(spCls, "isFlipped", cFnPtr(flippedIsFlipped), "B@:");
+        let _ = objcAddMethod(spCls, "drawRect:", cFnPtr(splitViewDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        let _ = objcAddMethod(spCls, "resizeSubviewsWithOldSize:", cFnPtr(splitViewResizeSubviews), "v@:{CGSize=dd}");
+        objcRegisterClass(spCls)
+    } else ();
+
+    let scCls = objcAllocateClass("NSView", "JuxuCandidateShowcaseView");
+    if (!ptrIsNull(scCls)) {
+        let _ = objcAddMethod(scCls, "isFlipped", cFnPtr(flippedIsFlipped), "B@:");
+        let _ = objcAddMethod(scCls, "drawRect:", cFnPtr(showcaseBgDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        objcRegisterClass(scCls)
+    } else ();
+
+    let ieCls = objcAllocateClass("NSView", "JuxuInlineEditorMockView");
+    if (!ptrIsNull(ieCls)) {
+        let _ = objcAddMethod(ieCls, "isFlipped", cFnPtr(flippedIsFlipped), "B@:");
+        let _ = objcAddMethod(ieCls, "drawRect:", cFnPtr(inlineEditorBoxDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        objcRegisterClass(ieCls)
+    } else ();
+
+    let wcCls = objcAllocateClass("NSView", "JuxuWindowChromeView");
+    if (!ptrIsNull(wcCls)) {
+        let _ = objcAddMethod(wcCls, "isFlipped", cFnPtr(flippedIsFlipped), "B@:");
+        let _ = objcAddMethod(wcCls, "drawRect:", cFnPtr(windowChromeDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        objcRegisterClass(wcCls)
+    } else ()
 }

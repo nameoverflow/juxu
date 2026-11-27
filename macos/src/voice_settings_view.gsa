@@ -1,0 +1,2563 @@
+/// 1:1 Geisha AppKit port of `Sources/VoiceSettingsView.swift` (1,064 lines):
+/// - `voiceBuildSettingsPageView(session: JuxuSession, width: Float): Ptr`
+/// - `voiceOnSettingsWindowClosed(): Void`
+/// - Master Switch Card (`开启句序语音输入入口`, dynamic active/off subtitle, `bolt.shield` on-demand banner when off, lifecycle draft cleanup)
+/// - `providerCard` (`运行方案`: side-by-side `"云端 BYOK"` & `"本地模型"` selectable cards with `checkmark.circle.fill`/`circle` & `0.11` accent fill)
+/// - `cloudBYOKCard` (`云端服务商` picker, `API Key` `NSSecureTextField` + `"✓ 钥匙串"`/`"必填"`, full Custom URL/ASR/LLM/SplitLLM fields, `启用云端 AI 口语整理`)
+/// - `LocalVoiceConfigCard` (`本地语音识别模型` engine install/clean, Apple Speech locale + on-device, Custom HTTP; `本地 LLM 整理引擎` Qwen 1.5B / Ollama / None; live `VoiceInstallPhase` progress/status banner)
+/// - `triggerAndBehaviorCard` (`触发快捷键`, `全局语音快捷键` + `optionSpace` warning + Input Monitoring & Accessibility rows + `"打开系统设置"` + 2s poll, `开始和结束提示音`, `输出模式与语气` + `语气风格`, `选中文本语音改写（Speak to Edit）`)
+/// - `contextPrivacyCard` (3 switches with `.disabled(!capture)` dimming on rows 2 & 3)
+/// - `VoiceContextInspectorCard` (AX trust badge, `"3 秒后抓取前台窗口"` / countdown cancel, `"复制 JSON"` / `"展开 JSON"`, captured summary rows, ASR & Polish monospaced scroll boxes, raw JSON scroll box)
+/// - `vocabularyAndTestCard` (`联动句序个人词库（N 条）`, `自定义语音热词`, `"检测当前配置"` + `"配置：voice.json"` + green/red result text).
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecLen, vecPush, vecGetOr}
+use std.math.{ceil, abs}
+use std.str.{intToStr, strTrim, strContains}
+use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
+use std.path.{pathBasename}
+use objc.{
+    Id, NSObject,
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    objcSetAssocHandle, objcGetAssocHandle, objcReleaseRaw, idAdopt,
+    msgSend0, msgSend1Ptr, msgSend1Float, msgSendInt0, msgSendI64_0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
+}
+use juxu_shared.{
+    JuxuSession, bridgeRefreshUserPhrases,
+    CGPoint, CGSize, CGRect, cgPoint, cgRect,
+    nsStr, nsStrPtrToString, objcAllocInit, objcAllocInitFrame,
+    utf8ScalarCount, headScalars,
+    msgSendRect0, msgSendSize0, msgSend2Float, msgSend4Float, msgSend2Ptr,
+    msgSendVoid1Rect, dispatchMainAsync, dispatchMainAfterMs,
+}
+use voice_common.{
+    VoiceProviderMode, VpmCloudBYOK, VpmLocal, vpmDisplayName, vpmSummary,
+    VoiceCloudPreset, VcpGroq, VcpCustom, vcpAllCases, vcpDisplayName, vcpKeyPlaceholder, vcpSubtitle, vcpKeychainAccount,
+    VoiceKeychainAccount, VkaCustomLLM,
+    VoiceLocalASRModelPreset, VlaWhisperTurbo, VlaAppleSpeech, VlaCustomHTTP,
+    vlaAllCases, vlaDisplayName, vlaSizeLabel, vlaEngineLabel, vlaModelFilename, vlaIsEngineBackend,
+    VoiceLocalLLMPreset, VllQwen15B, VllOllamaHTTP, VllNone,
+    vllAllCases, vllDisplayName, vllSizeLabel, vllModelFilename,
+    VoiceTriggerKey, VtkRightOption, vtkAllCases, vtkDisplayName, vtkIsHoldToTalk,
+    VoiceOutputMode, VomSmartPolish, vomAllCases, vomDisplayName,
+    VoiceToneMode, VtmAutoByApp, vtmAllCases, vtmDisplayName,
+    VoicePreferences,
+    vpIsGlobalHotkeyEnabled, vpAreVoiceCuesEnabled, vpIsContextCaptureEnabled,
+    vpRespectsContextBlacklist, vpSendsScreenContextToCloud,
+    vpEffectiveCloudASRModel, vpEffectiveCloudLLMModel,
+    voiceKeychainRead, voiceKeychainWrite,
+    voicePrefsGet, voicePrefsFilePath, voicePrefsUpdate, gVoicePrefsObservers,
+    VoiceLocalComponentStatus, vlcsIsReady, vlcsFormattedModelSize,
+    VoiceInstallPhase, VipIdle, VipInstallingDep, VipDownloadingModel, VipCompleted, VipFailed, vipIsBusy,
+    VoiceGlobalPermStatus, VoiceContextSummary,
+    voiceAxIsTrusted,
+    gVoiceAsrStatusHook, gVoiceLlmStatusHook, gVoiceInstallPhaseCell, gVoiceInstallRefreshObservers,
+    gVoiceInstallASRHook, gVoiceInstallLLMHook, gVoiceDeleteModelHook, gVoiceCancelInstallHook,
+    gVoiceGlobalPermCurrentHook, gVoiceGlobalPermRequestHook,
+    gVoiceTestConfigHook,
+    gVoiceInspectorPresented, gVoiceInspectorCapturing, gVoiceInspectorCountdown,
+    gVoiceInspectorLastSummary, gVoiceInspectorObservers,
+    gVoiceInspectorTriggerHook, gVoiceInspectorCancelHook,
+}
+
+// ============================================================================
+// C11 & Objective-C FFI Helpers
+// ============================================================================
+
+extern "juxu_voice_ui_bounding_rect" def c_vsBoundingRect(nsStrPtr: Ptr, maxW: Float, attrs: Ptr, outRect4: Ptr): Void
+extern "juxu_voice_ui_open_url_utf8" def c_vsOpenUrlUtf8(url: String): Bool
+extern "juxu_voice_ui_copy_pasteboard_utf8" def c_vsCopyPasteboardUtf8(text: String): Void
+
+extern "objc_msgSend" def msgSendBezRoundedVs(cls: Ptr, sel: Ptr, r: CGRect, rx: Float, ry: Float): Ptr
+extern "objc_msgSend" def msgSendDrawAtPtAttrsVs(nsStrObj: Ptr, sel: Ptr, pt: CGPoint, attrs: Ptr): Void
+extern "objc_msgSend" def msgSendDrawInRectAttrsVs(nsStrObj: Ptr, sel: Ptr, r: CGRect, attrs: Ptr): Void
+extern "objc_msgSend" def msgSendDrawImgVs(
+    img: Ptr, sel: Ptr, dst: CGRect, src: CGRect, op: Int64, frac: Float, respectFlipped: Bool, hints: Ptr
+): Void
+extern "objc_msgSend" def msgSendSizeWithAttrsVs(nsStrObj: Ptr, sel: Ptr, attrs: Ptr): CGSize
+
+def maxVs(a: Float, b: Float): Float = if (a >= b) a else b
+def minVs(a: Float, b: Float): Float = if (a <= b) a else b
+def clampVs(v: Float, lo: Float, hi: Float): Float =
+    if (v < lo) lo else if (v > hi) hi else v
+
+def vsFontReg(): Float = 0.0
+def vsFontMed(): Float = 0.23
+def vsFontSemi(): Float = 0.30
+
+def vsFontSystem(size: Float, weight: Float): Ptr =
+    msgSend2Float(objcClass("NSFont"), objcSel("systemFontOfSize:weight:"), size, weight)
+
+def vsFontMono(size: Float, weight: Float): Ptr =
+    msgSend2Float(objcClass("NSFont"), objcSel("monospacedSystemFontOfSize:weight:"), size, weight)
+
+def vsColorRgba(r: Float, g: Float, b: Float, a: Float): Ptr =
+    msgSend4Float(objcClass("NSColor"), objcSel("colorWithSRGBRed:green:blue:alpha:"), r, g, b, a)
+
+def vsColorAlpha(col: Ptr, a: Float): Ptr =
+    if (ptrIsNull(col)) col else msgSend1Float(col, objcSel("colorWithAlphaComponent:"), clampVs(a, 0.0, 1.0))
+
+def vsColorLabel(): Ptr = msgSend0(objcClass("NSColor"), objcSel("labelColor"))
+def vsColorSecondary(): Ptr = msgSend0(objcClass("NSColor"), objcSel("secondaryLabelColor"))
+def vsColorTertiary(): Ptr = msgSend0(objcClass("NSColor"), objcSel("tertiaryLabelColor"))
+def vsColorSeparator(): Ptr = msgSend0(objcClass("NSColor"), objcSel("separatorColor"))
+def vsColorAccent(): Ptr = msgSend0(objcClass("NSColor"), objcSel("controlAccentColor"))
+def vsColorGreen(): Ptr = msgSend0(objcClass("NSColor"), objcSel("systemGreenColor"))
+def vsColorOrange(): Ptr = msgSend0(objcClass("NSColor"), objcSel("systemOrangeColor"))
+def vsColorRed(): Ptr = msgSend0(objcClass("NSColor"), objcSel("systemRedColor"))
+
+def vsViewIsDark(view: Ptr): Bool =
+    if (ptrIsNull(view)) false
+    else {
+        let app = msgSend0(view, objcSel("effectiveAppearance"));
+        if (ptrIsNull(app)) false
+        else {
+            let names = msgSend0(objcClass("NSMutableArray"), objcSel("array"));
+            msgSendVoid1Ptr(names, objcSel("addObject:"), nsStr("NSAppearanceNameAqua"));
+            msgSendVoid1Ptr(names, objcSel("addObject:"), nsStr("NSAppearanceNameDarkAqua"));
+            let best = msgSend1Ptr(app, objcSel("bestMatchFromAppearancesWithNames:"), names);
+            strContains(nsStrPtrToString(best), "Dark")
+        }
+    }
+
+def vsFillRoundedRect(r: CGRect, radius: Float, color: Ptr): Void =
+    if (!ptrIsNull(color) && r.size.width > 0.0 && r.size.height > 0.0) {
+        let maxR = 0.5 * minVs(r.size.width, r.size.height);
+        let rad = clampVs(radius, 0.0, maxR);
+        msgSendVoid0(color, objcSel("setFill"));
+        let p = msgSendBezRoundedVs(
+            objcClass("NSBezierPath"),
+            objcSel("bezierPathWithRoundedRect:xRadius:yRadius:"),
+            r, rad, rad
+        );
+        msgSendVoid0(p, objcSel("fill"))
+    } else ()
+
+def vsStrokeRoundedRect(r: CGRect, radius: Float, lineWidth: Float, color: Ptr): Void =
+    if (!ptrIsNull(color) && lineWidth > 0.0 && r.size.width > lineWidth && r.size.height > lineWidth) {
+        let half = lineWidth * 0.5;
+        let insetR = cgRect(r.origin.x + half, r.origin.y + half, r.size.width - lineWidth, r.size.height - lineWidth);
+        let adjR = maxVs(0.0, radius - half);
+        msgSendVoid0(color, objcSel("setStroke"));
+        let p = msgSendBezRoundedVs(
+            objcClass("NSBezierPath"),
+            objcSel("bezierPathWithRoundedRect:xRadius:yRadius:"),
+            insetR, adjR, adjR
+        );
+        msgSendVoid1Float(p, objcSel("setLineWidth:"), lineWidth);
+        msgSendVoid0(p, objcSel("stroke"))
+    } else ()
+
+def vsFillHairline(r: CGRect, color: Ptr): Void =
+    if (!ptrIsNull(color) && r.size.width > 0.0 && r.size.height > 0.0) {
+        msgSendVoid0(color, objcSel("setFill"));
+        msgSendVoid1Rect(objcClass("NSBezierPath"), objcSel("fillRect:"), r)
+    } else ()
+
+def vsMakeTextAttrs(font: Ptr, color: Ptr): Ptr = {
+    let d = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
+    if (!ptrIsNull(font)) {
+        let _ = msgSend2Ptr(d, objcSel("setObject:forKey:"), font, nsStr("NSFont"));
+        ()
+    } else ();
+    if (!ptrIsNull(color)) {
+        let _ = msgSend2Ptr(d, objcSel("setObject:forKey:"), color, nsStr("NSColor"));
+        ()
+    } else ();
+    d
+}
+
+def vsMeasureTextHeight(text: String, font: Ptr, maxW: Float, minH: Float): Float = {
+    let safeW = maxVs(40.0, maxW);
+    let attrs = vsMakeTextAttrs(font, vsColorLabel());
+    let buf = ptrAllocBytes(32);
+    c_vsBoundingRect(nsStr(text), safeW, attrs, buf);
+    let h = ceil(ptrReadF64Le(buf, 24)) + 1.0;
+    maxVs(minH, h)
+}
+
+def vsSymbolImage(symbolName: String, ptSize: Float, weight: Float): Ptr = {
+    let imgCls = objcClass("NSImage");
+    if (ptrIsNull(imgCls)) ptrNull()
+    else {
+        let base = msgSend2Ptr(
+            imgCls,
+            objcSel("imageWithSystemSymbolName:accessibilityDescription:"),
+            nsStr(symbolName),
+            ptrNull()
+        );
+        if (ptrIsNull(base)) ptrNull()
+        else {
+            let cfgCls = objcClass("NSImageSymbolConfiguration");
+            if (ptrIsNull(cfgCls)) base
+            else {
+                let cfg = msgSend2Float(cfgCls, objcSel("configurationWithPointSize:weight:"), ptSize, weight);
+                if (ptrIsNull(cfg)) base
+                else {
+                    let configured = msgSend1Ptr(base, objcSel("imageWithSymbolConfiguration:"), cfg);
+                    if (!ptrIsNull(configured)) configured else base
+                }
+            }
+        }
+    }
+}
+
+def vsDrawTintedSymbol(symbolName: String, ptSize: Float, weight: Float, tint: Ptr, dstRect: CGRect): Void = {
+    let base = vsSymbolImage(symbolName, ptSize, weight);
+    if (!ptrIsNull(base)) {
+        let palArr = msgSend1Ptr(objcClass("NSArray"), objcSel("arrayWithObject:"), tint);
+        let pCfg = if (ptrIsNull(palArr)) ptrNull() else msgSend1Ptr(objcClass("NSImageSymbolConfiguration"), objcSel("configurationWithPaletteColors:"), palArr);
+        let tinted = if (ptrIsNull(pCfg)) ptrNull() else msgSend1Ptr(base, objcSel("imageWithSymbolConfiguration:"), pCfg);
+        let img = if (!ptrIsNull(tinted)) tinted else base;
+        let sz = msgSendSize0(img, objcSel("size"));
+        let dx = dstRect.origin.x + (dstRect.size.width - sz.width) * 0.5;
+        let dy = dstRect.origin.y + (dstRect.size.height - sz.height) * 0.5;
+        msgSendDrawImgVs(
+            img,
+            objcSel("drawInRect:fromRect:operation:fraction:respectFlipped:hints:"),
+            cgRect(dx, dy, sz.width, sz.height),
+            cgRect(0.0, 0.0, 0.0, 0.0),
+            intToI64(2),
+            1.0,
+            true,
+            ptrNull()
+        )
+    } else ()
+}
+
+def vsMakeSymbolImageView(frame: CGRect, symbolName: String, ptSize: Float, weight: Float, tint: Ptr): Ptr = {
+    let iv = objcAllocInitFrame("NSImageView", frame);
+    let img = vsSymbolImage(symbolName, ptSize, weight);
+    if (!ptrIsNull(img)) msgSendVoid1Ptr(iv, objcSel("setImage:"), img) else ();
+    if (!ptrIsNull(tint)) msgSendVoid1Ptr(iv, objcSel("setContentTintColor:"), tint) else ();
+    iv
+}
+
+def vsMakeLabel(frame: CGRect, text: String, font: Ptr, color: Ptr, wraps: Bool, selectable: Bool): Ptr = {
+    let lbl = objcAllocInitFrame("NSTextField", frame);
+    msgSendVoid1Bool(lbl, objcSel("setBezeled:"), false);
+    msgSendVoid1Bool(lbl, objcSel("setDrawsBackground:"), false);
+    msgSendVoid1Bool(lbl, objcSel("setEditable:"), false);
+    msgSendVoid1Bool(lbl, objcSel("setSelectable:"), selectable);
+    if (!ptrIsNull(font)) msgSendVoid1Ptr(lbl, objcSel("setFont:"), font) else ();
+    if (!ptrIsNull(color)) msgSendVoid1Ptr(lbl, objcSel("setTextColor:"), color) else ();
+    if (wraps) {
+        msgSendVoid1Bool(lbl, objcSel("setUsesSingleLineMode:"), false);
+        let cellObj = msgSend0(lbl, objcSel("cell"));
+        if (!ptrIsNull(cellObj)) {
+            msgSendVoid1Bool(cellObj, objcSel("setWraps:"), true);
+            msgSendVoid1Bool(cellObj, objcSel("setScrollable:"), false)
+        } else ()
+    } else {
+        msgSendVoid1Bool(lbl, objcSel("setUsesSingleLineMode:"), true);
+        msgSendVoid1I64(lbl, objcSel("setLineBreakMode:"), intToI64(4))
+    };
+    msgSendVoid1Ptr(lbl, objcSel("setStringValue:"), nsStr(text));
+    lbl
+}
+
+// ============================================================================
+// Custom AppKit Subclasses for VoiceSettingsView
+// ============================================================================
+
+// ---- 1. Action Target & TextField Change Delegate ----
+
+def gVsActionKey: Cell Ptr = cellNew(ptrNull())
+def gVsKeepAliveKey: Cell Ptr = cellNew(ptrNull())
+def gVsFieldBindKey: Cell Ptr = cellNew(ptrNull())
+
+def vsActionAssocKey(): Ptr = {
+    let k = cellGet(gVsActionKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gVsActionKey, nk); nk }
+}
+
+def vsKeepAliveAssocKey(): Ptr = {
+    let k = cellGet(gVsKeepAliveKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gVsKeepAliveKey, nk); nk }
+}
+
+def vsFieldBindAssocKey(): Ptr = {
+    let k = cellGet(gVsFieldBindKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gVsFieldBindKey, nk); nk }
+}
+
+def vsActionTargetInvoke(self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
+    let h = objcGetAssocHandle(self, vsActionAssocKey());
+    if (h != intToI64(0)) {
+        let cb: (Ptr) -> Void = gcHandleGet(h);
+        cb(sender)
+    } else ()
+}
+
+def vsBindControl(control: Ptr, cb: (Ptr) -> Void): Void = {
+    let tgt = objcAllocInit("JuxuGeishaVoiceActionTarget");
+    objcSetAssocHandle(tgt, vsActionAssocKey(), gcHandleNew(cb));
+    msgSendVoid1Ptr(control, objcSel("setTarget:"), tgt);
+    msgSendVoid1Ptr(control, objcSel("setAction:"), objcSel("invokeVoiceAction:"));
+    let retained: Id NSObject = idAdopt(tgt);
+    objcSetAssocHandle(control, vsKeepAliveAssocKey(), gcHandleNew(retained))
+}
+
+data VoiceTextFieldBind {
+    vtfbOnChange: (String) -> Void,
+}
+
+def vsTextFieldDidChange(self: Ptr, _cmd: Ptr, notif: Ptr): Void = {
+    let h = objcGetAssocHandle(self, vsFieldBindAssocKey());
+    if (!ptrIsNull(notif) && h != intToI64(0)) {
+        let field = msgSend0(notif, objcSel("object"));
+        if (!ptrIsNull(field)) {
+            let bind: VoiceTextFieldBind = gcHandleGet(h);
+            let txt = nsStrPtrToString(msgSend0(field, objcSel("stringValue")));
+            let cb = bind.vtfbOnChange;
+            cb(txt)
+        } else ()
+    } else ()
+}
+
+def vsMakeInputField(
+    frame: CGRect,
+    secure: Bool,
+    value: String,
+    placeholder: String,
+    onChange: (String) -> Void
+): Ptr = {
+    let box = objcAllocInitFrame("JuxuGeishaVoiceCardView", frame);
+    objcSetAssocHandle(box, vsCardAssocKey(), gcHandleNew(VoiceSettingsCardData {
+        vscdDividerYs: vecNew(),
+        vscdRadius: 6.0,
+        vscdFillKind: 3,
+    }));
+
+    let clsName = if (secure) "NSSecureTextField" else "NSTextField";
+    let innerH = 17.0;
+    let innerY = maxVs(2.0, (frame.size.height - innerH) * 0.5);
+    let fld = objcAllocInitFrame(clsName, cgRect(6.0, innerY, maxVs(24.0, frame.size.width - 12.0), innerH));
+    msgSendVoid1Bool(fld, objcSel("setBezeled:"), false);
+    msgSendVoid1Bool(fld, objcSel("setDrawsBackground:"), false);
+    msgSendVoid1I64(fld, objcSel("setFocusRingType:"), intToI64(1));
+    msgSendVoid1Bool(fld, objcSel("setEditable:"), true);
+    msgSendVoid1Bool(fld, objcSel("setSelectable:"), true);
+    msgSendVoid1Bool(fld, objcSel("setUsesSingleLineMode:"), true);
+    msgSendVoid1Ptr(fld, objcSel("setFont:"), vsFontSystem(12.5, vsFontReg()));
+    msgSendVoid1Ptr(fld, objcSel("setTextColor:"), vsColorLabel());
+    let cellObj = msgSend0(fld, objcSel("cell"));
+    if (!ptrIsNull(cellObj)) {
+        msgSendVoid1Bool(cellObj, objcSel("setWraps:"), false);
+        msgSendVoid1Bool(cellObj, objcSel("setScrollable:"), true)
+    } else ();
+    if (strLen(placeholder) > 0) {
+        let phCol = vsColorRgba(0.55, 0.55, 0.58, 1.0);
+        let phAttrs = vsMakeTextAttrs(vsFontSystem(12.5, vsFontReg()), phCol);
+        let phAttrStr = msgSend2Ptr(
+            msgSend0(objcClass("NSAttributedString"), objcSel("alloc")),
+            objcSel("initWithString:attributes:"),
+            nsStr(placeholder),
+            phAttrs
+        );
+        msgSendVoid1Ptr(fld, objcSel("setPlaceholderAttributedString:"), phAttrStr);
+        objcReleaseRaw(phAttrStr)
+    } else ();
+    msgSendVoid1Ptr(fld, objcSel("setStringValue:"), nsStr(value));
+
+    let del = objcAllocInit("JuxuGeishaVoiceTextFieldDelegate");
+    objcSetAssocHandle(del, vsFieldBindAssocKey(), gcHandleNew(VoiceTextFieldBind { vtfbOnChange: onChange }));
+    msgSendVoid1Ptr(fld, objcSel("setDelegate:"), del);
+    let retained: Id NSObject = idAdopt(del);
+    objcSetAssocHandle(fld, vsKeepAliveAssocKey(), gcHandleNew(retained));
+
+    msgSendVoid1Ptr(box, objcSel("addSubview:"), fld);
+    objcReleaseRaw(fld);
+    box
+}
+
+// ---- 2. Grouped Card View & Tinted Box View ----
+
+data VoiceSettingsCardData {
+    vscdDividerYs: Vec Float,
+    vscdRadius: Float,
+    vscdFillKind: Int,
+}
+
+def gVsCardKey: Cell Ptr = cellNew(ptrNull())
+
+def vsCardAssocKey(): Ptr = {
+    let k = cellGet(gVsCardKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gVsCardKey, nk); nk }
+}
+
+def vsFlipped(_self: Ptr, _cmd: Ptr): Bool = true
+
+def vsCardDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let bounds = msgSendRect0(self, objcSel("bounds"));
+    let h = objcGetAssocHandle(self, vsCardAssocKey());
+    if (h != intToI64(0)) {
+        let st: VoiceSettingsCardData = gcHandleGet(h);
+        if (st.vscdFillKind == 1) {
+            // ASR context box: Color.accentColor.opacity(0.06)
+            vsFillRoundedRect(bounds, st.vscdRadius, vsColorAlpha(vsColorAccent(), 0.06))
+        } else if (st.vscdFillKind == 2) {
+            // Polish / Raw JSON box: Color.primary.opacity(0.04)
+            vsFillRoundedRect(bounds, st.vscdRadius, vsColorAlpha(vsColorLabel(), 0.04))
+        } else if (st.vscdFillKind == 3) {
+            // Rounded text field bezel (`textFieldStyle(.roundedBorder)`): crisp opaque fill + hairline border
+            let isDark = vsViewIsDark(self);
+            let bgCol = if (isDark) vsColorRgba(0.14, 0.14, 0.16, 1.0) else vsColorRgba(1.0, 1.0, 1.0, 1.0);
+            let bdCol = if (isDark) vsColorRgba(1.0, 1.0, 1.0, 0.14) else vsColorRgba(0.0, 0.0, 0.0, 0.11);
+            vsFillRoundedRect(bounds, st.vscdRadius, bgCol);
+            vsStrokeRoundedRect(bounds, st.vscdRadius, 0.65, bdCol)
+        } else {
+            let isDark = vsViewIsDark(self);
+            let fillCol =
+                if (isDark) vsColorRgba(1.0, 1.0, 1.0, 0.048)
+                else vsColorRgba(0.0, 0.0, 0.0, 0.028);
+            let borderCol =
+                if (isDark) vsColorRgba(1.0, 1.0, 1.0, 0.085)
+                else vsColorRgba(0.0, 0.0, 0.0, 0.065);
+            vsFillRoundedRect(bounds, st.vscdRadius, fillCol);
+            vsStrokeRoundedRect(bounds, st.vscdRadius, 0.6, borderCol);
+
+            let sep = vsColorSeparator();
+            let n = vecLen(st.vscdDividerYs);
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let dy = vecGetOr(st.vscdDividerYs, cellGet(i), 0.0);
+                vsFillHairline(cgRect(14.0, dy, maxVs(0.0, bounds.size.width - 28.0), 0.5), sep);
+                cellSet(i, cellGet(i) + 1)
+            }
+        }
+    } else ()
+}
+
+def vsMakeCard(frame: CGRect, dividerYs: Vec Float): Ptr = {
+    let v = objcAllocInitFrame("JuxuGeishaVoiceCardView", frame);
+    objcSetAssocHandle(v, vsCardAssocKey(), gcHandleNew(VoiceSettingsCardData {
+        vscdDividerYs: dividerYs,
+        vscdRadius: 10.0,
+        vscdFillKind: 0,
+    }));
+    v
+}
+
+def vsMakeCodeBox(frame: CGRect, accentTint: Bool): Ptr = {
+    let v = objcAllocInitFrame("JuxuGeishaVoiceCardView", frame);
+    objcSetAssocHandle(v, vsCardAssocKey(), gcHandleNew(VoiceSettingsCardData {
+        vscdDividerYs: vecNew(),
+        vscdRadius: 6.0,
+        vscdFillKind: if (accentTint) 1 else 2,
+    }));
+    v
+}
+
+// ---- 3. Provider Mode Option Card (`providerOptionCard`, lines 118-152) ----
+
+data VoiceOptionCardData {
+    vocdTitle: String,
+    vocdSubtitle: String,
+    vocdSelected: Bool,
+    vocdOnClick: () -> Void,
+}
+
+def gVsOptCardKey: Cell Ptr = cellNew(ptrNull())
+
+def vsOptCardAssocKey(): Ptr = {
+    let k = cellGet(gVsOptCardKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gVsOptCardKey, nk); nk }
+}
+
+def vsOptCardDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let h = objcGetAssocHandle(self, vsOptCardAssocKey());
+    if (h != intToI64(0)) {
+        let st: VoiceOptionCardData = gcHandleGet(h);
+        let bounds = msgSendRect0(self, objcSel("bounds"));
+        let fillCol =
+            if (st.vocdSelected) vsColorAlpha(vsColorAccent(), 0.11)
+            else vsColorAlpha(vsColorLabel(), 0.03);
+        vsFillRoundedRect(bounds, 8.0, fillCol);
+        if (st.vocdSelected) {
+            vsStrokeRoundedRect(bounds, 8.0, 1.2, vsColorAccent())
+        } else {
+            vsStrokeRoundedRect(bounds, 8.0, 0.6, vsColorAlpha(vsColorLabel(), 0.10))
+        };
+
+        let titleAttrs = vsMakeTextAttrs(vsFontSystem(13.0, vsFontSemi()), vsColorLabel());
+        msgSendDrawAtPtAttrsVs(
+            nsStr(st.vocdTitle),
+            objcSel("drawAtPoint:withAttributes:"),
+            cgPoint(10.0, 10.0),
+            titleAttrs
+        );
+
+        let subAttrs = vsMakeTextAttrs(vsFontSystem(11.0, vsFontReg()), vsColorSecondary());
+        msgSendDrawInRectAttrsVs(
+            nsStr(st.vocdSubtitle),
+            objcSel("drawInRect:withAttributes:"),
+            cgRect(10.0, 31.0, maxVs(40.0, bounds.size.width - 20.0), maxVs(18.0, bounds.size.height - 39.0)),
+            subAttrs
+        )
+    } else ()
+}
+
+def vsOptCardMouseDown(self: Ptr, _cmd: Ptr, _ev: Ptr): Void = {
+    let h = objcGetAssocHandle(self, vsOptCardAssocKey());
+    if (h != intToI64(0)) {
+        let st: VoiceOptionCardData = gcHandleGet(h);
+        let cb = st.vocdOnClick;
+        cb()
+    } else ()
+}
+
+def vsMakeOptionCard(frame: CGRect, title: String, subtitle: String, selected: Bool, onClick: () -> Void): Ptr = {
+    let v = objcAllocInitFrame("JuxuGeishaVoiceOptionCardView", frame);
+    objcSetAssocHandle(v, vsOptCardAssocKey(), gcHandleNew(VoiceOptionCardData {
+        vocdTitle: title,
+        vocdSubtitle: subtitle,
+        vocdSelected: selected,
+        vocdOnClick: onClick,
+    }));
+    let symName = if (selected) "checkmark.circle.fill" else "circle";
+    let symTint = if (selected) vsColorAccent() else vsColorAlpha(vsColorSecondary(), 0.5);
+    let iv = vsMakeSymbolImageView(cgRect(frame.size.width - 25.0, 10.0, 15.0, 15.0), symName, 13.0, if (selected) vsFontSemi() else vsFontReg(), symTint);
+    msgSendVoid1Ptr(v, objcSel("addSubview:"), iv);
+    objcReleaseRaw(iv);
+    v
+}
+
+// ============================================================================
+// VoiceSettingsPageState & Preferences Mutation Helpers
+// ============================================================================
+
+pub data VoiceSettingsPageState {
+    vsvSession: JuxuSession,
+    vsvPageView: Ptr,
+    vsvWidth: Cell Float,
+    vsvIsWindowVisible: Cell Bool,
+    vsvPermGen: Cell Int64,
+    vsvGlobalPerms: Cell VoiceGlobalPermStatus,
+    vsvPrimaryKeyDraft: Cell String,
+    vsvSplitLLMKeyDraft: Cell String,
+    vsvLoadedKeyAccount: Cell (Option VoiceKeychainAccount),
+    vsvTestStatus: Cell String,
+    vsvTestOK: Cell Bool,
+    vsvIsTesting: Cell Bool,
+    vsvShowRawJSON: Cell Bool,
+    vsvCopiedJSONNotice: Cell Bool,
+    vsvCopiedASRNotice: Cell Bool,
+    vsvSuppressObserver: Cell Bool,
+}
+
+def gActiveVoiceSettingsPage: Cell (Option VoiceSettingsPageState) = cellNew(None)
+def gVoiceSettingsObserversRegistered: Cell Bool = cellNew(false)
+def gVsPageStateKey: Cell Ptr = cellNew(ptrNull())
+
+def vsPageStateAssocKey(): Ptr = {
+    let k = cellGet(gVsPageStateKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gVsPageStateKey, nk); nk }
+}
+
+def clonePrefsWith(
+    p: VoicePreferences,
+    enabledOpt: Option Bool,
+    providerOpt: Option VoiceProviderMode,
+    triggerOpt: Option VoiceTriggerKey,
+    outputOpt: Option VoiceOutputMode,
+    toneOpt: Option VoiceToneMode,
+    speakEditOpt: Option Bool,
+    syncLexOpt: Option Bool,
+    vocabOpt: Option String,
+    cloudPresetOpt: Option VoiceCloudPreset,
+    cloudPolishOpt: Option Bool,
+    customBaseOpt: Option String,
+    customAsrOpt: Option String,
+    customLlmOpt: Option String,
+    customSplitOpt: Option Bool,
+    customLlmBaseOpt: Option String,
+    localAsrOpt: Option VoiceLocalASRModelPreset,
+    appleLocaleOpt: Option String,
+    appleOnDevOpt: Option Bool,
+    httpAsrBaseOpt: Option String,
+    httpAsrModelOpt: Option String,
+    localLlmOpt: Option VoiceLocalLLMPreset,
+    httpLlmBaseOpt: Option String,
+    httpLlmModelOpt: Option String,
+    globalHkOpt: Option (Option Bool),
+    cuesOpt: Option (Option Bool),
+    ctxCapOpt: Option (Option Bool),
+    ctxBlOpt: Option (Option Bool),
+    screenCloudOpt: Option (Option Bool)
+): VoicePreferences = VoicePreferences {
+    vpEnabled: match enabledOpt { Some(v) -> v, None -> p.vpEnabled },
+    vpProviderMode: match providerOpt { Some(v) -> v, None -> p.vpProviderMode },
+    vpTriggerKey: match triggerOpt { Some(v) -> v, None -> p.vpTriggerKey },
+    vpOutputMode: match outputOpt { Some(v) -> v, None -> p.vpOutputMode },
+    vpToneMode: match toneOpt { Some(v) -> v, None -> p.vpToneMode },
+    vpLanguage: p.vpLanguage,
+    vpSpeakToEditSelection: match speakEditOpt { Some(v) -> v, None -> p.vpSpeakToEditSelection },
+    vpSyncJuxuLexicon: match syncLexOpt { Some(v) -> v, None -> p.vpSyncJuxuLexicon },
+    vpCustomVocabulary: match vocabOpt { Some(v) -> v, None -> p.vpCustomVocabulary },
+    vpCloudPreset: match cloudPresetOpt { Some(v) -> v, None -> p.vpCloudPreset },
+    vpCloudPolishEnabled: match cloudPolishOpt { Some(v) -> v, None -> p.vpCloudPolishEnabled },
+    vpCustomBaseURL: match customBaseOpt { Some(v) -> v, None -> p.vpCustomBaseURL },
+    vpCustomASRModel: match customAsrOpt { Some(v) -> v, None -> p.vpCustomASRModel },
+    vpCustomLLMModel: match customLlmOpt { Some(v) -> v, None -> p.vpCustomLLMModel },
+    vpCustomSplitLLM: match customSplitOpt { Some(v) -> v, None -> p.vpCustomSplitLLM },
+    vpCustomLLMBaseURL: match customLlmBaseOpt { Some(v) -> v, None -> p.vpCustomLLMBaseURL },
+    vpLocalASRPreset: match localAsrOpt { Some(v) -> v, None -> p.vpLocalASRPreset },
+    vpLocalAppleLocale: match appleLocaleOpt { Some(v) -> v, None -> p.vpLocalAppleLocale },
+    vpLocalAppleRequireOnDevice: match appleOnDevOpt { Some(v) -> v, None -> p.vpLocalAppleRequireOnDevice },
+    vpLocalHTTPASRBaseURL: match httpAsrBaseOpt { Some(v) -> v, None -> p.vpLocalHTTPASRBaseURL },
+    vpLocalHTTPASRModel: match httpAsrModelOpt { Some(v) -> v, None -> p.vpLocalHTTPASRModel },
+    vpLocalLLMPreset: match localLlmOpt { Some(v) -> v, None -> p.vpLocalLLMPreset },
+    vpLocalHTTPLLMBaseURL: match httpLlmBaseOpt { Some(v) -> v, None -> p.vpLocalHTTPLLMBaseURL },
+    vpLocalHTTPLLMModel: match httpLlmModelOpt { Some(v) -> v, None -> p.vpLocalHTTPLLMModel },
+    vpGlobalVoiceHotkey: match globalHkOpt { Some(v) -> v, None -> p.vpGlobalVoiceHotkey },
+    vpVoiceCues: match cuesOpt { Some(v) -> v, None -> p.vpVoiceCues },
+    vpContextCapture: match ctxCapOpt { Some(v) -> v, None -> p.vpContextCapture },
+    vpContextBlacklist: match ctxBlOpt { Some(v) -> v, None -> p.vpContextBlacklist },
+    vpScreenContextToCloud: match screenCloudOpt { Some(v) -> v, None -> p.vpScreenContextToCloud },
+}
+
+def updateVoicePrefsQuiet(st: VoiceSettingsPageState, mutFn: (VoicePreferences) -> VoicePreferences): Void = {
+    let next = mutFn(voicePrefsGet());
+    cellSet(st.vsvSuppressObserver, true);
+    voicePrefsUpdate(next, true);
+    cellSet(st.vsvSuppressObserver, false)
+}
+
+def reloadKeysForCurrentPreset(st: VoiceSettingsPageState): Void = {
+    let prefs = voicePrefsGet();
+    let acc = vcpKeychainAccount(prefs.vpCloudPreset);
+    let alreadyLoaded = match cellGet(st.vsvLoadedKeyAccount) {
+        Some(prev) -> prev == acc,
+        None       -> false,
+    };
+    if (!alreadyLoaded) {
+        cellSet(st.vsvLoadedKeyAccount, Some(acc));
+        cellSet(st.vsvPrimaryKeyDraft, voiceKeychainRead(acc))
+    } else ();
+    if (prefs.vpCloudPreset == VcpCustom) {
+        cellSet(st.vsvSplitLLMKeyDraft, voiceKeychainRead(VkaCustomLLM))
+    } else ()
+}
+
+def clearVoiceDrafts(st: VoiceSettingsPageState): Void = {
+    cellSet(st.vsvPrimaryKeyDraft, "");
+    cellSet(st.vsvSplitLLMKeyDraft, "");
+    cellSet(st.vsvLoadedKeyAccount, None);
+    cellSet(st.vsvTestStatus, "")
+}
+
+// ============================================================================
+// Reusable Row & Control Builders
+// ============================================================================
+
+def vsClearSubviews(container: Ptr): Void =
+    if (!ptrIsNull(container)) {
+        let emptyArr = msgSend0(objcClass("NSArray"), objcSel("array"));
+        msgSendVoid1Ptr(container, objcSel("setSubviews:"), emptyArr)
+    } else ()
+
+data VsCapsuleSwitchState {
+    vcssIsOn: Cell Bool,
+    vcssEnabled: Bool,
+    vcssOnToggle: (Bool) -> Void,
+}
+
+def gVsSwitchKey: Cell Ptr = cellNew(ptrNull())
+def vsSwitchAssocKey(): Ptr = {
+    let k = cellGet(gVsSwitchKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gVsSwitchKey, nk); nk }
+}
+
+def vsCapsuleSwitchDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let h = objcGetAssocHandle(self, vsSwitchAssocKey());
+    if (h != intToI64(0)) {
+        let st: VsCapsuleSwitchState = gcHandleGet(h);
+        let on = cellGet(st.vcssIsOn);
+        let en = st.vcssEnabled;
+        let trackRect = cgRect(0.0, 0.0, 36.0, 20.0);
+        let baseTrack = if (on) vsColorAccent() else vsColorAlpha(vsColorLabel(), 0.16);
+        let trackCol = if (en) baseTrack else vsColorAlpha(baseTrack, 0.45);
+        vsFillRoundedRect(trackRect, 10.0, trackCol);
+
+        let knobX = if (on) 18.0 else 2.0;
+        let shadowAlpha = if (en) 0.18 else 0.08;
+        let knobAlpha = if (en) 1.0 else 0.65;
+        vsFillRoundedRect(cgRect(knobX, 2.8, 16.0, 16.0), 8.0, vsColorRgba(0.0, 0.0, 0.0, shadowAlpha));
+        vsFillRoundedRect(cgRect(knobX, 2.0, 16.0, 16.0), 8.0, vsColorRgba(1.0, 1.0, 1.0, knobAlpha))
+    } else ()
+}
+
+def vsCapsuleSwitchMouseDown(self: Ptr, _cmd: Ptr, _ev: Ptr): Void = {
+    let h = objcGetAssocHandle(self, vsSwitchAssocKey());
+    if (h != intToI64(0)) {
+        let st: VsCapsuleSwitchState = gcHandleGet(h);
+        if (st.vcssEnabled) {
+            let nextVal = !cellGet(st.vcssIsOn);
+            cellSet(st.vcssIsOn, nextVal);
+            msgSendVoid1Bool(self, objcSel("setNeedsDisplay:"), true);
+            let cb = st.vcssOnToggle;
+            cb(nextVal)
+        } else ()
+    } else ()
+}
+
+def vsMakeSmallSwitch(isOn: Bool, enabled: Bool, onToggle: (Bool) -> Void): (Ptr, CGSize) = {
+    let sw = objcAllocInitFrame("JuxuGeishaVoiceSwitchView", cgRect(0.0, 0.0, 36.0, 20.0));
+    objcSetAssocHandle(sw, vsSwitchAssocKey(), gcHandleNew(VsCapsuleSwitchState {
+        vcssIsOn: cellNew(isOn),
+        vcssEnabled: enabled,
+        vcssOnToggle: onToggle,
+    }));
+    (sw, cgRect(0.0, 0.0, 36.0, 20.0).size)
+}
+
+def vsMakeButton(title: String, prominent: Bool, mini: Bool, enabled: Bool, onClick: () -> Void): (Ptr, CGSize) = {
+    let btn = objcAllocInitFrame("NSButton", cgRect(0.0, 0.0, 90.0, 24.0));
+    msgSendVoid1I64(btn, objcSel("setBezelStyle:"), intToI64(1));
+    msgSendVoid1I64(btn, objcSel("setControlSize:"), if (mini) intToI64(2) else intToI64(1));
+    msgSendVoid1Ptr(btn, objcSel("setFont:"), vsFontSystem(if (mini) 10.5 else 11.5, vsFontReg()));
+    msgSendVoid1Ptr(btn, objcSel("setTitle:"), nsStr(title));
+    msgSendVoid1Bool(btn, objcSel("setEnabled:"), enabled);
+    if (prominent) {
+        msgSendVoid1Ptr(btn, objcSel("setBezelColor:"), vsColorAccent())
+    } else ();
+    msgSendVoid0(btn, objcSel("sizeToFit"));
+    vsBindControl(btn, (_s: Ptr) -> onClick());
+    let sz = msgSendRect0(btn, objcSel("frame")).size;
+    (btn, sz)
+}
+
+def vsMakePopup(titles: Vec String, selectedIdx: Int, maxW: Float, onSelect: (Int) -> Void): (Ptr, CGSize) = {
+    let pop = objcAllocInitFrame("NSPopUpButton", cgRect(0.0, 0.0, 160.0, 24.0));
+    let n = vecLen(titles);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        msgSendVoid1Ptr(pop, objcSel("addItemWithTitle:"), nsStr(vecGetOr(titles, idx, "")));
+        cellSet(i, idx + 1)
+    };
+    let safeIdx = if (selectedIdx < 0 || selectedIdx >= n) 0 else selectedIdx;
+    if (n > 0) msgSendVoid1I64(pop, objcSel("selectItemAtIndex:"), intToI64(safeIdx)) else ();
+    msgSendVoid0(pop, objcSel("sizeToFit"));
+    let fitted = msgSendRect0(pop, objcSel("frame")).size;
+    let finalW = clampVs(fitted.width + 4.0, 108.0, maxW);
+    let finalH = maxVs(24.0, fitted.height);
+    msgSendVoid1Rect(pop, objcSel("setFrame:"), cgRect(0.0, 0.0, finalW, finalH));
+    vsBindControl(pop, (sender: Ptr) -> {
+        let idx = msgSendInt0(sender, objcSel("indexOfSelectedItem"));
+        onSelect(idx)
+    });
+    (pop, cgRect(0.0, 0.0, finalW, finalH).size)
+}
+
+def vsAddHeader(parent: Ptr, y: Float, width: Float, title: String, subtitle: String): Float = {
+    let tLbl = vsMakeLabel(cgRect(0.0, y, width, 24.0), title, vsFontSystem(17.0, vsFontSemi()), vsColorLabel(), false, false);
+    msgSendVoid1Ptr(parent, objcSel("addSubview:"), tLbl);
+    objcReleaseRaw(tLbl);
+
+    let subFont = vsFontSystem(12.5, vsFontReg());
+    let subH = vsMeasureTextHeight(subtitle, subFont, width, 18.0);
+    let sLbl = vsMakeLabel(cgRect(0.0, y + 25.0, width, subH), subtitle, subFont, vsColorSecondary(), true, false);
+    msgSendVoid1Ptr(parent, objcSel("addSubview:"), sLbl);
+    objcReleaseRaw(sLbl);
+    y + 25.0 + subH + 12.0
+}
+
+def vsAddSwitchRow(
+    card: Ptr,
+    y: Float,
+    cardW: Float,
+    title: String,
+    titleSize: Float,
+    titleWeight: Float,
+    subtitle: String,
+    subtitleSize: Float,
+    isOn: Bool,
+    enabled: Bool,
+    onToggle: (Bool) -> Void
+): (Float, Ptr) = {
+    let (sw, swSz) = vsMakeSmallSwitch(isOn, enabled, onToggle);
+    let textMaxW = maxVs(120.0, cardW - 14.0 - swSz.width - 26.0);
+    let tFont = vsFontSystem(titleSize, titleWeight);
+    let sFont = vsFontSystem(subtitleSize, vsFontReg());
+    let tCol = if (enabled) vsColorLabel() else vsColorAlpha(vsColorLabel(), 0.45);
+    let sCol = if (enabled) vsColorSecondary() else vsColorAlpha(vsColorSecondary(), 0.45);
+
+    let subH = if (strLen(subtitle) > 0) vsMeasureTextHeight(subtitle, sFont, textMaxW, 16.0) else 0.0;
+    let contentH = if (strLen(subtitle) > 0) 19.0 + 2.0 + subH else 19.0;
+    let rowH = maxVs(44.0, contentH + 18.0);
+    let topY = y + (rowH - contentH) * 0.5;
+
+    let tLbl = vsMakeLabel(cgRect(14.0, topY, textMaxW, 19.0), title, tFont, tCol, false, false);
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), tLbl);
+    objcReleaseRaw(tLbl);
+
+    let subRef = cellNew(ptrNull());
+    if (strLen(subtitle) > 0) {
+        let sLbl = vsMakeLabel(cgRect(14.0, topY + 21.0, textMaxW, subH), subtitle, sFont, sCol, true, false);
+        msgSendVoid1Ptr(card, objcSel("addSubview:"), sLbl);
+        cellSet(subRef, sLbl);
+        objcReleaseRaw(sLbl)
+    } else ();
+
+    msgSendVoid1Rect(sw, objcSel("setFrame:"), cgRect(cardW - 14.0 - swSz.width, y + (rowH - swSz.height) * 0.5, swSz.width, swSz.height));
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), sw);
+    objcReleaseRaw(sw);
+    (y + rowH, cellGet(subRef))
+}
+
+def vsAddPopupRow(
+    card: Ptr,
+    y: Float,
+    cardW: Float,
+    title: String,
+    titleWeight: Float,
+    subtitle: String,
+    titles: Vec String,
+    selectedIdx: Int,
+    onSelect: (Int) -> Void
+): Float = {
+    let maxPopW = minVs(282.0, cardW * 0.57);
+    let (pop, popSz) = vsMakePopup(titles, selectedIdx, maxPopW, onSelect);
+    let textMaxW = maxVs(120.0, cardW - 14.0 - popSz.width - 26.0);
+    let tFont = vsFontSystem(13.0, titleWeight);
+    let sFont = vsFontSystem(11.5, vsFontReg());
+
+    let subH = if (strLen(subtitle) > 0) vsMeasureTextHeight(subtitle, sFont, textMaxW, 16.0) else 0.0;
+    let contentH = if (strLen(subtitle) > 0) 19.0 + 2.0 + subH else 19.0;
+    let rowH = maxVs(44.0, contentH + 18.0);
+    let topY = y + (rowH - contentH) * 0.5;
+
+    let tCol = if (strLen(subtitle) > 0) vsColorLabel() else vsColorSecondary();
+    let finalTFont = if (strLen(subtitle) > 0) tFont else vsFontSystem(12.5, vsFontReg());
+    let tLbl = vsMakeLabel(cgRect(14.0, topY, textMaxW, 19.0), title, finalTFont, tCol, false, false);
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), tLbl);
+    objcReleaseRaw(tLbl);
+
+    if (strLen(subtitle) > 0) {
+        let sLbl = vsMakeLabel(cgRect(14.0, topY + 21.0, textMaxW, subH), subtitle, sFont, vsColorSecondary(), true, false);
+        msgSendVoid1Ptr(card, objcSel("addSubview:"), sLbl);
+        objcReleaseRaw(sLbl)
+    } else ();
+
+    msgSendVoid1Rect(pop, objcSel("setFrame:"), cgRect(cardW - 14.0 - popSz.width, y + (rowH - popSz.height) * 0.5, popSz.width, popSz.height));
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), pop);
+    objcReleaseRaw(pop);
+    y + rowH
+}
+
+def vsAddFieldRow(
+    card: Ptr,
+    y: Float,
+    cardW: Float,
+    labelTitle: String,
+    secure: Bool,
+    value: String,
+    placeholder: String,
+    trailingWidth: Float,
+    onChange: (String) -> Void
+): (Float, Ptr) = {
+    let rowH = 40.0;
+    let lbl = vsMakeLabel(cgRect(14.0, y + 11.0, 92.0, 18.0), labelTitle, vsFontSystem(12.5, vsFontReg()), vsColorSecondary(), false, false);
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), lbl);
+    objcReleaseRaw(lbl);
+
+    let fieldX = 14.0 + 92.0 + 10.0;
+    let rightReserve = if (trailingWidth > 0.0) trailingWidth + 8.0 else 0.0;
+    let fieldW = maxVs(100.0, cardW - fieldX - 14.0 - rightReserve);
+    let fld = vsMakeInputField(cgRect(fieldX, y + 8.0, fieldW, 24.0), secure, value, placeholder, onChange);
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), fld);
+    objcReleaseRaw(fld);
+    (y + rowH, fld)
+}
+
+def vsFinalizeCard(parent: Ptr, cardY: Float, cardW: Float, innerView: Ptr, innerH: Float, divs: Vec Float): Float = {
+    let card = vsMakeCard(cgRect(0.0, cardY, cardW, innerH), divs);
+    msgSendVoid1Rect(innerView, objcSel("setFrame:"), cgRect(0.0, 0.0, cardW, innerH));
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), innerView);
+    objcReleaseRaw(innerView);
+    msgSendVoid1Ptr(parent, objcSel("addSubview:"), card);
+    objcReleaseRaw(card);
+    cardY + innerH + 14.0
+}
+
+// ============================================================================
+// Context Inspector Helpers (`compactPreview`, Fallback Prompt Preview, Monospaced Scroll Box)
+// ============================================================================
+
+def vsCompactPreview(s: String, limit: Int): String = {
+    let b = bufNew();
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let ch = strByteAt(s, idx);
+        if (ch == 10) {
+            bufPushStr(b, " ⏎ ")
+        } else if (ch == 13) {
+            ()
+        } else {
+            bufPushByte(b, ch)
+        };
+        cellSet(i, idx + 1)
+    };
+    let oneLine = bufToString(b);
+    if (utf8ScalarCount(oneLine) <= limit) oneLine
+    else headScalars(oneLine, limit) + "…"
+}
+
+def vsResolvedInspectorLabels(cap: VoiceContextSummary, prefs: VoicePreferences): (String, String, String, String) =
+    if (strLen(cap.vcsAsrTargetLabel) > 0) {
+        (cap.vcsAsrTargetLabel, cap.vcsAsrContext, cap.vcsPolishBudgetLabel, cap.vcsPolishContext)
+    } else {
+        let asrLabel = match prefs.vpProviderMode {
+            VpmCloudBYOK -> vpEffectiveCloudASRModel(prefs) + " · 云端识别",
+            VpmLocal -> match prefs.vpLocalASRPreset {
+                VlaAppleSpeech -> "Apple Speech contextualStrings",
+                VlaCustomHTTP  -> prefs.vpLocalHTTPASRModel + " · 本地 HTTP",
+                other          -> vlaEngineLabel(other),
+            },
+        };
+        let (polishOn, budgetName) = match prefs.vpProviderMode {
+            VpmCloudBYOK -> (prefs.vpOutputMode == VomSmartPolish && prefs.vpCloudPolishEnabled, "full"),
+            VpmLocal     -> (prefs.vpOutputMode == VomSmartPolish && prefs.vpLocalLLMPreset != VllNone, "compact"),
+        };
+        let polishLabel =
+            if (polishOn) "AI 润色（" + budgetName + "）"
+            else "AI 润色未开启（预览 · " + budgetName + "）";
+        (asrLabel, cap.vcsAsrContext, polishLabel, cap.vcsPolishContext)
+    }
+
+def vsAddMonospacedScrollBox(
+    parent: Ptr,
+    x: Float,
+    y: Float,
+    boxW: Float,
+    minH: Float,
+    maxH: Float,
+    fontPt: Float,
+    accentTint: Bool,
+    allowHorizScroll: Bool,
+    text: String,
+    isSecondary: Bool
+): Float = {
+    let font = vsFontMono(fontPt, vsFontReg());
+    let textCol = if (isSecondary) vsColorSecondary() else vsColorLabel();
+    let innerPad = 8.0;
+    let docTextW = if (allowHorizScroll) maxVs(boxW - innerPad * 2.0 - 14.0, 560.0) else maxVs(80.0, boxW - innerPad * 2.0 - 14.0);
+    let measuredH = vsMeasureTextHeight(text, font, docTextW, 16.0);
+    let boxH = clampVs(measuredH + innerPad * 2.0, minH, maxH);
+
+    let box = vsMakeCodeBox(cgRect(x, y, boxW, boxH), accentTint);
+    let scroll = objcAllocInitFrame("NSScrollView", cgRect(2.0, 2.0, boxW - 4.0, boxH - 4.0));
+    msgSendVoid1Bool(scroll, objcSel("setDrawsBackground:"), false);
+    msgSendVoid1Bool(scroll, objcSel("setHasVerticalScroller:"), measuredH + innerPad * 2.0 > boxH);
+    msgSendVoid1Bool(scroll, objcSel("setHasHorizontalScroller:"), allowHorizScroll);
+
+    let docH = maxVs(boxH - 4.0, measuredH + innerPad * 2.0);
+    let docW = if (allowHorizScroll) docTextW + innerPad * 2.0 else boxW - 4.0;
+    let doc = objcAllocInitFrame("JuxuGeishaVoiceFlippedView", cgRect(0.0, 0.0, docW, docH));
+    let lbl = vsMakeLabel(
+        cgRect(innerPad, innerPad - 2.0, docW - innerPad * 2.0, measuredH + 4.0),
+        text,
+        font,
+        textCol,
+        true,
+        true
+    );
+    msgSendVoid1Ptr(doc, objcSel("addSubview:"), lbl);
+    objcReleaseRaw(lbl);
+
+    msgSendVoid1Ptr(scroll, objcSel("setDocumentView:"), doc);
+    objcReleaseRaw(doc);
+    msgSendVoid1Ptr(box, objcSel("addSubview:"), scroll);
+    objcReleaseRaw(scroll);
+    msgSendVoid1Ptr(parent, objcSel("addSubview:"), box);
+    objcReleaseRaw(box);
+    y + boxH
+}
+
+// ============================================================================
+// LocalVoiceConfigCard Install Action Row (`installActionRow`, lines 773-813)
+// ============================================================================
+
+def vsAddInstallActionRow(
+    parent: Ptr,
+    y: Float,
+    cardW: Float,
+    status: VoiceLocalComponentStatus,
+    sizeLabel: String,
+    depName: String,
+    busy: Bool,
+    onInstall: () -> Void,
+    onDelete: () -> Void
+): Float = {
+    let ready = vlcsIsReady(status);
+    let symName = if (ready) "checkmark.circle.fill" else "arrow.down.circle";
+    let symTint = if (ready) vsColorGreen() else vsColorAccent();
+    let btnTitle = if (ready) "清理模型" else "一键下载并安装";
+    let (btn, btnSz) = vsMakeButton(btnTitle, !ready, false, !busy, () -> {
+        if (ready) onDelete() else onInstall()
+    });
+
+    let statusText =
+        if (ready) {
+            "已就绪（" + depName + " + 模型 " + vlcsFormattedModelSize(status) + "）"
+        } else if (!status.vlcsDependencyInstalled && !status.vlcsModelInstalled) {
+            "需安装 " + depName + " 并下载模型（约 " + sizeLabel + "）"
+        } else if (!status.vlcsDependencyInstalled) {
+            "模型已在本地，需安装 " + depName + " 依赖"
+        } else {
+            depName + " 已就绪，需下载模型（约 " + sizeLabel + "）"
+        };
+
+    let textX = 36.0;
+    let textMaxW = maxVs(100.0, cardW - textX - 14.0 - btnSz.width - 10.0);
+    let sFont = vsFontSystem(11.5, vsFontReg());
+    let textH = vsMeasureTextHeight(statusText, sFont, textMaxW, 16.0);
+    let rowH = maxVs(30.0, textH + 10.0);
+
+    let iv = vsMakeSymbolImageView(cgRect(14.0, y + (rowH - 16.0) * 0.5, 16.0, 16.0), symName, 13.0, vsFontMed(), symTint);
+    msgSendVoid1Ptr(parent, objcSel("addSubview:"), iv);
+    objcReleaseRaw(iv);
+
+    let lbl = vsMakeLabel(cgRect(textX, y + (rowH - textH) * 0.5, textMaxW, textH), statusText, sFont, vsColorSecondary(), true, false);
+    msgSendVoid1Ptr(parent, objcSel("addSubview:"), lbl);
+    objcReleaseRaw(lbl);
+
+    msgSendVoid1Rect(btn, objcSel("setFrame:"), cgRect(cardW - 14.0 - btnSz.width, y + (rowH - btnSz.height) * 0.5, btnSz.width, btnSz.height));
+    msgSendVoid1Ptr(parent, objcSel("addSubview:"), btn);
+    objcReleaseRaw(btn);
+    y + rowH + 6.0
+}
+
+// ============================================================================
+// Global Permission Poll Timer (`VoiceSettingsView.swift` lines 319-325)
+// ============================================================================
+
+def vsSyncPermissionPoll(st: VoiceSettingsPageState): Void = {
+    let nextGen = cellGet(st.vsvPermGen) + intToI64(1);
+    cellSet(st.vsvPermGen, nextGen);
+    let prefs = voicePrefsGet();
+    if (prefs.vpEnabled && vpIsGlobalHotkeyEnabled(prefs) && cellGet(st.vsvIsWindowVisible)) {
+        let curPerms = (cellGet(gVoiceGlobalPermCurrentHook))();
+        cellSet(st.vsvGlobalPerms, curPerms);
+        vsSchedulePermTick(st, nextGen)
+    } else ()
+}
+
+def vsSchedulePermTick(st: VoiceSettingsPageState, expectedGen: Int64): Void =
+    dispatchMainAfterMs(2000, () -> {
+        if (cellGet(st.vsvPermGen) == expectedGen && cellGet(st.vsvIsWindowVisible)) {
+            let prefs = voicePrefsGet();
+            if (prefs.vpEnabled && vpIsGlobalHotkeyEnabled(prefs)) {
+                let latest = (cellGet(gVoiceGlobalPermCurrentHook))();
+                if (latest != cellGet(st.vsvGlobalPerms)) {
+                    cellSet(st.vsvGlobalPerms, latest);
+                    rebuildVoiceSettingsPage(st)
+                } else {
+                    vsSchedulePermTick(st, expectedGen)
+                }
+            } else ()
+        } else ()
+    })
+
+// ============================================================================
+// Full Page Builder (`rebuildVoiceSettingsPage`)
+// ============================================================================
+
+def rebuildVoiceSettingsPage(st: VoiceSettingsPageState): Void = {
+    let page = st.vsvPageView;
+    let w = maxVs(360.0, cellGet(st.vsvWidth));
+    vsClearSubviews(page);
+
+    let prefs = voicePrefsGet();
+    if (prefs.vpEnabled) {
+        reloadKeysForCurrentPreset(st)
+    } else ();
+
+    let inspectorActive = prefs.vpEnabled && vpIsContextCaptureEnabled(prefs) && cellGet(st.vsvIsWindowVisible);
+    cellSet(gVoiceInspectorPresented, inspectorActive);
+
+    let curY = cellNew(vsAddHeader(
+        page,
+        0.0,
+        w,
+        "语音识别与智能整理",
+        "云端预设填 Key 即用，本地一键下载模型与依赖；未开启时不占内存、不申请麦克风权限"
+    ));
+
+    // ------------------------------------------------------------------------
+    // 1. Master Switch Card (lines 31-64)
+    // ------------------------------------------------------------------------
+    let masterInner = objcAllocInitFrame("JuxuGeishaVoiceFlippedView", cgRect(0.0, 0.0, w, 120.0));
+    let masterDivs: Vec Float = vecNew();
+    let masterSub =
+        if (prefs.vpEnabled) {
+            "已激活：" + vtkDisplayName(prefs.vpTriggerKey) + "说话，松手自动整理上屏（Esc 取消）"
+        } else {
+            "默认关闭。未开启时不加载音频引擎、语音识别器、网络会话与悬浮窗"
+        };
+    let (mRowEnd, _) = vsAddSwitchRow(
+        masterInner,
+        0.0,
+        w,
+        "开启句序语音输入入口",
+        13.5,
+        vsFontSemi(),
+        masterSub,
+        11.5,
+        prefs.vpEnabled,
+        true,
+        (isOn: Bool) -> {
+            updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                p, Some(isOn), None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None
+            ));
+            if (isOn) reloadKeysForCurrentPreset(st) else clearVoiceDrafts(st);
+            rebuildVoiceSettingsPage(st)
+        }
+    );
+    let mY = cellNew(mRowEnd);
+
+    if (!prefs.vpEnabled) {
+        vecPush(masterDivs, cellGet(mY));
+        let noteText = "按需加载：开启后才加载语音模块与配置；随时关闭即立刻释放全部资源。";
+        let noteFont = vsFontSystem(11.5, vsFontReg());
+        let noteW = maxVs(120.0, w - 38.0 - 14.0);
+        let noteH = vsMeasureTextHeight(noteText, noteFont, noteW, 16.0);
+        let rowH = maxVs(34.0, noteH + 14.0);
+        let baseY = cellGet(mY);
+
+        let shieldIv = vsMakeSymbolImageView(
+            cgRect(14.0, baseY + (rowH - 15.0) * 0.5, 16.0, 15.0),
+            "bolt.shield",
+            12.0,
+            vsFontReg(),
+            vsColorSecondary()
+        );
+        msgSendVoid1Ptr(masterInner, objcSel("addSubview:"), shieldIv);
+        objcReleaseRaw(shieldIv);
+
+        let noteLbl = vsMakeLabel(
+            cgRect(36.0, baseY + (rowH - noteH) * 0.5, noteW, noteH),
+            noteText,
+            noteFont,
+            vsColorSecondary(),
+            true,
+            false
+        );
+        msgSendVoid1Ptr(masterInner, objcSel("addSubview:"), noteLbl);
+        objcReleaseRaw(noteLbl);
+        cellSet(mY, baseY + rowH)
+    } else ();
+
+    cellSet(curY, vsFinalizeCard(page, cellGet(curY), w, masterInner, cellGet(mY), masterDivs));
+
+    // ------------------------------------------------------------------------
+    // 2..7. Active Configuration Sections (only when `prefs.vpEnabled`)
+    // ------------------------------------------------------------------------
+    if (prefs.vpEnabled) {
+        // ---- 2A. Provider Mode Section (`运行方案`, lines 106-152) ----
+        let secHdr = vsMakeLabel(
+            cgRect(4.0, cellGet(curY) + 2.0, w - 8.0, 18.0),
+            "运行方案",
+            vsFontSystem(13.0, vsFontSemi()),
+            vsColorLabel(),
+            false,
+            false
+        );
+        msgSendVoid1Ptr(page, objcSel("addSubview:"), secHdr);
+        objcReleaseRaw(secHdr);
+        cellSet(curY, cellGet(curY) + 24.0);
+
+        let provInner = objcAllocInitFrame("JuxuGeishaVoiceFlippedView", cgRect(0.0, 0.0, w, 82.0));
+        let optGap = 10.0;
+        let optW = (w - 20.0 - optGap) * 0.5;
+        let optH = 60.0;
+
+        let cloudOpt = vsMakeOptionCard(
+            cgRect(10.0, 10.0, optW, optH),
+            vpmDisplayName(VpmCloudBYOK),
+            vpmSummary(VpmCloudBYOK),
+            prefs.vpProviderMode == VpmCloudBYOK,
+            () -> {
+                if (prefs.vpProviderMode != VpmCloudBYOK) {
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, Some(VpmCloudBYOK), None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None
+                    ));
+                    rebuildVoiceSettingsPage(st)
+                } else ()
+            }
+        );
+        let localOpt = vsMakeOptionCard(
+            cgRect(10.0 + optW + optGap, 10.0, optW, optH),
+            vpmDisplayName(VpmLocal),
+            vpmSummary(VpmLocal),
+            prefs.vpProviderMode == VpmLocal,
+            () -> {
+                if (prefs.vpProviderMode != VpmLocal) {
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, Some(VpmLocal), None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None
+                    ));
+                    rebuildVoiceSettingsPage(st)
+                } else ()
+            }
+        );
+        msgSendVoid1Ptr(provInner, objcSel("addSubview:"), cloudOpt);
+        msgSendVoid1Ptr(provInner, objcSel("addSubview:"), localOpt);
+        objcReleaseRaw(cloudOpt);
+        objcReleaseRaw(localOpt);
+        cellSet(curY, vsFinalizeCard(page, cellGet(curY), w, provInner, optH + 20.0, vecNew()));
+
+        // ---- 2B / 2C. Cloud BYOK Card OR LocalVoiceConfigCard ----
+        if (prefs.vpProviderMode == VpmCloudBYOK) {
+            let preset = prefs.vpCloudPreset;
+            let cloudInner = objcAllocInitFrame("JuxuGeishaVoiceFlippedView", cgRect(0.0, 0.0, w, 400.0));
+            let cloudDivs: Vec Float = vecNew();
+            let cY = cellNew(0.0);
+
+            let presetCases = vcpAllCases();
+            let presetTitles: Vec String = vecNew();
+            let presetSelIdx = cellNew(0);
+            let pi = cellNew(0);
+            while (cellGet(pi) < vecLen(presetCases)) {
+                let idx = cellGet(pi);
+                let item = vecGetOr(presetCases, idx, VcpGroq);
+                vecPush(presetTitles, vcpDisplayName(item));
+                if (item == preset) cellSet(presetSelIdx, idx) else ();
+                cellSet(pi, idx + 1)
+            };
+
+            cellSet(cY, vsAddPopupRow(
+                cloudInner,
+                cellGet(cY),
+                w,
+                "云端服务商",
+                vsFontSemi(),
+                vcpSubtitle(preset),
+                presetTitles,
+                cellGet(presetSelIdx),
+                (selIdx: Int) -> {
+                    let chosen = vecGetOr(presetCases, selIdx, VcpGroq);
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, None, None, None, None, Some(chosen), None,
+                        None, None, None, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None
+                    ));
+                    reloadKeysForCurrentPreset(st);
+                    rebuildVoiceSettingsPage(st)
+                }
+            ));
+            vecPush(cloudDivs, cellGet(cY));
+
+            // API Key row + live status badge (`✓ 钥匙串` / `必填`)
+            let keyRowY = cellGet(cY);
+            let initHasKey = strLen(strTrim(cellGet(st.vsvPrimaryKeyDraft))) > 0;
+            let statusLbl = vsMakeLabel(
+                cgRect(w - 14.0 - 54.0, keyRowY + 12.0, 54.0, 16.0),
+                if (initHasKey) "✓ 钥匙串" else "必填",
+                vsFontSystem(11.0, vsFontMed()),
+                if (initHasKey) vsColorGreen() else vsColorOrange(),
+                false,
+                false
+            );
+            // NSTextAlignmentRight == 2
+            msgSendVoid1I64(statusLbl, objcSel("setAlignment:"), intToI64(2));
+            let (afterKeyY, _) = vsAddFieldRow(
+                cloudInner,
+                keyRowY,
+                w,
+                "API Key",
+                true,
+                cellGet(st.vsvPrimaryKeyDraft),
+                vcpKeyPlaceholder(preset),
+                54.0,
+                (newVal: String) -> {
+                    cellSet(st.vsvPrimaryKeyDraft, newVal);
+                    let curPreset = (voicePrefsGet()).vpCloudPreset;
+                    let _ = voiceKeychainWrite(newVal, vcpKeychainAccount(curPreset));
+                    let hasNow = strLen(strTrim(newVal)) > 0;
+                    msgSendVoid1Ptr(statusLbl, objcSel("setStringValue:"), nsStr(if (hasNow) "✓ 钥匙串" else "必填"));
+                    msgSendVoid1Ptr(statusLbl, objcSel("setTextColor:"), if (hasNow) vsColorGreen() else vsColorOrange())
+                }
+            );
+            msgSendVoid1Ptr(cloudInner, objcSel("addSubview:"), statusLbl);
+            objcReleaseRaw(statusLbl);
+            cellSet(cY, afterKeyY);
+            vecPush(cloudDivs, cellGet(cY));
+
+            let polishSubLabelCell: Cell Ptr = cellNew(ptrNull());
+
+            if (preset == VcpCustom) {
+                let (uEnd, _) = vsAddFieldRow(
+                    cloudInner, cellGet(cY), w, "Base URL", false,
+                    prefs.vpCustomBaseURL, "https://api.openai.com/v1", 0.0,
+                    (v: String) -> updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, None, None, None, None, None, None,
+                        Some(v), None, None, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None
+                    ))
+                );
+                cellSet(cY, uEnd);
+                vecPush(cloudDivs, cellGet(cY));
+
+                let (aEnd, _) = vsAddFieldRow(
+                    cloudInner, cellGet(cY), w, "语音识别模型", false,
+                    prefs.vpCustomASRModel, "whisper-1", 0.0,
+                    (v: String) -> updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, None, None, None, None, None, None,
+                        None, Some(v), None, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None
+                    ))
+                );
+                cellSet(cY, aEnd);
+                vecPush(cloudDivs, cellGet(cY));
+
+                if (prefs.vpCloudPolishEnabled) {
+                    let (lEnd, _) = vsAddFieldRow(
+                        cloudInner, cellGet(cY), w, "口语整理模型", false,
+                        prefs.vpCustomLLMModel, "gpt-4o-mini", 0.0,
+                        (v: String) -> {
+                            updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                                p, None, None, None, None, None, None, None, None, None, None,
+                                None, None, Some(v), None, None, None, None, None, None, None, None, None, None,
+                                None, None, None, None, None
+                            ));
+                            let subPtr = cellGet(polishSubLabelCell);
+                            if (!ptrIsNull(subPtr)) {
+                                let updated = voicePrefsGet();
+                                msgSendVoid1Ptr(
+                                    subPtr,
+                                    objcSel("setStringValue:"),
+                                    nsStr("自动去口水词、修正口误并按应用调整语气（" + vpEffectiveCloudLLMModel(updated) + "）")
+                                )
+                            } else ()
+                        }
+                    );
+                    cellSet(cY, lEnd);
+                    vecPush(cloudDivs, cellGet(cY));
+
+                    // `整理模型使用独立接口与 Key`
+                    let splitY = cellGet(cY);
+                    let (spSw, spSwSz) = vsMakeSmallSwitch(prefs.vpCustomSplitLLM, true, (on: Bool) -> {
+                        updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                            p, None, None, None, None, None, None, None, None, None, None,
+                            None, None, None, Some(on), None, None, None, None, None, None, None, None, None,
+                            None, None, None, None, None
+                        ));
+                        rebuildVoiceSettingsPage(st)
+                    });
+                    let spLbl = vsMakeLabel(
+                        cgRect(14.0, splitY + 10.0, w - 76.0, 18.0),
+                        "整理模型使用独立接口与 Key",
+                        vsFontSystem(12.0, vsFontReg()),
+                        vsColorSecondary(),
+                        false,
+                        false
+                    );
+                    msgSendVoid1Ptr(cloudInner, objcSel("addSubview:"), spLbl);
+                    objcReleaseRaw(spLbl);
+                    msgSendVoid1Rect(spSw, objcSel("setFrame:"), cgRect(w - 14.0 - spSwSz.width, splitY + (38.0 - spSwSz.height) * 0.5, spSwSz.width, spSwSz.height));
+                    msgSendVoid1Ptr(cloudInner, objcSel("addSubview:"), spSw);
+                    objcReleaseRaw(spSw);
+                    cellSet(cY, splitY + 38.0);
+                    vecPush(cloudDivs, cellGet(cY));
+
+                    if (prefs.vpCustomSplitLLM) {
+                        let (sbEnd, _) = vsAddFieldRow(
+                            cloudInner, cellGet(cY), w, "整理 Base URL", false,
+                            prefs.vpCustomLLMBaseURL, "https://api.deepseek.com/v1", 0.0,
+                            (v: String) -> updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                                p, None, None, None, None, None, None, None, None, None, None,
+                                None, None, None, None, Some(v), None, None, None, None, None, None, None, None,
+                                None, None, None, None, None
+                            ))
+                        );
+                        cellSet(cY, sbEnd);
+                        vecPush(cloudDivs, cellGet(cY));
+
+                        let (skEnd, _) = vsAddFieldRow(
+                            cloudInner, cellGet(cY), w, "整理 API Key", true,
+                            cellGet(st.vsvSplitLLMKeyDraft), "sk-...", 0.0,
+                            (v: String) -> {
+                                cellSet(st.vsvSplitLLMKeyDraft, v);
+                                let _ = voiceKeychainWrite(v, VkaCustomLLM);
+                                ()
+                            }
+                        );
+                        cellSet(cY, skEnd);
+                        vecPush(cloudDivs, cellGet(cY))
+                    } else ()
+                } else ()
+            } else ();
+
+            let (pEnd, pSubLbl) = vsAddSwitchRow(
+                cloudInner,
+                cellGet(cY),
+                w,
+                "启用云端 AI 口语整理",
+                12.5,
+                vsFontMed(),
+                "自动去口水词、修正口误并按应用调整语气（" + vpEffectiveCloudLLMModel(prefs) + "）",
+                11.0,
+                prefs.vpCloudPolishEnabled,
+                true,
+                (on: Bool) -> {
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, None, None, None, None, None, Some(on),
+                        None, None, None, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None
+                    ));
+                    rebuildVoiceSettingsPage(st)
+                }
+            );
+            cellSet(polishSubLabelCell, pSubLbl);
+            cellSet(cY, pEnd);
+
+            cellSet(curY, vsFinalizeCard(page, cellGet(curY), w, cloudInner, cellGet(cY), cloudDivs))
+        } else {
+            // ---- 2C. LocalVoiceConfigCard (lines 606-823) ----
+            let asrPreset = prefs.vpLocalASRPreset;
+            let asrStatus = (cellGet(gVoiceAsrStatusHook))(asrPreset);
+            let llmPreset = prefs.vpLocalLLMPreset;
+            let llmStatus = (cellGet(gVoiceLlmStatusHook))(llmPreset);
+            let phase = cellGet(gVoiceInstallPhaseCell);
+            let busy = vipIsBusy(phase);
+
+            let localInner = objcAllocInitFrame("JuxuGeishaVoiceFlippedView", cgRect(0.0, 0.0, w, 420.0));
+            let localDivs: Vec Float = vecNew();
+            let lY = cellNew(0.0);
+
+            // 1. Local ASR Section
+            let asrCases = vlaAllCases();
+            let asrTitles: Vec String = vecNew();
+            let asrSel = cellNew(0);
+            let ai = cellNew(0);
+            while (cellGet(ai) < vecLen(asrCases)) {
+                let idx = cellGet(ai);
+                let it = vecGetOr(asrCases, idx, VlaWhisperTurbo);
+                vecPush(asrTitles, vlaDisplayName(it));
+                if (it == asrPreset) cellSet(asrSel, idx) else ();
+                cellSet(ai, idx + 1)
+            };
+
+            cellSet(lY, vsAddPopupRow(
+                localInner,
+                cellGet(lY),
+                w,
+                "本地语音识别模型",
+                vsFontSemi(),
+                "选择模型并一键下载；按需运行，闲置自动释放",
+                asrTitles,
+                cellGet(asrSel),
+                (selIdx: Int) -> {
+                    let chosen = vecGetOr(asrCases, selIdx, VlaWhisperTurbo);
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, Some(chosen), None, None, None, None, None, None, None,
+                        None, None, None, None, None
+                    ));
+                    rebuildVoiceSettingsPage(st)
+                }
+            ));
+
+            if (vlaIsEngineBackend(asrPreset)) {
+                cellSet(lY, vsAddInstallActionRow(
+                    localInner,
+                    cellGet(lY),
+                    w,
+                    asrStatus,
+                    vlaSizeLabel(asrPreset),
+                    vlaEngineLabel(asrPreset),
+                    busy,
+                    () -> {
+                        (cellGet(gVoiceInstallASRHook))(asrPreset);
+                        rebuildVoiceSettingsPage(st)
+                    },
+                    () -> {
+                        match vlaModelFilename(asrPreset) {
+                            Some(file) -> (cellGet(gVoiceDeleteModelHook))(file),
+                            None       -> (),
+                        };
+                        rebuildVoiceSettingsPage(st)
+                    }
+                ))
+            } else if (asrPreset == VlaAppleSpeech) {
+                let apY = cellGet(lY);
+                let locLbl = vsMakeLabel(cgRect(14.0, apY + 6.0, 58.0, 18.0), "识别语言", vsFontSystem(12.5, vsFontReg()), vsColorSecondary(), false, false);
+                let locFld = vsMakeInputField(cgRect(80.0, apY + 3.0, 90.0, 24.0), false, prefs.vpLocalAppleLocale, "zh-CN", (v: String) -> {
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, Some(v), None, None, None, None, None, None,
+                        None, None, None, None, None
+                    ))
+                });
+                let (odSw, odSz) = vsMakeSmallSwitch(prefs.vpLocalAppleRequireOnDevice, true, (on: Bool) -> {
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, Some(on), None, None, None, None, None,
+                        None, None, None, None, None
+                    ))
+                });
+                let odLbl = vsMakeLabel(cgRect(w - 14.0 - odSz.width - 48.0, apY + 6.0, 42.0, 18.0), "仅离线", vsFontSystem(12.5, vsFontReg()), vsColorSecondary(), false, false);
+                msgSendVoid1Rect(odSw, objcSel("setFrame:"), cgRect(w - 14.0 - odSz.width, apY + (30.0 - odSz.height) * 0.5, odSz.width, odSz.height));
+                msgSendVoid1Ptr(localInner, objcSel("addSubview:"), locLbl);
+                msgSendVoid1Ptr(localInner, objcSel("addSubview:"), locFld);
+                msgSendVoid1Ptr(localInner, objcSel("addSubview:"), odLbl);
+                msgSendVoid1Ptr(localInner, objcSel("addSubview:"), odSw);
+                objcReleaseRaw(locLbl);
+                objcReleaseRaw(locFld);
+                objcReleaseRaw(odLbl);
+                objcReleaseRaw(odSw);
+                cellSet(lY, apY + 36.0)
+            } else {
+                let htY = cellGet(lY);
+                let modW = 110.0;
+                let urlW = maxVs(120.0, w - 28.0 - modW - 8.0);
+                let urlFld = vsMakeInputField(cgRect(14.0, htY + 3.0, urlW, 24.0), false, prefs.vpLocalHTTPASRBaseURL, "http://127.0.0.1:8080/v1", (v: String) -> {
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, None, Some(v), None, None, None, None,
+                        None, None, None, None, None
+                    ))
+                });
+                let modFld = vsMakeInputField(cgRect(14.0 + urlW + 8.0, htY + 3.0, modW, 24.0), false, prefs.vpLocalHTTPASRModel, "whisper-1", (v: String) -> {
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, None, None, Some(v), None, None, None,
+                        None, None, None, None, None
+                    ))
+                });
+                msgSendVoid1Ptr(localInner, objcSel("addSubview:"), urlFld);
+                msgSendVoid1Ptr(localInner, objcSel("addSubview:"), modFld);
+                objcReleaseRaw(urlFld);
+                objcReleaseRaw(modFld);
+                cellSet(lY, htY + 36.0)
+            };
+
+            vecPush(localDivs, cellGet(lY));
+
+            // 2. Local LLM Polish Section
+            let llmCases = vllAllCases();
+            let llmTitles: Vec String = vecNew();
+            let llmSel = cellNew(0);
+            let li = cellNew(0);
+            while (cellGet(li) < vecLen(llmCases)) {
+                let idx = cellGet(li);
+                let it = vecGetOr(llmCases, idx, VllQwen15B);
+                vecPush(llmTitles, vllDisplayName(it));
+                if (it == llmPreset) cellSet(llmSel, idx) else ();
+                cellSet(li, idx + 1)
+            };
+
+            cellSet(lY, vsAddPopupRow(
+                localInner,
+                cellGet(lY),
+                w,
+                "本地 LLM 整理引擎",
+                vsFontSemi(),
+                "一键下载 Qwen2.5-1.5B（llama.cpp Metal 加速），或接入已有本地 LLM 服务",
+                llmTitles,
+                cellGet(llmSel),
+                (selIdx: Int) -> {
+                    let chosen = vecGetOr(llmCases, selIdx, VllQwen15B);
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, None, None, None, Some(chosen), None, None,
+                        None, None, None, None, None
+                    ));
+                    rebuildVoiceSettingsPage(st)
+                }
+            ));
+
+            if (llmPreset == VllQwen15B) {
+                cellSet(lY, vsAddInstallActionRow(
+                    localInner,
+                    cellGet(lY),
+                    w,
+                    llmStatus,
+                    vllSizeLabel(llmPreset),
+                    "llama.cpp",
+                    busy,
+                    () -> {
+                        (cellGet(gVoiceInstallLLMHook))(VllQwen15B);
+                        rebuildVoiceSettingsPage(st)
+                    },
+                    () -> {
+                        match vllModelFilename(llmPreset) {
+                            Some(file) -> (cellGet(gVoiceDeleteModelHook))(file),
+                            None       -> (),
+                        };
+                        rebuildVoiceSettingsPage(st)
+                    }
+                ))
+            } else if (llmPreset == VllOllamaHTTP) {
+                let olY = cellGet(lY);
+                let modW = 120.0;
+                let urlW = maxVs(120.0, w - 28.0 - modW - 8.0);
+                let urlFld = vsMakeInputField(cgRect(14.0, olY + 3.0, urlW, 24.0), false, prefs.vpLocalHTTPLLMBaseURL, "http://127.0.0.1:11434/v1", (v: String) -> {
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, None, None, None, None, Some(v), None,
+                        None, None, None, None, None
+                    ))
+                });
+                let modFld = vsMakeInputField(cgRect(14.0 + urlW + 8.0, olY + 3.0, modW, 24.0), false, prefs.vpLocalHTTPLLMModel, "qwen2.5:3b", (v: String) -> {
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, None, None, None, None, None, Some(v),
+                        None, None, None, None, None
+                    ))
+                });
+                msgSendVoid1Ptr(localInner, objcSel("addSubview:"), urlFld);
+                msgSendVoid1Ptr(localInner, objcSel("addSubview:"), modFld);
+                objcReleaseRaw(urlFld);
+                objcReleaseRaw(modFld);
+                cellSet(lY, olY + 36.0)
+            } else ();
+
+            // 3. Live Installer Progress / Status Banner (lines 731-770)
+            match phase {
+                VipIdle -> (),
+                VipInstallingDep(depName) -> {
+                    vecPush(localDivs, cellGet(lY));
+                    let pY = cellGet(lY);
+                    let spin = objcAllocInitFrame("NSProgressIndicator", cgRect(14.0, pY + 10.0, 16.0, 16.0));
+                    msgSendVoid1I64(spin, objcSel("setStyle:"), intToI64(1));
+                    msgSendVoid1I64(spin, objcSel("setControlSize:"), intToI64(1));
+                    msgSendVoid1Bool(spin, objcSel("setIndeterminate:"), true);
+                    msgSendVoid1Ptr(spin, objcSel("startAnimation:"), ptrNull());
+                    msgSendVoid1Ptr(localInner, objcSel("addSubview:"), spin);
+                    objcReleaseRaw(spin);
+
+                    let (cBtn, cSz) = vsMakeButton("取消", false, true, true, () -> {
+                        (cellGet(gVoiceCancelInstallHook))();
+                        rebuildVoiceSettingsPage(st)
+                    });
+                    let msgLbl = vsMakeLabel(
+                        cgRect(38.0, pY + 10.0, maxVs(100.0, w - 52.0 - cSz.width - 8.0), 17.0),
+                        "正在通过 Homebrew 安装 " + depName + "…",
+                        vsFontSystem(11.5, vsFontReg()),
+                        vsColorSecondary(),
+                        false,
+                        false
+                    );
+                    msgSendVoid1Ptr(localInner, objcSel("addSubview:"), msgLbl);
+                    objcReleaseRaw(msgLbl);
+                    msgSendVoid1Rect(cBtn, objcSel("setFrame:"), cgRect(w - 14.0 - cSz.width, pY + (36.0 - cSz.height) * 0.5, cSz.width, cSz.height));
+                    msgSendVoid1Ptr(localInner, objcSel("addSubview:"), cBtn);
+                    objcReleaseRaw(cBtn);
+                    cellSet(lY, pY + 36.0)
+                },
+                VipDownloadingModel(modelName, progress, detail) -> {
+                    vecPush(localDivs, cellGet(lY));
+                    let pY = cellGet(lY);
+                    let (cBtn, cSz) = vsMakeButton("取消", false, true, true, () -> {
+                        (cellGet(gVoiceCancelInstallHook))();
+                        rebuildVoiceSettingsPage(st)
+                    });
+                    let detFont = vsFontMono(11.0, vsFontReg());
+                    let detSz = msgSendSizeWithAttrsVs(nsStr(detail), objcSel("sizeWithAttributes:"), vsMakeTextAttrs(detFont, vsColorSecondary()));
+                    let detW = ceil(detSz.width) + 6.0;
+                    let detX = w - 14.0 - cSz.width - 8.0 - detW;
+
+                    let titleLbl = vsMakeLabel(
+                        cgRect(14.0, pY + 9.0, maxVs(100.0, detX - 20.0), 17.0),
+                        "正在下载 " + modelName,
+                        vsFontSystem(11.5, vsFontMed()),
+                        vsColorLabel(),
+                        false,
+                        false
+                    );
+                    let detLbl = vsMakeLabel(cgRect(detX, pY + 9.0, detW, 17.0), detail, detFont, vsColorSecondary(), false, false);
+                    msgSendVoid1Rect(cBtn, objcSel("setFrame:"), cgRect(w - 14.0 - cSz.width, pY + 8.0, cSz.width, cSz.height));
+
+                    let bar = objcAllocInitFrame("NSProgressIndicator", cgRect(14.0, pY + 31.0, w - 28.0, 10.0));
+                    msgSendVoid1I64(bar, objcSel("setStyle:"), intToI64(0));
+                    msgSendVoid1Bool(bar, objcSel("setIndeterminate:"), false);
+                    msgSendVoid1Float(bar, objcSel("setMinValue:"), 0.0);
+                    msgSendVoid1Float(bar, objcSel("setMaxValue:"), 1.0);
+                    msgSendVoid1Float(bar, objcSel("setDoubleValue:"), clampVs(progress, 0.0, 1.0));
+
+                    msgSendVoid1Ptr(localInner, objcSel("addSubview:"), titleLbl);
+                    msgSendVoid1Ptr(localInner, objcSel("addSubview:"), detLbl);
+                    msgSendVoid1Ptr(localInner, objcSel("addSubview:"), cBtn);
+                    msgSendVoid1Ptr(localInner, objcSel("addSubview:"), bar);
+                    objcReleaseRaw(titleLbl);
+                    objcReleaseRaw(detLbl);
+                    objcReleaseRaw(cBtn);
+                    objcReleaseRaw(bar);
+                    cellSet(lY, pY + 48.0)
+                },
+                VipCompleted(msg) -> {
+                    vecPush(localDivs, cellGet(lY));
+                    let pY = cellGet(lY);
+                    let mFont = vsFontSystem(11.5, vsFontReg());
+                    let mH = vsMeasureTextHeight(msg, mFont, w - 28.0, 16.0);
+                    let mLbl = vsMakeLabel(cgRect(14.0, pY + 8.0, w - 28.0, mH), msg, mFont, vsColorGreen(), true, false);
+                    msgSendVoid1Ptr(localInner, objcSel("addSubview:"), mLbl);
+                    objcReleaseRaw(mLbl);
+                    cellSet(lY, pY + mH + 16.0)
+                },
+                VipFailed(msg) -> {
+                    vecPush(localDivs, cellGet(lY));
+                    let pY = cellGet(lY);
+                    let mFont = vsFontSystem(11.5, vsFontReg());
+                    let mH = vsMeasureTextHeight(msg, mFont, w - 28.0, 16.0);
+                    let mLbl = vsMakeLabel(cgRect(14.0, pY + 8.0, w - 28.0, mH), msg, mFont, vsColorRed(), true, true);
+                    msgSendVoid1Ptr(localInner, objcSel("addSubview:"), mLbl);
+                    objcReleaseRaw(mLbl);
+                    cellSet(lY, pY + mH + 16.0)
+                },
+            };
+
+            cellSet(curY, vsFinalizeCard(page, cellGet(curY), w, localInner, cellGet(lY), localDivs))
+        };
+
+        // ---- 3. Trigger & Behavior Card (`triggerAndBehaviorCard`, lines 261-436) ----
+        let trigInner = objcAllocInitFrame("JuxuGeishaVoiceFlippedView", cgRect(0.0, 0.0, w, 520.0));
+        let trigDivs: Vec Float = vecNew();
+        let tY = cellNew(0.0);
+
+        let tkCases = vtkAllCases();
+        let tkTitles: Vec String = vecNew();
+        let tkSel = cellNew(0);
+        let tki = cellNew(0);
+        while (cellGet(tki) < vecLen(tkCases)) {
+            let idx = cellGet(tki);
+            let it = vecGetOr(tkCases, idx, VtkRightOption);
+            vecPush(tkTitles, vtkDisplayName(it));
+            if (it == prefs.vpTriggerKey) cellSet(tkSel, idx) else ();
+            cellSet(tki, idx + 1)
+        };
+
+        cellSet(tY, vsAddPopupRow(
+            trigInner,
+            cellGet(tY),
+            w,
+            "触发快捷键",
+            vsFontMed(),
+            "在句序激活状态下生效；长按模式需按住超过 0.22 秒避免误触",
+            tkTitles,
+            cellGet(tkSel),
+            (selIdx: Int) -> {
+                let chosen = vecGetOr(tkCases, selIdx, VtkRightOption);
+                updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                    p, None, None, Some(chosen), None, None, None, None, None, None, None,
+                    None, None, None, None, None, None, None, None, None, None, None, None, None,
+                    None, None, None, None, None
+                ));
+                rebuildVoiceSettingsPage(st)
+            }
+        ));
+        vecPush(trigDivs, cellGet(tY));
+
+        // Global Voice Hotkey row + permissions
+        let globalOn = vpIsGlobalHotkeyEnabled(prefs);
+        let (ghEnd, _) = vsAddSwitchRow(
+            trigInner,
+            cellGet(tY),
+            w,
+            "全局语音快捷键",
+            13.0,
+            vsFontMed(),
+            "在任何应用里按住语音键，即使当前输入法不是句序",
+            11.5,
+            globalOn,
+            true,
+            (on: Bool) -> {
+                let nextHk: Option Bool = if (on) Some(true) else None;
+                updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                    p, None, None, None, None, None, None, None, None, None, None,
+                    None, None, None, None, None, None, None, None, None, None, None, None, None,
+                    Some(nextHk), None, None, None, None
+                ));
+                if (on) (cellGet(gVoiceGlobalPermRequestHook))() else ();
+                cellSet(st.vsvGlobalPerms, (cellGet(gVoiceGlobalPermCurrentHook))());
+                rebuildVoiceSettingsPage(st)
+            }
+        );
+        cellSet(tY, ghEnd);
+
+        if (globalOn) {
+            let perms = (cellGet(gVoiceGlobalPermCurrentHook))();
+            cellSet(st.vsvGlobalPerms, perms);
+
+            if (!vtkIsHoldToTalk(prefs.vpTriggerKey)) {
+                let warnText = "全局模式需要长按类触发键，请改选右 Option、右 Command 或 Fn";
+                let wFont = vsFontSystem(11.5, vsFontReg());
+                let wH = vsMeasureTextHeight(warnText, wFont, w - 28.0, 16.0);
+                let wLbl = vsMakeLabel(cgRect(14.0, cellGet(tY) - 2.0, w - 28.0, wH), warnText, wFont, vsColorOrange(), true, false);
+                msgSendVoid1Ptr(trigInner, objcSel("addSubview:"), wLbl);
+                objcReleaseRaw(wLbl);
+                cellSet(tY, cellGet(tY) + wH + 4.0)
+            } else ();
+
+            let addPermRow = (pTitle: String, granted: Bool, paneUrl: String) -> {
+                let prY = cellGet(tY);
+                let sym = if (granted) "checkmark.circle.fill" else "exclamationmark.circle";
+                let col = if (granted) vsColorGreen() else vsColorOrange();
+                let pIv = vsMakeSymbolImageView(cgRect(14.0, prY + 5.0, 15.0, 15.0), sym, 12.0, vsFontMed(), col);
+                msgSendVoid1Ptr(trigInner, objcSel("addSubview:"), pIv);
+                objcReleaseRaw(pIv);
+
+                let btnReserve = if (granted) 0.0 else 104.0;
+                let pLbl = vsMakeLabel(
+                    cgRect(34.0, prY + 4.0, maxVs(100.0, w - 48.0 - btnReserve), 17.0),
+                    pTitle + (if (granted) "：已授权" else "：未授权"),
+                    vsFontSystem(11.5, vsFontReg()),
+                    vsColorSecondary(),
+                    false,
+                    false
+                );
+                msgSendVoid1Ptr(trigInner, objcSel("addSubview:"), pLbl);
+                objcReleaseRaw(pLbl);
+
+                if (!granted) {
+                    let (openBtn, openSz) = vsMakeButton("打开系统设置", false, false, true, () -> {
+                        let _ = c_vsOpenUrlUtf8(paneUrl);
+                        ()
+                    });
+                    msgSendVoid1Rect(openBtn, objcSel("setFrame:"), cgRect(w - 14.0 - openSz.width, prY + (26.0 - openSz.height) * 0.5, openSz.width, openSz.height));
+                    msgSendVoid1Ptr(trigInner, objcSel("addSubview:"), openBtn);
+                    objcReleaseRaw(openBtn)
+                } else ();
+                cellSet(tY, prY + 26.0)
+            };
+
+            addPermRow("输入监控（监听语音键）", perms.vgpInputMonitoring, "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent");
+            addPermRow("辅助功能（写入其他应用）", perms.vgpAccessibility, "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility");
+
+            if (!perms.vgpInputMonitoring || !perms.vgpAccessibility) {
+                let reSignNote = "如果列表里已勾选句序仍显示未授权，通常是应用更新后签名变化：请移除句序后重新添加。";
+                let nFont = vsFontSystem(11.0, vsFontReg());
+                let nH = vsMeasureTextHeight(reSignNote, nFont, w - 28.0, 15.0);
+                let nLbl = vsMakeLabel(cgRect(14.0, cellGet(tY) + 2.0, w - 28.0, nH), reSignNote, nFont, vsColorSecondary(), true, false);
+                msgSendVoid1Ptr(trigInner, objcSel("addSubview:"), nLbl);
+                objcReleaseRaw(nLbl);
+                cellSet(tY, cellGet(tY) + nH + 8.0)
+            } else {
+                cellSet(tY, cellGet(tY) + 6.0)
+            }
+        } else ();
+        vecPush(trigDivs, cellGet(tY));
+
+        // Voice cues switch
+        let (cueEnd, _) = vsAddSwitchRow(
+            trigInner,
+            cellGet(tY),
+            w,
+            "开始和结束提示音",
+            13.0,
+            vsFontMed(),
+            "双击语音键可免按住长录，再按一下结束，Esc 取消",
+            11.5,
+            vpAreVoiceCuesEnabled(prefs),
+            true,
+            (on: Bool) -> {
+                let nextCue: Option Bool = if (on) None else Some(false);
+                updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                    p, None, None, None, None, None, None, None, None, None, None,
+                    None, None, None, None, None, None, None, None, None, None, None, None, None,
+                    None, Some(nextCue), None, None, None
+                ))
+            }
+        );
+        cellSet(tY, cueEnd);
+        vecPush(trigDivs, cellGet(tY));
+
+        // Output mode & Tone
+        let omCases = vomAllCases();
+        let omTitles: Vec String = vecNew();
+        let omSel = cellNew(0);
+        let omi = cellNew(0);
+        while (cellGet(omi) < vecLen(omCases)) {
+            let idx = cellGet(omi);
+            let it = vecGetOr(omCases, idx, VomSmartPolish);
+            vecPush(omTitles, vomDisplayName(it));
+            if (it == prefs.vpOutputMode) cellSet(omSel, idx) else ();
+            cellSet(omi, idx + 1)
+        };
+
+        cellSet(tY, vsAddPopupRow(
+            trigInner,
+            cellGet(tY),
+            w,
+            "输出模式与语气",
+            vsFontMed(),
+            "智能整理会自动去口水词、修正口误，并按聊天/IDE/邮件切换风格",
+            omTitles,
+            cellGet(omSel),
+            (selIdx: Int) -> {
+                let chosen = vecGetOr(omCases, selIdx, VomSmartPolish);
+                updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                    p, None, None, None, Some(chosen), None, None, None, None, None, None,
+                    None, None, None, None, None, None, None, None, None, None, None, None, None,
+                    None, None, None, None, None
+                ));
+                rebuildVoiceSettingsPage(st)
+            }
+        ));
+        vecPush(trigDivs, cellGet(tY));
+
+        if (prefs.vpOutputMode == VomSmartPolish) {
+            let tmCases = vtmAllCases();
+            let tmTitles: Vec String = vecNew();
+            let tmSel = cellNew(0);
+            let tmi = cellNew(0);
+            while (cellGet(tmi) < vecLen(tmCases)) {
+                let idx = cellGet(tmi);
+                let it = vecGetOr(tmCases, idx, VtmAutoByApp);
+                vecPush(tmTitles, vtmDisplayName(it));
+                if (it == prefs.vpToneMode) cellSet(tmSel, idx) else ();
+                cellSet(tmi, idx + 1)
+            };
+
+            cellSet(tY, vsAddPopupRow(
+                trigInner,
+                cellGet(tY),
+                w,
+                "语气风格",
+                vsFontReg(),
+                "",
+                tmTitles,
+                cellGet(tmSel),
+                (selIdx: Int) -> {
+                    let chosen = vecGetOr(tmCases, selIdx, VtmAutoByApp);
+                    updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                        p, None, None, None, None, Some(chosen), None, None, None, None, None,
+                        None, None, None, None, None, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None
+                    ))
+                }
+            ));
+            vecPush(trigDivs, cellGet(tY))
+        } else ();
+
+        // Speak to Edit switch
+        let (steEnd, _) = vsAddSwitchRow(
+            trigInner,
+            cellGet(tY),
+            w,
+            "选中文本语音改写（Speak to Edit）",
+            13.0,
+            vsFontMed(),
+            "先选中文字再说出修改指令（如“改正式一点 / 翻成英文”），直接替换选区",
+            11.5,
+            prefs.vpSpeakToEditSelection,
+            true,
+            (on: Bool) -> updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                p, None, None, None, None, None, Some(on), None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None
+            ))
+        );
+        cellSet(tY, steEnd);
+        cellSet(curY, vsFinalizeCard(page, cellGet(curY), w, trigInner, cellGet(tY), trigDivs));
+
+        // ---- 4. Context & Privacy Card (`contextPrivacyCard`, lines 440-481) ----
+        let captureOn = vpIsContextCaptureEnabled(prefs);
+        let ctxInner = objcAllocInitFrame("JuxuGeishaVoiceFlippedView", cgRect(0.0, 0.0, w, 300.0));
+        let ctxDivs: Vec Float = vecNew();
+        let xY = cellNew(0.0);
+
+        let (x1End, _) = vsAddSwitchRow(
+            ctxInner,
+            cellGet(xY),
+            w,
+            "读取当前应用的上下文",
+            13.0,
+            vsFontMed(),
+            "通过辅助功能读取窗口标题、网址、光标前后文和屏幕可见文字，帮助识别专有名词、衔接前文。密码框、密码管理器、终端和浏览器无痕窗口始终不读。",
+            11.5,
+            captureOn,
+            true,
+            (on: Bool) -> {
+                updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                    p, None, None, None, None, None, None, None, None, None, None,
+                    None, None, None, None, None, None, None, None, None, None, None, None, None,
+                    None, None, Some(Some(on)), None, None
+                ));
+                rebuildVoiceSettingsPage(st)
+            }
+        );
+        cellSet(xY, x1End);
+        vecPush(ctxDivs, cellGet(xY));
+
+        let (x2End, _) = vsAddSwitchRow(
+            ctxInner,
+            cellGet(xY),
+            w,
+            "敏感应用/网址黑名单",
+            13.0,
+            vsFontMed(),
+            "开启时，微信、Excel、WPS、Google 文档、腾讯文档等黑名单应用和网页不读取任何窗口、光标或屏幕文字，只发送应用名和个人词表（“选中改写”时会发送你选中的文字）。",
+            11.5,
+            vpRespectsContextBlacklist(prefs),
+            captureOn,
+            (on: Bool) -> updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                p, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, Some(Some(on)), None
+            ))
+        );
+        cellSet(xY, x2End);
+        vecPush(ctxDivs, cellGet(xY));
+
+        let (x3End, _) = vsAddSwitchRow(
+            ctxInner,
+            cellGet(xY),
+            w,
+            "把屏幕和输入框周围的文字发给云端",
+            13.0,
+            vsFontMed(),
+            "关闭时，云端识别和整理只收到窗口标题、网址和光标前后文，不含屏幕可见文字和输入框周围的文字；本地模型不受影响。",
+            11.5,
+            vpSendsScreenContextToCloud(prefs),
+            captureOn,
+            (on: Bool) -> updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                p, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, Some(Some(on))
+            ))
+        );
+        cellSet(xY, x3End);
+        cellSet(curY, vsFinalizeCard(page, cellGet(curY), w, ctxInner, cellGet(xY), ctxDivs));
+
+        // ---- 5. VoiceContextInspectorCard (when `captureOn`, lines 826-1044) ----
+        if (captureOn) {
+            let axTrusted = voiceAxIsTrusted();
+            let isCapturing = cellGet(gVoiceInspectorCapturing);
+            let countdown = cellGet(gVoiceInspectorCountdown);
+            let lastSummaryOpt = cellGet(gVoiceInspectorLastSummary);
+
+            let inspInner = objcAllocInitFrame("JuxuGeishaVoiceFlippedView", cgRect(0.0, 0.0, w, 720.0));
+            let inspDivs: Vec Float = vecNew();
+            let iY = cellNew(10.0);
+
+            // Header + AX Trust Badge
+            let axBadgeText = if (axTrusted) "辅助功能已授权" else "未授权辅助功能";
+            let axBadgeFont = vsFontSystem(11.0, vsFontReg());
+            let axBadgeSz = msgSendSizeWithAttrsVs(nsStr(axBadgeText), objcSel("sizeWithAttributes:"), vsMakeTextAttrs(axBadgeFont, vsColorSecondary()));
+            let badgeW = ceil(axBadgeSz.width) + 30.0;
+
+            let hdrMaxW = maxVs(120.0, w - 28.0 - badgeW - 8.0);
+            let iTitle = vsMakeLabel(cgRect(14.0, cellGet(iY), hdrMaxW, 18.0), "上下文抓取实测（AXUIElement）", vsFontSystem(13.0, vsFontSemi()), vsColorLabel(), false, false);
+            let iSubFont = vsFontSystem(11.5, vsFontReg());
+            let iSubText = "抓取前台 App、窗口标题、网页 URL、光标前后文、选区与屏幕可见文本";
+            let iSubH = vsMeasureTextHeight(iSubText, iSubFont, hdrMaxW, 16.0);
+            let iSub = vsMakeLabel(cgRect(14.0, cellGet(iY) + 20.0, hdrMaxW, iSubH), iSubText, iSubFont, vsColorSecondary(), true, false);
+
+            let badgeY = cellGet(iY) + 10.0;
+            let badgeIv = vsMakeSymbolImageView(
+                cgRect(w - 14.0 - badgeW, badgeY, 15.0, 15.0),
+                if (axTrusted) "checkmark.circle.fill" else "exclamationmark.triangle.fill",
+                11.5,
+                vsFontMed(),
+                if (axTrusted) vsColorGreen() else vsColorOrange()
+            );
+            let badgeLbl = vsMakeLabel(cgRect(w - 14.0 - badgeW + 19.0, badgeY, badgeW - 19.0, 16.0), axBadgeText, axBadgeFont, vsColorSecondary(), false, false);
+
+            msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), iTitle);
+            msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), iSub);
+            msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), badgeIv);
+            msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), badgeLbl);
+            objcReleaseRaw(iTitle);
+            objcReleaseRaw(iSub);
+            objcReleaseRaw(badgeIv);
+            objcReleaseRaw(badgeLbl);
+            cellSet(iY, cellGet(iY) + 22.0 + iSubH + 8.0);
+
+            // Action Buttons Row
+            let btnRowY = cellGet(iY);
+            if (isCapturing) {
+                let capTitle = if (countdown > 0) "切到目标 App… (" + intToStr(countdown) + "s)" else "抓取中…";
+                let (cBtn, cSz) = vsMakeButton(capTitle, false, false, true, () -> {
+                    (cellGet(gVoiceInspectorCancelHook))();
+                    rebuildVoiceSettingsPage(st)
+                });
+                msgSendVoid1Rect(cBtn, objcSel("setFrame:"), cgRect(14.0, btnRowY, cSz.width, cSz.height));
+                msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), cBtn);
+                objcReleaseRaw(cBtn)
+            } else {
+                let (tBtn, tSz) = vsMakeButton("3 秒后抓取前台窗口", true, false, true, () -> {
+                    (cellGet(gVoiceInspectorTriggerHook))(3, vpRespectsContextBlacklist(voicePrefsGet()));
+                    rebuildVoiceSettingsPage(st)
+                });
+                msgSendVoid1Rect(tBtn, objcSel("setFrame:"), cgRect(14.0, btnRowY, tSz.width, tSz.height));
+                msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), tBtn);
+                objcReleaseRaw(tBtn)
+            };
+
+            match lastSummaryOpt {
+                Some(cap) -> {
+                    let showRaw = cellGet(st.vsvShowRawJSON);
+                    let copiedJson = cellGet(st.vsvCopiedJSONNotice);
+                    let (rawBtn, rawSz) = vsMakeButton(if (showRaw) "收起 JSON" else "展开 JSON", false, false, true, () -> {
+                        cellSet(st.vsvShowRawJSON, !cellGet(st.vsvShowRawJSON));
+                        rebuildVoiceSettingsPage(st)
+                    });
+                    let (cpBtn, cpSz) = vsMakeButton(if (copiedJson) "已复制" else "复制 JSON", false, false, true, () -> {
+                        c_vsCopyPasteboardUtf8(cap.vcsPrettyJSON);
+                        cellSet(st.vsvCopiedJSONNotice, true);
+                        rebuildVoiceSettingsPage(st);
+                        dispatchMainAfterMs(1400, () -> {
+                            cellSet(st.vsvCopiedJSONNotice, false);
+                            match cellGet(gActiveVoiceSettingsPage) {
+                                Some(active) -> rebuildVoiceSettingsPage(active),
+                                None -> (),
+                            }
+                        })
+                    });
+                    let rawX = w - 14.0 - rawSz.width;
+                    let cpX = rawX - 8.0 - cpSz.width;
+                    msgSendVoid1Rect(cpBtn, objcSel("setFrame:"), cgRect(cpX, btnRowY, cpSz.width, cpSz.height));
+                    msgSendVoid1Rect(rawBtn, objcSel("setFrame:"), cgRect(rawX, btnRowY, rawSz.width, rawSz.height));
+                    msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), cpBtn);
+                    msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), rawBtn);
+                    objcReleaseRaw(cpBtn);
+                    objcReleaseRaw(rawBtn)
+                },
+                None -> (),
+            };
+            cellSet(iY, btnRowY + 32.0);
+
+            match lastSummaryOpt {
+                None -> {
+                    let hintText = "点击「3 秒后抓取前台窗口」后切到 Chrome / Slack / Cursor / 微信等任意应用，或在任意窗口按右 Command 语音输入，即可在此看到实时抓取结果。";
+                    let hFont = vsFontSystem(11.0, vsFontReg());
+                    let hH = vsMeasureTextHeight(hintText, hFont, w - 28.0, 16.0);
+                    let hLbl = vsMakeLabel(cgRect(14.0, cellGet(iY), w - 28.0, hH), hintText, hFont, vsColorSecondary(), true, false);
+                    msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), hLbl);
+                    objcReleaseRaw(hLbl);
+                    cellSet(iY, cellGet(iY) + hH + 12.0)
+                },
+                Some(cap) -> {
+                    vecPush(inspDivs, cellGet(iY));
+                    cellSet(iY, cellGet(iY) + 8.0);
+
+                    let addSummaryRow = (kLabel: String, vText: String) -> {
+                        let rY = cellGet(iY);
+                        let valX = 14.0 + 70.0 + 8.0;
+                        let valW = maxVs(80.0, w - valX - 14.0);
+                        let vFont = vsFontSystem(11.0, vsFontReg());
+                        let rawH = vsMeasureTextHeight(vText, vFont, valW, 15.0);
+                        let clampedH = minVs(32.0, rawH);
+
+                        let kLbl = vsMakeLabel(cgRect(14.0, rY, 70.0, 15.0), kLabel, vsFontSystem(11.0, vsFontMed()), vsColorSecondary(), false, false);
+                        let vLbl = vsMakeLabel(cgRect(valX, rY, valW, clampedH), vText, vFont, vsColorLabel(), true, true);
+                        msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), kLbl);
+                        msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), vLbl);
+                        objcReleaseRaw(kLbl);
+                        objcReleaseRaw(vLbl);
+                        cellSet(iY, rY + clampedH + 4.0)
+                    };
+
+                    let appDisp = if (strLen(cap.vcsAppName) == 0) "(未知)" else cap.vcsAppName;
+                    addSummaryRow("应用", appDisp + " · " + cap.vcsAppIdentifier + " (" + cap.vcsAppType + ") · " + intToStr(cap.vcsElapsedMs) + " ms");
+                    if (strLen(cap.vcsWindowTitle) > 0) {
+                        addSummaryRow("窗口", cap.vcsWindowTitle)
+                    } else ();
+                    match cap.vcsWebURL {
+                        Some(url) -> if (strLen(url) > 0) addSummaryRow("URL", url) else (),
+                        None -> (),
+                    };
+                    let roleDisp = if (strLen(cap.vcsRole) == 0) "无" else cap.vcsRole;
+                    let blSuffix = if (cap.vcsIsBlacklisted) {
+                        let r = match cap.vcsBlacklistReason { Some(s) -> s, None -> "" };
+                        " · 命中黑名单(" + r + ")"
+                    } else "";
+                    let secSuffix = if (cap.vcsIsSecureInput) " · 密码框已跳过" else "";
+                    addSummaryRow(
+                        "状态",
+                        "enhancedUI=" + (if (cap.vcsEnhancedUI) "是" else "否")
+                            + " · role=" + roleDisp
+                            + " · editable=" + (if (cap.vcsIsEditable) "是" else "否")
+                            + blSuffix + secSuffix
+                    );
+                    if (strLen(cap.vcsSelectedText) > 0) {
+                        addSummaryRow("选区", vsCompactPreview(cap.vcsSelectedText, 90))
+                    } else ();
+                    if (strLen(cap.vcsTextBeforeCursor) > 0 || strLen(cap.vcsTextAfterCursor) > 0) {
+                        addSummaryRow(
+                            "光标前/后",
+                            "前(" + intToStr(utf8ScalarCount(cap.vcsTextBeforeCursor)) + "字)："
+                                + vsCompactPreview(cap.vcsTextBeforeCursor, 60)
+                                + " | 后(" + intToStr(utf8ScalarCount(cap.vcsTextAfterCursor)) + "字)："
+                                + vsCompactPreview(cap.vcsTextAfterCursor, 40)
+                        )
+                    } else ();
+                    if (strLen(cap.vcsTextBeforeArea) > 0 || strLen(cap.vcsTextAfterArea) > 0) {
+                        addSummaryRow(
+                            "周边上下文",
+                            "上(" + intToStr(utf8ScalarCount(cap.vcsTextBeforeArea)) + "字) / 下("
+                                + intToStr(utf8ScalarCount(cap.vcsTextAfterArea)) + "字)"
+                        )
+                    } else ();
+                    let visStr = match cap.vcsVisibleScreenContent { Some(v) -> v, None -> "" };
+                    let visCnt = utf8ScalarCount(visStr);
+                    let visVal =
+                        if (visCnt > 0) intToStr(visCnt) + " 字：" + vsCompactPreview(visStr, 80)
+                        else if (cap.vcsIsBlacklisted) "黑名单跳过"
+                        else "无";
+                    addSummaryRow("屏幕可见文本", visVal);
+
+                    cellSet(iY, cellGet(iY) + 4.0);
+                    vecPush(inspDivs, cellGet(iY));
+                    cellSet(iY, cellGet(iY) + 8.0);
+
+                    let (asrLblStr, asrCtxStr, polLblStr, polCtxStr) = vsResolvedInspectorLabels(cap, prefs);
+
+                    // ASR Context Preview Header + Copy + Scroll Box
+                    let asrHdrY = cellGet(iY);
+                    let asrHdrTitle = "实际送给 ASR 模型的上下文";
+                    let asrHdrFont = vsFontSystem(11.5, vsFontSemi());
+                    let asrHdrSz = msgSendSizeWithAttrsVs(nsStr(asrHdrTitle), objcSel("sizeWithAttributes:"), vsMakeTextAttrs(asrHdrFont, vsColorLabel()));
+                    let asrHdrLbl = vsMakeLabel(cgRect(14.0, asrHdrY, ceil(asrHdrSz.width) + 4.0, 16.0), asrHdrTitle, asrHdrFont, vsColorLabel(), false, false);
+                    let asrMetaLbl = vsMakeLabel(
+                        cgRect(14.0 + ceil(asrHdrSz.width) + 10.0, asrHdrY + 1.0, maxVs(80.0, w - 120.0 - ceil(asrHdrSz.width)), 15.0),
+                        asrLblStr + " · 实发 " + intToStr(utf8ScalarCount(asrCtxStr)) + " 字",
+                        vsFontSystem(10.5, vsFontReg()),
+                        vsColorSecondary(),
+                        false,
+                        false
+                    );
+                    msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), asrHdrLbl);
+                    msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), asrMetaLbl);
+                    objcReleaseRaw(asrHdrLbl);
+                    objcReleaseRaw(asrMetaLbl);
+
+                    if (strLen(asrCtxStr) > 0) {
+                        let copiedAsr = cellGet(st.vsvCopiedASRNotice);
+                        let (cpAsrBtn, cpAsrSz) = vsMakeButton(if (copiedAsr) "已复制" else "复制", false, true, true, () -> {
+                            c_vsCopyPasteboardUtf8(asrCtxStr);
+                            cellSet(st.vsvCopiedASRNotice, true);
+                            rebuildVoiceSettingsPage(st);
+                            dispatchMainAfterMs(1400, () -> {
+                                cellSet(st.vsvCopiedASRNotice, false);
+                                match cellGet(gActiveVoiceSettingsPage) {
+                                    Some(active) -> rebuildVoiceSettingsPage(active),
+                                    None -> (),
+                                }
+                            })
+                        });
+                        msgSendVoid1Rect(cpAsrBtn, objcSel("setFrame:"), cgRect(w - 14.0 - cpAsrSz.width, asrHdrY - 1.0, cpAsrSz.width, cpAsrSz.height));
+                        msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), cpAsrBtn);
+                        objcReleaseRaw(cpAsrBtn)
+                    } else ();
+                    cellSet(iY, asrHdrY + 20.0);
+
+                    let asrEmpty = strLen(asrCtxStr) == 0;
+                    cellSet(iY, vsAddMonospacedScrollBox(
+                        inspInner, 14.0, cellGet(iY), w - 28.0,
+                        36.0, 110.0, 11.0, true, false,
+                        if (asrEmpty) "（无上下文发送）" else asrCtxStr,
+                        asrEmpty
+                    ) + 8.0);
+
+                    // Polish Context Preview Header + Scroll Box
+                    let polHdrY = cellGet(iY);
+                    let polHdrTitle = "实际送给润色模型的上下文";
+                    let polHdrFont = vsFontSystem(11.5, vsFontSemi());
+                    let polHdrSz = msgSendSizeWithAttrsVs(nsStr(polHdrTitle), objcSel("sizeWithAttributes:"), vsMakeTextAttrs(polHdrFont, vsColorLabel()));
+                    let polHdrLbl = vsMakeLabel(cgRect(14.0, polHdrY, ceil(polHdrSz.width) + 4.0, 16.0), polHdrTitle, polHdrFont, vsColorLabel(), false, false);
+                    let polMetaLbl = vsMakeLabel(
+                        cgRect(14.0 + ceil(polHdrSz.width) + 10.0, polHdrY + 1.0, maxVs(80.0, w - 50.0 - ceil(polHdrSz.width)), 15.0),
+                        polLblStr + " · " + intToStr(utf8ScalarCount(polCtxStr)) + " 字",
+                        vsFontSystem(10.5, vsFontReg()),
+                        vsColorSecondary(),
+                        false,
+                        false
+                    );
+                    msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), polHdrLbl);
+                    msgSendVoid1Ptr(inspInner, objcSel("addSubview:"), polMetaLbl);
+                    objcReleaseRaw(polHdrLbl);
+                    objcReleaseRaw(polMetaLbl);
+                    cellSet(iY, polHdrY + 20.0);
+
+                    let polEmpty = strLen(polCtxStr) == 0;
+                    cellSet(iY, vsAddMonospacedScrollBox(
+                        inspInner, 14.0, cellGet(iY), w - 28.0,
+                        32.0, 100.0, 10.5, false, false,
+                        if (polEmpty) "（无参考上下文）" else polCtxStr,
+                        polEmpty
+                    ) + 10.0);
+
+                    if (cellGet(st.vsvShowRawJSON)) {
+                        cellSet(iY, vsAddMonospacedScrollBox(
+                            inspInner, 14.0, cellGet(iY), w - 28.0,
+                            80.0, 210.0, 10.5, false, true,
+                            cap.vcsPrettyJSON,
+                            false
+                        ) + 10.0)
+                    } else ()
+                },
+            };
+
+            cellSet(curY, vsFinalizeCard(page, cellGet(curY), w, inspInner, cellGet(iY), inspDivs))
+        } else ();
+
+        // ---- 6. Vocabulary & Connectivity Test Card (`vocabularyAndTestCard`, lines 485-544) ----
+        let _ = bridgeRefreshUserPhrases(st.vsvSession);
+        let phraseCount = vecLen(cellGet(st.vsvSession.userPhrases));
+
+        let vocabInner = objcAllocInitFrame("JuxuGeishaVoiceFlippedView", cgRect(0.0, 0.0, w, 240.0));
+        let vocabDivs: Vec Float = vecNew();
+        let vY = cellNew(0.0);
+
+        let (lexEnd, _) = vsAddSwitchRow(
+            vocabInner,
+            cellGet(vY),
+            w,
+            "联动句序个人词库（" + intToStr(phraseCount) + " 条）",
+            13.0,
+            vsFontMed(),
+            "自动把句序里的自造词作为热词注入语音识别与整理",
+            11.5,
+            prefs.vpSyncJuxuLexicon,
+            true,
+            (on: Bool) -> updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                p, None, None, None, None, None, None, Some(on), None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None
+            ))
+        );
+        cellSet(vY, lexEnd);
+        vecPush(vocabDivs, cellGet(vY));
+
+        // Custom Vocabulary row
+        let cvY = cellGet(vY);
+        let cvLbl = vsMakeLabel(
+            cgRect(14.0, cvY + 9.0, w - 28.0, 18.0),
+            "自定义语音热词（逗号或换行分隔）",
+            vsFontSystem(12.5, vsFontMed()),
+            vsColorLabel(),
+            false,
+            false
+        );
+        let cvFld = vsMakeInputField(
+            cgRect(14.0, cvY + 31.0, w - 28.0, 24.0),
+            false,
+            prefs.vpCustomVocabulary,
+            "例如：句序, Juxu, RWKV-7, Typeless, SwiftUI",
+            (v: String) -> updateVoicePrefsQuiet(st, (p) -> clonePrefsWith(
+                p, None, None, None, None, None, None, None, Some(v), None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None
+            ))
+        );
+        msgSendVoid1Ptr(vocabInner, objcSel("addSubview:"), cvLbl);
+        msgSendVoid1Ptr(vocabInner, objcSel("addSubview:"), cvFld);
+        objcReleaseRaw(cvLbl);
+        objcReleaseRaw(cvFld);
+        cellSet(vY, cvY + 65.0);
+        vecPush(vocabDivs, cellGet(vY));
+
+        // Test Configuration button + `配置：voice.json` + result banner
+        let testY = cellGet(vY);
+        let testingNow = cellGet(st.vsvIsTesting);
+        let (testBtn, testBtnSz) = vsMakeButton(
+            if (testingNow) "检测中…" else "检测当前配置",
+            false,
+            false,
+            !testingNow,
+            () -> {
+                if (!cellGet(st.vsvIsTesting)) {
+                    cellSet(st.vsvIsTesting, true);
+                    cellSet(st.vsvTestStatus, "");
+                    rebuildVoiceSettingsPage(st);
+                    let hook = cellGet(gVoiceTestConfigHook);
+                    hook((ok: Bool, msg: String) -> {
+                        dispatchMainAsync(() -> {
+                            cellSet(st.vsvIsTesting, false);
+                            cellSet(st.vsvTestOK, ok);
+                            cellSet(st.vsvTestStatus, msg);
+                            match cellGet(gActiveVoiceSettingsPage) {
+                                Some(active) -> rebuildVoiceSettingsPage(active),
+                                None -> rebuildVoiceSettingsPage(st),
+                            }
+                        })
+                    })
+                } else ()
+            }
+        );
+        msgSendVoid1Rect(testBtn, objcSel("setFrame:"), cgRect(14.0, testY + 10.0, testBtnSz.width, testBtnSz.height));
+        msgSendVoid1Ptr(vocabInner, objcSel("addSubview:"), testBtn);
+        objcReleaseRaw(testBtn);
+
+        let cfgName = pathBasename(voicePrefsFilePath());
+        let cfgStr = "配置：" + (if (strLen(cfgName) > 0) cfgName else "voice.json");
+        let cfgFont = vsFontSystem(11.0, vsFontReg());
+        let cfgSz = msgSendSizeWithAttrsVs(nsStr(cfgStr), objcSel("sizeWithAttributes:"), vsMakeTextAttrs(cfgFont, vsColorTertiary()));
+        let cfgW = ceil(cfgSz.width) + 6.0;
+        let cfgLbl = vsMakeLabel(cgRect(w - 14.0 - cfgW, testY + 13.0, cfgW, 16.0), cfgStr, cfgFont, vsColorTertiary(), false, false);
+        msgSendVoid1Ptr(vocabInner, objcSel("addSubview:"), cfgLbl);
+        objcReleaseRaw(cfgLbl);
+        cellSet(vY, testY + 42.0);
+
+        let curTestStatus = cellGet(st.vsvTestStatus);
+        if (strLen(curTestStatus) > 0) {
+            let tsFont = vsFontSystem(11.5, vsFontReg());
+            let tsH = vsMeasureTextHeight(curTestStatus, tsFont, w - 28.0, 16.0);
+            let tsCol = if (cellGet(st.vsvTestOK)) vsColorGreen() else vsColorRed();
+            let tsLbl = vsMakeLabel(cgRect(14.0, cellGet(vY) - 2.0, w - 28.0, tsH), curTestStatus, tsFont, tsCol, true, true);
+            msgSendVoid1Ptr(vocabInner, objcSel("addSubview:"), tsLbl);
+            objcReleaseRaw(tsLbl);
+            cellSet(vY, cellGet(vY) + tsH + 10.0)
+        } else ();
+
+        cellSet(curY, vsFinalizeCard(page, cellGet(curY), w, vocabInner, cellGet(vY), vocabDivs))
+    } else ();
+
+    let totalH = maxVs(220.0, cellGet(curY));
+    let oldFrame = msgSendRect0(page, objcSel("frame"));
+    msgSendVoid1Rect(page, objcSel("setFrame:"), cgRect(oldFrame.origin.x, oldFrame.origin.y, w, totalH));
+
+    // If embedded inside `SettingsWindow`'s `NSScrollView` document view, keep scroll document height synced!
+    let docSuper = msgSend0(page, objcSel("superview"));
+    let encScroll = msgSend0(page, objcSel("enclosingScrollView"));
+    if (!ptrIsNull(docSuper) && !ptrIsNull(encScroll)) {
+        let scrollBounds = msgSendRect0(encScroll, objcSel("bounds"));
+        let docFrame = msgSendRect0(docSuper, objcSel("frame"));
+        let neededDocH = maxVs(scrollBounds.size.height, oldFrame.origin.y + maxVs(420.0, totalH) + 24.0);
+        if (abs(docFrame.size.height - neededDocH) > 0.5) {
+            msgSendVoid1Rect(docSuper, objcSel("setFrame:"), cgRect(docFrame.origin.x, docFrame.origin.y, docFrame.size.width, neededDocH))
+        } else ()
+    } else ();
+
+    vsSyncPermissionPoll(st)
+}
+
+def ensureVoiceSettingsObserversInstalled(): Void =
+    if (!cellGet(gVoiceSettingsObserversRegistered)) {
+        cellSet(gVoiceSettingsObserversRegistered, true);
+        vecPush(gVoicePrefsObservers, (_newPrefs: VoicePreferences) -> {
+            match cellGet(gActiveVoiceSettingsPage) {
+                Some(st) -> if (!cellGet(st.vsvSuppressObserver)) {
+                    dispatchMainAsync(() -> rebuildVoiceSettingsPage(st))
+                } else (),
+                None -> (),
+            }
+        });
+        vecPush(gVoiceInstallRefreshObservers, () -> {
+            match cellGet(gActiveVoiceSettingsPage) {
+                Some(st) -> dispatchMainAsync(() -> rebuildVoiceSettingsPage(st)),
+                None     -> (),
+            }
+        });
+        vecPush(gVoiceInspectorObservers, () -> {
+            match cellGet(gActiveVoiceSettingsPage) {
+                Some(st) -> dispatchMainAsync(() -> rebuildVoiceSettingsPage(st)),
+                None     -> (),
+            }
+        })
+    } else ()
+
+// ============================================================================
+// Public Entry Points (`voiceBuildSettingsPageView` & `voiceOnSettingsWindowClosed`)
+// ============================================================================
+
+/// Build and return the Voice Settings AppKit page view (`NSView *`, autoreleased) for `width`.
+pub def voiceBuildSettingsPageView(session: JuxuSession, width: Float): Ptr = {
+    ensureVoiceSettingsObserversInstalled();
+
+    // Clean up any previous active page state before replacing
+    match cellGet(gActiveVoiceSettingsPage) {
+        Some(prev) -> {
+            cellSet(prev.vsvIsWindowVisible, false);
+            cellSet(prev.vsvPermGen, cellGet(prev.vsvPermGen) + intToI64(1))
+        },
+        None -> (),
+    };
+
+    let safeW = maxVs(360.0, width);
+    let rawView = objcAllocInitFrame("JuxuGeishaVoiceFlippedView", cgRect(0.0, 0.0, safeW, 420.0));
+    let st = VoiceSettingsPageState {
+        vsvSession: session,
+        vsvPageView: rawView,
+        vsvWidth: cellNew(safeW),
+        vsvIsWindowVisible: cellNew(true),
+        vsvPermGen: cellNew(intToI64(0)),
+        vsvGlobalPerms: cellNew((cellGet(gVoiceGlobalPermCurrentHook))()),
+        vsvPrimaryKeyDraft: cellNew(""),
+        vsvSplitLLMKeyDraft: cellNew(""),
+        vsvLoadedKeyAccount: cellNew(None),
+        vsvTestStatus: cellNew(""),
+        vsvTestOK: cellNew(true),
+        vsvIsTesting: cellNew(false),
+        vsvShowRawJSON: cellNew(false),
+        vsvCopiedJSONNotice: cellNew(false),
+        vsvCopiedASRNotice: cellNew(false),
+        vsvSuppressObserver: cellNew(false),
+    };
+    objcSetAssocHandle(rawView, vsPageStateAssocKey(), gcHandleNew(st));
+    cellSet(gActiveVoiceSettingsPage, Some(st));
+    rebuildVoiceSettingsPage(st);
+
+    // Return autoreleased (+0) NSView* so both `addSubview:` callers (`settings_window.gsa`)
+    // and standalone `withAutoreleasePool` test callers have zero leaks and zero double-releases.
+    msgSend0(rawView, objcSel("autorelease"))
+}
+
+/// Tear down timers, inspector visibility, and active page state when Settings window closes.
+pub def voiceOnSettingsWindowClosed(): Void = {
+    cellSet(gVoiceInspectorPresented, false);
+    match cellGet(gActiveVoiceSettingsPage) {
+        Some(st) -> {
+            cellSet(st.vsvIsWindowVisible, false);
+            cellSet(st.vsvPermGen, cellGet(st.vsvPermGen) + intToI64(1));
+            clearVoiceDrafts(st);
+            cellSet(gActiveVoiceSettingsPage, None)
+        },
+        None -> (),
+    }
+}
+
+// ============================================================================
+// Objective-C Subclass Registrations (`extern init(105)`)
+// ============================================================================
+
+extern init(105) def registerVoiceSettingsClasses(): Void = {
+    let actCls = objcAllocateClass("NSObject", "JuxuGeishaVoiceActionTarget");
+    if (!ptrIsNull(actCls)) {
+        let _ = objcAddMethod(actCls, "invokeVoiceAction:", cFnPtr(vsActionTargetInvoke), "v@:@");
+        objcRegisterClass(actCls)
+    } else ();
+
+    let tfCls = objcAllocateClass("NSObject", "JuxuGeishaVoiceTextFieldDelegate");
+    if (!ptrIsNull(tfCls)) {
+        let _ = objcAddMethod(tfCls, "controlTextDidChange:", cFnPtr(vsTextFieldDidChange), "v@:@");
+        objcRegisterClass(tfCls)
+    } else ();
+
+    let cardCls = objcAllocateClass("NSView", "JuxuGeishaVoiceCardView");
+    if (!ptrIsNull(cardCls)) {
+        let _ = objcAddMethod(cardCls, "isFlipped", cFnPtr(vsFlipped), "B@:");
+        let _ = objcAddMethod(cardCls, "drawRect:", cFnPtr(vsCardDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        objcRegisterClass(cardCls)
+    } else ();
+
+    let optCls = objcAllocateClass("NSView", "JuxuGeishaVoiceOptionCardView");
+    if (!ptrIsNull(optCls)) {
+        let _ = objcAddMethod(optCls, "isFlipped", cFnPtr(vsFlipped), "B@:");
+        let _ = objcAddMethod(optCls, "drawRect:", cFnPtr(vsOptCardDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        let _ = objcAddMethod(optCls, "mouseDown:", cFnPtr(vsOptCardMouseDown), "v@:@");
+        objcRegisterClass(optCls)
+    } else ();
+
+    let swCls = objcAllocateClass("NSView", "JuxuGeishaVoiceSwitchView");
+    if (!ptrIsNull(swCls)) {
+        let _ = objcAddMethod(swCls, "isFlipped", cFnPtr(vsFlipped), "B@:");
+        let _ = objcAddMethod(swCls, "drawRect:", cFnPtr(vsCapsuleSwitchDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        let _ = objcAddMethod(swCls, "mouseDown:", cFnPtr(vsCapsuleSwitchMouseDown), "v@:@");
+        objcRegisterClass(swCls)
+    } else ()
+}

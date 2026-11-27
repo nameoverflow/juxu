@@ -2,19 +2,32 @@ name = "juxu_ios_keyboard"
 version = "0.2.0"
 entry = "src/main.gsa"
 src_dir = "src"
+tests = ["tests/ios_keyboard_test.gsa"]
 
 [deps]
 juxu_shared = { path = "../shared" }
 juxu_core = { git = "https://github.com/nameoverflow/juxu-core.git", version = "0.1.9" }
 objc = { git = "https://github.com/geisha-lang/objc.gsa.git", version = "0.1.0" }
 
+[target.native]
+c_sources = ["csrc/ios_ui_abi.c"]
+c_flags   = ["-O2"]
+
+[[target.native.when]]
+os = "macos"
+link_flags = ["-framework", "Foundation", "-framework", "CoreGraphics", "-framework", "Security"]
+
 [target.ios]
 bundle_id       = "im.juxu.app.keyboard"
 bundle_name     = "JuxuKeyboard"
-version         = "0.2.0"
+version         = "0.1.8"
 min_os          = "16.0"
 is_extension    = true
 extension_point = "com.apple.keyboard-service"
 principal_class = "KeyboardViewController"
-frameworks      = ["UIKit", "Foundation", "QuartzCore", "CoreGraphics", "CoreText", "Security"]
+info_plist      = "Info.plist"
+entitlements    = "JuxuKeyboard.entitlements"
+c_sources       = ["csrc/ios_ui_abi.c", "csrc/sim_entitlements.c"]
+c_flags         = ["-O2"]
+frameworks      = ["UIKit", "Foundation", "QuartzCore", "CoreGraphics", "CoreText", "CoreHaptics", "Security"]
 codesign        = "-"

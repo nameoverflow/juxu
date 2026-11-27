@@ -1,0 +1,2044 @@
+/// Complete 1:1 port of `iOS/KeyboardExtension/IOSCandidateViews.swift` (1,287 lines):
+/// - `cleanIOSCandidateAnnotation` & `expandedCandidateDisplayHint`
+/// - `IOSRibbonSlotControl : UIControl` (zero `UIButton.Configuration`, `0.01` alpha cross-process hit backing,
+///   `9.0pt` continuous squircle highlight, `#1` medium + monospaced `11.0pt` secondary annotation)
+/// - `IOSClipboardPillControl : UIControl` (`JuxuClipboardPill`, OTP `key.fill` vs `doc.on.clipboard`,
+///   2-line portrait & single-line compact landscape layout)
+/// - `IOSRibbonChevronButton : UIControl` (`JuxuCandidateToggle`, `chevron.down`/`chevron.up` `15.0pt semibold`)
+/// - `IOSCandidateRibbonView : UIView <UIGestureRecognizerDelegate>` (`JuxuRibbon`, ZERO `UIScrollView`,
+///   horizontal `UIPanGestureRecognizer` with `0.25` rubberband & `0.24s` deceleration, conditional `CAGradientLayer`
+///   edge fade mask, bottom `8pt` Row-0 pass-through, inter-slot gap snapping, `JuxuClipboardDismiss`)
+/// - `IOSExpandedScrollView : UIScrollView` (`JuxuExpandedCandidates`, zero touch delay, `touchesShouldCancelInContentView:`)
+/// - `IOSExpandedCellButton : UIButton` (`JuxuExpandedCandidate0..N`, char-wrapping full-width sentence cells + 4-col compact grid)
+/// - `IOSExpandedCandidateView : UIView` (pooled cells + right-hand rail `chevron.up`, `delete.backward`, `重输`, `gearshape` `JuxuOpenSettings`).
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGet, vecGetOr, vecClear}
+use std.buf.{bufNew, bufPushStr, bufToString}
+use std.str.{intToStr, strContains, strTrim}
+use std.math.{abs, floor, ceil}
+use std.generic
+use objc.{
+    Id, NSObject, idAdoptOpt,
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcAddProtocol, objcRegisterClass,
+    objcSetAssocHandle, objcGetAssocHandle,
+    msgSend0, msgSend1I64, msgSendI64_0, msgSendFloat0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1Bool, msgSendVoid1I64, msgSendVoid1Float,
+}
+use juxu_core.{
+    Candidate, candidateBadge,
+    Shortcode, TypoCorrected, Wildcard, PinyinLookup,
+}
+use juxu_shared.{
+    CGPoint, CGRect,
+    cgPoint, cgSize, cgRect,
+    rectContainsPoint, rectInset, rectMaxX,
+    ptrToI64, msgSend2Ptr, msgSendPoint1Ptr, msgSendSize1Size,
+    msgSendVoid1Size, msgSendVoid1Ptr1I64, msgSendVoid1Ptr1Sel1U64,
+    objcSendSuperVoid0, objcSendSuperVoid1Bool,
+    nsStr, objcAllocInitFrame,
+    JuxuActionState,
+}
+use layout_engine.{keyCornerRadius, optBoolEq}
+use clipboard_suggestion.{IOSClipboardSuggestion, optClipSuggestionEq}
+use ios_ui_kit.{
+    setContinuousCorner, initEdgeFadeLayer, applyEdgeFadeMask,
+    uiColorRgba, uiColorWhite, uiColorSystemBlue, uiColorSystemBgAlpha, uiColorLabelAlpha,
+    uiColorPureWhite, uiColorBlack, uiColorClear,
+    uiSystemFont, uiMonospacedFont, uiMonospacedDigitFont, uiSymbolImage,
+    uiMeasureTextWidth, uiSetDualAttributedLabel,
+    uiPerformWithoutAnimation, uiAnimate,
+    uiAnimOptCurveEaseOut, uiAnimOptAllowUserInteraction, uiAnimOptBeginFromCurrentState,
+    uiAccessibilityTraitButton, viewDisplayScale,
+    suppressIOS26ScrollEdgeEffects, objcSendSuperHitTest,
+    viewLayer, setLayerShadowOpacity,
+    setViewHidden, isViewHidden, viewBounds, viewFrame, setViewFrame,
+    viewAlpha, setViewBgColor, setAccessibilityId, setAccessibilityLabelStr,
+    pinAnchorConst, pinDimensionConst, convertPointToView,
+    setLabelText, setLabelTextColor, setLabelFont, setLabelAlignment,
+    setScrollContentOffsetZero, removeAllLayerAnimations,
+}
+
+def minInt(a: Int, b: Int): Int = if (a < b) a else b
+def maxInt(a: Int, b: Int): Int = if (a > b) a else b
+def minFloat(a: Float, b: Float): Float = if (a < b) a else b
+def maxFloat(a: Float, b: Float): Float = if (a > b) a else b
+def roundHalf(x: Float): Float = floor(x + 0.5)
+
+// ============================================================================
+// Candidate Annotation Cleaning (`IOSCandidateViews.swift` lines 5–21 & 1263–1271)
+// ============================================================================
+
+def firstWordBeforeSpace(s: String): String = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n && strByteAt(s, cellGet(i)) != 32) {
+        cellSet(i, cellGet(i) + 1)
+    };
+    strSlice(s, 0, cellGet(i))
+}
+
+def stripSubstr(s: String, sub: String): String = {
+    let sLen = strLen(s);
+    let subLen = strLen(sub);
+    if (subLen == 0 || sLen < subLen) s
+    else {
+        let out = bufNew();
+        let i = cellNew(0);
+        while (cellGet(i) < sLen) {
+            let idx = cellGet(i);
+            if (idx + subLen <= sLen && strSlice(s, idx, idx + subLen) == sub) {
+                cellSet(i, idx + subLen)
+            } else {
+                bufPushStr(out, strSlice(s, idx, idx + 1));
+                cellSet(i, idx + 1)
+            }
+        };
+        bufToString(out)
+    }
+}
+
+pub def cleanIOSCandidateAnnotation(item: Candidate): String =
+    if (strLen(item.comment) == 0) ""
+    else {
+        let raw = match candidateBadge(item) {
+            TypoCorrected -> firstWordBeforeSpace(item.comment),
+            PinyinLookup -> item.comment,
+            Shortcode -> item.comment,
+            Wildcard -> item.comment,
+            _ -> "",
+        };
+        if (strLen(raw) == 0) ""
+        else {
+            let c1 = stripSubstr(raw, "⌖");
+            let c2 = stripSubstr(c1, "⟲");
+            let c3 = stripSubstr(c2, "⇄");
+            let c4 = stripSubstr(c3, "⎵");
+            strTrim(c4)
+        }
+    }
+
+pub def expandedCandidateDisplayHint(item: Candidate): Option String =
+    match candidateBadge(item) {
+        PinyinLookup -> {
+            let cleaned = cleanIOSCandidateAnnotation(item);
+            if (strLen(cleaned) == 0) None else Some(cleaned)
+        },
+        Shortcode -> {
+            let cleaned = cleanIOSCandidateAnnotation(item);
+            if (strLen(cleaned) == 0) None else Some(cleaned)
+        },
+        TypoCorrected -> {
+            let cleaned = cleanIOSCandidateAnnotation(item);
+            if (strLen(cleaned) == 0) None else Some(cleaned)
+        },
+        _ -> None,
+    }
+
+// ============================================================================
+// IOSRibbonSlotControl (`IOSCandidateViews.swift` lines 25–117)
+// ============================================================================
+
+def slotHorizontalPadding(): Float = 12.0
+
+data SlotTitleCacheKey : Eq {
+    sckPrimary: String,
+    sckSecondary: String,
+    sckFontSize: Float,
+    sckIsEmphasized: Bool,
+    sckDark: Bool,
+}
+
+data IOSRibbonSlotControl {
+    rscView: Ptr,
+    rscLabel: Ptr,
+    rscSlotIndex: Cell Int,
+    rscStarterWord: Cell (Option String),
+    rscSlotWidth: Cell Float,
+    rscCachedKey: Cell (Option SlotTitleCacheKey),
+}
+
+def slotAssocKey(): Ptr = objcSel("__juxuRibbonSlotAssocKey")
+
+def rscSetHighlighted(self: Ptr, cmd: Ptr, highlighted: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIControl", cmd, highlighted);
+    setViewBgColor(
+        self,
+        if (highlighted) uiColorLabelAlpha(0.10) else uiColorWhite(0.5, 0.01)
+    )
+}
+
+def rscLayoutSubviews(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIControl", cmd);
+    let h = objcGetAssocHandle(self, slotAssocKey());
+    if (h != intToI64(0)) {
+        let slot: IOSRibbonSlotControl = gcHandleGet(h);
+        setViewFrame(slot.rscLabel, viewBounds(self))
+    } else ()
+}
+
+def ribbonSlotNew(): IOSRibbonSlotControl = {
+    let z = cgRect(0.0, 0.0, 0.0, 0.0);
+    let v = objcAllocInitFrame("JuxuIOSRibbonSlotControl", z);
+    let lbl = objcAllocInitFrame("UILabel", z);
+    if (!ptrIsNull(v)) {
+        msgSendVoid1Bool(v, objcSel("setOpaque:"), false);
+        setViewBgColor(v, uiColorWhite(0.5, 0.01));
+        setContinuousCorner(viewLayer(v), 9.0);
+        if (!ptrIsNull(lbl)) {
+            msgSendVoid1I64(lbl, objcSel("setNumberOfLines:"), intToI64(1));
+            setLabelAlignment(lbl, 1); // .center
+            msgSendVoid1I64(lbl, objcSel("setLineBreakMode:"), intToI64(2)); // .byClipping
+            msgSendVoid1Bool(lbl, objcSel("setUserInteractionEnabled:"), false);
+            msgSendVoid1Ptr(v, objcSel("addSubview:"), lbl);
+            msgSendVoid0(lbl, objcSel("release"))
+        } else ()
+    } else ();
+    let slot = IOSRibbonSlotControl {
+        rscView: v,
+        rscLabel: lbl,
+        rscSlotIndex: cellNew(0),
+        rscStarterWord: cellNew(None),
+        rscSlotWidth: cellNew(0.0),
+        rscCachedKey: cellNew(None),
+    };
+    if (!ptrIsNull(v)) {
+        objcSetAssocHandle(v, slotAssocKey(), gcHandleNew(slot))
+    } else ();
+    slot
+}
+
+def ribbonSlotSetContent(
+    slot: IOSRibbonSlotControl,
+    primary: String,
+    secondary: String,
+    fontSize: Float,
+    isEmphasized: Bool,
+    primaryColor: Ptr,
+    subtleColor: Ptr,
+    dark: Bool
+): Void = {
+    let key = SlotTitleCacheKey {
+        sckPrimary: primary,
+        sckSecondary: secondary,
+        sckFontSize: fontSize,
+        sckIsEmphasized: isEmphasized,
+        sckDark: dark,
+    };
+    let unchanged = match cellGet(slot.rscCachedKey) {
+        Some(prev) -> prev == key,
+        None -> false,
+    };
+    if (!unchanged) {
+        cellSet(slot.rscCachedKey, Some(key));
+        let pFont = uiSystemFont(fontSize, if (isEmphasized) 1 else 0);
+        let secWithSpace = if (strLen(secondary) > 0) (" " + secondary) else "";
+        let sFont = if (strLen(secondary) > 0) uiMonospacedFont(11.0, 0) else ptrNull();
+        let w = uiSetDualAttributedLabel(
+            slot.rscLabel,
+            primary,
+            pFont,
+            primaryColor,
+            secWithSpace,
+            sFont,
+            subtleColor
+        );
+        cellSet(slot.rscSlotWidth, w + slotHorizontalPadding() * 2.0)
+    } else ()
+}
+
+// ============================================================================
+// IOSClipboardPillControl (`IOSCandidateViews.swift` lines 121–256)
+// ============================================================================
+
+data IOSClipboardPillControl {
+    cpcView: Ptr,
+    cpcIconView: Ptr,
+    cpcSubtitleLabel: Ptr,
+    cpcValueLabel: Ptr,
+    cpcIsDarkTheme: Cell Bool,
+    cpcIsCompactLandscape: Cell Bool,
+    cpcIntrinsicWidth: Cell Float,
+}
+
+def pillAssocKey(): Ptr = objcSel("__juxuClipPillAssocKey")
+
+def pillUpdateSurface(pill: IOSClipboardPillControl): Void =
+    if (!ptrIsNull(pill.cpcView)) {
+        let highlighted = msgSendI64_0(pill.cpcView, objcSel("isHighlighted")) != intToI64(0);
+        let dark = cellGet(pill.cpcIsDarkTheme);
+        let col =
+            if (highlighted) {
+                if (dark) uiColorWhite(1.0, 0.22) else uiColorWhite(0.0, 0.11)
+            } else {
+                if (dark) uiColorWhite(1.0, 0.11) else uiColorWhite(0.0, 0.048)
+            };
+        setViewBgColor(pill.cpcView, col)
+    } else ()
+
+def cpcSetHighlighted(self: Ptr, cmd: Ptr, highlighted: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIControl", cmd, highlighted);
+    let h = objcGetAssocHandle(self, pillAssocKey());
+    if (h != intToI64(0)) {
+        let pill: IOSClipboardPillControl = gcHandleGet(h);
+        pillUpdateSurface(pill)
+    } else ()
+}
+
+def cpcLayoutSubviews(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIControl", cmd);
+    let h = objcGetAssocHandle(self, pillAssocKey());
+    if (h != intToI64(0)) {
+        let pill: IOSClipboardPillControl = gcHandleGet(h);
+        let b = viewBounds(self);
+        let w = b.size.width;
+        let bh = b.size.height;
+        let padX = 12.0;
+
+        if (cellGet(pill.cpcIsCompactLandscape)) {
+            let iconSide = 14.0;
+            let gap = 5.0;
+            let maxTextW = maxFloat(20.0, w - padX * 2.0 - iconSide - gap);
+            let fitSz = msgSendSize1Size(pill.cpcValueLabel, objcSel("sizeThatFits:"), cgSize(maxTextW, bh));
+            let textW = minFloat(maxTextW, ceil(fitSz.width));
+            let totalW = iconSide + gap + textW;
+            let startX = floor((w - totalW) * 0.5);
+            setViewFrame(pill.cpcIconView, cgRect(startX, floor((bh - iconSide) * 0.5), iconSide, iconSide));
+            setViewFrame(pill.cpcValueLabel, cgRect(startX + iconSide + gap, 0.0, textW, bh))
+        } else {
+            let iconSide = 11.0;
+            let gap = 3.5;
+            let subFit = msgSendSize1Size(
+                pill.cpcSubtitleLabel,
+                objcSel("sizeThatFits:"),
+                cgSize(maxFloat(20.0, w - padX * 2.0), 14.0)
+            );
+            let subW = minFloat(maxFloat(20.0, w - padX * 2.0 - iconSide - gap), ceil(subFit.width));
+            let topTotalW = iconSide + gap + subW;
+            let topStartX = floor((w - topTotalW) * 0.5);
+            let topY = 3.5;
+            setViewFrame(pill.cpcIconView, cgRect(topStartX, topY + 1.0, iconSide, iconSide));
+            setViewFrame(pill.cpcSubtitleLabel, cgRect(topStartX + iconSide + gap, topY, subW, 13.0));
+
+            let valY = 16.5;
+            setViewFrame(
+                pill.cpcValueLabel,
+                cgRect(padX, valY, maxFloat(20.0, w - padX * 2.0), maxFloat(18.0, bh - valY - 2.5))
+            )
+        }
+    } else ()
+}
+
+def clipboardPillNew(): IOSClipboardPillControl = {
+    let z = cgRect(0.0, 0.0, 0.0, 0.0);
+    let v = objcAllocInitFrame("JuxuIOSClipboardPillControl", z);
+    let iconV = objcAllocInitFrame("UIImageView", z);
+    let subLbl = objcAllocInitFrame("UILabel", z);
+    let valLbl = objcAllocInitFrame("UILabel", z);
+    if (!ptrIsNull(v)) {
+        msgSendVoid1Bool(v, objcSel("setOpaque:"), false);
+        setContinuousCorner(viewLayer(v), 11.0);
+        msgSendVoid1Bool(v, objcSel("setIsAccessibilityElement:"), true);
+        msgSendVoid1I64(v, objcSel("setAccessibilityTraits:"), uiAccessibilityTraitButton());
+        setAccessibilityId(v, "JuxuClipboardPill");
+
+        msgSendVoid1I64(iconV, objcSel("setContentMode:"), intToI64(1)); // .scaleAspectFit
+        msgSendVoid1Bool(iconV, objcSel("setUserInteractionEnabled:"), false);
+
+        msgSendVoid1I64(subLbl, objcSel("setNumberOfLines:"), intToI64(1));
+        setLabelAlignment(subLbl, 0); // .left
+        msgSendVoid1I64(subLbl, objcSel("setLineBreakMode:"), intToI64(2)); // .byClipping
+        msgSendVoid1Bool(subLbl, objcSel("setUserInteractionEnabled:"), false);
+
+        msgSendVoid1I64(valLbl, objcSel("setNumberOfLines:"), intToI64(1));
+        setLabelAlignment(valLbl, 1); // .center
+        msgSendVoid1I64(valLbl, objcSel("setLineBreakMode:"), intToI64(4)); // .byTruncatingTail
+        msgSendVoid1Bool(valLbl, objcSel("setUserInteractionEnabled:"), false);
+
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), iconV);
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), subLbl);
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), valLbl);
+        msgSendVoid0(iconV, objcSel("release"));
+        msgSendVoid0(subLbl, objcSel("release"));
+        msgSendVoid0(valLbl, objcSel("release"))
+    } else ();
+
+    let pill = IOSClipboardPillControl {
+        cpcView: v,
+        cpcIconView: iconV,
+        cpcSubtitleLabel: subLbl,
+        cpcValueLabel: valLbl,
+        cpcIsDarkTheme: cellNew(false),
+        cpcIsCompactLandscape: cellNew(false),
+        cpcIntrinsicWidth: cellNew(140.0),
+    };
+    if (!ptrIsNull(v)) {
+        objcSetAssocHandle(v, pillAssocKey(), gcHandleNew(pill))
+    } else ();
+    pill
+}
+
+def clipboardPillConfigure(
+    pill: IOSClipboardPillControl,
+    suggestion: IOSClipboardSuggestion,
+    dark: Bool,
+    compactLandscape: Bool
+): Void =
+    if (!ptrIsNull(pill.cpcView)) {
+        cellSet(pill.cpcIsDarkTheme, dark);
+        cellSet(pill.cpcIsCompactLandscape, compactLandscape);
+
+        let textCol = if (dark) uiColorPureWhite() else uiColorBlack();
+        let subtleCol = if (dark) uiColorWhite(0.70, 1.0) else uiColorWhite(0.42, 1.0);
+        let otpTint = if (dark) uiColorRgba(0.40, 0.70, 1.0, 1.0) else uiColorSystemBlue(1.0);
+
+        let symbolName = if (suggestion.csIsOTP) "key.fill" else "doc.on.clipboard";
+        let symSize = if (compactLandscape) 12.0 else 9.5;
+        let symImg = uiSymbolImage(symbolName, symSize, 1, true);
+        msgSendVoid1Ptr(pill.cpcIconView, objcSel("setImage:"), symImg);
+        msgSendVoid1Ptr(pill.cpcIconView, objcSel("setTintColor:"), if (suggestion.csIsOTP) otpTint else subtleCol);
+
+        setViewHidden(pill.cpcSubtitleLabel, compactLandscape);
+        let subFont = uiSystemFont(10.5, 0);
+        setLabelFont(pill.cpcSubtitleLabel, subFont);
+        setLabelTextColor(pill.cpcSubtitleLabel, subtleCol);
+        setLabelText(pill.cpcSubtitleLabel, suggestion.csSubtitle);
+
+        let valFont =
+            if (suggestion.csIsOTP) {
+                uiMonospacedDigitFont(if (compactLandscape) 15.5 else 16.5, 2)
+            } else {
+                uiSystemFont(if (compactLandscape) 14.5 else 15.0, 1)
+            };
+        setLabelFont(pill.cpcValueLabel, valFont);
+        setLabelTextColor(pill.cpcValueLabel, textCol);
+        setLabelText(pill.cpcValueLabel, suggestion.csDisplayText);
+
+        let iconW = if (compactLandscape) 14.0 else 11.5;
+        let valueW = ceil(uiMeasureTextWidth(suggestion.csDisplayText, valFont));
+        let intrW =
+            if (compactLandscape) {
+                iconW + 5.0 + valueW + 24.0
+            } else {
+                let subW = ceil(uiMeasureTextWidth(suggestion.csSubtitle, subFont));
+                let topW = iconW + 3.5 + subW;
+                maxFloat(topW, valueW) + 28.0
+            };
+        cellSet(pill.cpcIntrinsicWidth, intrW);
+
+        setAccessibilityLabelStr(pill.cpcView, suggestion.csSubtitle + "：" + suggestion.csDisplayText);
+        pillUpdateSurface(pill);
+        msgSendVoid0(pill.cpcView, objcSel("setNeedsLayout"))
+    } else ()
+
+// ============================================================================
+// IOSRibbonChevronButton (`IOSCandidateViews.swift` lines 260–344)
+// ============================================================================
+
+data IOSRibbonChevronButton {
+    rcbView: Ptr,
+    rcbHighlightPill: Ptr,
+    rcbIconView: Ptr,
+    rcbBandTopInset: Cell Float,
+    rcbBandBottomInset: Cell Float,
+}
+
+def chevronAssocKey(): Ptr = objcSel("__juxuRibbonChevronAssocKey")
+
+def rcbSetHighlighted(self: Ptr, cmd: Ptr, highlighted: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIControl", cmd, highlighted);
+    let h = objcGetAssocHandle(self, chevronAssocKey());
+    if (h != intToI64(0)) {
+        let btn: IOSRibbonChevronButton = gcHandleGet(h);
+        setViewBgColor(
+            btn.rcbHighlightPill,
+            if (highlighted) uiColorLabelAlpha(0.10) else uiColorClear()
+        )
+    } else ()
+}
+
+def rcbTintColorDidChange(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIControl", cmd);
+    let h = objcGetAssocHandle(self, chevronAssocKey());
+    if (h != intToI64(0)) {
+        let btn: IOSRibbonChevronButton = gcHandleGet(h);
+        let tc = msgSend0(self, objcSel("tintColor"));
+        if (!ptrIsNull(tc)) {
+            msgSendVoid1Ptr(btn.rcbIconView, objcSel("setTintColor:"), tc)
+        } else ()
+    } else ()
+}
+
+def rcbLayoutSubviews(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIControl", cmd);
+    let h = objcGetAssocHandle(self, chevronAssocKey());
+    if (h != intToI64(0)) {
+        let btn: IOSRibbonChevronButton = gcHandleGet(h);
+        let b = viewBounds(self);
+        let topIns = cellGet(btn.rcbBandTopInset);
+        let botIns = cellGet(btn.rcbBandBottomInset);
+        let bandH = maxFloat(20.0, b.size.height - topIns - botIns);
+        let centerY = topIns + bandH * 0.5;
+        let centerX = b.size.width * 0.5;
+        let iconSide = 18.0;
+        setViewFrame(
+            btn.rcbIconView,
+            cgRect(
+                roundHalf(centerX - iconSide * 0.5),
+                roundHalf(centerY - iconSide * 0.5),
+                iconSide,
+                iconSide
+            )
+        );
+        let pillW = minFloat(36.0, b.size.width - 8.0);
+        let pillH = minFloat(34.0, bandH - 4.0);
+        setViewFrame(
+            btn.rcbHighlightPill,
+            cgRect(
+                roundHalf(centerX - pillW * 0.5),
+                roundHalf(centerY - pillH * 0.5),
+                pillW,
+                pillH
+            )
+        )
+    } else ()
+}
+
+def rcbPointInside(self: Ptr, _cmd: Ptr, pt: CGPoint, _ev: Ptr): Bool = {
+    let b = viewBounds(self);
+    // UIEdgeInsets(top: -4, left: -12, bottom: -6, right: -4)
+    let expanded = cgRect(b.origin.x - 12.0, b.origin.y - 4.0, b.size.width + 16.0, b.size.height + 10.0);
+    rectContainsPoint(expanded, pt)
+}
+
+def ribbonChevronNew(): IOSRibbonChevronButton = {
+    let z = cgRect(0.0, 0.0, 0.0, 0.0);
+    let v = objcAllocInitFrame("JuxuIOSRibbonChevronButton", z);
+    let pill = objcAllocInitFrame("UIView", z);
+    let iconV = objcAllocInitFrame("UIImageView", z);
+    if (!ptrIsNull(v)) {
+        msgSendVoid1Bool(v, objcSel("setOpaque:"), false);
+        setViewBgColor(v, uiColorWhite(0.5, 0.01));
+        msgSendVoid1Bool(v, objcSel("setIsAccessibilityElement:"), true);
+        msgSendVoid1I64(v, objcSel("setAccessibilityTraits:"), uiAccessibilityTraitButton());
+
+        msgSendVoid1Bool(pill, objcSel("setUserInteractionEnabled:"), false);
+        setViewBgColor(pill, uiColorClear());
+        setContinuousCorner(viewLayer(pill), 9.0);
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), pill);
+        msgSendVoid0(pill, objcSel("release"));
+
+        msgSendVoid1I64(iconV, objcSel("setContentMode:"), intToI64(4)); // .center
+        msgSendVoid1Bool(iconV, objcSel("setUserInteractionEnabled:"), false);
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), iconV);
+        msgSendVoid0(iconV, objcSel("release"))
+    } else ();
+
+    let btn = IOSRibbonChevronButton {
+        rcbView: v,
+        rcbHighlightPill: pill,
+        rcbIconView: iconV,
+        rcbBandTopInset: cellNew(4.0),
+        rcbBandBottomInset: cellNew(7.0),
+    };
+    if (!ptrIsNull(v)) {
+        objcSetAssocHandle(v, chevronAssocKey(), gcHandleNew(btn))
+    } else ();
+    btn
+}
+
+def ribbonChevronSetImage(btn: IOSRibbonChevronButton, symbolName: String): Void =
+    if (!ptrIsNull(btn.rcbIconView)) {
+        let img = uiSymbolImage(symbolName, 15.0, 2, true);
+        msgSendVoid1Ptr(btn.rcbIconView, objcSel("setImage:"), img)
+    } else ()
+
+// ============================================================================
+// IOSCandidateRibbonView (`IOSCandidateViews.swift` lines 351–885)
+// ============================================================================
+
+pub def ribbonStarterWords(): Vec String = {
+    let v: Vec String = vecWithCap(8);
+    vecPush(v, "我"); vecPush(v, "我们"); vecPush(v, "不是"); vecPush(v, "怎么");
+    vecPush(v, "你"); vecPush(v, "在"); vecPush(v, "这"); vecPush(v, "可以");
+    v
+}
+
+def ribbonVisualHorizontalInset(): Float = 18.0
+def ribbonChevronWidth(): Float = 48.0
+
+pub data IOSCandidateRibbonView {
+    rvView: Ptr,
+    rvOwner: Option (Id NSObject),
+    rvClipContainer: Ptr,
+    rvContentTrack: Ptr,
+    rvEdgeFadeMask: Ptr,
+    rvEdgeFadeOwner: Option (Id NSObject),
+    rvChevronDivider: Ptr,
+    rvChevronBtn: IOSRibbonChevronButton,
+    rvClipboardPill: IOSClipboardPillControl,
+    rvClipboardDismissBtn: Ptr,
+    rvSlotControls: Vec IOSRibbonSlotControl,
+    rvSlotDividers: Vec Ptr,
+    rvContentWidth: Cell Float,
+    rvScrollOffsetX: Cell Float,
+    rvPanStartOffsetX: Cell Float,
+    rvActiveClipboard: Cell (Option IOSClipboardSuggestion),
+    rvLastClipboardCompact: Cell (Option Bool),
+    rvLastCandidates: Cell (Option (Vec Candidate)),
+    rvLastIdleWords: Cell (Option (Vec String)),
+    rvLastPreeditEmpty: Cell (Option Bool),
+    rvLastDark: Cell (Option Bool),
+    rvOnSelectCandidate: Cell (Option ((Int) -> Void)),
+    rvOnSelectStarterWord: Cell (Option ((String) -> Void)),
+    rvOnSelectClipboard: Cell (Option ((IOSClipboardSuggestion) -> Void)),
+    rvOnDismissClipboard: Cell (Option ((IOSClipboardSuggestion) -> Void)),
+    rvOnTapChevron: Cell (Option (() -> Void)),
+}
+
+def ribbonAssocKey(): Ptr = objcSel("__juxuCandidateRibbonAssocKey")
+
+def getRibbonFromSelf(self: Ptr): Option IOSCandidateRibbonView = {
+    let h = objcGetAssocHandle(self, ribbonAssocKey());
+    if (h == intToI64(0)) None
+    else Some(gcHandleGet(h))
+}
+
+def ribbonIsCompactBar(rv: IOSCandidateRibbonView): Bool = {
+    let h = viewBounds(rv.rvView).size.height;
+    h > 0.0 && h < 46.0
+}
+
+def ribbonBandTopInset(rv: IOSCandidateRibbonView): Float =
+    if (ribbonIsCompactBar(rv)) 2.0 else 4.0
+
+def ribbonBandBottomInset(rv: IOSCandidateRibbonView): Float =
+    if (ribbonIsCompactBar(rv)) 5.0 else 7.0
+
+def isInsideChevronHitZone(rv: IOSCandidateRibbonView, pt: CGPoint): Bool =
+    if (isViewHidden(rv.rvChevronBtn.rcbView)) false
+    else {
+        let cf = viewFrame(rv.rvChevronBtn.rcbView);
+        let b = viewBounds(rv.rvView);
+        let minX = cf.origin.x - 10.0;
+        let expanded = cgRect(minX, -4.0, b.size.width - minX + 4.0, b.size.height + 10.0);
+        rectContainsPoint(expanded, pt)
+    }
+
+def ribbonApplyScrollOffset(rv: IOSCandidateRibbonView): Void =
+    if (!ptrIsNull(rv.rvClipContainer) && !ptrIsNull(rv.rvContentTrack)) {
+        let cb = viewBounds(rv.rvClipContainer);
+        let availW = cb.size.width;
+        let barH = cb.size.height;
+        let scrollX = cellGet(rv.rvScrollOffsetX);
+        let contentW = cellGet(rv.rvContentWidth);
+
+        setViewFrame(
+            rv.rvContentTrack,
+            cgRect(0.0 - scrollX, 0.0, maxFloat(availW, contentW), barH)
+        );
+        let hasLeft = scrollX > 0.5;
+        let hasRight = (contentW - scrollX) > availW + 2.0;
+        applyEdgeFadeMask(rv.rvEdgeFadeMask, rv.rvClipContainer, hasLeft, hasRight, availW, barH)
+    } else ()
+
+def ribbonLayoutSubviewsImpl(rv: IOSCandidateRibbonView): Void =
+    if (!ptrIsNull(rv.rvView)) {
+        let b = viewBounds(rv.rvView);
+        let topInset = ribbonBandTopInset(rv);
+        let bottomInset = ribbonBandBottomInset(rv);
+        if (cellGet(rv.rvChevronBtn.rcbBandTopInset) != topInset) {
+            cellSet(rv.rvChevronBtn.rcbBandTopInset, topInset);
+            msgSendVoid0(rv.rvChevronBtn.rcbView, objcSel("setNeedsLayout"))
+        } else ();
+        if (cellGet(rv.rvChevronBtn.rcbBandBottomInset) != bottomInset) {
+            cellSet(rv.rvChevronBtn.rcbBandBottomInset, bottomInset);
+            msgSendVoid0(rv.rvChevronBtn.rcbView, objcSel("setNeedsLayout"))
+        } else ();
+
+        let chevX = maxFloat(0.0, b.size.width - ribbonChevronWidth());
+        setViewFrame(rv.rvChevronBtn.rcbView, cgRect(chevX, 0.0, ribbonChevronWidth(), b.size.height));
+
+        let barH = maxFloat(0.0, b.size.height - topInset - bottomInset);
+        let clipWidth =
+            if (isViewHidden(rv.rvChevronBtn.rcbView)) maxFloat(0.0, b.size.width - 6.0)
+            else maxFloat(0.0, chevX);
+        setViewFrame(rv.rvClipContainer, cgRect(0.0, topInset, clipWidth, barH));
+
+        let scale = viewDisplayScale(rv.rvView);
+        let hairline = 1.0 / scale;
+        let slotH = minFloat(36.0, barH);
+        let slotY = floor((barH - slotH) * 0.5);
+
+        if (!isViewHidden(rv.rvChevronBtn.rcbView)) {
+            let dividerH = minFloat(20.0, maxFloat(14.0, barH - 20.0));
+            let dividerY = topInset + (barH - dividerH) * 0.5;
+            setViewFrame(
+                rv.rvChevronDivider,
+                cgRect(
+                    b.size.width - ribbonChevronWidth(),
+                    roundHalf(dividerY * scale) / scale,
+                    hairline,
+                    roundHalf(dividerH * scale) / scale
+                )
+            )
+        } else ();
+
+        if (!isViewHidden(rv.rvClipboardPill.cpcView)) {
+            match cellGet(rv.rvActiveClipboard) {
+                Some(suggestion) -> {
+                    let compact = b.size.height < 46.0;
+                    let sameCompact = match cellGet(rv.rvLastClipboardCompact) {
+                        Some(prev) -> prev == compact,
+                        None -> false,
+                    };
+                    if (!sameCompact) {
+                        cellSet(rv.rvLastClipboardCompact, Some(compact));
+                        let dark = match cellGet(rv.rvLastDark) { Some(d) -> d, None -> false };
+                        clipboardPillConfigure(rv.rvClipboardPill, suggestion, dark, compact)
+                    } else ();
+
+                    let totalW = b.size.width;
+                    let dismissW = 38.0;
+                    let pillH = if (compact) minFloat(30.0, maxFloat(26.0, b.size.height - 8.0)) else 38.0;
+                    let usableBandH = maxFloat(pillH, b.size.height - 8.0);
+                    let pillY =
+                        if (compact) floor((usableBandH - pillH) * 0.5)
+                        else minFloat(b.size.height - 8.5 - pillH, floor((b.size.height - pillH) * 0.5) - 1.0);
+                    let maxPillW = maxFloat(120.0, minFloat(totalW - (dismissW + 12.0) * 2.0, 292.0));
+                    let desiredW = minFloat(maxPillW, maxFloat(126.0, cellGet(rv.rvClipboardPill.cpcIntrinsicWidth)));
+                    let pillX = floor((totalW - desiredW) * 0.5);
+                    setViewFrame(rv.rvClipboardPill.cpcView, cgRect(pillX, pillY, desiredW, pillH));
+                    setViewFrame(rv.rvClipboardDismissBtn, cgRect(totalW - dismissW - 4.0, pillY, dismissW, pillH))
+                },
+                None -> (),
+            }
+        } else ();
+
+        let firstSlotX = ribbonVisualHorizontalInset() - slotHorizontalPadding();
+        let visibleSlots: Vec IOSRibbonSlotControl = vecNew();
+        let totalSlotWidths = cellNew(0.0);
+        let si = cellNew(0);
+        while (cellGet(si) < vecLen(rv.rvSlotControls)) {
+            match vecGet(rv.rvSlotControls, cellGet(si)) {
+                Some(slot) ->
+                    if (!isViewHidden(slot.rscView)) {
+                        vecPush(visibleSlots, slot);
+                        cellSet(totalSlotWidths, cellGet(totalSlotWidths) + cellGet(slot.rscSlotWidth))
+                    } else (),
+                None -> (),
+            };
+            cellSet(si, cellGet(si) + 1)
+        };
+
+        let visCount = vecLen(visibleSlots);
+        let availW = clipWidth;
+        let preeditWasEmpty = match cellGet(rv.rvLastPreeditEmpty) {
+            Some(v) -> v,
+            None -> false,
+        };
+        let spacing =
+            if (preeditWasEmpty && visCount > 1 && availW > 200.0) {
+                let naturalSpan = firstSlotX + cellGet(totalSlotWidths) + intToFloat(visCount - 1) * 6.0 + 10.0;
+                if (naturalSpan <= availW) {
+                    minFloat(14.0, floor((availW - firstSlotX - 10.0 - cellGet(totalSlotWidths)) / intToFloat(visCount - 1)))
+                } else 4.0
+            } else 6.0;
+
+        let dividerH = minFloat(18.0, maxFloat(12.0, slotH - 16.0));
+        let dividerY = slotY + (slotH - dividerH) * 0.5;
+        let x = cellNew(firstSlotX);
+        let vi = cellNew(0);
+        while (cellGet(vi) < visCount) {
+            let idx = cellGet(vi);
+            match vecGet(visibleSlots, idx) {
+                Some(slot) -> {
+                    let sw = cellGet(slot.rscSlotWidth);
+                    let sf = cgRect(cellGet(x), slotY, sw, slotH);
+                    setViewFrame(slot.rscView, sf);
+                    let sMaxX = rectMaxX(sf);
+                    if (idx + 1 < visCount) {
+                        match vecGet(rv.rvSlotDividers, idx) {
+                            Some(div) -> {
+                                setViewHidden(div, false);
+                                setViewFrame(
+                                    div,
+                                    cgRect(
+                                        roundHalf((sMaxX + spacing * 0.5) * scale) / scale,
+                                        roundHalf(dividerY * scale) / scale,
+                                        hairline,
+                                        roundHalf(dividerH * scale) / scale
+                                    )
+                                )
+                            },
+                            None -> (),
+                        }
+                    } else ();
+                    cellSet(x, sMaxX + spacing)
+                },
+                None -> (),
+            };
+            cellSet(vi, idx + 1)
+        };
+
+        let hideDivStart = maxInt(0, visCount - 1);
+        let di = cellNew(hideDivStart);
+        while (cellGet(di) < vecLen(rv.rvSlotDividers)) {
+            match vecGet(rv.rvSlotDividers, cellGet(di)) {
+                Some(div) -> setViewHidden(div, true),
+                None -> (),
+            };
+            cellSet(di, cellGet(di) + 1)
+        };
+
+        let cw = maxFloat(0.0, cellGet(x) - spacing + 10.0);
+        cellSet(rv.rvContentWidth, cw);
+
+        let maxOffset = maxFloat(0.0, cw - availW);
+        if (cellGet(rv.rvScrollOffsetX) > maxOffset) {
+            cellSet(rv.rvScrollOffsetX, maxOffset)
+        } else ();
+        ribbonApplyScrollOffset(rv)
+    } else ()
+
+def ribbonEnsureSlotCapacity(rv: IOSCandidateRibbonView, count: Int): Void = {
+    while (vecLen(rv.rvSlotControls) < count) {
+        let ctrl = ribbonSlotNew();
+        if (!ptrIsNull(ctrl.rscView)) {
+            msgSendVoid1Ptr1Sel1U64(
+                ctrl.rscView,
+                objcSel("addTarget:action:forControlEvents:"),
+                rv.rvView,
+                objcSel("handleRibbonSlotTap:"),
+                intToI64(64)
+            );
+            setViewHidden(ctrl.rscView, true);
+            msgSendVoid1Ptr(rv.rvContentTrack, objcSel("addSubview:"), ctrl.rscView);
+            msgSendVoid0(ctrl.rscView, objcSel("release"))
+        } else ();
+        vecPush(rv.rvSlotControls, ctrl)
+    };
+    let neededDivs = maxInt(0, count - 1);
+    while (vecLen(rv.rvSlotDividers) < neededDivs) {
+        let div = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 0.0, 0.0));
+        if (!ptrIsNull(div)) {
+            msgSendVoid1Bool(div, objcSel("setUserInteractionEnabled:"), false);
+            setViewHidden(div, true);
+            msgSendVoid1Ptr(rv.rvContentTrack, objcSel("addSubview:"), div);
+            msgSendVoid0(div, objcSel("release"))
+        } else ();
+        vecPush(rv.rvSlotDividers, div)
+    }
+}
+
+// Ribbon ObjC method implementations
+def rvPointInside(self: Ptr, _cmd: Ptr, pt: CGPoint, _ev: Ptr): Bool =
+    match getRibbonFromSelf(self) {
+        None -> false,
+        Some(rv) ->
+            if (isInsideChevronHitZone(rv, pt)) true
+            else {
+                let b = viewBounds(self);
+                if (!rectContainsPoint(b, pt)) false
+                else if (pt.y > b.size.height - 8.0) false
+                else if (!isViewHidden(rv.rvClipboardPill.cpcView)) {
+                    if (!isViewHidden(rv.rvClipboardDismissBtn)
+                        && rectContainsPoint(rectInset(viewFrame(rv.rvClipboardDismissBtn), -6.0, -4.0), pt)) {
+                        true
+                    } else if (rectContainsPoint(rectInset(viewFrame(rv.rvClipboardPill.cpcView), -10.0, -4.0), pt)) {
+                        true
+                    } else {
+                        pt.y < b.size.height * 0.45
+                    }
+                } else {
+                    let availW = viewBounds(rv.rvClipContainer).size.width;
+                    let hasOverflow = cellGet(rv.rvContentWidth) > availW + 2.0;
+                    if (!hasOverflow) {
+                        let maxVisMaxX = cellNew(0.0);
+                        let scrollX = cellGet(rv.rvScrollOffsetX);
+                        let i = cellNew(0);
+                        while (cellGet(i) < vecLen(rv.rvSlotControls)) {
+                            match vecGet(rv.rvSlotControls, cellGet(i)) {
+                                Some(slot) ->
+                                    if (!isViewHidden(slot.rscView)) {
+                                        let mx = rectMaxX(viewFrame(slot.rscView)) - scrollX;
+                                        if (mx > cellGet(maxVisMaxX)) cellSet(maxVisMaxX, mx) else ()
+                                    } else (),
+                                None -> (),
+                            };
+                            cellSet(i, cellGet(i) + 1)
+                        };
+                        if (pt.x > cellGet(maxVisMaxX) + 10.0 && pt.y >= b.size.height * 0.45) false
+                        else true
+                    } else true
+                }
+            },
+    }
+
+def rvHitTest(self: Ptr, cmd: Ptr, pt: CGPoint, ev: Ptr): Ptr =
+    if (isViewHidden(self) || viewAlpha(self) < 0.01 || msgSendI64_0(self, objcSel("isUserInteractionEnabled")) == intToI64(0)) {
+        ptrNull()
+    } else {
+        match getRibbonFromSelf(self) {
+            None -> ptrNull(),
+            Some(rv) ->
+                if (isInsideChevronHitZone(rv, pt)) rv.rvChevronBtn.rcbView
+                else {
+                    let superHit = objcSendSuperHitTest(self, "UIView", cmd, pt.x, pt.y, ev);
+                    if (ptrIsNull(superHit)) ptrNull()
+                    else {
+                        let clipOverride: Ptr =
+                            if (!isViewHidden(rv.rvClipboardPill.cpcView)) {
+                                if (!isViewHidden(rv.rvClipboardDismissBtn)
+                                    && rectContainsPoint(rectInset(viewFrame(rv.rvClipboardDismissBtn), -6.0, -4.0), pt)) {
+                                    rv.rvClipboardDismissBtn
+                                } else if (rectContainsPoint(rectInset(viewFrame(rv.rvClipboardPill.cpcView), -10.0, -4.0), pt)) {
+                                    rv.rvClipboardPill.cpcView
+                                } else ptrNull()
+                            } else ptrNull();
+
+                        if (!ptrIsNull(clipOverride)) clipOverride
+                        else if (ptrToI64(superHit) == ptrToI64(rv.rvClipContainer)
+                            || ptrToI64(superHit) == ptrToI64(rv.rvContentTrack)
+                            || (ptrToI64(superHit) == ptrToI64(self) && pt.y >= 4.0)) {
+                            let trackPt = convertPointToView(self, pt, rv.rvContentTrack);
+                            let bestSlot: Cell Ptr = cellNew(ptrNull());
+                            let bestDx = cellNew(1.0e18);
+                            let i = cellNew(0);
+                            while (cellGet(i) < vecLen(rv.rvSlotControls)) {
+                                match vecGet(rv.rvSlotControls, cellGet(i)) {
+                                    Some(slot) ->
+                                        if (!isViewHidden(slot.rscView)) {
+                                            let sf = viewFrame(slot.rscView);
+                                            let dx = maxFloat(sf.origin.x - trackPt.x, maxFloat(0.0, trackPt.x - rectMaxX(sf)));
+                                            if (dx <= 10.0 && dx < cellGet(bestDx)) {
+                                                cellSet(bestDx, dx);
+                                                cellSet(bestSlot, slot.rscView)
+                                            } else ()
+                                        } else (),
+                                    None -> (),
+                                };
+                                cellSet(i, cellGet(i) + 1)
+                            };
+                            let nearest = cellGet(bestSlot);
+                            if (!ptrIsNull(nearest)) nearest else superHit
+                        } else superHit
+                    }
+                },
+        }
+    }
+
+def rvLayoutSubviews(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIView", cmd);
+    match getRibbonFromSelf(self) {
+        Some(rv) -> ribbonLayoutSubviewsImpl(rv),
+        None -> (),
+    }
+}
+
+def rvGestureShouldBegin(self: Ptr, _cmd: Ptr, gr: Ptr): Bool =
+    match getRibbonFromSelf(self) {
+        None -> false,
+        Some(rv) -> {
+            let availW = viewBounds(rv.rvClipContainer).size.width;
+            if (cellGet(rv.rvContentWidth) <= availW + 2.0) false
+            else {
+                let vel = msgSendPoint1Ptr(gr, objcSel("velocityInView:"), rv.rvClipContainer);
+                abs(vel.x) > abs(vel.y) * 1.2
+            }
+        },
+    }
+
+def rvHandleHorizontalPan(self: Ptr, _cmd: Ptr, pan: Ptr): Void =
+    match getRibbonFromSelf(self) {
+        None -> (),
+        Some(rv) -> {
+            let availW = viewBounds(rv.rvClipContainer).size.width;
+            let maxOffset = maxFloat(0.0, cellGet(rv.rvContentWidth) - availW);
+            if (maxOffset > 0.0) {
+                let st = i64ToInt(msgSendI64_0(pan, objcSel("state")));
+                // UIGestureRecognizerState: Began = 1, Changed = 2, Ended = 3, Cancelled = 4
+                if (st == 1) {
+                    removeAllLayerAnimations(rv.rvContentTrack);
+                    cellSet(rv.rvPanStartOffsetX, cellGet(rv.rvScrollOffsetX))
+                } else if (st == 2) {
+                    let dx = msgSendPoint1Ptr(pan, objcSel("translationInView:"), rv.rvClipContainer).x;
+                    let raw = cellGet(rv.rvPanStartOffsetX) - dx;
+                    let nextOff =
+                        if (raw < 0.0) raw * 0.25
+                        else if (raw > maxOffset) maxOffset + (raw - maxOffset) * 0.25
+                        else raw;
+                    cellSet(rv.rvScrollOffsetX, nextOff);
+                    ribbonApplyScrollOffset(rv)
+                } else if (st == 3 || st == 4) {
+                    let vx = msgSendPoint1Ptr(pan, objcSel("velocityInView:"), rv.rvClipContainer).x;
+                    let projected = minFloat(maxFloat(0.0, cellGet(rv.rvScrollOffsetX) - vx * 0.16), maxOffset);
+                    let opts = uiAnimOptCurveEaseOut() | uiAnimOptAllowUserInteraction() | uiAnimOptBeginFromCurrentState();
+                    uiAnimate(0.24, opts, () -> {
+                        cellSet(rv.rvScrollOffsetX, projected);
+                        ribbonApplyScrollOffset(rv)
+                    })
+                } else ()
+            } else ()
+        },
+    }
+
+def rvHandleSlotTap(self: Ptr, _cmd: Ptr, sender: Ptr): Void =
+    match getRibbonFromSelf(self) {
+        None -> (),
+        Some(rv) -> {
+            let sh = objcGetAssocHandle(sender, slotAssocKey());
+            if (sh != intToI64(0)) {
+                let slot: IOSRibbonSlotControl = gcHandleGet(sh);
+                match cellGet(slot.rscStarterWord) {
+                    Some(word) -> match cellGet(rv.rvOnSelectStarterWord) {
+                        Some(cb) -> cb(word),
+                        None -> (),
+                    },
+                    None -> match cellGet(rv.rvOnSelectCandidate) {
+                        Some(cb) -> cb(cellGet(slot.rscSlotIndex)),
+                        None -> (),
+                    },
+                }
+            } else ()
+        },
+    }
+
+def rvHandleChevronTap(self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    match getRibbonFromSelf(self) {
+        Some(rv) -> match cellGet(rv.rvOnTapChevron) { Some(cb) -> cb(), None -> () },
+        None -> (),
+    }
+
+def rvHandleClipboardTap(self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    match getRibbonFromSelf(self) {
+        Some(rv) -> match cellGet(rv.rvActiveClipboard) {
+            Some(clip) -> match cellGet(rv.rvOnSelectClipboard) { Some(cb) -> cb(clip), None -> () },
+            None -> (),
+        },
+        None -> (),
+    }
+
+def rvHandleClipboardDismiss(self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    match getRibbonFromSelf(self) {
+        Some(rv) -> match cellGet(rv.rvActiveClipboard) {
+            Some(clip) -> match cellGet(rv.rvOnDismissClipboard) { Some(cb) -> cb(clip), None -> () },
+            None -> (),
+        },
+        None -> (),
+    }
+
+pub def candidateRibbonViewNew(): IOSCandidateRibbonView = {
+    let z = cgRect(0.0, 0.0, 0.0, 0.0);
+    let v = objcAllocInitFrame("JuxuIOSCandidateRibbonView", z);
+    let clipCont = objcAllocInitFrame("UIView", z);
+    let track = objcAllocInitFrame("UIView", z);
+    let gradCls = objcClass("CAGradientLayer");
+    let grad = if (ptrIsNull(gradCls)) ptrNull() else msgSend0(msgSend0(gradCls, objcSel("alloc")), objcSel("init"));
+    let chevDiv = objcAllocInitFrame("UIView", z);
+    let chevBtn = ribbonChevronNew();
+    let clipPill = clipboardPillNew();
+    let btnCls = objcClass("UIButton");
+    let dismissBtn = if (ptrIsNull(btnCls)) ptrNull() else msgSend1I64(btnCls, objcSel("buttonWithType:"), intToI64(1));
+
+    if (!ptrIsNull(v)) {
+        setAccessibilityId(v, "JuxuRibbon");
+
+        msgSendVoid1Bool(clipCont, objcSel("setClipsToBounds:"), true);
+        setViewBgColor(clipCont, uiColorClear());
+        setViewBgColor(track, uiColorClear());
+        msgSendVoid1Ptr(clipCont, objcSel("addSubview:"), track);
+        msgSendVoid0(track, objcSel("release"));
+
+        if (!ptrIsNull(grad)) initEdgeFadeLayer(grad) else ();
+
+        let panCls = objcClass("UIPanGestureRecognizer");
+        if (!ptrIsNull(panCls)) {
+            let pan = msgSend0(panCls, objcSel("alloc"));
+            let panInit = msgSend2Ptr(pan, objcSel("initWithTarget:action:"), v, objcSel("handleRibbonHorizontalPan:"));
+            if (!ptrIsNull(panInit)) {
+                msgSendVoid1Ptr(panInit, objcSel("setDelegate:"), v);
+                msgSendVoid1Bool(panInit, objcSel("setCancelsTouchesInView:"), true);
+                msgSendVoid1Ptr(clipCont, objcSel("addGestureRecognizer:"), panInit);
+                msgSendVoid0(panInit, objcSel("release"))
+            } else ()
+        } else ();
+
+        msgSendVoid1Bool(chevDiv, objcSel("setUserInteractionEnabled:"), false);
+
+        setAccessibilityId(chevBtn.rcbView, "JuxuCandidateToggle");
+        setAccessibilityLabelStr(chevBtn.rcbView, "展开候选");
+        ribbonChevronSetImage(chevBtn, "chevron.down");
+        msgSendVoid1Ptr1Sel1U64(
+            chevBtn.rcbView,
+            objcSel("addTarget:action:forControlEvents:"),
+            v,
+            objcSel("handleRibbonChevron:"),
+            intToI64(64)
+        );
+
+        setViewHidden(clipPill.cpcView, true);
+        msgSendVoid1Ptr1Sel1U64(
+            clipPill.cpcView,
+            objcSel("addTarget:action:forControlEvents:"),
+            v,
+            objcSel("handleRibbonClipboardTap:"),
+            intToI64(64)
+        );
+
+        if (!ptrIsNull(dismissBtn)) {
+            let xImg = uiSymbolImage("xmark", 13.0, 1, false);
+            msgSendVoid1Ptr1I64(dismissBtn, objcSel("setImage:forState:"), xImg, intToI64(0));
+            setAccessibilityId(dismissBtn, "JuxuClipboardDismiss");
+            setAccessibilityLabelStr(dismissBtn, "关闭剪贴板提示");
+            setViewHidden(dismissBtn, true);
+            msgSendVoid1Ptr1Sel1U64(
+                dismissBtn,
+                objcSel("addTarget:action:forControlEvents:"),
+                v,
+                objcSel("handleRibbonClipboardDismiss:"),
+                intToI64(64)
+            )
+        } else ();
+
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), clipCont);
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), chevDiv);
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), chevBtn.rcbView);
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), clipPill.cpcView);
+        if (!ptrIsNull(dismissBtn)) msgSendVoid1Ptr(v, objcSel("addSubview:"), dismissBtn) else ();
+
+        msgSendVoid0(clipCont, objcSel("release"));
+        msgSendVoid0(chevDiv, objcSel("release"));
+        msgSendVoid0(chevBtn.rcbView, objcSel("release"));
+        msgSendVoid0(clipPill.cpcView, objcSel("release"))
+    } else ();
+
+    let rv = IOSCandidateRibbonView {
+        rvView: v,
+        rvOwner: idAdoptOpt(v),
+        rvClipContainer: clipCont,
+        rvContentTrack: track,
+        rvEdgeFadeMask: grad,
+        rvEdgeFadeOwner: idAdoptOpt(grad),
+        rvChevronDivider: chevDiv,
+        rvChevronBtn: chevBtn,
+        rvClipboardPill: clipPill,
+        rvClipboardDismissBtn: dismissBtn,
+        rvSlotControls: vecNew(),
+        rvSlotDividers: vecNew(),
+        rvContentWidth: cellNew(0.0),
+        rvScrollOffsetX: cellNew(0.0),
+        rvPanStartOffsetX: cellNew(0.0),
+        rvActiveClipboard: cellNew(None),
+        rvLastClipboardCompact: cellNew(None),
+        rvLastCandidates: cellNew(None),
+        rvLastIdleWords: cellNew(None),
+        rvLastPreeditEmpty: cellNew(None),
+        rvLastDark: cellNew(None),
+        rvOnSelectCandidate: cellNew(None),
+        rvOnSelectStarterWord: cellNew(None),
+        rvOnSelectClipboard: cellNew(None),
+        rvOnDismissClipboard: cellNew(None),
+        rvOnTapChevron: cellNew(None),
+    };
+    if (!ptrIsNull(v)) {
+        objcSetAssocHandle(v, ribbonAssocKey(), gcHandleNew(rv));
+        ribbonEnsureSlotCapacity(rv, 10)
+    } else ();
+    rv
+}
+
+pub def candidateRibbonSetExpanded(rv: IOSCandidateRibbonView, expanded: Bool): Void = {
+    ribbonChevronSetImage(rv.rvChevronBtn, if (expanded) "chevron.up" else "chevron.down");
+    setAccessibilityLabelStr(rv.rvChevronBtn.rcbView, if (expanded) "收起候选" else "展开候选")
+}
+
+def vecCandEq(a: Vec Candidate, b: Vec Candidate): Bool = {
+    let n = vecLen(a);
+    if (n != vecLen(b)) false
+    else {
+        let i = cellNew(0);
+        let same = cellNew(true);
+        while (cellGet(i) < n && cellGet(same)) {
+            match (vecGet(a, cellGet(i)), vecGet(b, cellGet(i))) {
+                (Some(ca), Some(cb)) -> if (ca != cb) cellSet(same, false) else (),
+                _ -> cellSet(same, false),
+            };
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(same)
+    }
+}
+
+def vecWordsEq(a: Vec String, b: Vec String): Bool = {
+    let n = vecLen(a);
+    if (n != vecLen(b)) false
+    else {
+        let i = cellNew(0);
+        let same = cellNew(true);
+        while (cellGet(i) < n && cellGet(same)) {
+            if (vecGetOr(a, cellGet(i), "") != vecGetOr(b, cellGet(i), "")) cellSet(same, false) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(same)
+    }
+}
+
+def cloneStringVec(src: Vec String): Vec String = {
+    let n = vecLen(src);
+    let out: Vec String = vecWithCap(n);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        vecPush(out, vecGetOr(src, cellGet(i), ""));
+        cellSet(i, cellGet(i) + 1)
+    };
+    out
+}
+
+def cloneCandVec(src: Vec Candidate): Vec Candidate = {
+    let n = vecLen(src);
+    let out: Vec Candidate = vecWithCap(n);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        match vecGet(src, cellGet(i)) {
+            Some(c) -> vecPush(out, c),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    out
+}
+
+pub def candidateRibbonUpdate(
+    rv: IOSCandidateRibbonView,
+    st: JuxuActionState,
+    dark: Bool,
+    clipboardSuggestionOpt: Option IOSClipboardSuggestion,
+    idleWordsOpt: Option (Vec String)
+): Void =
+    if (!ptrIsNull(rv.rvView)) {
+        let isEmpty = strLen(st.asPreedit) == 0;
+        let effectiveClipboard = if (isEmpty) clipboardSuggestionOpt else None;
+        let resolvedIdleWords = match idleWordsOpt {
+            Some(words) -> words,
+            None -> ribbonStarterWords(),
+        };
+
+        let samePreeditEmpty = optBoolEq(cellGet(rv.rvLastPreeditEmpty), Some(isEmpty));
+        let sameDark = optBoolEq(cellGet(rv.rvLastDark), Some(dark));
+        let sameClip = optClipSuggestionEq(cellGet(rv.rvActiveClipboard), effectiveClipboard);
+        let sameList =
+            if (isEmpty) {
+                match cellGet(rv.rvLastIdleWords) {
+                    Some(prev) -> vecWordsEq(prev, resolvedIdleWords),
+                    None -> false,
+                }
+            } else {
+                match cellGet(rv.rvLastCandidates) {
+                    Some(prev) -> vecCandEq(prev, st.asCandidates),
+                    None -> false,
+                }
+            };
+
+        if (!(samePreeditEmpty && sameDark && sameClip && sameList)) {
+            cellSet(rv.rvLastPreeditEmpty, Some(isEmpty));
+            cellSet(rv.rvLastDark, Some(dark));
+            cellSet(rv.rvLastCandidates, Some(cloneCandVec(st.asCandidates)));
+            cellSet(rv.rvLastIdleWords, if (isEmpty) Some(cloneStringVec(resolvedIdleWords)) else None);
+            cellSet(rv.rvActiveClipboard, effectiveClipboard);
+
+            let primaryCol = if (dark) uiColorPureWhite() else uiColorWhite(0.08, 1.0);
+            let secondaryCol = if (dark) uiColorWhite(0.90, 1.0) else uiColorWhite(0.16, 1.0);
+            let subtleCol = if (dark) uiColorWhite(0.62, 1.0) else uiColorWhite(0.46, 1.0);
+            let chevronCol = if (dark) uiColorWhite(0.84, 1.0) else uiColorWhite(0.26, 1.0);
+            let slotDividerCol = if (dark) uiColorWhite(1.0, 0.16) else uiColorWhite(0.0, 0.14);
+            let chevronDividerCol = if (dark) uiColorWhite(1.0, 0.22) else uiColorWhite(0.0, 0.18);
+            let compactBar = ribbonIsCompactBar(rv);
+            let candidateFontSize = if (compactBar) 17.5 else 19.5;
+            let idleFontSize = if (compactBar) 17.0 else 19.0;
+
+            let hideChevron = match effectiveClipboard { Some(_) -> true, None -> false };
+            msgSendVoid1Ptr(rv.rvChevronBtn.rcbView, objcSel("setTintColor:"), chevronCol);
+            setViewHidden(rv.rvChevronBtn.rcbView, hideChevron);
+            setViewBgColor(rv.rvChevronDivider, chevronDividerCol);
+            setViewHidden(rv.rvChevronDivider, hideChevron);
+
+            uiPerformWithoutAnimation(() -> {
+                match effectiveClipboard {
+                    Some(clip) -> {
+                        setViewHidden(rv.rvClipContainer, true);
+                        setViewHidden(rv.rvClipboardPill.cpcView, false);
+                        setViewHidden(rv.rvClipboardDismissBtn, false);
+                        msgSendVoid1Ptr(rv.rvClipboardDismissBtn, objcSel("setTintColor:"), subtleCol);
+                        let bh = viewBounds(rv.rvView).size.height;
+                        let compact = bh > 10.0 && bh < 46.0;
+                        cellSet(rv.rvLastClipboardCompact, Some(compact));
+                        clipboardPillConfigure(rv.rvClipboardPill, clip, dark, compact)
+                    },
+                    None -> {
+                        setViewHidden(rv.rvClipContainer, false);
+                        setViewHidden(rv.rvClipboardPill.cpcView, true);
+                        setViewHidden(rv.rvClipboardDismissBtn, true);
+                        cellSet(rv.rvLastClipboardCompact, None);
+
+                        if (isEmpty) {
+                            let wCnt = vecLen(resolvedIdleWords);
+                            ribbonEnsureSlotCapacity(rv, wCnt);
+                            let totalSlots = vecLen(rv.rvSlotControls);
+                            let i = cellNew(0);
+                            while (cellGet(i) < totalSlots) {
+                                let idx = cellGet(i);
+                                match vecGet(rv.rvSlotControls, idx) {
+                                    Some(ctrl) ->
+                                        if (idx < wCnt) {
+                                            let w = vecGetOr(resolvedIdleWords, idx, "");
+                                            cellSet(ctrl.rscSlotIndex, idx);
+                                            cellSet(ctrl.rscStarterWord, Some(w));
+                                            ribbonSlotSetContent(ctrl, w, "", idleFontSize, false, secondaryCol, subtleCol, dark);
+                                            setViewHidden(ctrl.rscView, false)
+                                        } else {
+                                            setViewHidden(ctrl.rscView, true)
+                                        },
+                                    None -> (),
+                                };
+                                cellSet(i, idx + 1)
+                            }
+                        } else {
+                            let items = st.asCandidates;
+                            let cCnt = vecLen(items);
+                            ribbonEnsureSlotCapacity(rv, cCnt);
+                            let totalSlots = vecLen(rv.rvSlotControls);
+                            let i = cellNew(0);
+                            while (cellGet(i) < totalSlots) {
+                                let idx = cellGet(i);
+                                match vecGet(rv.rvSlotControls, idx) {
+                                    Some(ctrl) ->
+                                        if (idx < cCnt) {
+                                            match vecGet(items, idx) {
+                                                Some(item) -> {
+                                                    cellSet(ctrl.rscSlotIndex, idx);
+                                                    cellSet(ctrl.rscStarterWord, None);
+                                                    let sec = cleanIOSCandidateAnnotation(item);
+                                                    ribbonSlotSetContent(
+                                                        ctrl,
+                                                        item.text,
+                                                        sec,
+                                                        candidateFontSize,
+                                                        idx == 0,
+                                                        if (idx == 0) primaryCol else secondaryCol,
+                                                        subtleCol,
+                                                        dark
+                                                    );
+                                                    setViewHidden(ctrl.rscView, false)
+                                                },
+                                                None -> setViewHidden(ctrl.rscView, true),
+                                            }
+                                        } else {
+                                            setViewHidden(ctrl.rscView, true)
+                                        },
+                                    None -> (),
+                                };
+                                cellSet(i, idx + 1)
+                            }
+                        };
+
+                        let di = cellNew(0);
+                        while (cellGet(di) < vecLen(rv.rvSlotDividers)) {
+                            match vecGet(rv.rvSlotDividers, cellGet(di)) {
+                                Some(div) -> setViewBgColor(div, slotDividerCol),
+                                None -> (),
+                            };
+                            cellSet(di, cellGet(di) + 1)
+                        }
+                    },
+                };
+
+                cellSet(rv.rvScrollOffsetX, 0.0);
+                msgSendVoid0(rv.rvView, objcSel("setNeedsLayout"));
+                let curB = viewBounds(rv.rvView);
+                if (curB.size.width > 0.0 && curB.size.height > 0.0) {
+                    ribbonLayoutSubviewsImpl(rv)
+                } else ()
+            })
+        } else ()
+    } else ()
+
+// ============================================================================
+// IOSExpandedScrollView, IOSExpandedCellButton & IOSExpandedCandidateView (`lines 889–1286`)
+// ============================================================================
+
+def esvTouchesShouldCancel(_self: Ptr, _cmd: Ptr, _view: Ptr): Bool = true
+
+data IOSExpandedCellButton {
+    ecbView: Ptr,
+    ecbCandidateLabel: Ptr,
+    ecbHintLabel: Ptr,
+    ecbCandidateIndex: Cell Int,
+    ecbIsCandidateCell: Cell Bool,
+    ecbHasHint: Cell Bool,
+    ecbMeasuredTextHeight: Cell Float,
+    ecbMeasuredHintHeight: Cell Float,
+    ecbCurrentTextInset: Cell Float,
+    ecbIsDark: Cell Bool,
+    ecbRailAction: Cell (Option (() -> Void)),
+}
+
+def expandedCellAssocKey(): Ptr = objcSel("__juxuExpandedCellAssocKey")
+
+def ecbUpdateSurface(cell: IOSExpandedCellButton): Void =
+    if (!ptrIsNull(cell.ecbView)) {
+        let highlighted = msgSendI64_0(cell.ecbView, objcSel("isHighlighted")) != intToI64(0);
+        let dark = cellGet(cell.ecbIsDark);
+        let col =
+            if (highlighted) {
+                if (dark) uiColorWhite(1.0, 0.30)
+                else uiColorRgba(214.0 / 255.0, 216.0 / 255.0, 222.0 / 255.0, 1.0)
+            } else {
+                if (dark) uiColorWhite(1.0, 0.175)
+                else uiColorPureWhite()
+            };
+        setViewBgColor(cell.ecbView, col)
+    } else ()
+
+def ecbSetHighlighted(self: Ptr, cmd: Ptr, highlighted: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIButton", cmd, highlighted);
+    let h = objcGetAssocHandle(self, expandedCellAssocKey());
+    if (h != intToI64(0)) {
+        let cell: IOSExpandedCellButton = gcHandleGet(h);
+        ecbUpdateSurface(cell)
+    } else ()
+}
+
+def ecbLayoutSubviews(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIButton", cmd);
+    let h = objcGetAssocHandle(self, expandedCellAssocKey());
+    if (h != intToI64(0)) {
+        let cell: IOSExpandedCellButton = gcHandleGet(h);
+        if (cellGet(cell.ecbIsCandidateCell)) {
+            let b = viewBounds(self);
+            let w = b.size.width;
+            let bh = b.size.height;
+            let inset = cellGet(cell.ecbCurrentTextInset);
+            let textW = maxFloat(1.0, w - 2.0 * inset);
+            let textH = cellGet(cell.ecbMeasuredTextHeight);
+            if (cellGet(cell.ecbHasHint)) {
+                let spacing = 1.0;
+                let hintH = cellGet(cell.ecbMeasuredHintHeight);
+                let totalH = textH + spacing + hintH;
+                let textY = floor((bh - totalH) * 0.5);
+                setViewFrame(cell.ecbCandidateLabel, cgRect(inset, textY, textW, textH));
+                setViewFrame(cell.ecbHintLabel, cgRect(4.0, textY + textH + spacing, maxFloat(1.0, w - 8.0), hintH))
+            } else {
+                setViewFrame(cell.ecbCandidateLabel, cgRect(inset, floor((bh - textH) * 0.5), textW, textH))
+            }
+        } else ()
+    } else ()
+}
+
+def expandedCellNew(isSystemType: Bool): IOSExpandedCellButton = {
+    let btnCls = objcClass("JuxuIOSExpandedCellButton");
+    // UIButtonTypeCustom == 0, UIButtonTypeSystem == 1
+    let v =
+        if (ptrIsNull(btnCls)) ptrNull()
+        else msgSend1I64(btnCls, objcSel("buttonWithType:"), intToI64(if (isSystemType) 1 else 0));
+    let z = cgRect(0.0, 0.0, 0.0, 0.0);
+    let candLbl = if (!isSystemType) objcAllocInitFrame("UILabel", z) else ptrNull();
+    let hintLbl = if (!isSystemType) objcAllocInitFrame("UILabel", z) else ptrNull();
+
+    if (!ptrIsNull(v)) {
+        setContinuousCorner(viewLayer(v), keyCornerRadius());
+        if (!isSystemType) {
+            msgSendVoid1Bool(v, objcSel("setTranslatesAutoresizingMaskIntoConstraints:"), true);
+            msgSendVoid1Bool(v, objcSel("setIsAccessibilityElement:"), true);
+
+            msgSendVoid1Bool(candLbl, objcSel("setTranslatesAutoresizingMaskIntoConstraints:"), true);
+            msgSendVoid1I64(candLbl, objcSel("setLineBreakMode:"), intToI64(1)); // .byCharWrapping
+            msgSendVoid1I64(candLbl, objcSel("setNumberOfLines:"), intToI64(0));
+            msgSendVoid1Bool(candLbl, objcSel("setUserInteractionEnabled:"), false);
+            msgSendVoid1Bool(candLbl, objcSel("setIsAccessibilityElement:"), false);
+            msgSendVoid1Ptr(v, objcSel("addSubview:"), candLbl);
+            msgSendVoid0(candLbl, objcSel("release"));
+
+            msgSendVoid1Bool(hintLbl, objcSel("setTranslatesAutoresizingMaskIntoConstraints:"), true);
+            setLabelFont(hintLbl, uiSystemFont(10.0, 0));
+            msgSendVoid1I64(hintLbl, objcSel("setLineBreakMode:"), intToI64(5)); // .byTruncatingMiddle
+            msgSendVoid1Bool(hintLbl, objcSel("setAdjustsFontSizeToFitWidth:"), true);
+            msgSendVoid1Float(hintLbl, objcSel("setMinimumScaleFactor:"), 0.72);
+            msgSendVoid1I64(hintLbl, objcSel("setNumberOfLines:"), intToI64(1));
+            msgSendVoid1Bool(hintLbl, objcSel("setUserInteractionEnabled:"), false);
+            msgSendVoid1Bool(hintLbl, objcSel("setIsAccessibilityElement:"), false);
+            setViewHidden(hintLbl, true);
+            msgSendVoid1Ptr(v, objcSel("addSubview:"), hintLbl);
+            msgSendVoid0(hintLbl, objcSel("release"))
+        } else ()
+    } else ();
+
+    let cell = IOSExpandedCellButton {
+        ecbView: v,
+        ecbCandidateLabel: candLbl,
+        ecbHintLabel: hintLbl,
+        ecbCandidateIndex: cellNew(0),
+        ecbIsCandidateCell: cellNew(!isSystemType),
+        ecbHasHint: cellNew(false),
+        ecbMeasuredTextHeight: cellNew(22.0),
+        ecbMeasuredHintHeight: cellNew(12.0),
+        ecbCurrentTextInset: cellNew(10.0),
+        ecbIsDark: cellNew(false),
+        ecbRailAction: cellNew(None),
+    };
+    if (!ptrIsNull(v)) {
+        objcSetAssocHandle(v, expandedCellAssocKey(), gcHandleNew(cell));
+        ecbUpdateSurface(cell)
+    } else ();
+    cell
+}
+
+def expandedCellConfigureCandidate(
+    cell: IOSExpandedCellButton,
+    text: String,
+    hintOpt: Option String,
+    index: Int,
+    font: Ptr,
+    dark: Bool
+): Void =
+    if (!ptrIsNull(cell.ecbView)) {
+        cellSet(cell.ecbCandidateIndex, index);
+        cellSet(cell.ecbIsDark, dark);
+        ecbUpdateSurface(cell);
+        setAccessibilityLabelStr(cell.ecbView, text);
+        setAccessibilityId(cell.ecbView, "JuxuExpandedCandidate" + intToStr(index));
+
+        setLabelText(cell.ecbCandidateLabel, text);
+        setLabelFont(cell.ecbCandidateLabel, font);
+        setLabelTextColor(cell.ecbCandidateLabel, if (dark) uiColorPureWhite() else uiColorBlack());
+
+        match hintOpt {
+            Some(hint) if (strLen(hint) > 0) -> {
+                cellSet(cell.ecbHasHint, true);
+                setLabelText(cell.ecbHintLabel, hint);
+                setLabelTextColor(
+                    cell.ecbHintLabel,
+                    if (dark) uiColorWhite(0.72, 1.0) else uiColorWhite(0.42, 1.0)
+                );
+                setViewHidden(cell.ecbHintLabel, false);
+                let hFont = msgSend0(cell.ecbHintLabel, objcSel("font"));
+                let lh = if (ptrIsNull(hFont)) 12.0 else ceil(msgSendFloat0(hFont, objcSel("lineHeight")));
+                cellSet(cell.ecbMeasuredHintHeight, lh)
+            },
+            _ -> {
+                cellSet(cell.ecbHasHint, false);
+                msgSendVoid1Ptr(cell.ecbHintLabel, objcSel("setText:"), ptrNull());
+                setViewHidden(cell.ecbHintLabel, true);
+                cellSet(cell.ecbMeasuredHintHeight, 0.0)
+            },
+        }
+    } else ()
+
+def expandedCellMeasureHeight(
+    cell: IOSExpandedCellButton,
+    width: Float,
+    fullWidth: Bool,
+    textInset: Float
+): Float = {
+    cellSet(cell.ecbCurrentTextInset, textInset);
+    // NSTextAlignmentNatural == 4, NSTextAlignmentCenter == 1
+    let align = if (fullWidth) 4 else 1;
+    setLabelAlignment(cell.ecbCandidateLabel, align);
+    setLabelAlignment(cell.ecbHintLabel, align);
+
+    let availW = maxFloat(1.0, width - 2.0 * textInset);
+    let fitSz = msgSendSize1Size(cell.ecbCandidateLabel, objcSel("sizeThatFits:"), cgSize(availW, 1.0e7));
+    let textH = ceil(fitSz.height);
+    cellSet(cell.ecbMeasuredTextHeight, textH);
+
+    if (cellGet(cell.ecbHasHint)) {
+        let totalContentH = textH + 1.0 + cellGet(cell.ecbMeasuredHintHeight);
+        maxFloat(48.0, totalContentH + 12.0)
+    } else {
+        maxFloat(45.0, textH + 16.0)
+    }
+}
+
+pub data IOSExpandedCandidateView {
+    egView: Ptr,
+    egOwner: Option (Id NSObject),
+    egScrollView: Ptr,
+    egRailStack: Ptr,
+    egRailButtons: Vec IOSExpandedCellButton,
+    egCellPool: Vec IOSExpandedCellButton,
+    egCandidates: Vec Candidate,
+    egDark: Cell Bool,
+    egLastLaidOutWidth: Cell Float,
+    egNeedsRelayout: Cell Bool,
+    egOnSelectAbsCandidate: Cell (Option ((Int) -> Void)),
+    egOnCollapse: Cell (Option (() -> Void)),
+    egOnBackspace: Cell (Option (() -> Void)),
+    egOnClear: Cell (Option (() -> Void)),
+    egOnOpenSettings: Cell (Option (() -> Void)),
+}
+
+def expandedGridAssocKey(): Ptr = objcSel("__juxuExpandedGridAssocKey")
+
+def getExpandedGridFromSelf(self: Ptr): Option IOSExpandedCandidateView = {
+    let h = objcGetAssocHandle(self, expandedGridAssocKey());
+    if (h == intToI64(0)) None
+    else Some(gcHandleGet(h))
+}
+
+def expandedGridEnsureCapacity(eg: IOSExpandedCandidateView, count: Int): Void =
+    while (vecLen(eg.egCellPool) < count) {
+        let cell = expandedCellNew(false);
+        if (!ptrIsNull(cell.ecbView)) {
+            setViewHidden(cell.ecbView, true);
+            msgSendVoid1Ptr1Sel1U64(
+                cell.ecbView,
+                objcSel("addTarget:action:forControlEvents:"),
+                eg.egView,
+                objcSel("handleExpandedCellTap:"),
+                intToI64(64)
+            );
+            msgSendVoid1Ptr(eg.egScrollView, objcSel("addSubview:"), cell.ecbView)
+        } else ();
+        vecPush(eg.egCellPool, cell)
+    }
+
+def expandedGridLayoutImpl(eg: IOSExpandedCandidateView): Void =
+    if (!ptrIsNull(eg.egScrollView)) {
+        let width = viewBounds(eg.egScrollView).size.width;
+        let columns = 4;
+        let colSpacing = 6.0;
+        let rowSpacing = 8.0;
+        let textInset = 10.0;
+        if (width > colSpacing * 3.0
+            && (cellGet(eg.egNeedsRelayout) || abs(width - cellGet(eg.egLastLaidOutWidth)) > 0.5)) {
+            cellSet(eg.egLastLaidOutWidth, width);
+            cellSet(eg.egNeedsRelayout, false);
+
+            let cellWidth = (width - intToFloat(columns - 1) * colSpacing) / intToFloat(columns);
+            let y = cellNew(0.0);
+            let compactIndices: Vec Int = vecWithCap(columns);
+            let compactRowH = cellNew(0.0);
+
+            let flushCompactRow = () ->
+                if (vecLen(compactIndices) > 0) {
+                    if (cellGet(y) > 0.0) {
+                        cellSet(y, cellGet(y) + rowSpacing)
+                    } else ();
+                    let rowH = cellGet(compactRowH);
+                    let curY = cellGet(y);
+                    let ci = cellNew(0);
+                    while (cellGet(ci) < vecLen(compactIndices)) {
+                        let col = cellGet(ci);
+                        let idx = vecGetOr(compactIndices, col, 0);
+                        match vecGet(eg.egCellPool, idx) {
+                            Some(cell) -> {
+                                let x = intToFloat(col) * (cellWidth + colSpacing);
+                                setViewFrame(cell.ecbView, cgRect(x, curY, cellWidth, rowH));
+                                msgSendVoid0(cell.ecbView, objcSel("setNeedsLayout"));
+                                msgSendVoid0(cell.ecbView, objcSel("layoutIfNeeded"))
+                            },
+                            None -> (),
+                        };
+                        cellSet(ci, col + 1)
+                    };
+                    cellSet(y, curY + rowH);
+                    vecClear(compactIndices);
+                    cellSet(compactRowH, 0.0)
+                } else ();
+
+            let candidateFont = uiSystemFont(17.5, 0);
+            let firstFont = uiSystemFont(17.5, 1);
+
+            uiPerformWithoutAnimation(() -> {
+                let n = vecLen(eg.egCandidates);
+                let i = cellNew(0);
+                while (cellGet(i) < n) {
+                    let index = cellGet(i);
+                    match (vecGet(eg.egCandidates, index), vecGet(eg.egCellPool, index)) {
+                        (Some(item), Some(cell)) -> {
+                            let font = if (index == 0) firstFont else candidateFont;
+                            let textW = uiMeasureTextWidth(item.text, font);
+                            let fullWidth = textW > cellWidth - 2.0 * textInset || strContains(item.text, "\n");
+                            let targetWidth = if (fullWidth) width else cellWidth;
+                            let height = expandedCellMeasureHeight(cell, targetWidth, fullWidth, textInset);
+
+                            if (fullWidth) {
+                                flushCompactRow();
+                                if (cellGet(y) > 0.0) {
+                                    cellSet(y, cellGet(y) + rowSpacing)
+                                } else ();
+                                let curY = cellGet(y);
+                                setViewFrame(cell.ecbView, cgRect(0.0, curY, width, height));
+                                msgSendVoid0(cell.ecbView, objcSel("setNeedsLayout"));
+                                msgSendVoid0(cell.ecbView, objcSel("layoutIfNeeded"));
+                                cellSet(y, curY + height)
+                            } else {
+                                vecPush(compactIndices, index);
+                                if (height > cellGet(compactRowH)) {
+                                    cellSet(compactRowH, height)
+                                } else ();
+                                if (vecLen(compactIndices) == columns) {
+                                    flushCompactRow()
+                                } else ()
+                            }
+                        },
+                        _ -> (),
+                    };
+                    cellSet(i, index + 1)
+                };
+                flushCompactRow();
+                msgSendVoid1Size(eg.egScrollView, objcSel("setContentSize:"), cgSize(width, cellGet(y)))
+            })
+        } else ()
+    } else ()
+
+def egLayoutSubviews(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIView", cmd);
+    match getExpandedGridFromSelf(self) {
+        Some(eg) -> expandedGridLayoutImpl(eg),
+        None -> (),
+    }
+}
+
+def egHandleCandidateCellTap(self: Ptr, _cmd: Ptr, sender: Ptr): Void =
+    match getExpandedGridFromSelf(self) {
+        None -> (),
+        Some(eg) -> {
+            let ch = objcGetAssocHandle(sender, expandedCellAssocKey());
+            if (ch != intToI64(0)) {
+                let cell: IOSExpandedCellButton = gcHandleGet(ch);
+                match cellGet(eg.egOnSelectAbsCandidate) {
+                    Some(cb) -> cb(cellGet(cell.ecbCandidateIndex)),
+                    None -> (),
+                }
+            } else ()
+        },
+    }
+
+def egHandleRailButtonTap(_self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
+    let ch = objcGetAssocHandle(sender, expandedCellAssocKey());
+    if (ch != intToI64(0)) {
+        let cell: IOSExpandedCellButton = gcHandleGet(ch);
+        match cellGet(cell.ecbRailAction) {
+            Some(act) -> act(),
+            None -> (),
+        }
+    } else ()
+}
+
+def makeRailButton(
+    targetView: Ptr,
+    titleOpt: Option String,
+    symbolOpt: Option String,
+    action: () -> Void
+): IOSExpandedCellButton = {
+    let cell = expandedCellNew(true);
+    cellSet(cell.ecbRailAction, Some(action));
+    if (!ptrIsNull(cell.ecbView)) {
+        match symbolOpt {
+            Some(sym) -> {
+                let img = uiSymbolImage(sym, 0.0, -1, false);
+                msgSendVoid1Ptr1I64(cell.ecbView, objcSel("setImage:forState:"), img, intToI64(0))
+            },
+            None -> match titleOpt {
+                Some(title) -> {
+                    msgSendVoid1Ptr1I64(cell.ecbView, objcSel("setTitle:forState:"), nsStr(title), intToI64(0));
+                    let tLbl = msgSend0(cell.ecbView, objcSel("titleLabel"));
+                    if (!ptrIsNull(tLbl)) setLabelFont(tLbl, uiSystemFont(14.0, 0)) else ()
+                },
+                None -> (),
+            },
+        };
+        msgSendVoid1Ptr1Sel1U64(
+            cell.ecbView,
+            objcSel("addTarget:action:forControlEvents:"),
+            targetView,
+            objcSel("handleExpandedRailTap:"),
+            intToI64(64)
+        )
+    } else ();
+    cell
+}
+
+pub def expandedCandidateViewNew(): IOSExpandedCandidateView = {
+    let z = cgRect(0.0, 0.0, 0.0, 0.0);
+    let v = objcAllocInitFrame("JuxuIOSExpandedCandidateView", z);
+    let sv = objcAllocInitFrame("JuxuIOSExpandedScrollView", z);
+    let rail = objcAllocInitFrame("UIStackView", z);
+    let railBtns: Vec IOSExpandedCellButton = vecWithCap(4);
+
+    let eg = IOSExpandedCandidateView {
+        egView: v,
+        egOwner: idAdoptOpt(v),
+        egScrollView: sv,
+        egRailStack: rail,
+        egRailButtons: railBtns,
+        egCellPool: vecNew(),
+        egCandidates: vecNew(),
+        egDark: cellNew(false),
+        egLastLaidOutWidth: cellNew(0.0),
+        egNeedsRelayout: cellNew(false),
+        egOnSelectAbsCandidate: cellNew(None),
+        egOnCollapse: cellNew(None),
+        egOnBackspace: cellNew(None),
+        egOnClear: cellNew(None),
+        egOnOpenSettings: cellNew(None),
+    };
+
+    if (!ptrIsNull(v)) {
+        objcSetAssocHandle(v, expandedGridAssocKey(), gcHandleNew(eg));
+        setViewBgColor(v, uiColorSystemBgAlpha(0.02));
+
+        if (!ptrIsNull(sv)) {
+            msgSendVoid1Bool(sv, objcSel("setDelaysContentTouches:"), false);
+            msgSendVoid1Bool(sv, objcSel("setCanCancelContentTouches:"), true);
+            let pgr = msgSend0(sv, objcSel("panGestureRecognizer"));
+            if (!ptrIsNull(pgr)) {
+                msgSendVoid1Bool(pgr, objcSel("setDelaysTouchesBegan:"), false)
+            } else ();
+            msgSendVoid1Bool(sv, objcSel("setTranslatesAutoresizingMaskIntoConstraints:"), false);
+            setAccessibilityId(sv, "JuxuExpandedCandidates");
+            // UIScrollViewContentInsetAdjustmentNever == 2
+            msgSendVoid1I64(sv, objcSel("setContentInsetAdjustmentBehavior:"), intToI64(2));
+            suppressIOS26ScrollEdgeEffects(sv);
+            msgSendVoid1Ptr(v, objcSel("addSubview:"), sv);
+            msgSendVoid0(sv, objcSel("release"))
+        } else ();
+
+        if (!ptrIsNull(rail)) {
+            msgSendVoid1Bool(rail, objcSel("setTranslatesAutoresizingMaskIntoConstraints:"), false);
+            // UILayoutConstraintAxisVertical == 1, UIStackViewDistributionFillEqually == 1
+            msgSendVoid1I64(rail, objcSel("setAxis:"), intToI64(1));
+            msgSendVoid1I64(rail, objcSel("setDistribution:"), intToI64(1));
+            msgSendVoid1Float(rail, objcSel("setSpacing:"), 8.0);
+            msgSendVoid1Ptr(v, objcSel("addSubview:"), rail);
+            msgSendVoid0(rail, objcSel("release"))
+        } else ();
+
+        if (!ptrIsNull(sv) && !ptrIsNull(rail)) {
+            let _ = pinAnchorConst(msgSend0(sv, objcSel("topAnchor")), msgSend0(v, objcSel("topAnchor")), 5.0);
+            let _ = pinAnchorConst(msgSend0(sv, objcSel("leadingAnchor")), msgSend0(v, objcSel("leadingAnchor")), 7.0);
+            let _ = pinAnchorConst(msgSend0(sv, objcSel("bottomAnchor")), msgSend0(v, objcSel("bottomAnchor")), -8.0);
+            let _ = pinAnchorConst(msgSend0(sv, objcSel("trailingAnchor")), msgSend0(rail, objcSel("leadingAnchor")), -8.0);
+
+            let _ = pinAnchorConst(msgSend0(rail, objcSel("topAnchor")), msgSend0(v, objcSel("topAnchor")), 5.0);
+            let _ = pinAnchorConst(msgSend0(rail, objcSel("trailingAnchor")), msgSend0(v, objcSel("trailingAnchor")), -7.0);
+            let _ = pinAnchorConst(msgSend0(rail, objcSel("bottomAnchor")), msgSend0(v, objcSel("bottomAnchor")), -8.0);
+            let _ = pinDimensionConst(msgSend0(rail, objcSel("widthAnchor")), 50.0);
+            ()
+        } else ();
+
+        let collapseBtn = makeRailButton(v, None, Some("chevron.up"), () -> {
+            match cellGet(eg.egOnCollapse) { Some(cb) -> cb(), None -> () }
+        });
+        let delBtn = makeRailButton(v, None, Some("delete.backward"), () -> {
+            match cellGet(eg.egOnBackspace) { Some(cb) -> cb(), None -> () }
+        });
+        let clrBtn = makeRailButton(v, Some("重输"), None, () -> {
+            match cellGet(eg.egOnClear) { Some(cb) -> cb(), None -> () }
+        });
+        let settingsBtn = makeRailButton(v, None, Some("gearshape"), () -> {
+            match cellGet(eg.egOnOpenSettings) { Some(cb) -> cb(), None -> () }
+        });
+        setAccessibilityId(settingsBtn.ecbView, "JuxuOpenSettings");
+        setAccessibilityLabelStr(settingsBtn.ecbView, "打开句序设置");
+
+        vecPush(railBtns, collapseBtn);
+        vecPush(railBtns, delBtn);
+        vecPush(railBtns, clrBtn);
+        vecPush(railBtns, settingsBtn);
+
+        let ri = cellNew(0);
+        while (cellGet(ri) < vecLen(railBtns)) {
+            match vecGet(railBtns, cellGet(ri)) {
+                Some(rb) -> if (!ptrIsNull(rb.ecbView)) {
+                    msgSendVoid1Ptr(rail, objcSel("addArrangedSubview:"), rb.ecbView)
+                } else (),
+                None -> (),
+            };
+            cellSet(ri, cellGet(ri) + 1)
+        }
+    } else ();
+    eg
+}
+
+pub def expandedCandidateReload(
+    eg: IOSExpandedCandidateView,
+    candidates: Vec Candidate,
+    dark: Bool
+): Void =
+    if (!ptrIsNull(eg.egView)) {
+        vecClear(eg.egCandidates);
+        let n = vecLen(candidates);
+        let ci = cellNew(0);
+        while (cellGet(ci) < n) {
+            match vecGet(candidates, cellGet(ci)) {
+                Some(c) -> vecPush(eg.egCandidates, c),
+                None -> (),
+            };
+            cellSet(ci, cellGet(ci) + 1)
+        };
+        cellSet(eg.egDark, dark);
+
+        let textCol = if (dark) uiColorPureWhite() else uiColorBlack();
+        let rbi = cellNew(0);
+        while (cellGet(rbi) < vecLen(eg.egRailButtons)) {
+            match vecGet(eg.egRailButtons, cellGet(rbi)) {
+                Some(rb) -> {
+                    cellSet(rb.ecbIsDark, dark);
+                    ecbUpdateSurface(rb);
+                    msgSendVoid1Ptr(rb.ecbView, objcSel("setTintColor:"), textCol);
+                    msgSendVoid1Ptr1I64(rb.ecbView, objcSel("setTitleColor:forState:"), textCol, intToI64(0));
+                    setLayerShadowOpacity(viewLayer(rb.ecbView), 0.0)
+                },
+                None -> (),
+            };
+            cellSet(rbi, cellGet(rbi) + 1)
+        };
+
+        expandedGridEnsureCapacity(eg, n);
+        let candidateFont = uiSystemFont(17.5, 0);
+        let firstFont = uiSystemFont(17.5, 1);
+
+        uiPerformWithoutAnimation(() -> {
+            let idx = cellNew(0);
+            while (cellGet(idx) < n) {
+                let i = cellGet(idx);
+                match (vecGet(eg.egCandidates, i), vecGet(eg.egCellPool, i)) {
+                    (Some(item), Some(cell)) -> {
+                        let hintOpt = expandedCandidateDisplayHint(item);
+                        let font = if (i == 0) firstFont else candidateFont;
+                        expandedCellConfigureCandidate(cell, item.text, hintOpt, i, font, dark);
+                        setViewHidden(cell.ecbView, false)
+                    },
+                    _ -> (),
+                };
+                cellSet(idx, i + 1)
+            };
+            let poolLen = vecLen(eg.egCellPool);
+            if (n < poolLen) {
+                let hi = cellNew(n);
+                while (cellGet(hi) < poolLen) {
+                    match vecGet(eg.egCellPool, cellGet(hi)) {
+                        Some(cell) -> setViewHidden(cell.ecbView, true),
+                        None -> (),
+                    };
+                    cellSet(hi, cellGet(hi) + 1)
+                }
+            } else ()
+        });
+
+        cellSet(eg.egNeedsRelayout, true);
+        setScrollContentOffsetZero(eg.egScrollView);
+        msgSendVoid0(eg.egView, objcSel("setNeedsLayout"))
+    } else ()
+
+pub def expandedCandidateTrimPool(eg: IOSExpandedCandidateView, maxKeep: Int): Void = {
+    let target = maxInt(vecLen(eg.egCandidates), maxInt(0, maxKeep));
+    let poolLen = vecLen(eg.egCellPool);
+    if (poolLen > target) {
+        let kept: Vec IOSExpandedCellButton = vecWithCap(target);
+        let i = cellNew(0);
+        while (cellGet(i) < poolLen) {
+            let idx = cellGet(i);
+            match vecGet(eg.egCellPool, idx) {
+                Some(cell) ->
+                    if (idx < target) vecPush(kept, cell)
+                    else if (!ptrIsNull(cell.ecbView)) msgSendVoid0(cell.ecbView, objcSel("removeFromSuperview"))
+                    else (),
+                None -> (),
+            };
+            cellSet(i, idx + 1)
+        };
+        vecClear(eg.egCellPool);
+        let j = cellNew(0);
+        while (cellGet(j) < vecLen(kept)) {
+            match vecGet(kept, cellGet(j)) {
+                Some(cell) -> vecPush(eg.egCellPool, cell),
+                None -> (),
+            };
+            cellSet(j, cellGet(j) + 1)
+        }
+    } else ()
+}
+
+pub def expandedCandidateClearAndTrim(eg: IOSExpandedCandidateView, maxKeep: Int): Void = {
+    vecClear(eg.egCandidates);
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(eg.egCellPool)) {
+        match vecGet(eg.egCellPool, cellGet(i)) {
+            Some(cell) -> setViewHidden(cell.ecbView, true),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    expandedCandidateTrimPool(eg, maxKeep);
+    if (!ptrIsNull(eg.egScrollView)) {
+        msgSendVoid1Size(eg.egScrollView, objcSel("setContentSize:"), cgSize(0.0, 0.0))
+    } else ()
+}
+
+// ============================================================================
+// Objective-C Subclass Registration
+// ============================================================================
+
+extern init(101) def registerCandidateViewsObjCClasses(): Void = {
+    let slotCls = objcAllocateClass("UIControl", "JuxuIOSRibbonSlotControl");
+    if (!ptrIsNull(slotCls)) {
+        let _ = objcAddMethod(slotCls, "setHighlighted:", cFnPtr(rscSetHighlighted), "v@:B");
+        let _ = objcAddMethod(slotCls, "layoutSubviews", cFnPtr(rscLayoutSubviews), "v@:");
+        objcRegisterClass(slotCls)
+    } else ();
+
+    let pillCls = objcAllocateClass("UIControl", "JuxuIOSClipboardPillControl");
+    if (!ptrIsNull(pillCls)) {
+        let _ = objcAddMethod(pillCls, "setHighlighted:", cFnPtr(cpcSetHighlighted), "v@:B");
+        let _ = objcAddMethod(pillCls, "layoutSubviews", cFnPtr(cpcLayoutSubviews), "v@:");
+        objcRegisterClass(pillCls)
+    } else ();
+
+    let chevCls = objcAllocateClass("UIControl", "JuxuIOSRibbonChevronButton");
+    if (!ptrIsNull(chevCls)) {
+        let _ = objcAddMethod(chevCls, "setHighlighted:", cFnPtr(rcbSetHighlighted), "v@:B");
+        let _ = objcAddMethod(chevCls, "tintColorDidChange", cFnPtr(rcbTintColorDidChange), "v@:");
+        let _ = objcAddMethod(chevCls, "layoutSubviews", cFnPtr(rcbLayoutSubviews), "v@:");
+        let _ = objcAddMethod(chevCls, "pointInside:withEvent:", cFnPtr(rcbPointInside), "B@:{CGPoint=dd}@");
+        objcRegisterClass(chevCls)
+    } else ();
+
+    let ribCls = objcAllocateClass("UIView", "JuxuIOSCandidateRibbonView");
+    if (!ptrIsNull(ribCls)) {
+        let _ = objcAddProtocol(ribCls, "UIGestureRecognizerDelegate");
+        let _ = objcAddMethod(ribCls, "pointInside:withEvent:", cFnPtr(rvPointInside), "B@:{CGPoint=dd}@");
+        let _ = objcAddMethod(ribCls, "hitTest:withEvent:", cFnPtr(rvHitTest), "@@:{CGPoint=dd}@");
+        let _ = objcAddMethod(ribCls, "layoutSubviews", cFnPtr(rvLayoutSubviews), "v@:");
+        let _ = objcAddMethod(ribCls, "gestureRecognizerShouldBegin:", cFnPtr(rvGestureShouldBegin), "B@:@");
+        let _ = objcAddMethod(ribCls, "handleRibbonHorizontalPan:", cFnPtr(rvHandleHorizontalPan), "v@:@");
+        let _ = objcAddMethod(ribCls, "handleRibbonSlotTap:", cFnPtr(rvHandleSlotTap), "v@:@");
+        let _ = objcAddMethod(ribCls, "handleRibbonChevron:", cFnPtr(rvHandleChevronTap), "v@:@");
+        let _ = objcAddMethod(ribCls, "handleRibbonClipboardTap:", cFnPtr(rvHandleClipboardTap), "v@:@");
+        let _ = objcAddMethod(ribCls, "handleRibbonClipboardDismiss:", cFnPtr(rvHandleClipboardDismiss), "v@:@");
+        objcRegisterClass(ribCls)
+    } else ();
+
+    let svCls = objcAllocateClass("UIScrollView", "JuxuIOSExpandedScrollView");
+    if (!ptrIsNull(svCls)) {
+        let _ = objcAddMethod(svCls, "touchesShouldCancelInContentView:", cFnPtr(esvTouchesShouldCancel), "B@:@");
+        objcRegisterClass(svCls)
+    } else ();
+
+    let ecbCls = objcAllocateClass("UIButton", "JuxuIOSExpandedCellButton");
+    if (!ptrIsNull(ecbCls)) {
+        let _ = objcAddMethod(ecbCls, "setHighlighted:", cFnPtr(ecbSetHighlighted), "v@:B");
+        let _ = objcAddMethod(ecbCls, "layoutSubviews", cFnPtr(ecbLayoutSubviews), "v@:");
+        objcRegisterClass(ecbCls)
+    } else ();
+
+    let egCls = objcAllocateClass("UIView", "JuxuIOSExpandedCandidateView");
+    if (!ptrIsNull(egCls)) {
+        let _ = objcAddMethod(egCls, "layoutSubviews", cFnPtr(egLayoutSubviews), "v@:");
+        let _ = objcAddMethod(egCls, "handleExpandedCellTap:", cFnPtr(egHandleCandidateCellTap), "v@:@");
+        let _ = objcAddMethod(egCls, "handleExpandedRailTap:", cFnPtr(egHandleRailButtonTap), "v@:@");
+        objcRegisterClass(egCls)
+    } else ()
+}

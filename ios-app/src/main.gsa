@@ -1,169 +1,180 @@
-/// Pure Geisha iOS Host App (`Juxu.app`, embedding `JuxuKeyboard.appex`).
-/// Native UIKit `UITabBarController` with 3 tabs (设置 / 试打 / 词库),
-/// synchronized with `JuxuKeyboard.appex` via Keychain (`JuxuSettingsGroup` + `user-data-zlib`).
+/// Pure Geisha iOS Host App (`Juxu.app`, embedding `JuxuKeyboard.appex`):
+/// 1:1 port of `iOS/HostApp/JuxuIOSApp.swift` + `iOS/HostApp/HostAppViews.swift`.
 
-use std.option.{Option, Some, None}
-use std.vec.{vecLen}
-use std.str.{intToStr}
+use sys.env.{argCount}
 use objc.{
     objcClass, objcSel, objcAllocateClass, objcAddMethod, objcAddProtocol, objcRegisterClass,
-    msgSend0, msgSend1Ptr, msgSendInt0, msgSendI64_0,
-    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64,
-}
-use juxu_core.{
-    ConfigFormat, Toml,
-    applyConfig, addUserPhrase, listUserPhrases,
+    msgSend0, msgSend1Ptr, msgSend1I64, msgSendI64_0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool,
 }
 use juxu_shared.{
-    JuxuSession, sessionNew,
-    keychainLoadEngineConfig, keychainSaveEngineConfig,
-    keychainLoadEngineUserData, keychainFlushEngineUserData,
-    cgRect, nsStr, nsStrPtrToString,
-    msgSendRect0, msgSendInitFrame, msgSend4Float, msgSendVoid1Ptr1I64, msgSendVoid1Ptr1Sel1U64,
-    objcAllocInit, objcAllocInitFrame,
+    i64ToPtr,
+    msgSendVoid1Ptr1I64, msgSendVoid1Ptr1Sel2Ptr,
+    nsStr, nsStrPtrToString, objcAllocInit, systemUptimeSeconds,
+    bridgeShared, bridgeLoadConfigAndUser, bridgeFlushUserDataSync, bridgeHandleMemoryWarning,
 }
+use uikit_kit.{
+    notifWillEnterForeground, notifDidEnterBackground, asciiLower,
+}
+use custom_views.{registerCustomViewClasses}
+use tab_home.{registerHomeTabClass, refreshHomeTab, dismissHomeKeyboardState}
+use tab_typing.{registerTypingTabClass, refreshTypingTab}
+use tab_typo.{registerTypoTabClass, refreshTypoTab}
+use tab_lexicon.{registerLexiconTabClass, refreshLexiconTab, syncLexiconTabUiOnly, dismissLexiconKeyboardState}
 
 extern "UIApplicationMain" def c_UIApplicationMain(argc: Int, argv: Ptr, principal: Ptr, delegate: Ptr): Int
-extern "objc_msgSend" def msgSendVoid1Ptr1I64_1Bool(obj: Ptr, sel: Ptr, a0: Ptr, a1: Int64, a2: Bool): Void
+extern "_NSGetArgv" def c_NSGetArgv(): Ptr
+extern "objc_msgSend" def msgSendInitTabItem(obj: Ptr, sel: Ptr, title: Ptr, img: Ptr, tag: Int64): Ptr
 
 def gAppWindow: Cell Ptr = cellNew(ptrNull())
-def gHostSession: Cell (Option JuxuSession) = cellNew(None)
-def gHostPhraseField: Cell Ptr = cellNew(ptrNull())
-def gHostPhraseStatus: Cell Ptr = cellNew(ptrNull())
-def gHostSchemaStatus: Cell Ptr = cellNew(ptrNull())
+def gMainTabs: Cell Ptr = cellNew(ptrNull())
+def gLastFgReloadUptime: Cell Float = cellNew(0.0)
 
-def ensureHostSession(): JuxuSession =
-    match cellGet(gHostSession) {
-        Some(s) -> s,
-        None -> {
-            let s = sessionNew();
-            let _ = keychainLoadEngineConfig(s.engine);
-            let _ = keychainLoadEngineUserData(s.engine);
-            cellSet(gHostSession, Some(s));
-            s
-        },
-    }
+// ============================================================================
+// `IOSHostTab` Navigation Wrapping & Tab Bar Construction
+// ============================================================================
 
-def hostSchemaTag(idx: Int): String =
-    if (idx == 0) "pinyin"
-    else if (idx == 1) "xiaohe_sp"
-    else if (idx == 2) "86"
-    else "cangjie5"
+def makeNavForTab(vcClassName: String, title: String, iconName: String, tag: Int, hideNavBar: Bool): Ptr = {
+    let vc = objcAllocInit(vcClassName);
+    if (!hideNavBar) {
+        msgSendVoid1Ptr(vc, objcSel("setTitle:"), nsStr(title))
+    } else ();
 
-def onHostSchemaChanged(_self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
-    let idx = msgSendInt0(sender, objcSel("selectedSegmentIndex"));
-    let tag = hostSchemaTag(idx);
-    let s = ensureHostSession();
-    applyConfig(s.engine, Toml, "[general]\nschema = \"" + tag + "\"\n");
-    let _ = keychainSaveEngineConfig(s.engine);
-    let lbl = cellGet(gHostSchemaStatus);
-    if (!ptrIsNull(lbl)) {
-        msgSendVoid1Ptr(lbl, objcSel("setText:"), nsStr("已同步方案：" + tag + "（Keychain）"))
-    } else ()
-}
+    let navAlloc = msgSend0(objcClass("UINavigationController"), objcSel("alloc"));
+    let nav = msgSend1Ptr(navAlloc, objcSel("initWithRootViewController:"), vc);
+    if (hideNavBar) {
+        msgSendVoid1Bool(nav, objcSel("setNavigationBarHidden:"), true)
+    } else {
+        let navBar = msgSend0(nav, objcSel("navigationBar"));
+        if (!ptrIsNull(navBar)) {
+            msgSendVoid1Bool(navBar, objcSel("setPrefersLargeTitles:"), true)
+        } else ()
+    };
 
-def onHostAddPhrase(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void = {
-    let s = ensureHostSession();
-    let tf = cellGet(gHostPhraseField);
-    let st = cellGet(gHostPhraseStatus);
-    let phrase = nsStrPtrToString(msgSend0(tf, objcSel("text")));
-    if (strLen(phrase) > 0) {
-        let _ = addUserPhrase(s.engine, phrase);
-        let _ = keychainFlushEngineUserData(s.engine);
-        msgSendVoid1Ptr(tf, objcSel("setText:"), nsStr(""));
-        let cnt = vecLen(listUserPhrases(s.engine));
-        msgSendVoid1Ptr(st, objcSel("setText:"), nsStr("已同步词条「" + phrase + "」，共 " + intToStr(cnt) + " 条"))
-    } else ()
-}
-
-def settingsVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
-    let _ = ensureHostSession();
-    let view = msgSend0(self, objcSel("view"));
-    msgSendVoid1Ptr(view, objcSel("setBackgroundColor:"),
-        msgSend4Float(objcClass("UIColor"), objcSel("colorWithRed:green:blue:alpha:"), 0.97, 0.97, 0.98, 1.0));
-
-    let title = objcAllocInitFrame("UILabel", cgRect(24.0, 80.0, 340.0, 34.0));
-    msgSendVoid1Ptr(title, objcSel("setText:"), nsStr("句序输入法设置"));
-    msgSendVoid1Ptr(view, objcSel("addSubview:"), title);
-
-    let seg = objcAllocInit("UISegmentedControl");
-    msgSendVoid1Ptr1I64_1Bool(seg, objcSel("insertSegmentWithTitle:atIndex:animated:"), nsStr("全拼"), intToI64(0), false);
-    msgSendVoid1Ptr1I64_1Bool(seg, objcSel("insertSegmentWithTitle:atIndex:animated:"), nsStr("双拼"), intToI64(1), false);
-    msgSendVoid1Ptr1I64_1Bool(seg, objcSel("insertSegmentWithTitle:atIndex:animated:"), nsStr("五笔86"), intToI64(2), false);
-    msgSendVoid1Ptr1I64_1Bool(seg, objcSel("insertSegmentWithTitle:atIndex:animated:"), nsStr("仓颉5"), intToI64(3), false);
-    msgSendVoid1I64(seg, objcSel("setSelectedSegmentIndex:"), intToI64(0));
-    let _ = msgSendInitFrame(seg, objcSel("setFrame:"), cgRect(24.0, 130.0, 340.0, 36.0));
-    // UIControlEventValueChanged == 1 << 12 = 4096
-    msgSendVoid1Ptr1Sel1U64(seg, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onHostSchemaChanged:"), intToI64(4096));
-    msgSendVoid1Ptr(view, objcSel("addSubview:"), seg);
-
-    let st = objcAllocInitFrame("UILabel", cgRect(24.0, 180.0, 340.0, 28.0));
-    msgSendVoid1Ptr(st, objcSel("setText:"), nsStr("选择方案后自动通过 Keychain 同步至键盘扩展"));
-    msgSendVoid1Ptr(view, objcSel("addSubview:"), st);
-    cellSet(gHostSchemaStatus, st)
-}
-
-def sandboxVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
-    let view = msgSend0(self, objcSel("view"));
-    msgSendVoid1Ptr(view, objcSel("setBackgroundColor:"),
-        msgSend4Float(objcClass("UIColor"), objcSel("colorWithRed:green:blue:alpha:"), 0.97, 0.97, 0.98, 1.0));
-
-    let hint = objcAllocInitFrame("UILabel", cgRect(24.0, 80.0, 340.0, 56.0));
-    msgSendVoid1I64(hint, objcSel("setNumberOfLines:"), intToI64(0));
-    msgSendVoid1Ptr(hint, objcSel("setText:"), nsStr("在「设置 → 通用 → 键盘 → 添加新键盘」中启用「句序」，然后在下方试打："));
-    msgSendVoid1Ptr(view, objcSel("addSubview:"), hint);
-
-    let tf = objcAllocInitFrame("UITextField", cgRect(24.0, 148.0, 340.0, 44.0));
-    msgSendVoid1I64(tf, objcSel("setBorderStyle:"), intToI64(3));
-    msgSendVoid1Ptr(tf, objcSel("setPlaceholder:"), nsStr("点击此处体验句序键盘…"));
-    msgSendVoid1Ptr(view, objcSel("addSubview:"), tf)
-}
-
-def phrasesVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
-    let s = ensureHostSession();
-    let view = msgSend0(self, objcSel("view"));
-    msgSendVoid1Ptr(view, objcSel("setBackgroundColor:"),
-        msgSend4Float(objcClass("UIColor"), objcSel("colorWithRed:green:blue:alpha:"), 0.97, 0.97, 0.98, 1.0));
-
-    let tf = objcAllocInitFrame("UITextField", cgRect(24.0, 96.0, 240.0, 40.0));
-    msgSendVoid1I64(tf, objcSel("setBorderStyle:"), intToI64(3));
-    msgSendVoid1Ptr(tf, objcSel("setPlaceholder:"), nsStr("输入自定义词条"));
-    msgSendVoid1Ptr(view, objcSel("addSubview:"), tf);
-
-    let btn = objcAllocInitFrame("UIButton", cgRect(274.0, 96.0, 90.0, 40.0));
-    msgSendVoid1Ptr(btn, objcSel("setBackgroundColor:"),
-        msgSend4Float(objcClass("UIColor"), objcSel("colorWithRed:green:blue:alpha:"), 0.05, 0.42, 0.92, 1.0));
-    // UIControlStateNormal == 0, UIControlEventTouchUpInside == 1 << 6 = 64
-    msgSendVoid1Ptr1I64(btn, objcSel("setTitle:forState:"), nsStr("添加"), intToI64(0));
-    msgSendVoid1Ptr1Sel1U64(btn, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onHostAddPhrase:"), intToI64(64));
-    msgSendVoid1Ptr(view, objcSel("addSubview:"), btn);
-
-    let st = objcAllocInitFrame("UILabel", cgRect(24.0, 152.0, 340.0, 30.0));
-    let cnt = vecLen(listUserPhrases(s.engine));
-    msgSendVoid1Ptr(st, objcSel("setText:"), nsStr("当前用户词条：" + intToStr(cnt) + " 条（Keychain zlib 同步）"));
-    msgSendVoid1Ptr(view, objcSel("addSubview:"), st);
-
-    cellSet(gHostPhraseField, tf);
-    cellSet(gHostPhraseStatus, st)
+    let img = msgSend1Ptr(objcClass("UIImage"), objcSel("systemImageNamed:"), nsStr(iconName));
+    let itemAlloc = msgSend0(objcClass("UITabBarItem"), objcSel("alloc"));
+    let tabItem = msgSendInitTabItem(
+        itemAlloc,
+        objcSel("initWithTitle:image:tag:"),
+        nsStr(title),
+        img,
+        intToI64(tag)
+    );
+    msgSendVoid1Ptr(nav, objcSel("setTabBarItem:"), tabItem);
+    let _ = msgSendVoid1Ptr1I64;
+    nav
 }
 
 def makeMainTabBarController(): Ptr = {
-    let vcSettings = objcAllocInit("JuxuIOSSettingsVC");
-    msgSendVoid1Ptr(vcSettings, objcSel("setTitle:"), nsStr("设置"));
-    let vcSandbox = objcAllocInit("JuxuIOSSandboxVC");
-    msgSendVoid1Ptr(vcSandbox, objcSel("setTitle:"), nsStr("试打"));
-    let vcPhrases = objcAllocInit("JuxuIOSPhrasesVC");
-    msgSendVoid1Ptr(vcPhrases, objcSel("setTitle:"), nsStr("词库"));
+    let _ = bridgeShared();
+    let nav0 = makeNavForTab("JuxuHomeTabVC", "首页与试手", "keyboard.badge.ellipsis", 0, true);
+    let nav1 = makeNavForTab("JuxuTypingTabVC", "输入设置", "slider.horizontal.3", 1, false);
+    let nav2 = makeNavForTab("JuxuTypoTabVC", "误触与热区", "hand.point.up.left", 2, false);
+    let nav3 = makeNavForTab("JuxuLexiconTabVC", "个人词库", "text.book.closed", 3, false);
 
     let arr = msgSend0(objcClass("NSMutableArray"), objcSel("array"));
-    msgSendVoid1Ptr(arr, objcSel("addObject:"), vcSettings);
-    msgSendVoid1Ptr(arr, objcSel("addObject:"), vcSandbox);
-    msgSendVoid1Ptr(arr, objcSel("addObject:"), vcPhrases);
+    msgSendVoid1Ptr(arr, objcSel("addObject:"), nav0);
+    msgSendVoid1Ptr(arr, objcSel("addObject:"), nav1);
+    msgSendVoid1Ptr(arr, objcSel("addObject:"), nav2);
+    msgSendVoid1Ptr(arr, objcSel("addObject:"), nav3);
 
     let tabs = objcAllocInit("UITabBarController");
     msgSendVoid1Ptr(tabs, objcSel("setViewControllers:"), arr);
+    msgSendVoid1I64(tabs, objcSel("setSelectedIndex:"), intToI64(0));
+    cellSet(gMainTabs, tabs);
     tabs
 }
+
+// ============================================================================
+// Deep-Link URL Routing (`juxu://...`, `HostAppViews.swift` lines 817-833)
+// ============================================================================
+
+def stripSlashes(s: String): String = {
+    let n = strLen(s);
+    let lo = cellNew(0);
+    while (cellGet(lo) < n && strByteAt(s, cellGet(lo)) == 47) {
+        cellSet(lo, cellGet(lo) + 1)
+    };
+    let hi = cellNew(n);
+    while (cellGet(hi) > cellGet(lo) && strByteAt(s, cellGet(hi) - 1) == 47) {
+        cellSet(hi, cellGet(hi) - 1)
+    };
+    strSlice(s, cellGet(lo), cellGet(hi))
+}
+
+def handleDeepLinkUrl(nsUrl: Ptr): Bool =
+    if (ptrIsNull(nsUrl)) false
+    else {
+        let scheme = asciiLower(nsStrPtrToString(msgSend0(nsUrl, objcSel("scheme"))));
+        if (scheme != "juxu") false
+        else {
+            dismissHomeKeyboardState();
+            dismissLexiconKeyboardState();
+            let hostRaw = nsStrPtrToString(msgSend0(nsUrl, objcSel("host")));
+            let pathRaw = nsStrPtrToString(msgSend0(nsUrl, objcSel("path")));
+            let dest = asciiLower(if (strLen(hostRaw) > 0) hostRaw else stripSlashes(pathRaw));
+            let targetIdx =
+                if (dest == "settings" || dest == "typing" || dest == "schema") 1
+                else if (dest == "typo" || dest == "hitbox") 2
+                else if (dest == "lexicon" || dest == "phrases") 3
+                else if (dest == "home" || dest == "sandbox") 0
+                else 1;
+            let tabs = cellGet(gMainTabs);
+            if (!ptrIsNull(tabs)) {
+                msgSendVoid1I64(tabs, objcSel("setSelectedIndex:"), intToI64(targetIdx));
+                if (targetIdx == 0) refreshHomeTab()
+                else if (targetIdx == 1) refreshTypingTab()
+                else if (targetIdx == 2) refreshTypoTab()
+                else refreshLexiconTab()
+            } else ();
+            true
+        }
+    }
+
+def handleOpenUrlContexts(urlContextsSet: Ptr): Void =
+    if (!ptrIsNull(urlContextsSet)) {
+        let arr = msgSend0(urlContextsSet, objcSel("allObjects"));
+        if (!ptrIsNull(arr)) {
+            let n = i64ToInt(msgSendI64_0(arr, objcSel("count")));
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let idx = cellGet(i);
+                let ctx = msgSend1I64(arr, objcSel("objectAtIndex:"), intToI64(idx));
+                if (!ptrIsNull(ctx)) {
+                    let url = msgSend0(ctx, objcSel("URL"));
+                    let _ = handleDeepLinkUrl(url);
+                    ()
+                } else ();
+                cellSet(i, idx + 1)
+            }
+        } else ()
+    } else ()
+
+// ============================================================================
+// Foreground / Background Sync (`JuxuIOSApp.swift` lines 12-18)
+// ============================================================================
+
+def performForegroundSync(): Void = {
+    let now = systemUptimeSeconds();
+    if (now - cellGet(gLastFgReloadUptime) >= 0.15 || cellGet(gLastFgReloadUptime) == 0.0) {
+        cellSet(gLastFgReloadUptime, now);
+        let s = bridgeShared();
+        bridgeLoadConfigAndUser(s, true);
+        refreshHomeTab();
+        refreshTypingTab();
+        refreshTypoTab();
+        syncLexiconTabUiOnly()
+    } else ()
+}
+
+def performBackgroundFlush(): Void = {
+    let s = bridgeShared();
+    bridgeFlushUserDataSync(s)
+}
+
+// ============================================================================
+// `JuxuIOSSceneDelegate` & `JuxuIOSAppDelegate`
+// ============================================================================
 
 def sceneGetWindow(_self: Ptr, _cmd: Ptr): Ptr =
     cellGet(gAppWindow)
@@ -171,37 +182,62 @@ def sceneGetWindow(_self: Ptr, _cmd: Ptr): Ptr =
 def sceneSetWindow(_self: Ptr, _cmd: Ptr, w: Ptr): Void =
     cellSet(gAppWindow, w)
 
-def sceneWillConnect(_self: Ptr, _cmd: Ptr, scene: Ptr, _session: Ptr, _opts: Ptr): Void = {
+def sceneWillConnect(_self: Ptr, _cmd: Ptr, scene: Ptr, _session: Ptr, connectionOptions: Ptr): Void = {
     let winAlloc = msgSend0(objcClass("UIWindow"), objcSel("alloc"));
     let win = msgSend1Ptr(winAlloc, objcSel("initWithWindowScene:"), scene);
-    msgSendVoid1Ptr(win, objcSel("setRootViewController:"), makeMainTabBarController());
+    let tabs = makeMainTabBarController();
+    msgSendVoid1Ptr(win, objcSel("setRootViewController:"), tabs);
     msgSendVoid0(win, objcSel("makeKeyAndVisible"));
-    cellSet(gAppWindow, win)
+    cellSet(gAppWindow, win);
+
+    if (!ptrIsNull(connectionOptions)) {
+        let urlContexts = msgSend0(connectionOptions, objcSel("URLContexts"));
+        handleOpenUrlContexts(urlContexts)
+    } else ()
 }
 
-def appDidFinishLaunching(_self: Ptr, _cmd: Ptr, _app: Ptr, _opts: Ptr): Bool =
+def sceneOpenUrlContexts(_self: Ptr, _cmd: Ptr, _scene: Ptr, urlContexts: Ptr): Void =
+    handleOpenUrlContexts(urlContexts)
+
+def sceneWillEnterForeground(_self: Ptr, _cmd: Ptr, _scene: Ptr): Void =
+    performForegroundSync()
+
+def sceneDidBecomeActive(_self: Ptr, _cmd: Ptr, _scene: Ptr): Void =
+    performForegroundSync()
+
+def sceneDidEnterBackground(_self: Ptr, _cmd: Ptr, _scene: Ptr): Void =
+    performBackgroundFlush()
+
+def appOnWillEnterForeground(_self: Ptr, _cmd: Ptr, _notif: Ptr): Void =
+    performForegroundSync()
+
+def appOnDidEnterBackground(_self: Ptr, _cmd: Ptr, _notif: Ptr): Void =
+    performBackgroundFlush()
+
+def appDidFinishLaunching(self: Ptr, _cmd: Ptr, _app: Ptr, _opts: Ptr): Bool = {
+    let _ = bridgeShared();
+    let nc = msgSend0(objcClass("NSNotificationCenter"), objcSel("defaultCenter"));
+    if (!ptrIsNull(nc)) {
+        msgSendVoid1Ptr1Sel2Ptr(nc, objcSel("addObserver:selector:name:object:"), self, objcSel("onAppWillEnterForeground:"), notifWillEnterForeground(), ptrNull());
+        msgSendVoid1Ptr1Sel2Ptr(nc, objcSel("addObserver:selector:name:object:"), self, objcSel("onAppDidEnterBackground:"), notifDidEnterBackground(), ptrNull())
+    } else ();
     true
+}
+
+def appOpenUrl(_self: Ptr, _cmd: Ptr, _app: Ptr, url: Ptr, _opts: Ptr): Bool =
+    handleDeepLinkUrl(url)
+
+def appDidReceiveMemoryWarning(_self: Ptr, _cmd: Ptr, _app: Ptr): Void = {
+    let s = bridgeShared();
+    bridgeHandleMemoryWarning(s)
+}
 
 extern init(100) def registerIosHostAppClasses(): Void = {
-    let sCls = objcAllocateClass("UIViewController", "JuxuIOSSettingsVC");
-    if (!ptrIsNull(sCls)) {
-        let _ = objcAddMethod(sCls, "viewDidLoad", cFnPtr(settingsVcViewDidLoad), "v@:");
-        let _ = objcAddMethod(sCls, "onHostSchemaChanged:", cFnPtr(onHostSchemaChanged), "v@:@");
-        objcRegisterClass(sCls)
-    } else ();
-
-    let bCls = objcAllocateClass("UIViewController", "JuxuIOSSandboxVC");
-    if (!ptrIsNull(bCls)) {
-        let _ = objcAddMethod(bCls, "viewDidLoad", cFnPtr(sandboxVcViewDidLoad), "v@:");
-        objcRegisterClass(bCls)
-    } else ();
-
-    let pCls = objcAllocateClass("UIViewController", "JuxuIOSPhrasesVC");
-    if (!ptrIsNull(pCls)) {
-        let _ = objcAddMethod(pCls, "viewDidLoad", cFnPtr(phrasesVcViewDidLoad), "v@:");
-        let _ = objcAddMethod(pCls, "onHostAddPhrase:", cFnPtr(onHostAddPhrase), "v@:@");
-        objcRegisterClass(pCls)
-    } else ();
+    registerCustomViewClasses();
+    registerHomeTabClass();
+    registerTypingTabClass();
+    registerTypoTabClass();
+    registerLexiconTabClass();
 
     let scCls = objcAllocateClass("UIResponder", "JuxuIOSSceneDelegate");
     if (!ptrIsNull(scCls)) {
@@ -209,6 +245,10 @@ extern init(100) def registerIosHostAppClasses(): Void = {
         let _ = objcAddMethod(scCls, "window", cFnPtr(sceneGetWindow), "@@:");
         let _ = objcAddMethod(scCls, "setWindow:", cFnPtr(sceneSetWindow), "v@:@");
         let _ = objcAddMethod(scCls, "scene:willConnectToSession:options:", cFnPtr(sceneWillConnect), "v@:@@@");
+        let _ = objcAddMethod(scCls, "scene:openURLContexts:", cFnPtr(sceneOpenUrlContexts), "v@:@@");
+        let _ = objcAddMethod(scCls, "sceneWillEnterForeground:", cFnPtr(sceneWillEnterForeground), "v@:@");
+        let _ = objcAddMethod(scCls, "sceneDidBecomeActive:", cFnPtr(sceneDidBecomeActive), "v@:@");
+        let _ = objcAddMethod(scCls, "sceneDidEnterBackground:", cFnPtr(sceneDidEnterBackground), "v@:@");
         objcRegisterClass(scCls)
     } else ();
 
@@ -216,11 +256,18 @@ extern init(100) def registerIosHostAppClasses(): Void = {
     if (!ptrIsNull(appCls)) {
         let _ = objcAddProtocol(appCls, "UIApplicationDelegate");
         let _ = objcAddMethod(appCls, "application:didFinishLaunchingWithOptions:", cFnPtr(appDidFinishLaunching), "B@:@@");
+        let _ = objcAddMethod(appCls, "application:openURL:options:", cFnPtr(appOpenUrl), "B@:@@@");
+        let _ = objcAddMethod(appCls, "applicationDidReceiveMemoryWarning:", cFnPtr(appDidReceiveMemoryWarning), "v@:@");
+        let _ = objcAddMethod(appCls, "onAppWillEnterForeground:", cFnPtr(appOnWillEnterForeground), "v@:@");
+        let _ = objcAddMethod(appCls, "onAppDidEnterBackground:", cFnPtr(appOnDidEnterBackground), "v@:@");
         objcRegisterClass(appCls)
     } else ()
 }
 
 def main(): Void = {
-    let _ = c_UIApplicationMain(0, ptrNull(), ptrNull(), nsStr("JuxuIOSAppDelegate"));
+    let argvSlot = c_NSGetArgv();
+    let argv = if (ptrIsNull(argvSlot)) ptrNull() else i64ToPtr(ptrReadI64Le(argvSlot, 0));
+    let argc = if (ptrIsNull(argv)) 0 else argCount();
+    let _ = c_UIApplicationMain(argc, argv, ptrNull(), nsStr("JuxuIOSAppDelegate"));
     ()
 }

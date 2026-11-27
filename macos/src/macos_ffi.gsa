@@ -1,0 +1,320 @@
+/// Shared macOS AppKit / QuartzCore / Carbon / CGEvent typed FFI & UI drawing helpers
+/// used across `floating_hud`, `candidate_panel`, `input_controller`, `settings_window`, and `main`.
+
+use std.math.{floor, ceil}
+use std.str.{strContains}
+use objc.{
+    objcClass, objcSel, msgSend0, msgSend1Ptr, msgSend1Float, msgSendI64_0, msgSendFloat0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
+}
+use juxu_shared.{
+    CGPoint, CGSize, CGRect, NSRange, cgPoint, cgRect,
+    nsStr, nsStrPtrToString, objcAllocInitFrame,
+    msgSend2Ptr, msgSend4Float, msgSend2Float, msgSend1Ptr1Float, msgSendVoid1Rect,
+}
+
+// ============================================================================
+// C11 Bridge Imports (`csrc/macos_tis.c`)
+// ============================================================================
+
+pub extern noalloc "juxu_wall_now_ms" def wallNowMs(): Int64
+pub extern noalloc "juxu_floating_window_base_level" def floatingWindowBaseLevel(): Int64
+pub extern noalloc "juxu_is_secure_event_input_enabled" def isSecureEventInputEnabled(): Bool
+pub extern noalloc "juxu_cg_preflight_post_event_access" def cgPreflightPostEventAccess(): Bool
+pub extern "juxu_post_virtual_key" def postVirtualKey(keyCode: Int): Void
+pub extern noalloc "juxu_has_intervening_hid_input" def hasInterveningHidInput(downTs: Float, nowUptime: Float): Bool
+pub extern "juxu_ns_beep" def nsBeep(): Void
+
+pub extern "juxu_msgSendSuper_init3ptr" def objcSendSuperInit3Ptr(
+    receiver: Ptr, superClassName: String, sel: Ptr, a0: Ptr, a1: Ptr, a2: Ptr
+): Ptr
+
+extern "juxu_msgSendSuper_void1size" def c_msgSendSuper_void1size(
+    receiver: Ptr, superClassName: String, sel: Ptr, w: Float, h: Float
+): Void
+
+pub def objcSendSuperVoid1Size(receiver: Ptr, superClassName: String, sel: Ptr, sz: CGSize): Void =
+    c_msgSendSuper_void1size(receiver, superClassName, sel, sz.width, sz.height)
+
+pub extern "juxu_layer_set_continuous_corner" def layerSetContinuousCorner(
+    layer: Ptr, radius: Float, masksToBounds: Bool
+): Void
+
+pub extern "juxu_layer_set_border_rgba" def layerSetBorderRgba(
+    layer: Ptr, width: Float, r: Float, g: Float, b: Float, a: Float
+): Void
+
+pub extern "juxu_tis_register_system_cache" def tisRegisterSystemCache(bundleUrl: Ptr): Void
+pub extern "juxu_tis_register_and_enable" def tisRegisterAndEnable(
+    bundleUrl: Ptr, bundleId: String, modeId: String, shouldSelect: Bool
+): Void
+
+// ============================================================================
+// Typed `objc_msgSend` Signatures for AppKit & InputMethodKit
+// ============================================================================
+
+pub extern "objc_msgSend" def msgSendSetFrameDisplay(win: Ptr, sel: Ptr, r: CGRect, disp: Bool): Void
+pub extern "objc_msgSend" def msgSendSetFrameDisplayAnimate(
+    win: Ptr, sel: Ptr, r: CGRect, disp: Bool, anim: Bool
+): Void
+pub extern "objc_msgSend" def msgSendDrawAtPoint(attrStr: Ptr, sel: Ptr, pt: CGPoint): Void
+pub extern "objc_msgSend" def msgSendDrawInRectAttrs(nsStrObj: Ptr, sel: Ptr, r: CGRect, attrs: Ptr): Void
+pub extern "objc_msgSend" def msgSendDrawInRectImg(
+    img: Ptr, sel: Ptr, dst: CGRect, src: CGRect, op: Int64, frac: Float, respectFlipped: Bool, hints: Ptr
+): Void
+pub extern "objc_msgSend" def msgSendSizeWithAttrs(nsStrObj: Ptr, sel: Ptr, attrs: Ptr): CGSize
+pub extern "objc_msgSend" def msgSendBezRoundedRect(
+    cls: Ptr, sel: Ptr, r: CGRect, rx: Float, ry: Float
+): Ptr
+pub extern "objc_msgSend" def msgSendRect1Range1Ptr(
+    obj: Ptr, sel: Ptr, r: NSRange, actualOut: Ptr
+): CGRect
+pub extern "objc_msgSend" def msgSendTrackingAreaInit(
+    obj: Ptr, sel: Ptr, r: CGRect, opts: Int64, owner: Ptr, info: Ptr
+): Ptr
+pub extern "objc_msgSend" def msgSendBitmapInit(
+    obj: Ptr, sel: Ptr, planes: Ptr, w: Int64, h: Int64,
+    bps: Int64, spp: Int64, alpha: Bool, planar: Bool, csName: Ptr, bpr: Int64, bpp: Int64
+): Ptr
+pub extern "objc_msgSend" def msgSendCacheDisplay(view: Ptr, sel: Ptr, r: CGRect, rep: Ptr): Void
+pub extern "objc_msgSend" def msgSendRepUsingType(rep: Ptr, sel: Ptr, fileType: Int64, props: Ptr): Ptr
+pub extern "objc_msgSend" def msgSendWriteToFile(dataObj: Ptr, sel: Ptr, path: Ptr, atomically: Bool): Bool
+pub extern "objc_msgSend" def msgSendKeyEvent(
+    cls: Ptr, sel: Ptr, evType: Int64, loc: CGPoint, mods: Int64, ts: Float,
+    winNum: Int64, ctx: Ptr, chars: Ptr, ignChars: Ptr, isRepeat: Bool, keyCode: Int
+): Ptr
+pub extern "objc_msgSend" def msgSendGradInit(obj: Ptr, sel: Ptr, startCol: Ptr, endCol: Ptr): Ptr
+pub extern "objc_msgSend" def msgSendGradDrawInRect(grad: Ptr, sel: Ptr, r: CGRect, angle: Float): Void
+
+// ============================================================================
+// Math & Geometry Utilities
+// ============================================================================
+
+pub def roundFloat(x: Float): Float =
+    if (x >= 0.0) floor(x + 0.5) else ceil(x - 0.5)
+
+pub def maxFloat(a: Float, b: Float): Float =
+    if (a >= b) a else b
+
+pub def minFloat(a: Float, b: Float): Float =
+    if (a <= b) a else b
+
+pub def clampFloat(v: Float, lo: Float, hi: Float): Float =
+    if (v < lo) lo else if (v > hi) hi else v
+
+// ============================================================================
+// AppKit Font, Color, Appearance, Bezier & SF Symbol Helpers
+// ============================================================================
+
+pub def fontWeightRegular(): Float = 0.0
+pub def fontWeightMedium(): Float = 0.23
+pub def fontWeightSemibold(): Float = 0.30
+
+pub def nsFontSystem(size: Float, weight: Float): Ptr =
+    msgSend2Float(objcClass("NSFont"), objcSel("systemFontOfSize:weight:"), size, weight)
+
+pub def nsFontMonoDigit(size: Float, weight: Float): Ptr =
+    msgSend2Float(objcClass("NSFont"), objcSel("monospacedDigitSystemFontOfSize:weight:"), size, weight)
+
+pub def nsFontMono(size: Float, weight: Float): Ptr =
+    msgSend2Float(objcClass("NSFont"), objcSel("monospacedSystemFontOfSize:weight:"), size, weight)
+
+pub def nsFontNamedOrSystem(name: String, size: Float, fallbackWeight: Float): Ptr = {
+    let f = msgSend1Ptr1Float(objcClass("NSFont"), objcSel("fontWithName:size:"), nsStr(name), size);
+    if (!ptrIsNull(f)) f else nsFontSystem(size, fallbackWeight)
+}
+
+pub def nsFontRounded(size: Float, weight: Float): Ptr = {
+    let base = nsFontSystem(size, weight);
+    if (ptrIsNull(base)) base
+    else {
+        let desc = msgSend0(base, objcSel("fontDescriptor"));
+        if (ptrIsNull(desc)) base
+        else {
+            let rDesc = msgSend1Ptr(desc, objcSel("fontDescriptorWithDesign:"), nsStr("NSCTFontUIFontDesignRounded"));
+            if (ptrIsNull(rDesc)) base
+            else {
+                let f = msgSend1Ptr1Float(objcClass("NSFont"), objcSel("fontWithDescriptor:size:"), rDesc, size);
+                if (!ptrIsNull(f)) f else base
+            }
+        }
+    }
+}
+
+pub def nsFontAscender(font: Ptr): Float =
+    if (ptrIsNull(font)) 14.0 else msgSendFloat0(font, objcSel("ascender"))
+
+pub def nsFontDescender(font: Ptr): Float =
+    if (ptrIsNull(font)) -4.0 else msgSendFloat0(font, objcSel("descender"))
+
+pub def nsColorRgba(r: Float, g: Float, b: Float, a: Float): Ptr =
+    msgSend4Float(objcClass("NSColor"), objcSel("colorWithSRGBRed:green:blue:alpha:"), r, g, b, a)
+
+pub def nsColorAlpha(col: Ptr, a: Float): Ptr =
+    if (ptrIsNull(col)) col
+    else msgSend1Float(col, objcSel("colorWithAlphaComponent:"), a)
+
+pub def nsColorClear(): Ptr = msgSend0(objcClass("NSColor"), objcSel("clearColor"))
+pub def nsColorWhite(): Ptr = msgSend0(objcClass("NSColor"), objcSel("whiteColor"))
+pub def nsColorBlack(): Ptr = msgSend0(objcClass("NSColor"), objcSel("blackColor"))
+pub def nsColorLabel(): Ptr = msgSend0(objcClass("NSColor"), objcSel("labelColor"))
+pub def nsColorSecondaryLabel(): Ptr = msgSend0(objcClass("NSColor"), objcSel("secondaryLabelColor"))
+pub def nsColorTertiaryLabel(): Ptr = msgSend0(objcClass("NSColor"), objcSel("tertiaryLabelColor"))
+pub def nsColorQuaternaryLabel(): Ptr = msgSend0(objcClass("NSColor"), objcSel("quaternaryLabelColor"))
+pub def nsColorSeparator(): Ptr = msgSend0(objcClass("NSColor"), objcSel("separatorColor"))
+pub def nsColorAccent(): Ptr = msgSend0(objcClass("NSColor"), objcSel("controlAccentColor"))
+pub def nsColorWindowBg(): Ptr = msgSend0(objcClass("NSColor"), objcSel("windowBackgroundColor"))
+pub def nsColorControlBg(): Ptr = msgSend0(objcClass("NSColor"), objcSel("controlBackgroundColor"))
+pub def nsColorTeal(): Ptr = msgSend0(objcClass("NSColor"), objcSel("systemTealColor"))
+pub def nsColorOrange(): Ptr = msgSend0(objcClass("NSColor"), objcSel("systemOrangeColor"))
+
+pub def viewIsDarkAppearance(view: Ptr): Bool =
+    if (ptrIsNull(view)) false
+    else {
+        let app = msgSend0(view, objcSel("effectiveAppearance"));
+        if (ptrIsNull(app)) false
+        else {
+            let names = msgSend0(objcClass("NSMutableArray"), objcSel("array"));
+            msgSendVoid1Ptr(names, objcSel("addObject:"), nsStr("NSAppearanceNameAqua"));
+            msgSendVoid1Ptr(names, objcSel("addObject:"), nsStr("NSAppearanceNameDarkAqua"));
+            let best = msgSend1Ptr(app, objcSel("bestMatchFromAppearancesWithNames:"), names);
+            strContains(nsStrPtrToString(best), "Dark")
+        }
+    }
+
+pub def fillRoundedRect(r: CGRect, radius: Float, color: Ptr): Void =
+    if (!ptrIsNull(color) && r.size.width > 0.0 && r.size.height > 0.0) {
+        msgSendVoid0(color, objcSel("setFill"));
+        let p = msgSendBezRoundedRect(
+            objcClass("NSBezierPath"),
+            objcSel("bezierPathWithRoundedRect:xRadius:yRadius:"),
+            r, radius, radius
+        );
+        msgSendVoid0(p, objcSel("fill"))
+    } else ()
+
+pub def strokeRoundedRect(r: CGRect, radius: Float, lineWidth: Float, color: Ptr): Void =
+    if (!ptrIsNull(color) && lineWidth > 0.0 && r.size.width > lineWidth && r.size.height > lineWidth) {
+        let half = lineWidth * 0.5;
+        let insetR = cgRect(
+            r.origin.x + half,
+            r.origin.y + half,
+            r.size.width - lineWidth,
+            r.size.height - lineWidth
+        );
+        let adjRadius = maxFloat(0.0, radius - half);
+        msgSendVoid0(color, objcSel("setStroke"));
+        let p = msgSendBezRoundedRect(
+            objcClass("NSBezierPath"),
+            objcSel("bezierPathWithRoundedRect:xRadius:yRadius:"),
+            insetR, adjRadius, adjRadius
+        );
+        msgSendVoid1Float(p, objcSel("setLineWidth:"), lineWidth);
+        msgSendVoid0(p, objcSel("stroke"))
+    } else ()
+
+pub def fillHairlineRect(r: CGRect, color: Ptr): Void =
+    if (!ptrIsNull(color) && r.size.width > 0.0 && r.size.height > 0.0) {
+        msgSendVoid0(color, objcSel("setFill"));
+        msgSendVoid1Rect(objcClass("NSBezierPath"), objcSel("fillRect:"), r)
+    } else ()
+
+pub def makeTextAttrs(font: Ptr, color: Ptr): Ptr = {
+    let d = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
+    if (!ptrIsNull(font)) {
+        let _ = msgSend2Ptr(d, objcSel("setObject:forKey:"), font, nsStr("NSFont"));
+        ()
+    } else ();
+    if (!ptrIsNull(color)) {
+        let _ = msgSend2Ptr(d, objcSel("setObject:forKey:"), color, nsStr("NSColor"));
+        ()
+    } else ();
+    d
+}
+
+pub def makeAttrString(s: String, attrs: Ptr): Ptr = {
+    let alloc = msgSend0(objcClass("NSAttributedString"), objcSel("alloc"));
+    msgSend2Ptr(alloc, objcSel("initWithString:attributes:"), nsStr(s), attrs)
+}
+
+pub def makeUnderlinedAttrString(s: String): Ptr = {
+    let d = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
+    let numOne = msgSend1I64(objcClass("NSNumber"), objcSel("numberWithInteger:"), intToI64(1));
+    let _ = msgSend2Ptr(d, objcSel("setObject:forKey:"), numOne, nsStr("NSUnderline"));
+    makeAttrString(s, d)
+}
+
+extern "objc_msgSend" def msgSend1I64(cls: Ptr, sel: Ptr, v: Int64): Ptr
+
+pub def nsSymbolImage(symbolName: String, ptSize: Float, weight: Float): Ptr = {
+    let imgCls = objcClass("NSImage");
+    if (ptrIsNull(imgCls)) ptrNull()
+    else {
+        let base = msgSend2Ptr(
+            imgCls,
+            objcSel("imageWithSystemSymbolName:accessibilityDescription:"),
+            nsStr(symbolName),
+            ptrNull()
+        );
+        if (ptrIsNull(base)) ptrNull()
+        else {
+            let cfgCls = objcClass("NSImageSymbolConfiguration");
+            if (ptrIsNull(cfgCls)) base
+            else {
+                let cfg = msgSend2Float(
+                    cfgCls,
+                    objcSel("configurationWithPointSize:weight:"),
+                    ptSize, weight
+                );
+                if (ptrIsNull(cfg)) base
+                else {
+                    let configured = msgSend1Ptr(base, objcSel("imageWithSymbolConfiguration:"), cfg);
+                    if (!ptrIsNull(configured)) configured else base
+                }
+            }
+        }
+    }
+}
+
+pub def makeSymbolImageView(frame: CGRect, symbolName: String, ptSize: Float, weight: Float, tintColor: Ptr): Ptr = {
+    let iv = objcAllocInitFrame("NSImageView", frame);
+    let img = nsSymbolImage(symbolName, ptSize, weight);
+    if (!ptrIsNull(img)) {
+        msgSendVoid1Ptr(iv, objcSel("setImage:"), img)
+    } else ();
+    if (!ptrIsNull(tintColor)) {
+        msgSendVoid1Ptr(iv, objcSel("setContentTintColor:"), tintColor)
+    } else ();
+    iv
+}
+
+pub def makeStaticLabel(frame: CGRect, text: String, font: Ptr, color: Ptr, wraps: Bool): Ptr = {
+    let lbl = objcAllocInitFrame("NSTextField", frame);
+    msgSendVoid1Bool(lbl, objcSel("setBezeled:"), false);
+    msgSendVoid1Bool(lbl, objcSel("setDrawsBackground:"), false);
+    msgSendVoid1Bool(lbl, objcSel("setEditable:"), false);
+    msgSendVoid1Bool(lbl, objcSel("setSelectable:"), false);
+    if (!ptrIsNull(font)) msgSendVoid1Ptr(lbl, objcSel("setFont:"), font) else ();
+    if (!ptrIsNull(color)) msgSendVoid1Ptr(lbl, objcSel("setTextColor:"), color) else ();
+    if (wraps) {
+        msgSendVoid1Bool(lbl, objcSel("setUsesSingleLineMode:"), false);
+        let cellObj = msgSend0(lbl, objcSel("cell"));
+        if (!ptrIsNull(cellObj)) {
+            msgSendVoid1Bool(cellObj, objcSel("setWraps:"), true);
+            msgSendVoid1Bool(cellObj, objcSel("setScrollable:"), false)
+        } else ()
+    } else {
+        msgSendVoid1Bool(lbl, objcSel("setUsesSingleLineMode:"), true);
+        msgSendVoid1I64(lbl, objcSel("setLineBreakMode:"), intToI64(4))
+    };
+    msgSendVoid1Ptr(lbl, objcSel("setStringValue:"), nsStr(text));
+    lbl
+}
+
+pub def mouseScreenLocation(): CGPoint = {
+    let evCls = objcClass("NSEvent");
+    if (ptrIsNull(evCls)) cgPoint(420.0, 420.0)
+    else msgSendPoint0(evCls, objcSel("mouseLocation"))
+}
+
+extern "objc_msgSend" def msgSendPoint0(obj: Ptr, sel: Ptr): CGPoint

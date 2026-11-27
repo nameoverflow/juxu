@@ -1,25 +1,33 @@
-/// Apple Keychain (`Security.framework`) + `NSData` zlib compression bridge for cross-process
-/// settings & user-data synchronization between iOS Host App (`Juxu.app`) and Keyboard Extension (`JuxuKeyboard.appex`).
-/// 100% pure Geisha — zero C shims required.
+/// Apple Keychain (`Security.framework`) + `NSData` zlib compression bridge (`IOSSharedSettings` 1:1 port).
+/// Supports:
+/// - Legacy access-group migration (`JuxuSettingsGroup` <- `LegacyJuxuSettingsGroup` <- `PrisWubiSettingsGroup`)
+/// - Settings TOML (`input-settings`)
+/// - 26-key `touch-profile` JSON with conflict-safe host-reset protection
+/// - Zlib-compressed `user-data-zlib` + fast `user-data-seq` (`SEQ\t<u64>` header parsing)
+/// - Zlib-compressed 400-line `eval-log-ring` JSONL ring buffer.
 
 use std.option.{Option, Some, None}
 use std.result.{Ok, Err}
-use std.str.{i64ToStr, parseInt64}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGetOr}
+use std.buf.{bufWithCap, bufPushStr, bufPushByte, bufToString}
+use std.str.{i64ToStr, parseInt64, strStartsWith, strTrim}
+use std.codec.{Value, VInt, VFloat, VStr, VArr, VObj}
+use std.json.{parse}
 use objc.{
     objcClass, objcSel, msgSend0, msgSend1Ptr, msgSend1I64, msgSend1Bool,
-    msgSendVoid1Ptr, msgSendI64_0,
 }
 use apple_geom.{nsStr, nsStrPtrToString, msgSend2Ptr, msgSend1Ptr1I64}
 use juxu_core.{
     JuxuEngine, ConfigFormat, Toml,
+    KeyTouchSample, TouchKeyOffset, MkTouchKeyOffset, touchKeyOffsetZero,
     applyConfig, exportConfig, importUserDataTsv, exportUserDataTsv, userDataSeq, isUserDirty,
+    touchProfileToJson,
 }
 
 extern "SecItemCopyMatching" def c_SecItemCopyMatching(query: Ptr, resultOut: Ptr): Int
 extern "SecItemAdd" def c_SecItemAdd(attrs: Ptr, resultOut: Ptr): Int
 extern "SecItemUpdate" def c_SecItemUpdate(query: Ptr, attrsToUpdate: Ptr): Int
 extern "SecItemDelete" def c_SecItemDelete(query: Ptr): Int
-extern "objc_msgSend" def msgSendDataBytes(cls: Ptr, sel: Ptr, bytes: Ptr, len: Int64): Ptr
 extern "objc_msgSend" def msgSendCompress(nsData: Ptr, sel: Ptr, algo: Int64, errOut: Ptr): Ptr
 
 pub def kcAccountSettings(): String = "input-settings"
@@ -28,25 +36,35 @@ pub def kcAccountEvalLog(): String = "eval-log-ring"
 pub def kcAccountUserDataZlib(): String = "user-data-zlib"
 pub def kcAccountUserDataSeq(): String = "user-data-seq"
 
-def bundleAccessGroup(): Option String = {
-    let bundle = msgSend0(objcClass("NSBundle"), objcSel("mainBundle"));
-    if (ptrIsNull(bundle)) None
+def normalizeAccessGroup(raw: String): Option String = {
+    let trimmed = strTrim(raw);
+    if (strLen(trimmed) == 0) None
+    else if (strStartsWith(trimmed, "$(AppIdentifierPrefix)")) {
+        let rest = strSlice(trimmed, 22, strLen(trimmed));
+        if (strLen(rest) > 0) Some(rest) else None
+    } else Some(trimmed)
+}
+
+def bundleAccessGroupForKey(groupKey: String): Option String = {
+    let cls = objcClass("NSBundle");
+    if (ptrIsNull(cls)) None
     else {
-        let v = msgSend1Ptr(bundle, objcSel("objectForInfoDictionaryKey:"), nsStr("JuxuSettingsGroup"));
-        if (ptrIsNull(v)) None
+        let bundle = msgSend0(cls, objcSel("mainBundle"));
+        if (ptrIsNull(bundle)) None
         else {
-            let s = nsStrPtrToString(v);
-            if (strLen(s) > 0) Some(s) else None
+            let v = msgSend1Ptr(bundle, objcSel("objectForInfoDictionaryKey:"), nsStr(groupKey));
+            if (ptrIsNull(v)) None
+            else normalizeAccessGroup(nsStrPtrToString(v))
         }
     }
 }
 
-def makeKeychainQuery(account: String): Ptr = {
+def makeKeychainQueryWithGroup(account: String, groupOpt: Option String, service: String): Ptr = {
     let q = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
     let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsStr("genp"), nsStr("class"));
-    let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsStr("Juxu"), nsStr("svce"));
+    let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsStr(service), nsStr("svce"));
     let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsStr(account), nsStr("acct"));
-    match bundleAccessGroup() {
+    match groupOpt {
         Some(grp) -> {
             let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsStr(grp), nsStr("agrp"));
             ()
@@ -55,6 +73,12 @@ def makeKeychainQuery(account: String): Ptr = {
     };
     q
 }
+
+def makePrimaryKeychainQuery(account: String): Option Ptr =
+    match bundleAccessGroupForKey("JuxuSettingsGroup") {
+        Some(grp) -> Some(makeKeychainQueryWithGroup(account, Some(grp), "Juxu")),
+        None -> None,
+    }
 
 def stringToNsData(s: String): Ptr = {
     let nss = nsStr(s);
@@ -70,30 +94,64 @@ def nsDataToString(nsData: Ptr): Option String =
         if (ptrIsNull(nss)) None else Some(nsStrPtrToString(nss))
     }
 
-/// Write raw `NSData*` into Keychain under `account` (insert or update).
+def tryReadQuery(q: Ptr): Ptr = {
+    let numTrue = msgSend1Bool(objcClass("NSNumber"), objcSel("numberWithBool:"), true);
+    let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), numTrue, nsStr("r_Data"));
+    let outSlot = ptrAllocBytes(8);
+    ptrWriteI64Le(outSlot, 0, intToI64(0));
+    let status = c_SecItemCopyMatching(q, outSlot);
+    if (status == 0) ptrOffset64(ptrNull(), ptrReadI64Le(outSlot, 0)) else ptrNull()
+}
+
+/// Write raw `NSData*` into Keychain under `account` (`JuxuSettingsGroup` / `"Juxu"`).
 pub def keychainWriteData(account: String, nsData: Ptr): Bool =
     if (ptrIsNull(nsData)) false
     else {
-        let q = makeKeychainQuery(account);
+        let q = match makePrimaryKeychainQuery(account) {
+            Some(pq) -> pq,
+            None -> makeKeychainQueryWithGroup(account, None, "Juxu"),
+        };
         let upd = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
         let _ = msgSend2Ptr(upd, objcSel("setObject:forKey:"), nsData, nsStr("v_Data"));
         let status = c_SecItemUpdate(q, upd);
         if (status == 0) true
         else {
             let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsData, nsStr("v_Data"));
+            // kSecAttrAccessibleWhenUnlockedThisDeviceOnly == "dku"
             let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), nsStr("dku"), nsStr("pdmn"));
             c_SecItemAdd(q, ptrNull()) == 0
         }
     }
 
-/// Read raw `NSData*` from Keychain under `account`.
+/// Read raw `NSData*` from Keychain under `account`, migrating from legacy groups if found.
 pub def keychainReadData(account: String): Ptr = {
-    let q = makeKeychainQuery(account);
-    let numTrue = msgSend1Bool(objcClass("NSNumber"), objcSel("numberWithBool:"), true);
-    let _ = msgSend2Ptr(q, objcSel("setObject:forKey:"), numTrue, nsStr("r_Data"));
-    let outSlot = ptrAllocBytes(8);
-    let status = c_SecItemCopyMatching(q, outSlot);
-    if (status == 0) ptrOffset64(ptrNull(), ptrReadI64Le(outSlot, 0)) else ptrNull()
+    let tryGroup = (groupKey: String, service: String) -> {
+        match bundleAccessGroupForKey(groupKey) {
+            Some(grp) -> tryReadQuery(makeKeychainQueryWithGroup(account, Some(grp), service)),
+            None -> ptrNull(),
+        }
+    };
+    let d0 = tryGroup("JuxuSettingsGroup", "Juxu");
+    if (!ptrIsNull(d0)) d0
+    else {
+        let d1 = tryGroup("LegacyJuxuSettingsGroup", "Juxu");
+        if (!ptrIsNull(d1)) {
+            let _ = keychainWriteData(account, d1);
+            d1
+        } else {
+            let d2 = tryGroup("PrisWubiSettingsGroup", "PrisWubi");
+            if (!ptrIsNull(d2)) {
+                let _ = keychainWriteData(account, d2);
+                d2
+            } else {
+                // Fallback for ungrouped simulator / ad-hoc testing when Info.plist has no group key
+                match bundleAccessGroupForKey("JuxuSettingsGroup") {
+                    Some(_) -> ptrNull(),
+                    None -> tryReadQuery(makeKeychainQueryWithGroup(account, None, "Juxu")),
+                }
+            }
+        }
+    }
 }
 
 /// Write a UTF-8 string to Keychain (`account`).
@@ -126,7 +184,206 @@ pub def keychainReadZlibString(account: String): Option String = {
     }
 }
 
-/// Sync engine configuration (TOML) from Keychain into `eng`.
+// ============================================================================
+// User Data Sequence & Zlib TSV Sync (`IOSSharedSettings.parseUserDataSeq`)
+// ============================================================================
+
+/// Parse `SEQ\t<u64>` from the first 512 bytes of a user-data TSV string.
+pub def parseUserDataSeqFromTsv(tsv: String): Int64 = {
+    let lim = if (strLen(tsv) < 512) strLen(tsv) else 512;
+    let pos = cellNew(0);
+    let found = cellNew(intToI64(0));
+    let done = cellNew(false);
+    while (cellGet(pos) < lim && !cellGet(done)) {
+        let start = cellGet(pos);
+        let end = cellNew(start);
+        while (cellGet(end) < lim && strByteAt(tsv, cellGet(end)) != 10) {
+            cellSet(end, cellGet(end) + 1)
+        };
+        let line = strSlice(tsv, start, cellGet(end));
+        cellSet(pos, cellGet(end) + 1);
+        if (strStartsWith(line, "SEQ\t")) {
+            let numStr = strTrim(strSlice(line, 4, strLen(line)));
+            match parseInt64(numStr) {
+                Ok(v) -> {
+                    cellSet(found, v);
+                    cellSet(done, true)
+                },
+                Err(_) -> (),
+            }
+        } else ()
+    };
+    cellGet(found)
+}
+
+pub def keychainReadUserDataSeq(): Option Int64 =
+    match keychainReadString(kcAccountUserDataSeq()) {
+        Some(raw) -> match parseInt64(strTrim(raw)) {
+            Ok(v) -> Some(v),
+            Err(_) -> None,
+        },
+        None -> None,
+    }
+
+pub def keychainWriteUserDataSeq(seq: Int64): Bool =
+    keychainWriteString(kcAccountUserDataSeq(), i64ToStr(seq))
+
+pub def keychainDecodeSharedUserData(): Option (Int64, String) =
+    match keychainReadZlibString(kcAccountUserDataZlib()) {
+        Some(tsv) if (strLen(tsv) > 0) -> Some((parseUserDataSeqFromTsv(tsv), tsv)),
+        _ -> None,
+    }
+
+pub def keychainWriteSharedUserData(tsv: String): Bool = {
+    let newSeq = parseUserDataSeqFromTsv(tsv);
+    if (newSeq <= intToI64(0)) false
+    else {
+        let stale = match keychainReadUserDataSeq() {
+            Some(existingSeq) -> existingSeq > newSeq,
+            None -> match keychainDecodeSharedUserData() {
+                Some((existingSeq, _)) -> {
+                    let _ = keychainWriteUserDataSeq(existingSeq);
+                    existingSeq > newSeq
+                },
+                None -> false,
+            },
+        };
+        if (stale) false
+        else if (keychainWriteZlibString(kcAccountUserDataZlib(), tsv)) {
+            let _ = keychainWriteUserDataSeq(newSeq);
+            true
+        } else false
+    }
+}
+
+// ============================================================================
+// 26-Key Touch Calibration JSON Sync (`touch-profile`)
+// ============================================================================
+
+def jsonLookupField(fields: List (String, Value), key: String): Option Value =
+    match fields {
+        Nil -> None,
+        Cons((k, v), rest) -> if (k == key) Some(v) else jsonLookupField(rest, key),
+    }
+
+def jsonValueToFloat(vOpt: Option Value, fallback: Float): Float =
+    match vOpt {
+        Some(VFloat(f)) -> f,
+        Some(VInt(n)) -> intToFloat(i64ToInt(n)),
+        _ -> fallback,
+    }
+
+def jsonValueToInt(vOpt: Option Value, fallback: Int): Int =
+    match vOpt {
+        Some(VInt(n)) -> i64ToInt(n),
+        Some(VFloat(f)) -> floatToInt(f),
+        _ -> fallback,
+    }
+
+def jsonValueToStr(vOpt: Option Value, fallback: String): String =
+    match vOpt {
+        Some(VStr(s)) -> s,
+        _ -> fallback,
+    }
+
+/// Parse a 26-element `KeyTouchSample` JSON array (`[{"key":"a","dx":...,"dy":...,"samples":...}]`).
+pub def parseTouchProfileJson(raw: String): Option (Vec KeyTouchSample) =
+    match parse(raw) {
+        Err(_) -> None,
+        Ok(VArr(items)) -> {
+            let out: Vec KeyTouchSample = vecWithCap(26);
+            let cur = cellNew(items);
+            let idx = cellNew(0);
+            let valid = cellNew(true);
+            while (match cellGet(cur) { Nil -> false, _ -> cellGet(valid) }) {
+                match cellGet(cur) {
+                    Cons(VObj(fs), rest) -> {
+                        let i = cellGet(idx);
+                        let keyStr = jsonValueToStr(jsonLookupField(fs, "key"), "");
+                        let expectedBuf = bufWithCap(1);
+                        bufPushByte(expectedBuf, 97 + i);
+                        if (i >= 26 || keyStr != bufToString(expectedBuf)) {
+                            cellSet(valid, false)
+                        } else {
+                            let dx = jsonValueToFloat(jsonLookupField(fs, "dx"), 0.0);
+                            let dy = jsonValueToFloat(jsonLookupField(fs, "dy"), 0.0);
+                            let samples = jsonValueToInt(jsonLookupField(fs, "samples"), 0);
+                            vecPush(out, KeyTouchSample {
+                                keyLabel: keyStr,
+                                offset: MkTouchKeyOffset { dx: dx, dy: dy, samples: samples },
+                            });
+                            cellSet(idx, i + 1)
+                        };
+                        cellSet(cur, rest)
+                    },
+                    _ -> cellSet(valid, false),
+                }
+            };
+            if (cellGet(valid) && vecLen(out) == 26) Some(out) else None
+        },
+        Ok(_) -> None,
+    }
+
+pub def keychainReadTouchProfile(): Option (Vec KeyTouchSample) =
+    match keychainReadString(kcAccountTouchProfile()) {
+        Some(raw) -> parseTouchProfileJson(raw),
+        None -> None,
+    }
+
+pub def keychainWriteTouchProfile(samples: Vec KeyTouchSample): Bool =
+    if (vecLen(samples) != 26) false
+    else keychainWriteString(kcAccountTouchProfile(), touchProfileToJson(samples))
+
+// ============================================================================
+// Eval Log Ring Buffer (`eval-log-ring`, 400 lines max, zlib-compressed)
+// ============================================================================
+
+pub def splitNonEmptyLines(text: String): Vec String = {
+    let n = strLen(text);
+    let out: Vec String = vecNew();
+    let pos = cellNew(0);
+    while (cellGet(pos) < n) {
+        let start = cellGet(pos);
+        let end = cellNew(start);
+        while (cellGet(end) < n && strByteAt(text, cellGet(end)) != 10) {
+            cellSet(end, cellGet(end) + 1)
+        };
+        let line = strSlice(text, start, cellGet(end));
+        if (strLen(line) > 0) vecPush(out, line) else ();
+        cellSet(pos, cellGet(end) + 1)
+    };
+    out
+}
+
+pub def joinLines(lines: Vec String): String = {
+    let n = vecLen(lines);
+    if (n == 0) ""
+    else {
+        let b = bufWithCap(n * 80);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let idx = cellGet(i);
+            if (idx > 0) bufPushByte(b, 10) else ();
+            bufPushStr(b, vecGetOr(lines, idx, ""));
+            cellSet(i, idx + 1)
+        };
+        bufToString(b)
+    }
+}
+
+pub def keychainDecodeEvalRingLines(): Vec String =
+    match keychainReadZlibString(kcAccountEvalLog()) {
+        Some(text) -> splitNonEmptyLines(text),
+        None -> vecNew(),
+    }
+
+pub def keychainWriteEvalRingLines(lines: Vec String): Bool =
+    keychainWriteZlibString(kcAccountEvalLog(), joinLines(lines))
+
+// ============================================================================
+// Direct Engine Convenience Helpers (backward-compatible)
+// ============================================================================
+
 pub def keychainLoadEngineConfig(eng: JuxuEngine): Bool =
     match keychainReadString(kcAccountSettings()) {
         Some(toml) if (strLen(toml) > 0) -> {
@@ -136,33 +393,23 @@ pub def keychainLoadEngineConfig(eng: JuxuEngine): Bool =
         _ -> false,
     }
 
-/// Save engine configuration (TOML) to Keychain.
 pub def keychainSaveEngineConfig(eng: JuxuEngine): Bool =
     keychainWriteString(kcAccountSettings(), exportConfig(eng, Toml))
 
-/// Sync zlib-compressed user data TSV from Keychain into `eng` if remote seq > local seq.
 pub def keychainLoadEngineUserData(eng: JuxuEngine): Bool = {
-    let remoteSeq = match keychainReadString(kcAccountUserDataSeq()) {
-        Some(s) -> match parseInt64(s) { Ok(v) -> v, Err(_) -> intToI64(0) },
-        None -> intToI64(0),
-    };
     let localSeq = userDataSeq(eng);
-    if (remoteSeq > localSeq || localSeq == intToI64(0)) {
-        match keychainReadZlibString(kcAccountUserDataZlib()) {
-            Some(tsv) if (strLen(tsv) > 0) -> {
+    match keychainDecodeSharedUserData() {
+        Some((remoteSeq, tsv)) ->
+            if (remoteSeq > localSeq || localSeq == intToI64(0)) {
                 importUserDataTsv(eng, tsv);
                 true
-            },
-            _ -> false,
-        }
-    } else false
+            } else false,
+        None -> false,
+    }
 }
 
-/// Flush dirty engine user data TSV (zlib-compressed) + sequence counter to Keychain.
 pub def keychainFlushEngineUserData(eng: JuxuEngine): Bool =
     if (isUserDirty(eng)) {
         let tsv = exportUserDataTsv(eng);
-        let ok1 = keychainWriteZlibString(kcAccountUserDataZlib(), tsv);
-        let ok2 = keychainWriteString(kcAccountUserDataSeq(), i64ToStr(userDataSeq(eng)));
-        ok1 && ok2
+        keychainWriteSharedUserData(tsv)
     } else false

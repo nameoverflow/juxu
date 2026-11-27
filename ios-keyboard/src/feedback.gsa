@@ -1,85 +1,131 @@
-/// Low-latency Taptic haptic & keyboard click audio feedback controller
-/// (1:1 port of `IOSKeyboardFeedbackController.swift`):
-/// - Pre-warmed 3-slot `UIImpactFeedbackGenerator` (`.rigid` = 4) ring with `impactOccurredWithIntensity: 0.42`
-/// - `UISelectionFeedbackGenerator` for soft ticks (trackpad cursor movement, candidate selection, repeat delete)
-/// - `UIDevice.currentDevice.playInputClick` (requires `enableInputClicksWhenVisible` on the keyboard view).
+/// Complete 1:1 port of `iOS/KeyboardExtension/IOSKeyboardFeedbackController.swift` (195 lines):
+/// - Shared process-wide `CHHapticEngine` driver (`playsHapticsOnly = true`, `isAutoShutdownEnabled = true`,
+///   `keyTap` intensity `0.45`/sharpness `0.88`, `softTick` intensity `0.31`/sharpness `0.80`, client refcount)
+/// - Per-controller 3-slot `UIImpactFeedbackGenerator` (`.rigid = 4`, `initWithStyle:view:` on iOS 17.5+)
+///   fallback ring (`intensity = 0.42`) + `UISelectionFeedbackGenerator` + `UIDevice.currentDevice.playInputClick`.
 
-use std.vec.{Vec, vecNew, vecLen, vecPush, vecGetOr}
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecWithCap, vecLen, vecPush, vecGet}
 use objc.{
+    Id, NSObject, idAdoptOpt,
     objcClass, objcSel, msgSend0, msgSend1I64,
     msgSendVoid0, msgSendVoid1Float,
 }
+use juxu_shared.{msgSend1I64_1Ptr, msgSendBool1Ptr, objcAllocInit}
+use ios_ui_kit.{
+    coreHapticsAcquire, coreHapticsRelease, coreHapticsPlayKeyTap, coreHapticsPlaySoftTick,
+}
 
-def gImpactRing: Cell (Vec Ptr) = cellNew(vecNew())
-def gRingIndex: Cell Int = cellNew(0)
-def gSelectionGen: Cell Ptr = cellNew(ptrNull())
-def gInitialized: Cell Bool = cellNew(false)
+pub data IOSKeyboardFeedbackController {
+    fcRigidRing: Vec (Ptr, Id NSObject),
+    fcRingIndex: Cell Int,
+    fcSelectionGen: Option (Ptr, Id NSObject),
+    fcIsPrepared: Cell Bool,
+}
 
-def ensureFeedbackInitialized(): Void =
-    if (!cellGet(gInitialized)) {
-        cellSet(gInitialized, true);
-        let ring = cellGet(gImpactRing);
-        let cls = objcClass("UIImpactFeedbackGenerator");
+def playSystemInputClick(): Void = {
+    let cls = objcClass("UIDevice");
+    if (!ptrIsNull(cls)) {
+        let dev = msgSend0(cls, objcSel("currentDevice"));
+        if (!ptrIsNull(dev)) {
+            msgSendVoid0(dev, objcSel("playInputClick"))
+        } else ()
+    } else ()
+}
+
+pub def feedbackControllerNew(attachingToView: Ptr): IOSKeyboardFeedbackController = {
+    let ring: Vec (Ptr, Id NSObject) = vecWithCap(3);
+    let impCls = objcClass("UIImpactFeedbackGenerator");
+    if (!ptrIsNull(impCls)) {
+        let initViewSel = objcSel("initWithStyle:view:");
         let i = cellNew(0);
         while (cellGet(i) < 3) {
-            // UIImpactFeedbackStyleRigid == 4
-            let gen = msgSend1I64(msgSend0(cls, objcSel("alloc")), objcSel("initWithStyle:"), intToI64(4));
-            if (!ptrIsNull(gen)) {
-                msgSendVoid0(gen, objcSel("prepare"));
-                vecPush(ring, gen)
-            } else ();
+            let allocObj = msgSend0(impCls, objcSel("alloc"));
+            let rawGen =
+                if (!ptrIsNull(attachingToView) && msgSendBool1Ptr(allocObj, objcSel("respondsToSelector:"), initViewSel)) {
+                    // UIImpactFeedbackStyleRigid == 4
+                    msgSend1I64_1Ptr(allocObj, initViewSel, intToI64(4), attachingToView)
+                } else {
+                    msgSend1I64(allocObj, objcSel("initWithStyle:"), intToI64(4))
+                };
+            match idAdoptOpt(rawGen) {
+                Some(adopted) -> vecPush(ring, (rawGen, adopted)),
+                None -> (),
+            };
             cellSet(i, cellGet(i) + 1)
-        };
-        let selGen = msgSend0(msgSend0(objcClass("UISelectionFeedbackGenerator"), objcSel("alloc")), objcSel("init"));
-        if (!ptrIsNull(selGen)) {
-            msgSendVoid0(selGen, objcSel("prepare"));
-            cellSet(gSelectionGen, selGen)
-        } else ()
-    } else ()
+        }
+    } else ();
 
-/// Pre-warm Taptic Engine generators when the keyboard appears.
-pub def feedbackPrepare(): Void = {
-    ensureFeedbackInitialized();
-    let ring = cellGet(gImpactRing);
-    let n = vecLen(ring);
+    let rawSel = objcAllocInit("UISelectionFeedbackGenerator");
+    let selGenOpt = match idAdoptOpt(rawSel) {
+        Some(adopted) -> Some((rawSel, adopted)),
+        None -> None,
+    };
+    IOSKeyboardFeedbackController {
+        fcRigidRing: ring,
+        fcRingIndex: cellNew(0),
+        fcSelectionGen: selGenOpt,
+        fcIsPrepared: cellNew(false),
+    }
+}
+
+pub def feedbackPrepare(ctrl: IOSKeyboardFeedbackController): Void = {
+    let n = vecLen(ctrl.fcRigidRing);
     let i = cellNew(0);
     while (cellGet(i) < n) {
-        let g = vecGetOr(ring, cellGet(i), ptrNull());
-        if (!ptrIsNull(g)) msgSendVoid0(g, objcSel("prepare")) else ();
+        match vecGet(ctrl.fcRigidRing, cellGet(i)) {
+            Some((rawPtr, _)) -> msgSendVoid0(rawPtr, objcSel("prepare")),
+            None -> (),
+        };
         cellSet(i, cellGet(i) + 1)
     };
-    let sg = cellGet(gSelectionGen);
-    if (!ptrIsNull(sg)) msgSendVoid0(sg, objcSel("prepare")) else ()
+    match ctrl.fcSelectionGen {
+        Some((rawSel, _)) -> msgSendVoid0(rawSel, objcSel("prepare")),
+        None -> (),
+    };
+    if (!cellGet(ctrl.fcIsPrepared)) {
+        cellSet(ctrl.fcIsPrepared, true);
+        coreHapticsAcquire()
+    } else ()
 }
 
-/// Fire crisp key-down click sound + `.rigid` Taptic impact (`intensity = 0.42`).
-pub def feedbackFireKeyDown(): Void = {
-    ensureFeedbackInitialized();
-    let dev = msgSend0(objcClass("UIDevice"), objcSel("currentDevice"));
-    if (!ptrIsNull(dev)) msgSendVoid0(dev, objcSel("playInputClick")) else ();
-    let ring = cellGet(gImpactRing);
-    let n = vecLen(ring);
-    if (n > 0) {
-        let idx = cellGet(gRingIndex) % n;
-        cellSet(gRingIndex, idx + 1);
-        let gen = vecGetOr(ring, idx, ptrNull());
-        if (!ptrIsNull(gen)) {
-            msgSendVoid1Float(gen, objcSel("impactOccurredWithIntensity:"), 0.42);
-            msgSendVoid0(gen, objcSel("prepare"))
+pub def feedbackSuspend(ctrl: IOSKeyboardFeedbackController): Void =
+    if (cellGet(ctrl.fcIsPrepared)) {
+        cellSet(ctrl.fcIsPrepared, false);
+        coreHapticsRelease()
+    } else ()
+
+pub def feedbackFireKeyDown(ctrl: IOSKeyboardFeedbackController): Void = {
+    playSystemInputClick();
+    if (coreHapticsPlayKeyTap()) {
+        ()
+    } else {
+        let n = vecLen(ctrl.fcRigidRing);
+        if (n > 0) {
+            let idx = cellGet(ctrl.fcRingIndex) % n;
+            cellSet(ctrl.fcRingIndex, idx + 1);
+            match vecGet(ctrl.fcRigidRing, idx) {
+                Some((rawGen, _)) -> {
+                    msgSendVoid1Float(rawGen, objcSel("impactOccurredWithIntensity:"), 0.42);
+                    msgSendVoid0(rawGen, objcSel("prepare"))
+                },
+                None -> (),
+            }
         } else ()
-    } else ()
+    }
 }
 
-/// Fire soft selection tick (for candidate tap, trackpad cursor steps, repeat backspace).
-pub def feedbackFireSoftStep(playClick: Bool): Void = {
-    ensureFeedbackInitialized();
-    if (playClick) {
-        let dev = msgSend0(objcClass("UIDevice"), objcSel("currentDevice"));
-        if (!ptrIsNull(dev)) msgSendVoid0(dev, objcSel("playInputClick")) else ()
-    } else ();
-    let sg = cellGet(gSelectionGen);
-    if (!ptrIsNull(sg)) {
-        msgSendVoid0(sg, objcSel("selectionChanged"));
-        msgSendVoid0(sg, objcSel("prepare"))
-    } else ()
+pub def feedbackFireSoftStep(ctrl: IOSKeyboardFeedbackController, playClick: Bool): Void = {
+    if (playClick) playSystemInputClick() else ();
+    if (coreHapticsPlaySoftTick()) {
+        ()
+    } else {
+        match ctrl.fcSelectionGen {
+            Some((rawSel, _)) -> {
+                msgSendVoid0(rawSel, objcSel("selectionChanged"));
+                msgSendVoid0(rawSel, objcSel("prepare"))
+            },
+            None -> (),
+        }
+    }
 }

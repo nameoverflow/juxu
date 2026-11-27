@@ -1,0 +1,514 @@
+/// Shared UIKit, QuartzCore, CoreGraphics & WebKit building blocks for Juxu iOS HostApp.
+
+use std.option.{Option, Some, None}
+use sys.ffi.{dlSym}
+use objc.{
+    objcClass, objcSel, msgSend0, msgSend1Ptr, msgSend2Ptr,
+    msgSend1Float, msgSend1I64, msgSend1Bool,
+    msgSendI64_0, msgSendFloat0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
+}
+use juxu_shared.{
+    CGPoint, CGSize, CGRect, UIEdgeInsets,
+    cgPoint, cgSize, cgRect, uiEdgeInsets,
+    ptrToI64, i64ToPtr,
+    msgSendRect0, msgSendRect1Rect1Ptr, msgSendSize1Size, msgSendInsets0,
+    msgSendVoid1Rect, msgSendVoid1Insets,
+    msgSend4Float, msgSend2Float, msgSend1Float1I64,
+    msgSendVoid1F32,
+    msgSendBool1Sel1Ptr2Ptr,
+    msgSendVoid1Ptr1Bool, msgSendVoid1Ptr1I64, msgSendVoid3Ptr,
+    msgSendVoid1Ptr1Sel1U64,
+    uiDynamicColor, nsStr, objcAllocInit, objcAllocInitFrame,
+    utf8ToScalars, scalarsToUtf8, isUnicodeWhitespaceScalar,
+}
+use std.vec.{vecLen, vecGetOr}
+
+// ============================================================================
+// Exported Apple SDK Constants Resolved via `dlSym(RTLD_DEFAULT, ...)`
+// ============================================================================
+
+pub def ptrEq(a: Ptr, b: Ptr): Bool =
+    ptrToI64(a) == ptrToI64(b)
+
+pub def readObjcGlobalPtr(symName: String, fallbackStr: String): Ptr =
+    match dlSym(ptrNull(), symName) {
+        Some(slot) -> {
+            let p = i64ToPtr(ptrReadI64Le(slot, 0));
+            if (!ptrIsNull(p)) p
+            else if (strLen(fallbackStr) > 0) nsStr(fallbackStr)
+            else ptrNull()
+        },
+        None ->
+            if (strLen(fallbackStr) > 0) nsStr(fallbackStr)
+            else ptrNull(),
+    }
+
+pub def readGlobalDouble(symName: String, fallback: Float): Float =
+    match dlSym(ptrNull(), symName) {
+        Some(slot) -> ptrReadF64Le(slot, 0),
+        None -> fallback,
+    }
+
+pub def cornerCurveContinuous(): Ptr =
+    readObjcGlobalPtr("kCACornerCurveContinuous", "continuous")
+
+pub def fontWeightRegular(): Float =
+    readGlobalDouble("UIFontWeightRegular", 0.0)
+
+pub def fontWeightMedium(): Float =
+    readGlobalDouble("UIFontWeightMedium", 0.23)
+
+pub def fontWeightSemibold(): Float =
+    readGlobalDouble("UIFontWeightSemibold", 0.30)
+
+pub def fontWeightBold(): Float =
+    readGlobalDouble("UIFontWeightBold", 0.40)
+
+pub def fontDesignRounded(): Ptr =
+    readObjcGlobalPtr("UIFontDescriptorSystemDesignRounded", "NSCTFontUIFontDesignRounded")
+
+pub def notifWillEnterForeground(): Ptr =
+    readObjcGlobalPtr("UIApplicationWillEnterForegroundNotification", "UIApplicationWillEnterForegroundNotification")
+
+pub def notifDidEnterBackground(): Ptr =
+    readObjcGlobalPtr("UIApplicationDidEnterBackgroundNotification", "UIApplicationDidEnterBackgroundNotification")
+
+pub def notifTextFieldDidChange(): Ptr =
+    readObjcGlobalPtr("UITextFieldTextDidChangeNotification", "UITextFieldTextDidChangeNotification")
+
+pub def notifTextViewDidChange(): Ptr =
+    readObjcGlobalPtr("UITextViewTextDidChangeNotification", "UITextViewTextDidChangeNotification")
+
+pub def notifKeyboardWillChangeFrame(): Ptr =
+    readObjcGlobalPtr("UIKeyboardWillChangeFrameNotification", "UIKeyboardWillChangeFrameNotification")
+
+pub def notifKeyboardWillHide(): Ptr =
+    readObjcGlobalPtr("UIKeyboardWillHideNotification", "UIKeyboardWillHideNotification")
+
+pub def keyKeyboardFrameEnd(): Ptr =
+    readObjcGlobalPtr("UIKeyboardFrameEndUserInfoKey", "UIKeyboardFrameEndUserInfoKey")
+
+pub def attrFontKey(): Ptr =
+    readObjcGlobalPtr("NSFontAttributeName", "NSFont")
+
+pub def attrForegroundColorKey(): Ptr =
+    readObjcGlobalPtr("NSForegroundColorAttributeName", "NSColor")
+
+// ============================================================================
+// Semantic & Dynamic Colors (`HostAppViews.swift` + `SharedSettingsComponents.swift`)
+// ============================================================================
+
+pub def colorSystemBackground(): Ptr =
+    msgSend0(objcClass("UIColor"), objcSel("systemBackgroundColor"))
+
+pub def colorLabel(): Ptr =
+    msgSend0(objcClass("UIColor"), objcSel("labelColor"))
+
+pub def colorSecondaryLabel(): Ptr =
+    msgSend0(objcClass("UIColor"), objcSel("secondaryLabelColor"))
+
+pub def colorTertiaryLabel(): Ptr =
+    msgSend0(objcClass("UIColor"), objcSel("tertiaryLabelColor"))
+
+pub def colorSeparator(): Ptr =
+    msgSend0(objcClass("UIColor"), objcSel("separatorColor"))
+
+pub def colorAccent(): Ptr =
+    msgSend0(objcClass("UIColor"), objcSel("systemBlueColor"))
+
+pub def colorGreen(): Ptr =
+    msgSend0(objcClass("UIColor"), objcSel("systemGreenColor"))
+
+pub def colorOrange(): Ptr =
+    msgSend0(objcClass("UIColor"), objcSel("systemOrangeColor"))
+
+pub def colorTeal(): Ptr =
+    msgSend0(objcClass("UIColor"), objcSel("systemTealColor"))
+
+pub def colorRed(): Ptr =
+    msgSend0(objcClass("UIColor"), objcSel("systemRedColor"))
+
+pub def colorWhite(): Ptr =
+    msgSend0(objcClass("UIColor"), objcSel("whiteColor"))
+
+pub def colorClear(): Ptr =
+    msgSend0(objcClass("UIColor"), objcSel("clearColor"))
+
+pub def colorRgba(r: Float, g: Float, b: Float, a: Float): Ptr =
+    msgSend4Float(objcClass("UIColor"), objcSel("colorWithRed:green:blue:alpha:"), r, g, b, a)
+
+pub def colorWithAlpha(col: Ptr, alpha: Float): Ptr =
+    if (ptrIsNull(col)) ptrNull()
+    else msgSend1Float(col, objcSel("colorWithAlphaComponent:"), alpha)
+
+/// `iosSettingsCard()` fill: Light `rgba(0,0,0,0.055)`, Dark `rgba(1,1,1,0.08)`.
+pub def colorSettingsCardFill(): Ptr =
+    uiDynamicColor(0.0, 0.0, 0.0, 0.055, 1.0, 1.0, 1.0, 0.08)
+
+/// `Color.primary.opacity(0.06)` (used in category pill container, inactive schema buttons & code pill).
+pub def colorPrimary06(): Ptr =
+    uiDynamicColor(0.0, 0.0, 0.0, 0.06, 1.0, 1.0, 1.0, 0.085)
+
+/// `Color.primary.opacity(0.08)` (small bordered button backing).
+pub def colorPrimary08(): Ptr =
+    uiDynamicColor(0.0, 0.0, 0.0, 0.08, 1.0, 1.0, 1.0, 0.12)
+
+/// `SharedEvalMetricCell` fill (`Color.primary.opacity(0.045)`).
+pub def colorEvalCellFill(): Ptr =
+    uiDynamicColor(0.0, 0.0, 0.0, 0.045, 1.0, 1.0, 1.0, 0.065)
+
+pub def resolveCgColor(uiCol: Ptr, view: Ptr): Ptr =
+    if (ptrIsNull(uiCol)) ptrNull()
+    else if (ptrIsNull(view)) msgSend0(uiCol, objcSel("CGColor"))
+    else {
+        let traits = msgSend0(view, objcSel("traitCollection"));
+        let resolved =
+            if (ptrIsNull(traits)) uiCol
+            else msgSend1Ptr(uiCol, objcSel("resolvedColorWithTraitCollection:"), traits);
+        msgSend0(resolved, objcSel("CGColor"))
+    }
+
+// ============================================================================
+// Typography (`UIFont` System / Rounded / Monospaced)
+// ============================================================================
+
+pub def sysFont(size: Float, weight: Float): Ptr =
+    msgSend2Float(objcClass("UIFont"), objcSel("systemFontOfSize:weight:"), size, weight)
+
+pub def sysFontRounded(size: Float, weight: Float): Ptr = {
+    let base = sysFont(size, weight);
+    if (ptrIsNull(base)) base
+    else {
+        let desc = msgSend0(base, objcSel("fontDescriptor"));
+        let design = fontDesignRounded();
+        if (ptrIsNull(desc) || ptrIsNull(design)) base
+        else {
+            let roundedDesc = msgSend1Ptr(desc, objcSel("fontDescriptorWithDesign:"), design);
+            if (ptrIsNull(roundedDesc)) base
+            else {
+                let f = msgSend1Ptr1FloatLocal(objcClass("UIFont"), objcSel("fontWithDescriptor:size:"), roundedDesc, size);
+                if (ptrIsNull(f)) base else f
+            }
+        }
+    }
+}
+
+extern "objc_msgSend" def msgSend1Ptr1FloatLocal(obj: Ptr, sel: Ptr, a0: Ptr, a1: Float): Ptr
+
+pub def sysFontMonospaced(size: Float, weight: Float): Ptr =
+    msgSend2Float(objcClass("UIFont"), objcSel("monospacedSystemFontOfSize:weight:"), size, weight)
+
+// ============================================================================
+// Pixel Rounding, Layers, Cards & Dividers
+// ============================================================================
+
+pub def screenScale(): Float = {
+    let scrCls = objcClass("UIScreen");
+    if (ptrIsNull(scrCls)) 2.0
+    else {
+        let mainScr = msgSend0(scrCls, objcSel("mainScreen"));
+        if (ptrIsNull(mainScr)) 2.0
+        else {
+            let s = msgSendFloat0(mainScr, objcSel("scale"));
+            if (s < 1.0) 2.0 else s
+        }
+    }
+}
+
+pub def hairlineHeight(): Float =
+    1.0 / screenScale()
+
+pub def ceilPx(v: Float): Float = {
+    let s = screenScale();
+    let scaled = v * s;
+    let i = floatToInt(scaled);
+    let ci = if (intToFloat(i) < scaled - 0.0001) i + 1 else i;
+    intToFloat(ci) / s
+}
+
+pub def roundPx(v: Float): Float = {
+    let s = screenScale();
+    intToFloat(floatToInt(v * s + 0.5)) / s
+}
+
+pub def viewLayer(view: Ptr): Ptr =
+    msgSend0(view, objcSel("layer"))
+
+pub def applyContinuousCorner(view: Ptr, radius: Float): Void = {
+    let layer = viewLayer(view);
+    if (!ptrIsNull(layer)) {
+        msgSendVoid1Float(layer, objcSel("setCornerRadius:"), radius);
+        let curve = cornerCurveContinuous();
+        if (!ptrIsNull(curve)) {
+            msgSendVoid1Ptr(layer, objcSel("setCornerCurve:"), curve)
+        } else ()
+    } else ()
+}
+
+pub def makeSettingsCard(): Ptr = {
+    let card = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 100.0, 40.0));
+    msgSendVoid1Ptr(card, objcSel("setBackgroundColor:"), colorSettingsCardFill());
+    applyContinuousCorner(card, 13.0);
+    card
+}
+
+pub def makeDivider(): Ptr = {
+    let div = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 100.0, hairlineHeight()));
+    msgSendVoid1Ptr(div, objcSel("setBackgroundColor:"), colorSeparator());
+    div
+}
+
+pub def removeAllSubviews(container: Ptr): Void =
+    if (!ptrIsNull(container)) {
+        let subs = msgSend0(container, objcSel("subviews"));
+        if (!ptrIsNull(subs)) {
+            let snap = msgSend0(subs, objcSel("copy"));
+            let n = i64ToInt(msgSendI64_0(snap, objcSel("count")));
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let child = msgSend1I64(snap, objcSel("objectAtIndex:"), intToI64(cellGet(i)));
+                if (!ptrIsNull(child)) {
+                    msgSendVoid0(child, objcSel("removeFromSuperview"))
+                } else ();
+                cellSet(i, cellGet(i) + 1)
+            }
+        } else ()
+    } else ()
+
+// ============================================================================
+// Labels, SF Symbols & Control Factories
+// ============================================================================
+
+pub def makeLabel(text: String, font: Ptr, color: Ptr, lines: Int): Ptr = {
+    let lbl = objcAllocInitFrame("UILabel", cgRect(0.0, 0.0, 100.0, 20.0));
+    msgSendVoid1Ptr(lbl, objcSel("setBackgroundColor:"), colorClear());
+    msgSendVoid1Ptr(lbl, objcSel("setFont:"), font);
+    msgSendVoid1Ptr(lbl, objcSel("setTextColor:"), color);
+    msgSendVoid1I64(lbl, objcSel("setNumberOfLines:"), intToI64(lines));
+    msgSendVoid1Ptr(lbl, objcSel("setText:"), nsStr(text));
+    lbl
+}
+
+pub def measureViewSize(view: Ptr, maxW: Float): CGSize = {
+    let w = if (maxW < 1.0) 1.0 else maxW;
+    let raw = msgSendSize1Size(view, objcSel("sizeThatFits:"), cgSize(w, 10000.0));
+    cgSize(ceilPx(raw.width), ceilPx(raw.height))
+}
+
+/// UIImageSymbolWeight: Regular = 4, Medium = 5, Semibold = 6, Bold = 7
+pub def sfSymbolImage(name: String, ptSize: Float, symWeight: Int): Ptr = {
+    let cfgCls = objcClass("UIImageSymbolConfiguration");
+    let imgCls = objcClass("UIImage");
+    if (ptrIsNull(cfgCls) || ptrIsNull(imgCls)) ptrNull()
+    else {
+        let cfg = msgSend1Float1I64(cfgCls, objcSel("configurationWithPointSize:weight:"), ptSize, intToI64(symWeight));
+        msgSend2Ptr(imgCls, objcSel("systemImageNamed:withConfiguration:"), nsStr(name), cfg)
+    }
+}
+
+pub def makeSymbolImageView(name: String, ptSize: Float, symWeight: Int, tintCol: Ptr): Ptr = {
+    let iv = objcAllocInitFrame("UIImageView", cgRect(0.0, 0.0, ptSize + 4.0, ptSize + 4.0));
+    let img = sfSymbolImage(name, ptSize, symWeight);
+    if (!ptrIsNull(img)) {
+        msgSendVoid1Ptr(iv, objcSel("setImage:"), img)
+    } else ();
+    if (!ptrIsNull(tintCol)) {
+        msgSendVoid1Ptr(iv, objcSel("setTintColor:"), tintCol)
+    } else ();
+    // UIViewContentModeScaleAspectFit = 1
+    msgSendVoid1I64(iv, objcSel("setContentMode:"), intToI64(1));
+    iv
+}
+
+pub def makeSwitch(title: String, isOn: Bool, target: Ptr, actionSel: Ptr): Ptr = {
+    let sw = objcAllocInit("UISwitch");
+    msgSendVoid1Bool(sw, objcSel("setOn:"), isOn);
+    msgSendVoid1Ptr(sw, objcSel("setAccessibilityLabel:"), nsStr(title));
+    // UIControlEventValueChanged = 4096
+    msgSendVoid1Ptr1Sel1U64(sw, objcSel("addTarget:action:forControlEvents:"), target, actionSel, intToI64(4096));
+    sw
+}
+
+pub def makeSlider(title: String, minVal: Float, maxVal: Float, curVal: Float, target: Ptr, actionSel: Ptr): Ptr = {
+    let sl = objcAllocInitFrame("UISlider", cgRect(0.0, 0.0, 200.0, 30.0));
+    msgSendVoid1F32(sl, objcSel("setMinimumValue:"), floatToF32(minVal));
+    msgSendVoid1F32(sl, objcSel("setMaximumValue:"), floatToF32(maxVal));
+    msgSendVoid1F32(sl, objcSel("setValue:"), floatToF32(curVal));
+    msgSendVoid1Bool(sl, objcSel("setContinuous:"), true);
+    msgSendVoid1Ptr(sl, objcSel("setAccessibilityLabel:"), nsStr(title));
+    // UIControlEventValueChanged = 4096
+    msgSendVoid1Ptr1Sel1U64(sl, objcSel("addTarget:action:forControlEvents:"), target, actionSel, intToI64(4096));
+    sl
+}
+
+pub def makeRoundedTextField(
+    placeholder: String,
+    accIdOpt: Option String,
+    delegate: Ptr,
+    target: Ptr,
+    editChangedSel: Ptr
+): Ptr = {
+    let tf = objcAllocInitFrame("UITextField", cgRect(0.0, 0.0, 240.0, 34.0));
+    // UITextBorderStyleRoundedRect = 3
+    msgSendVoid1I64(tf, objcSel("setBorderStyle:"), intToI64(3));
+    // UIReturnKeyDone = 9
+    msgSendVoid1I64(tf, objcSel("setReturnKeyType:"), intToI64(9));
+    msgSendVoid1Ptr(tf, objcSel("setFont:"), sysFont(15.0, fontWeightRegular()));
+    msgSendVoid1Ptr(tf, objcSel("setPlaceholder:"), nsStr(placeholder));
+    match accIdOpt {
+        Some(aid) -> msgSendVoid1Ptr(tf, objcSel("setAccessibilityIdentifier:"), nsStr(aid)),
+        None -> (),
+    };
+    if (!ptrIsNull(delegate)) {
+        msgSendVoid1Ptr(tf, objcSel("setDelegate:"), delegate)
+    } else ();
+    if (!ptrIsNull(target) && !ptrIsNull(editChangedSel)) {
+        // UIControlEventEditingChanged = 1 << 17 = 131072
+        msgSendVoid1Ptr1Sel1U64(tf, objcSel("addTarget:action:forControlEvents:"), target, editChangedSel, intToI64(131072))
+    } else ();
+    tf
+}
+
+pub def makeScrollContainer(interactiveDismiss: Bool): Ptr = {
+    let sv = objcAllocInitFrame("UIScrollView", cgRect(0.0, 0.0, 390.0, 844.0));
+    // UIViewAutoresizingFlexibleWidth (2) | UIViewAutoresizingFlexibleHeight (16) = 18
+    msgSendVoid1I64(sv, objcSel("setAutoresizingMask:"), intToI64(18));
+    msgSendVoid1Bool(sv, objcSel("setAlwaysBounceVertical:"), true);
+    msgSendVoid1Bool(sv, objcSel("setShowsHorizontalScrollIndicator:"), false);
+    msgSendVoid1Ptr(sv, objcSel("setBackgroundColor:"), colorSystemBackground());
+    if (interactiveDismiss) {
+        // UIScrollViewKeyboardDismissModeInteractive = 2
+        msgSendVoid1I64(sv, objcSel("setKeyboardDismissMode:"), intToI64(2))
+    } else ();
+    sv
+}
+
+/// Lay out a standard `iosToggleRow` inside `card`: returns next Y coordinate (`rowY + rowH`).
+pub def layoutToggleRow(
+    titleLbl: Ptr,
+    subLbl: Ptr,
+    sw: Ptr,
+    x: Float,
+    y: Float,
+    innerW: Float
+): Float = {
+    let swSz = measureViewSize(sw, 80.0);
+    let swW = if (swSz.width > 1.0) swSz.width else 51.0;
+    let swH = if (swSz.height > 1.0) swSz.height else 31.0;
+    let textW = innerW - swW - 10.0;
+    let tSz = measureViewSize(titleLbl, textW);
+    let sSz = measureViewSize(subLbl, textW);
+    let textStackH = tSz.height + 2.0 + sSz.height;
+    let rowH = if (textStackH > swH) textStackH else swH;
+    let textTop = y + roundPx((rowH - textStackH) * 0.5);
+    msgSendVoid1Rect(titleLbl, objcSel("setFrame:"), cgRect(x, textTop, textW, tSz.height));
+    msgSendVoid1Rect(subLbl, objcSel("setFrame:"), cgRect(x, textTop + tSz.height + 2.0, textW, sSz.height));
+    let swTop = y + roundPx((rowH - swH) * 0.5);
+    msgSendVoid1Rect(sw, objcSel("setFrame:"), cgRect(x + innerW - swW, swTop, swW, swH));
+    y + rowH
+}
+
+pub def updateScrollKeyboardInset(scrollView: Ptr, hostView: Ptr, notif: Ptr, isHiding: Bool): Void =
+    if (!ptrIsNull(scrollView) && !ptrIsNull(hostView)) {
+        let bottomInset =
+            if (isHiding || ptrIsNull(notif)) 0.0
+            else {
+                let info = msgSend0(notif, objcSel("userInfo"));
+                let key = keyKeyboardFrameEnd();
+                if (ptrIsNull(info) || ptrIsNull(key)) 0.0
+                else {
+                    let nsVal = msgSend1Ptr(info, objcSel("objectForKey:"), key);
+                    if (ptrIsNull(nsVal)) 0.0
+                    else {
+                        let kbScreenRect = msgSendRect0(nsVal, objcSel("CGRectValue"));
+                        let kbLocal = msgSendRect1Rect1Ptr(
+                            hostView,
+                            objcSel("convertRect:fromView:"),
+                            kbScreenRect,
+                            ptrNull()
+                        );
+                        let b = msgSendRect0(hostView, objcSel("bounds"));
+                        let safeBottom = msgSendInsets0(hostView, objcSel("safeAreaInsets")).bottom;
+                        let overlap = (b.origin.y + b.size.height) - kbLocal.origin.y - safeBottom;
+                        if (overlap > 0.0) overlap else 0.0
+                    }
+                }
+            };
+        let ins = uiEdgeInsets(0.0, 0.0, bottomInset, 0.0);
+        msgSendVoid1Insets(scrollView, objcSel("setContentInset:"), ins);
+        msgSendVoid1Insets(scrollView, objcSel("setScrollIndicatorInsets:"), ins)
+    } else ()
+
+// ============================================================================
+// System Keyboard Dismissal, Settings Deep Link & Unicode String Trimming
+// ============================================================================
+
+pub def dismissAllKeyboards(): Void = {
+    let appCls = objcClass("UIApplication");
+    if (!ptrIsNull(appCls)) {
+        let app = msgSend0(appCls, objcSel("sharedApplication"));
+        if (!ptrIsNull(app)) {
+            let _ = msgSendBool1Sel1Ptr2Ptr(
+                app,
+                objcSel("sendAction:to:from:forEvent:"),
+                objcSel("resignFirstResponder"),
+                ptrNull(),
+                ptrNull(),
+                ptrNull()
+            );
+            ()
+        } else ()
+    } else ()
+}
+
+pub def openSystemKeyboardSettings(): Void = {
+    let urlStr = readObjcGlobalPtr("UIApplicationOpenSettingsURLString", "app-settings:");
+    if (!ptrIsNull(urlStr)) {
+        let url = msgSend1Ptr(objcClass("NSURL"), objcSel("URLWithString:"), urlStr);
+        let app = msgSend0(objcClass("UIApplication"), objcSel("sharedApplication"));
+        if (!ptrIsNull(url) && !ptrIsNull(app)) {
+            let emptyDict = msgSend0(objcClass("NSDictionary"), objcSel("dictionary"));
+            msgSendVoid3Ptr(app, objcSel("openURL:options:completionHandler:"), url, emptyDict, ptrNull())
+        } else ()
+    } else ()
+}
+
+pub def trimUnicodeWhitespace(s: String): String = {
+    let scs = utf8ToScalars(s);
+    let n = vecLen(scs);
+    let lo = cellNew(0);
+    while (cellGet(lo) < n && isUnicodeWhitespaceScalar(vecGetOr(scs, cellGet(lo), 0))) {
+        cellSet(lo, cellGet(lo) + 1)
+    };
+    let hi = cellNew(n);
+    while (cellGet(hi) > cellGet(lo) && isUnicodeWhitespaceScalar(vecGetOr(scs, cellGet(hi) - 1, 0))) {
+        cellSet(hi, cellGet(hi) - 1)
+    };
+    scalarsToUtf8(scs, cellGet(lo), cellGet(hi))
+}
+
+pub def asciiLower(s: String): String = {
+    let scs = utf8ToScalars(s);
+    let n = vecLen(scs);
+    let out = std.vec.vecWithCap(n);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let cp = vecGetOr(scs, cellGet(i), 0);
+        let lc = if (cp >= 65 && cp <= 90) cp + 32 else cp;
+        std.vec.vecPush(out, lc);
+        cellSet(i, cellGet(i) + 1)
+    };
+    scalarsToUtf8(out, 0, n)
+}
+
+pub def setButtonPlainTitle(btn: Ptr, title: String, font: Ptr, color: Ptr): Void = {
+    // UIControlStateNormal = 0
+    msgSendVoid1Ptr1I64(btn, objcSel("setTitle:forState:"), nsStr(title), intToI64(0));
+    msgSendVoid1Ptr1I64(btn, objcSel("setTitleColor:forState:"), color, intToI64(0));
+    let lbl = msgSend0(btn, objcSel("titleLabel"));
+    if (!ptrIsNull(lbl)) {
+        msgSendVoid1Ptr(lbl, objcSel("setFont:"), font)
+    } else ();
+    msgSendVoid1Ptr(btn, objcSel("setAccessibilityLabel:"), nsStr(title))
+}

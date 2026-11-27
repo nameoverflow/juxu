@@ -1,105 +1,1394 @@
-/// High-level Juxu input session wrapping `juxu_core.JuxuEngine` directly in Geisha
-/// (zero C FFI, zero JSON parsing on hot paths).
+/// Complete 1:1 port of `Shared/JuxuBridge.swift` (1,352 lines):
+/// - Lazy single-active-schema `.wbdict`/`.pydict` mmap management (`retainOnlySchemaDict`)
+/// - `.appex` parent `../../Dicts` lookup + lazy `emoji.tsv` loading
+/// - macOS `~/.juxu.toml` / `~/.priswubi.toml` & `PrisWubi` legacy migration
+/// - iOS App Group (`group.im.juxu.shared`) + Keychain (`input-settings`, `touch-profile`, `user-data-zlib`, `eval-log-ring`)
+/// - Serial background persistence queue with debounced iOS Keychain flushes & log rotation.
 
 use std.option.{Option, Some, None}
-use std.result.{Result, Ok, Err}
-use std.path.{pathJoin}
-use sys.fs.{fileExists, writeFileAtomic, mkdirAll}
+use std.result.{Ok, Err}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGetOr, vecClear}
+use std.path.{pathJoin, pathDirname}
+use std.str.{strEndsWith, strTrim}
+use sys.fs.{
+    fileExists, isDir, mkdirAll, readFile, writeFileAtomic, writeFileAtomicMode,
+    removeFile, renameFile, fileMtimeMs,
+}
+use objc.{objcClass, objcSel, msgSend0, msgSend1Ptr, msgSendI64_0}
 use juxu_core.{
-    JuxuEngine, JuxuError,
+    JuxuEngine,
     InputSchema, Wubi86, Wubi98, Wubi06, Xiaohe, Pinyin, XiaoheShuangpin,
     Cangjie3, Cangjie5, Cangjie6,
+    JuxuConfig, defaultConfig, schemaId, schemaFromId,
     DictKind, SchemaDict, PinyinDict, EnglishDict, EmojiTable, AuxModel,
-    ConfigFormat, Toml,
-    InputEvent, EngineSnapshot,
-    engineNew, loadDict, hasActiveDict,
-    loadConfig, saveConfig, applyConfig, exportConfig, getSchema,
-    loadUserData, exportUserDataTsv, isUserDirty,
-    step, state, clear, trimMemory, setContext, predictNext,
+    ConfigFormat, Toml, Json,
+    PageDir, PagePrev, PageNext,
+    InputEvent, Key, Touch, T9Touch, LockT9Syllable, SelectPage, SelectAbs, TurnPage, ToggleAscii, CommitPending,
+    KeyInput, RawKey,
+    Candidate, UserPhraseInfo, KeyTouchSample, TouchKeyOffset, touchKeyOffsetZero,
+    EngineSnapshot,
+    engineNew, loadDict, retainOnlySchemaDict, hasActiveDict,
+    getSchema, getConfig, setConfig, loadConfig, saveConfig, applyConfig, exportConfig,
+    loadUserData, importUserDataTsv, userDataSeq, exportUserDataTsv, isUserDirty,
+    addUserPhrase, removeUserPhrase, listUserPhrases,
+    setKeyLayout, setT9Layout, resetTouchProfile, setTouchProfile, touchProfile,
+    step, state, clear, trimMemory, abandon, notifyPostCommitBackspace, resetQuoteState,
+    allCandidates, setContext, acceptPrediction, predictNext, drainEvalLogJsonl,
+    touchProfileToJson,
+}
+use juxu_core.config.{MkJuxuConfig}
+use apple_geom.{
+    nsStr, nsStrPtrToString, mainBundleResourcePath, mainBundlePath,
+    appleHomeDirectory, appleTemporaryDirectory, systemUptimeSeconds, utf8ScalarCount,
+    msgSend1I64_1Ptr,
+    dispatchQueueCreateSerial, dispatchAsync, dispatchSync, dispatchMainAsync, dispatchMainAfterMs,
+}
+use models.{
+    appGroupIdentifier,
+    EvalLogSummary, emptyEvalLogSummary, parseEvalLogSummary,
+    JuxuActionState, emptyActionState, snapshotToActionState,
 }
 use text_formatting.{
     PunctuationPairingTracker, punctuationTrackerNew, punctuationTrackerReset,
-    AutoSpaceOptions, defaultAutoSpaceOptions,
+    AutoSpaceContextTracker, autoSpaceTrackerNew, autoSpaceTrackerInvalidate,
+    AutoSpaceOptions, defaultAutoSpaceOptions, autoSpaceOptionsFromConfig,
 }
+use keychain.{
+    kcAccountSettings,
+    keychainReadString, keychainWriteString,
+    keychainReadUserDataSeq, keychainWriteUserDataSeq,
+    keychainDecodeSharedUserData, keychainWriteSharedUserData,
+    keychainReadTouchProfile, keychainWriteTouchProfile,
+    keychainDecodeEvalRingLines, keychainWriteEvalRingLines,
+    splitNonEmptyLines, joinLines,
+}
+
+extern "objc_msgSend" def msgSend2U64(obj: Ptr, sel: Ptr, a0: Int64, a1: Int64): Ptr
 
 pub data JuxuSession {
     engine: JuxuEngine,
     punctuation: PunctuationPairingTracker,
+    autoSpaceTracker: AutoSpaceContextTracker,
     autoSpace: Cell AutoSpaceOptions,
+    jsState: Cell JuxuActionState,
+    jsConfig: Cell JuxuConfig,
+    userPhrases: Cell (Vec UserPhraseInfo),
+    touchCalibrations: Cell (Vec KeyTouchSample),
+    evalLogSummary: Cell EvalLogSummary,
+    suppressEvalLogging: Cell Bool,
     configPath: Cell String,
     userDataPath: Cell String,
+    evalLogPath: Cell String,
     dictDir: Cell String,
+    hasSharedContainerAccess: Cell Bool,
+    inMemoryOnly: Cell Bool,
+    isAppExtension: Cell Bool,
+    isIosPlatform: Cell Bool,
+    emojiTableLoaded: Cell Bool,
+    pinyinDictLoaded: Cell Bool,
+    auxDictLoaded: Cell Bool,
+    loadedSchemaMask: Cell Int,
+    lastLoadedUserDataMtimeMs: Cell Int64,
+    userDataSaveGen: Cell Int64,
+    lastSharedPrefsRaw: Cell String,
+    lastSharedTouchJson: Cell String,
+    lastSharedUserDataSeq: Cell Int64,
+    lastAppearanceCheckUptime: Cell Float,
+    persistenceQueue: Ptr,
+    iosEvalRingLoaded: Cell Bool,
+    iosEvalRingLines: Vec String,
+    iosEvalRingDirty: Cell Bool,
+    pendingRingFlushArmed: Cell Bool,
+    pendingUserDataFlushArmed: Cell Bool,
+    pendingUserDataTsv: Cell String,
 }
 
-/// Create a new Juxu session with an initialized engine and default trackers.
-pub def sessionNew(): JuxuSession =
-    JuxuSession {
-        engine: engineNew(),
-        punctuation: punctuationTrackerNew(),
-        autoSpace: cellNew(defaultAutoSpaceOptions()),
-        configPath: cellNew(""),
-        userDataPath: cellNew(""),
-        dictDir: cellNew(""),
+def gSharedSession: Cell (Option JuxuSession) = cellNew(None)
+
+def detectIsIosPlatform(): Bool =
+    !ptrIsNull(objcClass("UIApplication"))
+
+def detectIsAppExtension(): Bool =
+    strEndsWith(mainBundlePath(), ".appex")
+
+def schemaBitMask(sid: Int): Int =
+    if (sid == 86) 1
+    else if (sid == 98) 2
+    else if (sid == 6) 4
+    else if (sid == 10) 8
+    else if (sid == 33) 16
+    else if (sid == 35) 32
+    else if (sid == 36) 64
+    else 0
+
+def schemaDictFilename(sid: Int): String =
+    if (sid == 98) "wubi98.wbdict"
+    else if (sid == 6) "wubi06.wbdict"
+    else if (sid == 10) "xiaohe.wbdict"
+    else if (sid == 33) "cangjie3.wbdict"
+    else if (sid == 35) "cangjie5.wbdict"
+    else if (sid == 36) "cangjie6.wbdict"
+    else "wubi86.wbdict"
+
+def resolveIosDocumentsDir(): String = {
+    let fmCls = objcClass("NSFileManager");
+    if (ptrIsNull(fmCls)) appleTemporaryDirectory()
+    else {
+        let fm = msgSend0(fmCls, objcSel("defaultManager"));
+        // NSDocumentDirectory = 9, NSUserDomainMask = 1
+        let urls = msgSend2U64(fm, objcSel("URLsForDirectory:inDomains:"), intToI64(9), intToI64(1));
+        if (ptrIsNull(urls) || msgSendI64_0(urls, objcSel("count")) == intToI64(0)) appleTemporaryDirectory()
+        else {
+            let firstUrl = msgSend1I64_1Ptr(urls, objcSel("objectAtIndex:"), intToI64(0), ptrNull());
+            let p = nsStrPtrToString(msgSend0(firstUrl, objcSel("path")));
+            if (strLen(p) > 0) p else appleTemporaryDirectory()
+        }
+    }
+}
+
+def resolveIosAppGroupDir(): Option String = {
+    let fmCls = objcClass("NSFileManager");
+    if (ptrIsNull(fmCls)) None
+    else {
+        let fm = msgSend0(fmCls, objcSel("defaultManager"));
+        let url = msgSend1Ptr(fm, objcSel("containerURLForSecurityApplicationGroupIdentifier:"), nsStr(appGroupIdentifier()));
+        if (ptrIsNull(url)) None
+        else {
+            let p = nsStrPtrToString(msgSend0(url, objcSel("path")));
+            if (strLen(p) > 0) Some(p) else None
+        }
+    }
+}
+
+def copyFileIfMissing(src: String, dst: String): Void =
+    if (fileExists(src) && !fileExists(dst)) {
+        match readFile(src) {
+            Ok(content) -> {
+                let _ = writeFileAtomic(dst, content);
+                ()
+            },
+            Err(_) -> (),
+        }
+    } else ()
+
+def configureDefaultPaths(s: JuxuSession, inMem: Bool): Void =
+    if (cellGet(s.isIosPlatform)) {
+        match resolveIosAppGroupDir() {
+            Some(grpDir) -> {
+                cellSet(s.configPath, pathJoin(grpDir, "config.toml"));
+                cellSet(s.userDataPath, pathJoin(grpDir, "user_data.tsv"));
+                cellSet(s.evalLogPath, pathJoin(grpDir, "eval_log.jsonl"));
+                cellSet(s.hasSharedContainerAccess, true)
+            },
+            None -> {
+                let docs = resolveIosDocumentsDir();
+                cellSet(s.configPath, pathJoin(docs, "config.toml"));
+                cellSet(s.userDataPath, pathJoin(docs, "user_data.tsv"));
+                cellSet(s.evalLogPath, pathJoin(docs, "eval_log.jsonl"));
+                cellSet(s.hasSharedContainerAccess, false)
+            },
+        }
+    } else {
+        let home = appleHomeDirectory();
+        let dotfile = pathJoin(home, ".juxu.toml");
+        let legacyDotfile = pathJoin(home, ".priswubi.toml");
+        let appSupport = pathJoin(home, "Library/Application Support/Juxu");
+        let legacyAppSupport = pathJoin(home, "Library/Application Support/PrisWubi");
+        if (!inMem) {
+            if (!isDir(appSupport) && isDir(legacyAppSupport)) {
+                let _ = mkdirAll(appSupport);
+                copyFileIfMissing(pathJoin(legacyAppSupport, "config.toml"), pathJoin(appSupport, "config.toml"));
+                copyFileIfMissing(pathJoin(legacyAppSupport, "user_data.tsv"), pathJoin(appSupport, "user_data.tsv"))
+            } else {
+                let _ = mkdirAll(appSupport);
+                ()
+            }
+        } else ();
+        let cfgP =
+            if (fileExists(dotfile)) dotfile
+            else if (fileExists(legacyDotfile)) legacyDotfile
+            else pathJoin(appSupport, "config.toml");
+        cellSet(s.configPath, cfgP);
+        cellSet(s.userDataPath, pathJoin(appSupport, "user_data.tsv"));
+        cellSet(s.evalLogPath, pathJoin(appSupport, "eval_log.jsonl"));
+        cellSet(s.hasSharedContainerAccess, true)
     }
 
-/// Load all available dictionaries from `dictDir` into the session's engine.
-/// Missing optional schema dicts are tolerated; returns `Ok(loadedCount)`.
-pub def sessionLoadDictsFromDir(s: JuxuSession, dir: String): Int = {
-    cellSet(s.dictDir, dir);
-    let loaded = cellNew(0);
-    let tryOne = (kind: DictKind, file: String) -> {
-        let p = pathJoin(dir, file);
-        if (fileExists(p)) {
-            match loadDict(s.engine, kind, p) {
-                Ok(_) -> cellSet(loaded, cellGet(loaded) + 1),
-                Err(_) -> (),
-            }
-        } else ()
-    };
-    tryOne(PinyinDict, "pinyin.pydict");
-    tryOne(AuxModel, "wubi_aux.wbaux");
-    tryOne(EnglishDict, "english.endict");
-    tryOne(EmojiTable, "emoji.tsv");
-    tryOne(SchemaDict(Wubi86), "wubi86.wbdict");
-    tryOne(SchemaDict(Wubi98), "wubi98.wbdict");
-    tryOne(SchemaDict(Wubi06), "wubi06.wbdict");
-    tryOne(SchemaDict(Xiaohe), "xiaohe.wbdict");
-    tryOne(SchemaDict(Cangjie3), "cangjie3.wbdict");
-    tryOne(SchemaDict(Cangjie5), "cangjie5.wbdict");
-    tryOne(SchemaDict(Cangjie6), "cangjie6.wbdict");
-    cellGet(loaded)
-}
+def safeMtimeMs(path: String): Int64 =
+    if (strLen(path) == 0 || !fileExists(path)) intToI64(0)
+    else match fileMtimeMs(path) {
+        Ok(ms) -> ms,
+        Err(_) -> intToI64(0),
+    }
 
-/// Bind persistent config & user-data paths in `dataDir` and load them if present.
-pub def sessionLoadPersistence(s: JuxuSession, dataDir: String): Void = {
-    let _ = mkdirAll(dataDir);
-    let cfgP = pathJoin(dataDir, "config.toml");
-    let usrP = pathJoin(dataDir, "user_data.tsv");
-    cellSet(s.configPath, cfgP);
-    cellSet(s.userDataPath, usrP);
-    if (fileExists(cfgP)) {
-        let _ = loadConfig(s.engine, cfgP);
+// ============================================================================
+// Persistence Worker Helpers (File I/O + Eval Ring + Keychain Zlib)
+// ============================================================================
+
+def writeUserDataFileDirect(path: String, tsv: String): Int64 =
+    if (strLen(path) == 0) intToI64(0)
+    else {
+        let _ = mkdirAll(pathDirname(path));
+        let _ = writeFileAtomic(path, tsv);
+        safeMtimeMs(path)
+    }
+
+def flushIosEvalRingDirect(s: JuxuSession): Void =
+    if (cellGet(s.iosEvalRingDirty)) {
+        cellSet(s.iosEvalRingDirty, false);
+        let _ = keychainWriteEvalRingLines(s.iosEvalRingLines);
         ()
-    } else ();
-    if (fileExists(usrP)) {
-        let _ = loadUserData(s.engine, usrP);
+    } else ()
+
+def flushIosUserDataDirect(s: JuxuSession): Void = {
+    let tsv = cellGet(s.pendingUserDataTsv);
+    if (strLen(tsv) > 0) {
+        cellSet(s.pendingUserDataTsv, "");
+        let _ = keychainWriteSharedUserData(tsv);
         ()
     } else ()
 }
 
-/// Flush dirty user data to disk atomically if `userDataPath` is configured.
-pub def sessionFlushUserData(s: JuxuSession): Bool = {
-    let p = cellGet(s.userDataPath);
-    if (strLen(p) > 0 && isUserDirty(s.engine)) {
-        let tsv = exportUserDataTsv(s.engine);
-        match writeFileAtomic(p, tsv) {
-            Ok(_) -> true,
-            Err(_) -> false,
-        }
-    } else false
+def appendEvalLogOnQueue(s: JuxuSession, batch: String): Void = {
+    let logPath = cellGet(s.evalLogPath);
+    if (strLen(logPath) > 0) {
+        let dir = pathDirname(logPath);
+        let _ = mkdirAll(dir);
+        let maxBytes = if (cellGet(s.isAppExtension)) 524288 else 8388608;
+        let existing = if (fileExists(logPath)) {
+            match readFile(logPath) { Ok(c) -> c, Err(_) -> "" }
+        } else "";
+        let baseContent =
+            if (strLen(existing) > maxBytes) {
+                let prevPath = pathJoin(dir, "eval_log.prev.jsonl");
+                let _ = removeFile(prevPath);
+                if (cellGet(s.isAppExtension)) {
+                    let _ = removeFile(logPath);
+                    ""
+                } else {
+                    let _ = renameFile(logPath, prevPath);
+                    ""
+                }
+            } else existing;
+        let nextContent = baseContent + batch + "\n";
+        let _ = writeFileAtomicMode(logPath, nextContent, 0o600);
+        ()
+    } else ();
+
+    if (cellGet(s.isIosPlatform)) {
+        if (!cellGet(s.iosEvalRingLoaded)) {
+            let loaded = keychainDecodeEvalRingLines();
+            vecClear(s.iosEvalRingLines);
+            let k = cellNew(0);
+            while (cellGet(k) < vecLen(loaded)) {
+                vecPush(s.iosEvalRingLines, vecGetOr(loaded, cellGet(k), ""));
+                cellSet(k, cellGet(k) + 1)
+            };
+            cellSet(s.iosEvalRingLoaded, true)
+        } else ();
+        let added = splitNonEmptyLines(batch);
+        if (vecLen(added) > 0) {
+            let total = vecLen(s.iosEvalRingLines) + vecLen(added);
+            let keepOldStart = if (total > 400) total - 400 else 0;
+            let merged: Vec String = vecWithCap(if (total > 400) 400 else total);
+            let oldN = vecLen(s.iosEvalRingLines);
+            let i = cellNew(if (keepOldStart < oldN) keepOldStart else oldN);
+            while (cellGet(i) < oldN) {
+                vecPush(merged, vecGetOr(s.iosEvalRingLines, cellGet(i), ""));
+                cellSet(i, cellGet(i) + 1)
+            };
+            let addStart = if (keepOldStart > oldN) keepOldStart - oldN else 0;
+            let j = cellNew(addStart);
+            while (cellGet(j) < vecLen(added)) {
+                vecPush(merged, vecGetOr(added, cellGet(j), ""));
+                cellSet(j, cellGet(j) + 1)
+            };
+            vecClear(s.iosEvalRingLines);
+            let m = cellNew(0);
+            while (cellGet(m) < vecLen(merged)) {
+                vecPush(s.iosEvalRingLines, vecGetOr(merged, cellGet(m), ""));
+                cellSet(m, cellGet(m) + 1)
+            };
+            cellSet(s.iosEvalRingDirty, true);
+            if (!cellGet(s.pendingRingFlushArmed)) {
+                cellSet(s.pendingRingFlushArmed, true);
+                dispatchMainAfterMs(1200, () -> {
+                    dispatchAsync(s.persistenceQueue, () -> {
+                        cellSet(s.pendingRingFlushArmed, false);
+                        flushIosEvalRingDirect(s)
+                    })
+                })
+            } else ()
+        } else ()
+    } else ()
 }
 
-/// Save current config TOML to `configPath` if configured.
+def drainEvalLogIfNeeded(s: JuxuSession): Void = {
+    let batch = drainEvalLogJsonl(s.engine);
+    if (!cellGet(s.inMemoryOnly) && !cellGet(s.suppressEvalLogging) && strLen(batch) > 0) {
+        dispatchAsync(s.persistenceQueue, () -> {
+            appendEvalLogOnQueue(s, batch)
+        })
+    } else ()
+}
+
+// ============================================================================
+// Dictionary Discovery & Lazy Active-Schema Loading (`JuxuBridge.loadDictionaries` / `ensureDictionaryLoaded`)
+// ============================================================================
+
+pub def bridgeDiscoverDicts(s: JuxuSession, overrideDirOpt: Option String): Void = {
+    let candidates: Vec String = vecWithCap(6);
+    match overrideDirOpt {
+        Some(ov) if (strLen(ov) > 0) -> vecPush(candidates, ov),
+        _ -> (),
+    };
+    let bundleP = mainBundlePath();
+    if (strLen(bundleP) > 0) {
+        // On iOS App Extensions (`JuxuApp.app/PlugIns/JuxuKeyboard.appex`), prefer containing app's `../../Dicts` first!
+        let parent2 = pathDirname(pathDirname(bundleP));
+        if (strLen(parent2) > 0) vecPush(candidates, pathJoin(parent2, "Dicts")) else ()
+    } else ();
+    let resP = mainBundleResourcePath();
+    if (strLen(resP) > 0) {
+        vecPush(candidates, pathJoin(resP, "Dicts"));
+        vecPush(candidates, resP)
+    } else ();
+    vecPush(candidates, "Resources/Dicts");
+    vecPush(candidates, "../Resources/Dicts");
+
+    let n = vecLen(candidates);
+    let i = cellNew(0);
+    let found = cellNew(false);
+    while (cellGet(i) < n && !cellGet(found)) {
+        let dir = vecGetOr(candidates, cellGet(i), "");
+        if (strLen(dir) > 0 && fileExists(pathJoin(dir, "wubi86.wbdict"))) {
+            cellSet(s.dictDir, dir);
+            cellSet(found, true);
+            if (!cellGet(s.auxDictLoaded)) {
+                let pAux = pathJoin(dir, "wubi_aux.wbaux");
+                if (fileExists(pAux)) {
+                    match loadDict(s.engine, AuxModel, pAux) {
+                        Ok(_) -> cellSet(s.auxDictLoaded, true),
+                        Err(_) -> (),
+                    }
+                } else ()
+            } else ();
+            let pEn = pathJoin(dir, "english.endict");
+            if (fileExists(pEn)) {
+                let _ = loadDict(s.engine, EnglishDict, pEn);
+                ()
+            } else ()
+        } else ();
+        cellSet(i, cellGet(i) + 1)
+    }
+}
+
+def ensureEmojiTableLoaded(s: JuxuSession): Void = {
+    let cfg = cellGet(s.jsConfig);
+    let dir = cellGet(s.dictDir);
+    if (cfg.emojiCandidates && !cellGet(s.emojiTableLoaded) && strLen(dir) > 0) {
+        let pEmoji = pathJoin(dir, "emoji.tsv");
+        if (fileExists(pEmoji)) {
+            match loadDict(s.engine, EmojiTable, pEmoji) {
+                Ok(_) -> cellSet(s.emojiTableLoaded, true),
+                Err(_) -> (),
+            }
+        } else ()
+    } else ()
+}
+
+pub def bridgeEnsureDictionaryLoaded(s: JuxuSession, sid: Int): Void = {
+    if (strLen(cellGet(s.dictDir)) == 0) {
+        bridgeDiscoverDicts(s, None)
+    } else ();
+    let dir = cellGet(s.dictDir);
+    if (strLen(dir) > 0) {
+        if (!cellGet(s.auxDictLoaded)) {
+            let pAux = pathJoin(dir, "wubi_aux.wbaux");
+            if (fileExists(pAux)) {
+                match loadDict(s.engine, AuxModel, pAux) {
+                    Ok(_) -> cellSet(s.auxDictLoaded, true),
+                    Err(_) -> (),
+                }
+            } else ()
+        } else ();
+
+        let schema = schemaFromId(sid);
+        if (sid == 20 || sid == 21) {
+            if (cellGet(s.loadedSchemaMask) != 0) {
+                retainOnlySchemaDict(s.engine, schema);
+                cellSet(s.loadedSchemaMask, 0)
+            } else ();
+            if (!cellGet(s.pinyinDictLoaded) || !hasActiveDict(s.engine)) {
+                let pPy = pathJoin(dir, "pinyin.pydict");
+                if (fileExists(pPy)) {
+                    match loadDict(s.engine, PinyinDict, pPy) {
+                        Ok(_) -> cellSet(s.pinyinDictLoaded, true),
+                        Err(_) -> (),
+                    }
+                } else ()
+            } else ()
+        } else {
+            let bit = schemaBitMask(sid);
+            let curMask = cellGet(s.loadedSchemaMask);
+            if (cellGet(s.pinyinDictLoaded) || (curMask != 0 && curMask != bit)) {
+                retainOnlySchemaDict(s.engine, schema);
+                cellSet(s.pinyinDictLoaded, false);
+                cellSet(s.loadedSchemaMask, if ((curMask & bit) != 0) bit else 0)
+            } else ();
+            let newMask = cellGet(s.loadedSchemaMask);
+            if ((newMask & bit) == 0 || (schemaId(getSchema(s.engine)) == sid && !hasActiveDict(s.engine))) {
+                let pDict = pathJoin(dir, schemaDictFilename(sid));
+                if (fileExists(pDict)) {
+                    match loadDict(s.engine, SchemaDict(schema), pDict) {
+                        Ok(_) -> cellSet(s.loadedSchemaMask, newMask | bit),
+                        Err(_) -> (),
+                    }
+                } else ()
+            } else ()
+        }
+    } else ()
+}
+
+// ============================================================================
+// State & Published Lists Refresh
+// ============================================================================
+
+def applySnapToSession(s: JuxuSession, snap: EngineSnapshot): JuxuActionState = {
+    let includeTouch = match snap.action {
+        Some(a) -> strLen(a.commitText) > 0,
+        None -> true,
+    };
+    let freshTouchOpt =
+        if (includeTouch && snap.calibratedKeyCount > 0) Some(touchProfile(s.engine))
+        else None;
+    let nextSt = snapshotToActionState(snap, freshTouchOpt, cellGet(s.jsState));
+    cellSet(s.jsState, nextSt);
+    nextSt
+}
+
+pub def bridgeRefreshState(s: JuxuSession): JuxuActionState =
+    applySnapToSession(s, state(s.engine))
+
+pub def bridgeRefreshUserPhrases(s: JuxuSession): Vec UserPhraseInfo = {
+    let list = listUserPhrases(s.engine);
+    cellSet(s.userPhrases, list);
+    list
+}
+
+pub def bridgeRefreshTouchProfile(s: JuxuSession): Vec KeyTouchSample = {
+    let prof = touchProfile(s.engine);
+    cellSet(s.touchCalibrations, prof);
+    prof
+}
+
+def adoptSharedTouchSamples(s: JuxuSession, samples: Vec KeyTouchSample): Void = {
+    let jsonStr = touchProfileToJson(samples);
+    cellSet(s.lastSharedTouchJson, jsonStr);
+    if (vecLen(samples) == 26 && jsonStr != touchProfileToJson(touchProfile(s.engine))) {
+        let offsets: Vec TouchKeyOffset = vecWithCap(26);
+        let dummy = KeyTouchSample { keyLabel: "a", offset: touchKeyOffsetZero() };
+        let i = cellNew(0);
+        while (cellGet(i) < 26) {
+            vecPush(offsets, vecGetOr(samples, cellGet(i), dummy).offset);
+            cellSet(i, cellGet(i) + 1)
+        };
+        let _ = setTouchProfile(s.engine, offsets);
+        ()
+    } else ()
+}
+
+def hasAnyTouchSamples(samples: Vec KeyTouchSample): Bool = {
+    let dummy = KeyTouchSample { keyLabel: "a", offset: touchKeyOffsetZero() };
+    let i = cellNew(0);
+    let any = cellNew(false);
+    while (cellGet(i) < vecLen(samples) && !cellGet(any)) {
+        if (vecGetOr(samples, cellGet(i), dummy).offset.samples > 0) cellSet(any, true) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(any)
+}
+
+def publishTouchProfileSync(s: JuxuSession, isReset: Bool): Void =
+    if (!cellGet(s.inMemoryOnly) && cellGet(s.isIosPlatform)) {
+        let prof = touchProfile(s.engine);
+        let jsonStr = touchProfileToJson(prof);
+        let known = cellGet(s.lastSharedTouchJson);
+        if (vecLen(prof) == 26 && (isReset || (jsonStr != known && hasAnyTouchSamples(prof)))) {
+            if (!isReset) {
+                match keychainReadTouchProfile() {
+                    Some(remote) -> {
+                        let remoteJson = touchProfileToJson(remote);
+                        if (strLen(known) > 0 && remoteJson != known) {
+                            adoptSharedTouchSamples(s, remote)
+                        } else if (keychainWriteTouchProfile(prof)) {
+                            cellSet(s.lastSharedTouchJson, jsonStr)
+                        } else ()
+                    },
+                    None ->
+                        if (keychainWriteTouchProfile(prof)) {
+                            cellSet(s.lastSharedTouchJson, jsonStr)
+                        } else (),
+                }
+            } else if (keychainWriteTouchProfile(prof)) {
+                cellSet(s.lastSharedTouchJson, jsonStr)
+            } else ()
+        } else ()
+    } else ()
+
+def loadSharedTouchProfileOnInit(s: JuxuSession): Void =
+    if (!cellGet(s.inMemoryOnly) && cellGet(s.isIosPlatform)) {
+        match keychainReadTouchProfile() {
+            Some(prof) -> adoptSharedTouchSamples(s, prof),
+            None -> publishTouchProfileSync(s, false),
+        }
+    } else ()
+
+// ============================================================================
+// Initialization & Config/User Synchronization (`JuxuBridge.init` / `loadConfigAndUser`)
+// ============================================================================
+
+pub def bridgeLoadConfigAndUser(s: JuxuSession, refreshPublishedLists: Bool): Void = {
+    let inMem = cellGet(s.inMemoryOnly);
+    let cfgPath = cellGet(s.configPath);
+    let usrPath = cellGet(s.userDataPath);
+    if (!inMem && strLen(cfgPath) > 0) {
+        if (fileExists(cfgPath)) {
+            let _ = loadConfig(s.engine, cfgPath);
+            ()
+        } else {
+            let _ = mkdirAll(pathDirname(cfgPath));
+            let _ = saveConfig(s.engine, cfgPath);
+            ()
+        }
+    } else ();
+
+    if (cellGet(s.isIosPlatform) && !inMem) {
+        match keychainReadString(kcAccountSettings()) {
+            Some(sharedToml) if (strLen(sharedToml) > 0) -> {
+                cellSet(s.lastSharedPrefsRaw, sharedToml);
+                applyConfig(s.engine, Toml, sharedToml);
+                if (cellGet(s.isAppExtension) && strLen(cfgPath) > 0) {
+                    let _ = saveConfig(s.engine, cfgPath);
+                    ()
+                } else ()
+            },
+            _ -> cellSet(s.lastSharedPrefsRaw, ""),
+        };
+        if (!cellGet(s.isAppExtension)) {
+            loadSharedTouchProfileOnInit(s);
+            cellSet(s.lastAppearanceCheckUptime, systemUptimeSeconds())
+        } else {
+            cellSet(s.lastAppearanceCheckUptime, 0.0)
+        }
+    } else ();
+
+    let cfg = getConfig(s.engine);
+    cellSet(s.jsConfig, cfg);
+    cellSet(s.autoSpace, autoSpaceOptionsFromConfig(cfg));
+    bridgeEnsureDictionaryLoaded(s, schemaId(cfg.schema));
+    ensureEmojiTableLoaded(s);
+
+    if (!inMem && strLen(usrPath) > 0 && fileExists(usrPath)) {
+        let mtime = safeMtimeMs(usrPath);
+        let prevMtime = cellGet(s.lastLoadedUserDataMtimeMs);
+        if (prevMtime == intToI64(0) || mtime == intToI64(0) || mtime != prevMtime) {
+            match loadUserData(s.engine, usrPath) {
+                Ok(_) -> cellSet(s.lastLoadedUserDataMtimeMs, mtime),
+                Err(_) -> (),
+            }
+        } else ()
+    } else ();
+
+    if (cellGet(s.isIosPlatform) && !inMem && !cellGet(s.hasSharedContainerAccess)) {
+        let localSeq = userDataSeq(s.engine);
+        if (cellGet(s.isAppExtension)) {
+            cellSet(s.lastSharedUserDataSeq, localSeq)
+        } else {
+            let sharedCell: Cell (Option (Int64, String)) = cellNew(None);
+            dispatchSync(s.persistenceQueue, () -> {
+                cellSet(sharedCell, keychainDecodeSharedUserData())
+            });
+            match cellGet(sharedCell) {
+                Some((sSeq, sTsv)) ->
+                    if (sSeq > localSeq) {
+                        importUserDataTsv(s.engine, sTsv);
+                        cellSet(s.lastSharedUserDataSeq, sSeq);
+                        let exported = exportUserDataTsv(s.engine);
+                        let savedMtime = cellNew(intToI64(0));
+                        dispatchSync(s.persistenceQueue, () -> {
+                            cellSet(savedMtime, writeUserDataFileDirect(usrPath, exported))
+                        });
+                        cellSet(s.lastLoadedUserDataMtimeMs, cellGet(savedMtime))
+                    } else {
+                        cellSet(s.lastSharedUserDataSeq, if (localSeq > sSeq) localSeq else sSeq);
+                        if (localSeq > sSeq && localSeq > intToI64(1)) {
+                            let tsv = exportUserDataTsv(s.engine);
+                            dispatchAsync(s.persistenceQueue, () -> {
+                                let _ = keychainWriteSharedUserData(tsv);
+                                ()
+                            })
+                        } else ()
+                    },
+                None ->
+                    if (localSeq > intToI64(1)) {
+                        cellSet(s.lastSharedUserDataSeq, localSeq);
+                        let tsv = exportUserDataTsv(s.engine);
+                        dispatchAsync(s.persistenceQueue, () -> {
+                            let _ = keychainWriteSharedUserData(tsv);
+                            ()
+                        })
+                    } else (),
+            }
+        }
+    } else ();
+
+    let _ = bridgeRefreshState(s);
+    if (refreshPublishedLists) {
+        let _ = bridgeRefreshUserPhrases(s);
+        let _ = bridgeRefreshTouchProfile(s);
+        ()
+    } else ()
+}
+
+/// Create a full `JuxuSession` (`JuxuBridge.init(customDictsDir:inMemoryOnly:)`).
+pub def bridgeNew(customDictsDirOpt: Option String, inMemoryOnly: Bool): JuxuSession = {
+    let eng = engineNew();
+    let cfg = getConfig(eng);
+    let isIos = detectIsIosPlatform();
+    let isExt = detectIsAppExtension();
+    let s = JuxuSession {
+        engine: eng,
+        punctuation: punctuationTrackerNew(),
+        autoSpaceTracker: autoSpaceTrackerNew(),
+        autoSpace: cellNew(autoSpaceOptionsFromConfig(cfg)),
+        jsState: cellNew(emptyActionState()),
+        jsConfig: cellNew(cfg),
+        userPhrases: cellNew(vecNew()),
+        touchCalibrations: cellNew(vecNew()),
+        evalLogSummary: cellNew(emptyEvalLogSummary()),
+        suppressEvalLogging: cellNew(false),
+        configPath: cellNew(""),
+        userDataPath: cellNew(""),
+        evalLogPath: cellNew(""),
+        dictDir: cellNew(""),
+        hasSharedContainerAccess: cellNew(!isIos),
+        inMemoryOnly: cellNew(inMemoryOnly),
+        isAppExtension: cellNew(isExt),
+        isIosPlatform: cellNew(isIos),
+        emojiTableLoaded: cellNew(false),
+        pinyinDictLoaded: cellNew(false),
+        auxDictLoaded: cellNew(false),
+        loadedSchemaMask: cellNew(0),
+        lastLoadedUserDataMtimeMs: cellNew(intToI64(0)),
+        userDataSaveGen: cellNew(intToI64(0)),
+        lastSharedPrefsRaw: cellNew(""),
+        lastSharedTouchJson: cellNew(""),
+        lastSharedUserDataSeq: cellNew(intToI64(0)),
+        lastAppearanceCheckUptime: cellNew(0.0),
+        persistenceQueue: dispatchQueueCreateSerial("im.juxu.persistence"),
+        iosEvalRingLoaded: cellNew(false),
+        iosEvalRingLines: vecNew(),
+        iosEvalRingDirty: cellNew(false),
+        pendingRingFlushArmed: cellNew(false),
+        pendingUserDataFlushArmed: cellNew(false),
+        pendingUserDataTsv: cellNew(""),
+    };
+    configureDefaultPaths(s, inMemoryOnly);
+    bridgeDiscoverDicts(s, customDictsDirOpt);
+    if (!inMemoryOnly) {
+        bridgeLoadConfigAndUser(s, !isExt)
+    } else {
+        bridgeEnsureDictionaryLoaded(s, schemaId(cfg.schema));
+        let _ = bridgeRefreshState(s);
+        if (!isExt) {
+            let _ = bridgeRefreshTouchProfile(s);
+            ()
+        } else ()
+    };
+    s
+}
+
+/// Process-wide singleton `JuxuBridge.shared`.
+pub def bridgeShared(): JuxuSession =
+    match cellGet(gSharedSession) {
+        Some(s) -> s,
+        None -> {
+            let s = bridgeNew(None, false);
+            cellSet(gSharedSession, Some(s));
+            s
+        },
+    }
+
+// ============================================================================
+// Preferences, Schema Switching & Persistence (`applyAndSavePreferences`, `flushUserData*`)
+// ============================================================================
+
+pub def bridgeApplyAndSaveConfig(s: JuxuSession, newCfg: JuxuConfig, persist: Bool): Void = {
+    cellSet(s.jsConfig, newCfg);
+    cellSet(s.autoSpace, autoSpaceOptionsFromConfig(newCfg));
+    bridgeEnsureDictionaryLoaded(s, schemaId(newCfg.schema));
+    setConfig(s.engine, newCfg);
+    ensureEmojiTableLoaded(s);
+    if (persist && !cellGet(s.inMemoryOnly)) {
+        let cfgP = cellGet(s.configPath);
+        if (strLen(cfgP) > 0) {
+            let _ = mkdirAll(pathDirname(cfgP));
+            let _ = saveConfig(s.engine, cfgP);
+            ()
+        } else ();
+        if (cellGet(s.isIosPlatform)) {
+            let toml = exportConfig(s.engine, Toml);
+            cellSet(s.lastSharedPrefsRaw, toml);
+            let _ = keychainWriteString(kcAccountSettings(), toml);
+            ()
+        } else ()
+    } else ();
+    let _ = bridgeRefreshState(s);
+    let _ = bridgeRefreshUserPhrases(s);
+    ()
+}
+
+pub def bridgeSwitchSchema(s: JuxuSession, sid: Int, persist: Bool): Void = {
+    let curJson = exportConfig(s.engine, Json);
+    applyConfig(s.engine, Json, curJson);
+    applyConfig(s.engine, Toml, exportConfig(s.engine, Toml) + "\n");
+    let schema = schemaFromId(sid);
+    // Update schema field via round-trip TOML header replacement or typed config update:
+    let cur = cellGet(s.jsConfig);
+    let updated = MkJuxuConfig {
+        schema: schema,
+        fourthCodeAutoCommit: cur.fourthCodeAutoCommit,
+        fifthCodePushCommit: cur.fifthCodePushCommit,
+        fourthEmptyBehavior: cur.fourthEmptyBehavior,
+        shortestCodeFirst: cur.shortestCodeFirst,
+        strictShortcode: cur.strictShortcode,
+        spaceless: cur.spaceless,
+        showShortcodeHint: cur.showShortcodeHint,
+        dynamicWordFreq: cur.dynamicWordFreq,
+        dynamicCharFreq: cur.dynamicCharFreq,
+        autoPhrase: cur.autoPhrase,
+        autoPhraseThreshold: cur.autoPhraseThreshold,
+        zOmnipotent: cur.zOmnipotent,
+        semicolonQuoteSelect: cur.semicolonQuoteSelect,
+        smartPunctuation: cur.smartPunctuation,
+        autoSpaceZhEn: cur.autoSpaceZhEn,
+        autoSpaceDigits: cur.autoSpaceDigits,
+        clipboardSuggestion: cur.clipboardSuggestion,
+        cangjieKeycapRadicals: cur.cangjieKeycapRadicals,
+        wubiKeycapRadicals: cur.wubiKeycapRadicals,
+        keySwipeUpInput: cur.keySwipeUpInput,
+        spaceCommaKey: cur.spaceCommaKey,
+        keyLongPressAlternates: cur.keyLongPressAlternates,
+        backspaceSwipeClear: cur.backspaceSwipeClear,
+        keyboardHoldCursor: cur.keyboardHoldCursor,
+        enableRareCharset: cur.enableRareCharset,
+        pinyinInitialAbbr: cur.pinyinInitialAbbr,
+        pinyinT9Layout: cur.pinyinT9Layout,
+        shiftToggleMode: cur.shiftToggleMode,
+        pageSize: cur.pageSize,
+        orientation: cur.orientation,
+        evalLogging: cur.evalLogging,
+        emojiCandidates: cur.emojiCandidates,
+        typo: cur.typo,
+    };
+    bridgeApplyAndSaveConfig(s, updated, persist)
+}
+
+pub def bridgeFlushPendingPersistence(s: JuxuSession): Void =
+    if (!cellGet(s.inMemoryOnly) && cellGet(s.isIosPlatform)) {
+        dispatchAsync(s.persistenceQueue, () -> {
+            cellSet(s.pendingRingFlushArmed, false);
+            flushIosEvalRingDirect(s);
+            cellSet(s.pendingUserDataFlushArmed, false);
+            flushIosUserDataDirect(s)
+        })
+    } else ()
+
+pub def bridgeFlushUserDataIfNeeded(s: JuxuSession, refreshPublishedLists: Bool): Void = {
+    drainEvalLogIfNeeded(s);
+    if (isUserDirty(s.engine)) {
+        cellSet(s.userDataSaveGen, cellGet(s.userDataSaveGen) + intToI64(1));
+        let tsv = exportUserDataTsv(s.engine);
+        let isIos = cellGet(s.isIosPlatform);
+        let inMem = cellGet(s.inMemoryOnly);
+        if (isIos) publishTouchProfileSync(s, false) else ();
+        let usrP = cellGet(s.userDataPath);
+        if (!inMem) {
+            let savedMtime = cellNew(intToI64(0));
+            dispatchSync(s.persistenceQueue, () -> {
+                cellSet(savedMtime, writeUserDataFileDirect(usrP, tsv));
+                if (isIos && !cellGet(s.hasSharedContainerAccess) && strLen(tsv) > 0) {
+                    cellSet(s.pendingUserDataFlushArmed, false);
+                    cellSet(s.pendingUserDataTsv, "");
+                    let _ = keychainWriteSharedUserData(tsv);
+                    ()
+                } else ()
+            });
+            cellSet(s.lastLoadedUserDataMtimeMs, cellGet(savedMtime));
+            if (isIos && !cellGet(s.hasSharedContainerAccess)) {
+                cellSet(s.lastSharedUserDataSeq, userDataSeq(s.engine))
+            } else ()
+        } else ();
+        if (refreshPublishedLists) {
+            let _ = bridgeRefreshUserPhrases(s);
+            let _ = bridgeRefreshTouchProfile(s);
+            ()
+        } else ()
+    } else ();
+    if (!cellGet(s.inMemoryOnly)) {
+        dispatchSync(s.persistenceQueue, () -> {
+            if (cellGet(s.isIosPlatform)) {
+                cellSet(s.pendingRingFlushArmed, false);
+                flushIosEvalRingDirect(s);
+                cellSet(s.pendingUserDataFlushArmed, false);
+                flushIosUserDataDirect(s)
+            } else ()
+        })
+    } else ()
+}
+
+pub def bridgeFlushUserDataSync(s: JuxuSession): Void =
+    bridgeFlushUserDataIfNeeded(s, false)
+
+/// Non-blocking user-data + touch-profile persistence for live typing commits (`JuxuBridge.flushUserDataAsync`).
+pub def bridgeFlushUserDataAsync(s: JuxuSession): Void =
+    if (!cellGet(s.inMemoryOnly) && isUserDirty(s.engine)) {
+        let gen = cellGet(s.userDataSaveGen) + intToI64(1);
+        cellSet(s.userDataSaveGen, gen);
+        let tsv = exportUserDataTsv(s.engine);
+        let isIos = cellGet(s.isIosPlatform);
+        let isExt = cellGet(s.isAppExtension);
+        let usrP = cellGet(s.userDataPath);
+
+        if (isIos) {
+            let prof = touchProfile(s.engine);
+            let profJson = touchProfileToJson(prof);
+            let knownJson = cellGet(s.lastSharedTouchJson);
+            if (vecLen(prof) == 26 && profJson != knownJson && hasAnyTouchSamples(prof)) {
+                dispatchAsync(s.persistenceQueue, () -> {
+                    match keychainReadTouchProfile() {
+                        Some(remote) -> {
+                            let rJson = touchProfileToJson(remote);
+                            if (strLen(knownJson) > 0 && rJson != knownJson) {
+                                dispatchMainAsync(() -> { adoptSharedTouchSamples(s, remote) })
+                            } else if (keychainWriteTouchProfile(prof)) {
+                                dispatchMainAsync(() -> { cellSet(s.lastSharedTouchJson, profJson) })
+                            } else ()
+                        },
+                        None ->
+                            if (keychainWriteTouchProfile(prof)) {
+                                dispatchMainAsync(() -> { cellSet(s.lastSharedTouchJson, profJson) })
+                            } else (),
+                    }
+                })
+            } else ()
+        } else ();
+
+        dispatchAsync(s.persistenceQueue, () -> {
+            let mtime = writeUserDataFileDirect(usrP, tsv);
+            if (isIos && !cellGet(s.hasSharedContainerAccess)) {
+                cellSet(s.pendingUserDataTsv, tsv);
+                if (!cellGet(s.pendingUserDataFlushArmed)) {
+                    cellSet(s.pendingUserDataFlushArmed, true);
+                    let delayMs = if (isExt) 4000 else 1500;
+                    dispatchMainAfterMs(delayMs, () -> {
+                        dispatchAsync(s.persistenceQueue, () -> {
+                            cellSet(s.pendingUserDataFlushArmed, false);
+                            flushIosUserDataDirect(s)
+                        })
+                    })
+                } else ()
+            } else ();
+            dispatchMainAsync(() -> {
+                if (cellGet(s.userDataSaveGen) == gen) {
+                    cellSet(s.lastLoadedUserDataMtimeMs, mtime);
+                    if (isIos) {
+                        let curSeq = userDataSeq(s.engine);
+                        if (curSeq > cellGet(s.lastSharedUserDataSeq)) {
+                            cellSet(s.lastSharedUserDataSeq, curSeq)
+                        } else ()
+                    } else ()
+                } else ()
+            })
+        })
+    } else ()
+
+/// Non-blocking appearance check on iOS `viewWillAppear` (`JuxuBridge.reloadConfigAndUserOnAppear`).
+pub def bridgeReloadConfigAndUserOnAppear(s: JuxuSession, onApplied: () -> Void): Void =
+    if (!cellGet(s.inMemoryOnly) && cellGet(s.isIosPlatform)) {
+        let now = systemUptimeSeconds();
+        if (now - cellGet(s.lastAppearanceCheckUptime) >= 0.8 || cellGet(s.lastAppearanceCheckUptime) == 0.0) {
+            cellSet(s.lastAppearanceCheckUptime, now);
+            let localSeq = userDataSeq(s.engine);
+            let knownSeq = if (cellGet(s.lastSharedUserDataSeq) > localSeq) cellGet(s.lastSharedUserDataSeq) else localSeq;
+            let usrP = cellGet(s.userDataPath);
+            dispatchAsync(s.persistenceQueue, () -> {
+                let prefsOpt = keychainReadString(kcAccountSettings());
+                let touchOpt = keychainReadTouchProfile();
+                let mtime = safeMtimeMs(usrP);
+                let newerUserOpt: Option (Int64, String) = match keychainReadUserDataSeq() {
+                    Some(fastSeq) ->
+                        if (fastSeq > knownSeq) {
+                            match keychainDecodeSharedUserData() {
+                                Some((sSeq, sTsv)) if (sSeq > knownSeq) -> Some((sSeq, sTsv)),
+                                _ -> None,
+                            }
+                        } else None,
+                    None -> match keychainDecodeSharedUserData() {
+                        Some((sSeq, sTsv)) -> {
+                            let _ = keychainWriteUserDataSeq(sSeq);
+                            if (sSeq > knownSeq) Some((sSeq, sTsv)) else None
+                        },
+                        None -> None,
+                    },
+                };
+
+                dispatchMainAsync(() -> {
+                    let changed = cellNew(false);
+                    let rawPrefs = match prefsOpt { Some(p) -> p, None -> "" };
+                    if (rawPrefs != cellGet(s.lastSharedPrefsRaw)) {
+                        cellSet(s.lastSharedPrefsRaw, rawPrefs);
+                        if (strLen(rawPrefs) > 0) {
+                            applyConfig(s.engine, Toml, rawPrefs);
+                            if (cellGet(s.isAppExtension) && strLen(cellGet(s.configPath)) > 0) {
+                                let _ = saveConfig(s.engine, cellGet(s.configPath));
+                                ()
+                            } else ();
+                            let cfg = getConfig(s.engine);
+                            cellSet(s.jsConfig, cfg);
+                            cellSet(s.autoSpace, autoSpaceOptionsFromConfig(cfg));
+                            bridgeEnsureDictionaryLoaded(s, schemaId(cfg.schema));
+                            ensureEmojiTableLoaded(s);
+                            cellSet(changed, true)
+                        } else ()
+                    } else ();
+
+                    match touchOpt {
+                        Some(tProf) -> {
+                            let tJson = touchProfileToJson(tProf);
+                            if (tJson != cellGet(s.lastSharedTouchJson)) {
+                                adoptSharedTouchSamples(s, tProf);
+                                cellSet(changed, true)
+                            } else ()
+                        },
+                        None -> (),
+                    };
+
+                    match newerUserOpt {
+                        Some((sSeq, sTsv)) ->
+                            if (!isUserDirty(s.engine) && sSeq > userDataSeq(s.engine)) {
+                                importUserDataTsv(s.engine, sTsv);
+                                cellSet(s.lastSharedUserDataSeq, sSeq);
+                                let gen = cellGet(s.userDataSaveGen) + intToI64(1);
+                                cellSet(s.userDataSaveGen, gen);
+                                let exported = exportUserDataTsv(s.engine);
+                                dispatchAsync(s.persistenceQueue, () -> {
+                                    let savedM = writeUserDataFileDirect(usrP, exported);
+                                    dispatchMainAsync(() -> {
+                                        if (cellGet(s.userDataSaveGen) == gen) {
+                                            cellSet(s.lastLoadedUserDataMtimeMs, savedM)
+                                        } else ()
+                                    })
+                                });
+                                if (!cellGet(s.isAppExtension)) {
+                                    let _ = bridgeRefreshUserPhrases(s);
+                                    ()
+                                } else ();
+                                cellSet(changed, true)
+                            } else (),
+                        None ->
+                            if (mtime > intToI64(0) && !isUserDirty(s.engine) && cellGet(s.lastLoadedUserDataMtimeMs) != mtime) {
+                                match loadUserData(s.engine, usrP) {
+                                    Ok(_) -> {
+                                        cellSet(s.lastLoadedUserDataMtimeMs, mtime);
+                                        let curS = userDataSeq(s.engine);
+                                        if (curS > cellGet(s.lastSharedUserDataSeq)) {
+                                            cellSet(s.lastSharedUserDataSeq, curS)
+                                        } else ();
+                                        cellSet(changed, true)
+                                    },
+                                    Err(_) -> (),
+                                }
+                            } else (),
+                    };
+
+                    if (cellGet(changed)) {
+                        let _ = bridgeRefreshState(s);
+                        onApplied()
+                    } else ()
+                })
+            })
+        } else ()
+    } else ()
+
+// ============================================================================
+// Virtual Keyboard Layout & Input Operations (`JuxuBridge` methods)
+// ============================================================================
+
+pub def bridgeSetKeyLayout52(
+    s: JuxuSession,
+    centers52: Vec Float,
+    originX: Float,
+    originY: Float,
+    pitchX: Float,
+    pitchY: Float
+): Void =
+    if (vecLen(centers52) == 52) {
+        let pairs: Vec (Float, Float) = vecWithCap(26);
+        let i = cellNew(0);
+        while (cellGet(i) < 26) {
+            let idx = cellGet(i);
+            vecPush(pairs, (vecGetOr(centers52, idx * 2, 0.0), vecGetOr(centers52, idx * 2 + 1, 0.0)));
+            cellSet(i, idx + 1)
+        };
+        setKeyLayout(s.engine, Some(pairs), originX, originY, pitchX, pitchY)
+    } else ()
+
+pub def bridgeSetT9Layout16(
+    s: JuxuSession,
+    centers16: Vec Float,
+    originX: Float,
+    originY: Float,
+    pitchX: Float,
+    pitchY: Float
+): Void =
+    if (vecLen(centers16) == 16) {
+        let pairs: Vec (Float, Float) = vecWithCap(8);
+        let i = cellNew(0);
+        while (cellGet(i) < 8) {
+            let idx = cellGet(i);
+            vecPush(pairs, (vecGetOr(centers16, idx * 2, 0.0), vecGetOr(centers16, idx * 2 + 1, 0.0)));
+            cellSet(i, idx + 1)
+        };
+        setT9Layout(s.engine, Some(pairs), originX, originY, pitchX, pitchY)
+    } else ()
+
+def ensureActiveDictReady(s: JuxuSession): Void =
+    if (!hasActiveDict(s.engine)) {
+        bridgeEnsureDictionaryLoaded(s, schemaId(getSchema(s.engine)))
+    } else ()
+
+pub def bridgeHandleKey(
+    s: JuxuSession,
+    keyCode: Int,
+    scalar: Int,
+    hasCmdOrCtrl: Bool,
+    timestampMs: Int64
+): JuxuActionState = {
+    ensureActiveDictReady(s);
+    let snap = step(s.engine, Key {
+        key: RawKey { keycode: keyCode, scalar: scalar },
+        hasCmdOrCtrl: hasCmdOrCtrl,
+        atMs: timestampMs,
+    });
+    let st = applySnapToSession(s, snap);
+    drainEvalLogIfNeeded(s);
+    st
+}
+
+pub def bridgePushTouch(
+    s: JuxuSession,
+    reportedAscii: Int,
+    x: Float,
+    y: Float,
+    isNormalized: Bool,
+    timestampMs: Int64
+): JuxuActionState = {
+    ensureActiveDictReady(s);
+    let snap = step(s.engine, Touch {
+        ascii: reportedAscii,
+        x: x,
+        y: y,
+        normalized: isNormalized,
+        atMs: timestampMs,
+    });
+    let st = applySnapToSession(s, snap);
+    drainEvalLogIfNeeded(s);
+    st
+}
+
+pub def bridgePushT9Touch(
+    s: JuxuSession,
+    reportedDigit: Int,
+    x: Float,
+    y: Float,
+    isNormalized: Bool,
+    timestampMs: Int64
+): JuxuActionState = {
+    ensureActiveDictReady(s);
+    let snap = step(s.engine, T9Touch {
+        digit: reportedDigit,
+        x: x,
+        y: y,
+        normalized: isNormalized,
+        atMs: timestampMs,
+    });
+    let st = applySnapToSession(s, snap);
+    drainEvalLogIfNeeded(s);
+    st
+}
+
+pub def bridgeLockT9Syllable(s: JuxuSession, syllable: String): JuxuActionState =
+    applySnapToSession(s, step(s.engine, LockT9Syllable(syllable)))
+
+pub def bridgeSelectCandidate(s: JuxuSession, pageRelIndex: Int, timestampMs: Int64): JuxuActionState = {
+    let idx = if (pageRelIndex < 0) 0 else pageRelIndex;
+    let st = applySnapToSession(s, step(s.engine, SelectPage { index: idx, atMs: timestampMs }));
+    drainEvalLogIfNeeded(s);
+    st
+}
+
+pub def bridgeSelectAbsCandidate(s: JuxuSession, absIndex: Int, timestampMs: Int64): JuxuActionState = {
+    let idx = if (absIndex < 0) 0 else absIndex;
+    let st = applySnapToSession(s, step(s.engine, SelectAbs { index: idx, atMs: timestampMs }));
+    drainEvalLogIfNeeded(s);
+    st
+}
+
+pub def bridgeCommitPending(s: JuxuSession, timestampMs: Int64): JuxuActionState = {
+    ensureActiveDictReady(s);
+    let st = applySnapToSession(s, step(s.engine, CommitPending(timestampMs)));
+    drainEvalLogIfNeeded(s);
+    st
+}
+
+pub def bridgeResetQuoteState(s: JuxuSession): Void =
+    resetQuoteState(s.engine)
+
+pub def bridgeAllCandidates(s: JuxuSession, maxCount: Int): Vec Candidate =
+    allCandidates(s.engine, if (maxCount < 1) 1 else maxCount)
+
+pub def bridgeTurnPage(s: JuxuSession, delta: Int): JuxuActionState = {
+    let dir = if (delta < 0) PagePrev else PageNext;
+    applySnapToSession(s, step(s.engine, TurnPage(dir)))
+}
+
+pub def bridgeToggleAsciiMode(s: JuxuSession): JuxuActionState =
+    applySnapToSession(s, step(s.engine, ToggleAscii))
+
+pub def bridgeClearComposition(s: JuxuSession): Void = {
+    clear(s.engine);
+    let _ = bridgeRefreshState(s);
+    ()
+}
+
+pub def bridgeHandleMemoryWarning(s: JuxuSession): Void = {
+    drainEvalLogIfNeeded(s);
+    bridgeFlushUserDataAsync(s);
+    trimMemory(s.engine)
+}
+
+pub def bridgeAbandonComposition(s: JuxuSession, timestampMs: Int64): Void = {
+    abandon(s.engine, timestampMs);
+    drainEvalLogIfNeeded(s);
+    let _ = bridgeRefreshState(s);
+    ()
+}
+
+pub def bridgeNotifyPostCommitBackspace(s: JuxuSession, timestampMs: Int64): Void = {
+    notifyPostCommitBackspace(s.engine, timestampMs);
+    drainEvalLogIfNeeded(s)
+}
+
+pub def bridgeSetContext(s: JuxuSession, text: String): Void =
+    setContext(s.engine, text)
+
+pub def bridgeAcceptPrediction(s: JuxuSession, text: String, timestampMs: Int64): Void =
+    acceptPrediction(s.engine, text, timestampMs)
+
+pub def bridgePredictNextWords(s: JuxuSession, maxCount: Int): Vec String =
+    predictNext(s.engine, if (maxCount < 1) 1 else maxCount)
+
+// ============================================================================
+// User Phrases, Touch Calibration & Eval Log Management
+// ============================================================================
+
+pub def bridgeAddUserPhrase(s: JuxuSession, text: String, persist: Bool): String = {
+    let trimmed = strTrim(text);
+    if (utf8ScalarCount(trimmed) < 2) ""
+    else {
+        if (persist && cellGet(s.isIosPlatform) && !cellGet(s.inMemoryOnly) && !cellGet(s.hasSharedContainerAccess)) {
+            let sharedCell: Cell (Option (Int64, String)) = cellNew(None);
+            dispatchSync(s.persistenceQueue, () -> {
+                cellSet(sharedCell, keychainDecodeSharedUserData())
+            });
+            match cellGet(sharedCell) {
+                Some((sSeq, sTsv)) if (sSeq > userDataSeq(s.engine)) -> importUserDataTsv(s.engine, sTsv),
+                _ -> (),
+            }
+        } else ();
+        let code = match addUserPhrase(s.engine, trimmed) {
+            Some(c) -> c,
+            None -> "",
+        };
+        if (strLen(code) > 0 && persist) {
+            bridgeFlushUserDataIfNeeded(s, true)
+        } else ();
+        let _ = bridgeRefreshState(s);
+        let _ = bridgeRefreshUserPhrases(s);
+        code
+    }
+}
+
+pub def bridgeRemoveUserPhrase(s: JuxuSession, text: String, persist: Bool): Void = {
+    if (persist && cellGet(s.isIosPlatform) && !cellGet(s.inMemoryOnly) && !cellGet(s.hasSharedContainerAccess)) {
+        let sharedCell: Cell (Option (Int64, String)) = cellNew(None);
+        dispatchSync(s.persistenceQueue, () -> {
+            cellSet(sharedCell, keychainDecodeSharedUserData())
+        });
+        match cellGet(sharedCell) {
+            Some((sSeq, sTsv)) if (sSeq > userDataSeq(s.engine)) -> importUserDataTsv(s.engine, sTsv),
+            _ -> (),
+        }
+    } else ();
+    let _ = removeUserPhrase(s.engine, text);
+    if (persist) {
+        bridgeFlushUserDataIfNeeded(s, true)
+    } else ();
+    let _ = bridgeRefreshState(s);
+    let _ = bridgeRefreshUserPhrases(s);
+    ()
+}
+
+pub def bridgeResetTouchCalibration(s: JuxuSession, persist: Bool): Void = {
+    resetTouchProfile(s.engine);
+    if (persist) {
+        if (cellGet(s.isIosPlatform)) publishTouchProfileSync(s, true) else ();
+        bridgeFlushUserDataIfNeeded(s, true)
+    } else ();
+    let _ = bridgeRefreshState(s);
+    let _ = bridgeRefreshTouchProfile(s);
+    ()
+}
+
+pub def bridgeApplyTouchCalibrations(s: JuxuSession, samples: Vec KeyTouchSample): Void =
+    if (vecLen(samples) == 26) {
+        let offsets: Vec TouchKeyOffset = vecWithCap(26);
+        let dummy = KeyTouchSample { keyLabel: "a", offset: touchKeyOffsetZero() };
+        let i = cellNew(0);
+        while (cellGet(i) < 26) {
+            vecPush(offsets, vecGetOr(samples, cellGet(i), dummy).offset);
+            cellSet(i, cellGet(i) + 1)
+        };
+        let _ = setTouchProfile(s.engine, offsets);
+        let _ = bridgeRefreshState(s);
+        let _ = bridgeRefreshTouchProfile(s);
+        ()
+    } else ()
+
+pub def bridgeReloadTouchCalibration(s: JuxuSession): Void = {
+    loadSharedTouchProfileOnInit(s);
+    let _ = bridgeRefreshTouchProfile(s);
+    ()
+}
+
+pub def bridgeReadEvalLogText(s: JuxuSession): String =
+    if (cellGet(s.inMemoryOnly)) ""
+    else {
+        drainEvalLogIfNeeded(s);
+        let outCell = cellNew("");
+        dispatchSync(s.persistenceQueue, () -> {
+            if (cellGet(s.isIosPlatform)) {
+                cellSet(s.pendingRingFlushArmed, false);
+                flushIosEvalRingDirect(s);
+                if (cellGet(s.iosEvalRingLoaded) && vecLen(s.iosEvalRingLines) > 0) {
+                    cellSet(outCell, joinLines(s.iosEvalRingLines) + "\n")
+                } else {
+                    let ring = keychainDecodeEvalRingLines();
+                    if (vecLen(ring) > 0) {
+                        cellSet(outCell, joinLines(ring) + "\n")
+                    } else {
+                        let p = cellGet(s.evalLogPath);
+                        if (strLen(p) > 0 && fileExists(p)) {
+                            match readFile(p) { Ok(c) -> cellSet(outCell, c), Err(_) -> () }
+                        } else ()
+                    }
+                }
+            } else {
+                let p = cellGet(s.evalLogPath);
+                if (strLen(p) > 0 && fileExists(p)) {
+                    match readFile(p) { Ok(c) -> cellSet(outCell, c), Err(_) -> () }
+                } else ()
+            }
+        });
+        cellGet(outCell)
+    }
+
+pub def bridgeReloadEvalLogSummary(s: JuxuSession): EvalLogSummary = {
+    let summary = parseEvalLogSummary(bridgeReadEvalLogText(s));
+    cellSet(s.evalLogSummary, summary);
+    summary
+}
+
+pub def bridgeExportEvalLogFilePath(s: JuxuSession): Option String =
+    if (cellGet(s.isIosPlatform)) {
+        let text = bridgeReadEvalLogText(s);
+        if (strLen(text) == 0) None
+        else {
+            let outPath = pathJoin(appleTemporaryDirectory(), "juxu_ios_eval_log.jsonl");
+            match writeFileAtomic(outPath, text) {
+                Ok(_) -> Some(outPath),
+                Err(_) -> None,
+            }
+        }
+    } else {
+        dispatchSync(s.persistenceQueue, () -> ());
+        let p = cellGet(s.evalLogPath);
+        if (strLen(p) > 0 && fileExists(p)) Some(p) else None
+    }
+
+pub def bridgeClearEvalLog(s: JuxuSession): Void = {
+    if (!cellGet(s.inMemoryOnly)) {
+        dispatchSync(s.persistenceQueue, () -> {
+            if (cellGet(s.isIosPlatform)) {
+                cellSet(s.pendingRingFlushArmed, false);
+                vecClear(s.iosEvalRingLines);
+                cellSet(s.iosEvalRingLoaded, true);
+                cellSet(s.iosEvalRingDirty, false);
+                let _ = keychainWriteEvalRingLines(vecNew());
+                ()
+            } else ();
+            let p = cellGet(s.evalLogPath);
+            if (strLen(p) > 0) {
+                let _ = removeFile(p);
+                let _ = removeFile(pathJoin(pathDirname(p), "eval_log.prev.jsonl"));
+                ()
+            } else ()
+        })
+    } else ();
+    cellSet(s.evalLogSummary, emptyEvalLogSummary())
+}
+
+// ============================================================================
+// Backward-Compatible `session*` Helpers
+// ============================================================================
+
+pub def sessionNew(): JuxuSession =
+    bridgeNew(None, true)
+
+pub def sessionLoadDictsFromDir(s: JuxuSession, dir: String): Int = {
+    bridgeDiscoverDicts(s, Some(dir));
+    bridgeEnsureDictionaryLoaded(s, schemaId(getSchema(s.engine)));
+    let _ = bridgeRefreshState(s);
+    if (hasActiveDict(s.engine)) 1 else 0
+}
+
+pub def sessionLoadPersistence(s: JuxuSession, dataDir: String): Void = {
+    let _ = mkdirAll(dataDir);
+    cellSet(s.inMemoryOnly, false);
+    cellSet(s.configPath, pathJoin(dataDir, "config.toml"));
+    cellSet(s.userDataPath, pathJoin(dataDir, "user_data.tsv"));
+    cellSet(s.evalLogPath, pathJoin(dataDir, "eval_log.jsonl"));
+    bridgeLoadConfigAndUser(s, true)
+}
+
+pub def sessionFlushUserData(s: JuxuSession): Bool = {
+    let wasDirty = isUserDirty(s.engine);
+    bridgeFlushUserDataIfNeeded(s, false);
+    wasDirty
+}
+
 pub def sessionSaveConfig(s: JuxuSession): Bool = {
     let p = cellGet(s.configPath);
     if (strLen(p) > 0) {
@@ -110,16 +1399,25 @@ pub def sessionSaveConfig(s: JuxuSession): Bool = {
     } else false
 }
 
-/// Step the session's engine with an `InputEvent`.
-pub def sessionStep(s: JuxuSession, ev: InputEvent): EngineSnapshot =
-    step(s.engine, ev)
+pub def sessionStep(s: JuxuSession, ev: InputEvent): EngineSnapshot = {
+    ensureActiveDictReady(s);
+    let snap = step(s.engine, ev);
+    let _ = applySnapToSession(s, snap);
+    drainEvalLogIfNeeded(s);
+    snap
+}
 
-/// Read the current `EngineSnapshot` without mutating state.
-pub def sessionState(s: JuxuSession): EngineSnapshot =
-    state(s.engine)
+pub def sessionState(s: JuxuSession): EngineSnapshot = {
+    let snap = state(s.engine);
+    let _ = applySnapToSession(s, snap);
+    snap
+}
 
-/// Reset composition & punctuation trackers on client switch / deactivation.
 pub def sessionResetForFocusChange(s: JuxuSession): Void = {
     clear(s.engine);
-    punctuationTrackerReset(s.punctuation)
+    resetQuoteState(s.engine);
+    punctuationTrackerReset(s.punctuation);
+    autoSpaceTrackerInvalidate(s.autoSpaceTracker);
+    let _ = bridgeRefreshState(s);
+    ()
 }

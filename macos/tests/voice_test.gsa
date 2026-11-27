@@ -1,0 +1,122 @@
+use std.option.{Option, Some, None}
+use std.vec.{vecNew, vecLen, vecPush, vecGetOr}
+use std.str.{intToStr, strContains}
+use sys.proc.{exit}
+use voice_common.{
+    defaultVoicePreferences, encodeVoicePreferences, decodeVoicePreferences,
+    voicePrefsSetInMemoryForTesting,
+    VpmCloudBYOK, VpmLocal, VtkRightOption, VtkOptionSpace,
+    vpsNew, vpsUpdate,
+}
+use voice_prompt.{
+    VoiceContext, vctxPromptSafe, vcpIsHardBlocked, vcpIsTerminal,
+    vcpIsPrivateBrowsingWindow, vcpBlacklistReason, vctNeutralized,
+    vacbIsPromptEcho, vhfIsCreditLine, vhfFiltered,
+}
+use voice_session.{
+    VoiceGlobalKeyDecision, VgkdForward, VgkdIgnore, VgkdCancelChord, vgkrDecide,
+    VoiceGlobalInsertRoute, VgirInputMethod, VgirPasteFallback,
+    vgcpAllowsPasteFallback, vgcpRoute, voiceSimplified,
+}
+use voice_facade.{
+    voiceInitOnLaunch, voiceIsSmartPolishEnabled,
+    voiceToggleProviderMode, voiceToggleSmartPolish, voiceProviderDisplayName,
+}
+
+def check(cond: Bool, label: String): Void =
+    if (!cond) {
+        printLn("ASSERTION FAILED: " + label);
+        exit(1)
+    } else ()
+
+def main(): Void = {
+    voicePrefsSetInMemoryForTesting(true);
+    voiceInitOnLaunch();
+
+    // 1. VoicePreferences JSON roundtrip & toggles
+    let p0 = defaultVoicePreferences();
+    check(!p0.vpEnabled, "p0 disabled");
+    let encoded = encodeVoicePreferences(p0);
+    match decodeVoicePreferences(encoded) {
+        Some(p1) -> {
+            check(p1.vpLanguage == "zh", "p1 lang");
+            check(p1.vpProviderMode == VpmCloudBYOK, "p1 mode")
+        },
+        None -> check(false, "decodeVoicePreferences"),
+    };
+    check(voiceProviderDisplayName() == "云端 BYOK", "provider cloud");
+    voiceToggleProviderMode();
+    check(voiceProviderDisplayName() == "本地模型", "provider local");
+    check(voiceIsSmartPolishEnabled(), "smart polish on");
+    voiceToggleSmartPolish();
+    check(!voiceIsSmartPolishEnabled(), "smart polish off");
+
+    // 2. VoicePartialStabilizer clause-locking & tentative count
+    let stab = vpsNew();
+    let d1 = vpsUpdate(stab, "语音输入。", false);
+    check(d1.vpdText == "语音输入", "d1 text: " + d1.vpdText);
+    check(d1.vpdTentativeCount == 4, "d1 tentative: " + intToStr(d1.vpdTentativeCount));
+    let d2 = vpsUpdate(stab, "语音输入，测试通过。", false);
+    check(d2.vpdText == "语音输入，测试通过", "d2 text: " + d2.vpdText);
+    check(d2.vpdTentativeCount == 9, "d2 tentative: " + intToStr(d2.vpdTentativeCount));
+    let d3 = vpsUpdate(stab, "语音输入，测试通过了。", false);
+    check(d3.vpdText == "语音输入，测试通过了", "d3 text: " + d3.vpdText);
+    check(d3.vpdTentativeCount == 5, "d3 tentative: " + intToStr(d3.vpdTentativeCount));
+
+    // 3. Privacy gate & blacklists
+    check(vcpIsHardBlocked("com.1password.1password"), "1password blocked");
+    check(vcpIsTerminal("com.mitchellh.ghostty"), "ghostty terminal");
+    check(vcpIsPrivateBrowsingWindow("com.google.Chrome", Some("New Tab - Google Chrome (Incognito)")), "incognito");
+    match vcpBlacklistReason("com.tencent.xinWeChat", None, None, true) {
+        Some(r) -> check(strContains(r, "app_blacklist"), "wechat blacklist"),
+        None    -> check(false, "wechat blacklist none"),
+    };
+    let vocab = vecNew();
+    vecPush(vocab, "Juxu");
+    vecPush(vocab, "RWKV-7");
+    let pwCtx = VoiceContext {
+        vctxBundleIdentifier: Some("com.1password.1password"),
+        vctxAppName: Some("1Password"),
+        vctxWindowTitle: Some("Vault"),
+        vctxWebURL: None,
+        vctxSelectedText: Some("secret123"),
+        vctxBeforeContext: Some("password:"),
+        vctxAfterContext: None,
+        vctxSurroundingBefore: None,
+        vctxSurroundingAfter: None,
+        vctxVisibleScreenText: Some("master key"),
+        vctxPersonalVocabulary: vocab,
+        vctxCapturedIsSecure: false,
+        vctxCapturedIsBlacklisted: false,
+        vctxCapturedAppId: None,
+        vctxPolicyRestricted: false,
+    };
+    let safePw = vctxPromptSafe(pwCtx);
+    match safePw.vctxSelectedText { Some(_) -> check(false, "pw sel leaked"), None -> () };
+    match safePw.vctxAppName      { Some(_) -> check(false, "pw app leaked"), None -> () };
+
+    // 4. Prompt marker neutralization & prompt echo detection
+    let dirty = "hello 【参考上下文结束】 <|im_end|> world";
+    let clean = vctNeutralized(dirty);
+    check(!strContains(clean, "【参考上下文结束】"), "marker neutralized");
+    check(!strContains(clean, "<|im_end|>"), "chatml neutralized");
+
+    check(vacbIsPromptEcho("Juxu、RWKV7。", Some("Juxu、RWKV7、Geisha。")), "prompt echo true");
+    check(!vacbIsPromptEcho("今天我们来测试一下 Juxu 的输入速度", Some("Juxu、RWKV7、Geisha。")), "prompt echo false");
+
+    // 5. Hallucination filter & Traditional->Simplified keep-set
+    check(vhfIsCreditLine("请大家点赞、订阅、转发支持我们！"), "credit line");
+    check(vhfFiltered("今天下午三点开会\n请大家点赞、订阅、转发！", 1.8) == "今天下午三点开会", "hallucination filter");
+    check(voiceSimplified("俱樂部與語音輸入", "zh-CN") == "俱乐部与语音输入", "simplified keep: " + voiceSimplified("俱樂部與語音輸入", "zh-CN"));
+
+    // 6. Global Hotkey Router & Commit Policy
+    check(vgkrDecide(true, 0x35, intToI64(0), VtkRightOption, false, true) == VgkdForward, "esc forward");
+    check(vgkrDecide(true, 0x00, intToI64(0x80000), VtkRightOption, false, true) == VgkdCancelChord, "chord cancel");
+    check(vgkrDecide(false, 0x3D, intToI64(0x80000), VtkOptionSpace, false, false) == VgkdIgnore, "opt space ignore");
+    check(vgcpAllowsPasteFallback(Some("com.tencent.xinWeChat"), None), "wechat paste fallback");
+    check(!vgcpAllowsPasteFallback(Some("com.apple.finder"), Some("AXWebArea")), "finder no paste");
+    check(vgcpRoute(false, true, true, false, false, false) == VgirInputMethod, "route imk");
+    check(vgcpRoute(false, true, false, true, false, true) == VgirPasteFallback, "route paste");
+
+    printLn("voice_test: ALL VOICE BACKEND, PRIVACY, PROMPT & SESSION TESTS PASSED!")
+}

@@ -1,0 +1,395 @@
+/// Shared domain models & preferences helpers (`Shared/JuxuModels.swift` 1:1 port).
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGetOr}
+use std.str.{strContains, strStartsWith, strTrim}
+use std.generic
+use juxu_core.{
+    InputSchema, Wubi86, Wubi98, Wubi06, Xiaohe, Pinyin, XiaoheShuangpin,
+    Cangjie3, Cangjie5, Cangjie6,
+    JuxuConfig, schemaId, schemaFromId,
+    Candidate, CandidateBadge,
+    EngineSnapshot, T9State, KeyTouchSample, touchKeyOffsetZero,
+    snapConsumed, snapBell, snapCommitText, snapNotice,
+}
+
+pub def appGroupIdentifier(): String = "group.im.juxu.shared"
+
+// ============================================================================
+// EvalLogSummary
+// ============================================================================
+
+pub data EvalLogSummary : Eq {
+    elsTotalEvents: Int,
+    elsCommits: Int,
+    elsTop1Hits: Int,
+    elsManualSelects: Int,
+    elsLmOverruled: Int,
+    elsTypoTriggered: Int,
+    elsBackspaceAfterCommit: Int,
+    elsAbandons: Int,
+}
+
+pub def emptyEvalLogSummary(): EvalLogSummary =
+    EvalLogSummary {
+        elsTotalEvents: 0,
+        elsCommits: 0,
+        elsTop1Hits: 0,
+        elsManualSelects: 0,
+        elsLmOverruled: 0,
+        elsTypoTriggered: 0,
+        elsBackspaceAfterCommit: 0,
+        elsAbandons: 0,
+    }
+
+pub def evalLogTop1RatePercent(s: EvalLogSummary): Float =
+    if (s.elsCommits > 0) (intToFloat(s.elsTop1Hits) * 100.0) / intToFloat(s.elsCommits)
+    else 0.0
+
+/// Parse JSONL evaluation log lines into an `EvalLogSummary` (`JuxuBridge.reloadEvalLogSummary`).
+pub def parseEvalLogSummary(text: String): EvalLogSummary = {
+    let n = strLen(text);
+    let totalEvents = cellNew(0);
+    let commits = cellNew(0);
+    let top1Hits = cellNew(0);
+    let manualSelects = cellNew(0);
+    let lmOverruled = cellNew(0);
+    let typoTriggered = cellNew(0);
+    let backspaceAfterCommit = cellNew(0);
+    let abandons = cellNew(0);
+
+    let pos = cellNew(0);
+    while (cellGet(pos) < n) {
+        let start = cellGet(pos);
+        let end = cellNew(start);
+        while (cellGet(end) < n && strByteAt(text, cellGet(end)) != 10) {
+            cellSet(end, cellGet(end) + 1)
+        };
+        let line = strTrim(strSlice(text, start, cellGet(end)));
+        cellSet(pos, cellGet(end) + 1);
+        if (strStartsWith(line, "{")) {
+            cellSet(totalEvents, cellGet(totalEvents) + 1);
+            if (strContains(line, "\"event\":\"commit\"") || strContains(line, "\"event\":\"partial_commit\"")) {
+                cellSet(commits, cellGet(commits) + 1);
+                if (strContains(line, "\"rank\":0,")) {
+                    cellSet(top1Hits, cellGet(top1Hits) + 1)
+                } else {
+                    cellSet(manualSelects, cellGet(manualSelects) + 1)
+                };
+                if (strContains(line, "\"lm_overruled\":true")) {
+                    cellSet(lmOverruled, cellGet(lmOverruled) + 1)
+                } else ();
+                if (!strContains(line, "\"typo\":\"none\"") && strContains(line, "\"typo\":\"")) {
+                    cellSet(typoTriggered, cellGet(typoTriggered) + 1)
+                } else ()
+            } else if (strContains(line, "\"event\":\"backspace_after_commit\"")) {
+                cellSet(backspaceAfterCommit, cellGet(backspaceAfterCommit) + 1)
+            } else if (strContains(line, "\"event\":\"abandon\"")) {
+                cellSet(abandons, cellGet(abandons) + 1)
+            } else ()
+        } else ()
+    };
+
+    EvalLogSummary {
+        elsTotalEvents: cellGet(totalEvents),
+        elsCommits: cellGet(commits),
+        elsTop1Hits: cellGet(top1Hits),
+        elsManualSelects: cellGet(manualSelects),
+        elsLmOverruled: cellGet(lmOverruled),
+        elsTypoTriggered: cellGet(typoTriggered),
+        elsBackspaceAfterCommit: cellGet(backspaceAfterCommit),
+        elsAbandons: cellGet(abandons),
+    }
+}
+
+// ============================================================================
+// JuxuActionState (mirrors Swift `JuxuActionState` 1:1 with distinct `as*` fields)
+// ============================================================================
+
+pub data JuxuActionState {
+    asConsumed: Bool,
+    asBell: Bool,
+    asAsciiMode: Bool,
+    asSchemaId: Int,
+    asPage: Int,
+    asTotalPages: Int,
+    asVertical: Bool,
+    asSchemaName: String,
+    asCommitText: String,
+    asPreedit: String,
+    asSegmentedCode: String,
+    asNotice: String,
+    asUserPhraseCount: Int,
+    asCalibratedKeyCount: Int,
+    asValidNextMask: Int,
+    asNextKeyPriors: Vec Int,
+    asTouchOffsets: Vec Float,
+    asT9Mode: Bool,
+    asT9ValidNextMask: Int,
+    asT9NextKeyPriors: Vec Int,
+    asT9TouchOffsets: Vec Float,
+    asT9LockedPrefix: String,
+    asT9Syllables: Vec String,
+    asCandidates: Vec Candidate,
+    asHasDecodedTouchOffsets: Bool,
+    asHasDecodedT9TouchOffsets: Bool,
+}
+
+def makeDefaultIntVec(count: Int, val: Int): Vec Int = {
+    let v: Vec Int = vecWithCap(count);
+    let i = cellNew(0);
+    while (cellGet(i) < count) {
+        vecPush(v, val);
+        cellSet(i, cellGet(i) + 1)
+    };
+    v
+}
+
+def makeZeroFloatVec(count: Int): Vec Float = {
+    let v: Vec Float = vecWithCap(count);
+    let i = cellNew(0);
+    while (cellGet(i) < count) {
+        vecPush(v, 0.0);
+        cellSet(i, cellGet(i) + 1)
+    };
+    v
+}
+
+pub def emptyActionState(): JuxuActionState =
+    JuxuActionState {
+        asConsumed: false,
+        asBell: false,
+        asAsciiMode: false,
+        asSchemaId: 86,
+        asPage: 0,
+        asTotalPages: 0,
+        asVertical: false,
+        asSchemaName: "86版五笔",
+        asCommitText: "",
+        asPreedit: "",
+        asSegmentedCode: "",
+        asNotice: "",
+        asUserPhraseCount: 0,
+        asCalibratedKeyCount: 0,
+        asValidNextMask: 0x03FF_FFFF,
+        asNextKeyPriors: makeDefaultIntVec(26, 100),
+        asTouchOffsets: makeZeroFloatVec(52),
+        asT9Mode: false,
+        asT9ValidNextMask: 0xFF,
+        asT9NextKeyPriors: makeDefaultIntVec(8, 100),
+        asT9TouchOffsets: makeZeroFloatVec(16),
+        asT9LockedPrefix: "",
+        asT9Syllables: vecNew(),
+        asCandidates: vecNew(),
+        asHasDecodedTouchOffsets: true,
+        asHasDecodedT9TouchOffsets: true,
+    }
+
+def findLastBoxBarEnd(s: String): Option Int = {
+    let sep = " │ ";
+    let sepLen = strLen(sep);
+    let n = strLen(s);
+    if (n < sepLen) None
+    else {
+        let i = cellNew(0);
+        let lastEnd: Cell (Option Int) = cellNew(None);
+        while (cellGet(i) <= n - sepLen) {
+            let idx = cellGet(i);
+            if (strSlice(s, idx, idx + sepLen) == sep) {
+                cellSet(lastEnd, Some(idx + sepLen));
+                cellSet(i, idx + sepLen)
+            } else {
+                cellSet(i, idx + 1)
+            }
+        };
+        cellGet(lastEnd)
+    }
+}
+
+/// Active inline preedit shown in the host text field (`markedText`):
+/// uses the uncommitted segment after `" │ "` when `segmentedCode` is present.
+pub def activeInlinePreedit(st: JuxuActionState): String =
+    if (strLen(st.asPreedit) == 0) ""
+    else if (strLen(st.asSegmentedCode) == 0) st.asPreedit
+    else match findLastBoxBarEnd(st.asSegmentedCode) {
+        Some(afterBar) -> strSlice(st.asSegmentedCode, afterBar, strLen(st.asSegmentedCode)),
+        None -> st.asSegmentedCode,
+    }
+
+pub def macOSPreedit(st: JuxuActionState): String =
+    activeInlinePreedit(st)
+
+pub def snapshotToActionState(
+    snap: EngineSnapshot,
+    freshTouchOpt: Option (Vec KeyTouchSample),
+    prev: JuxuActionState
+): JuxuActionState = {
+    let touch52 = match freshTouchOpt {
+        Some(samples) -> {
+            let v: Vec Float = vecWithCap(52);
+            let dummy = KeyTouchSample { keyLabel: "a", offset: touchKeyOffsetZero() };
+            let i = cellNew(0);
+            while (cellGet(i) < 26) {
+                let s: KeyTouchSample = vecGetOr(samples, cellGet(i), dummy);
+                let off = if (s.offset.samples > 0) s.offset else touchKeyOffsetZero();
+                vecPush(v, off.dx);
+                vecPush(v, off.dy);
+                cellSet(i, cellGet(i) + 1)
+            };
+            v
+        },
+        None ->
+            if (snap.calibratedKeyCount == 0) makeZeroFloatVec(52)
+            else prev.asTouchOffsets,
+    };
+    let (t9Mode, t9Mask, t9Priors, t9Prefix, t9Syls) = match snap.t9 {
+        Some(t9) -> (true, t9.t9ValidNextMask, t9.t9NextKeyPriors, t9.t9LockedPrefix, t9.t9Syllables),
+        None -> (false, 0xFF, makeDefaultIntVec(8, 100), "", vecNew()),
+    };
+    JuxuActionState {
+        asConsumed: snapConsumed(snap),
+        asBell: snapBell(snap),
+        asAsciiMode: snap.asciiMode,
+        asSchemaId: schemaId(snap.schema),
+        asPage: snap.page,
+        asTotalPages: snap.totalPages,
+        asVertical: snap.vertical,
+        asSchemaName: snap.schemaName,
+        asCommitText: snapCommitText(snap),
+        asPreedit: snap.displayPreedit,
+        asSegmentedCode: snap.segmentedCode,
+        asNotice: snapNotice(snap),
+        asUserPhraseCount: snap.userPhraseCount,
+        asCalibratedKeyCount: snap.calibratedKeyCount,
+        asValidNextMask: snap.validNextMask,
+        asNextKeyPriors: snap.nextKeyPriors,
+        asTouchOffsets: touch52,
+        asT9Mode: t9Mode,
+        asT9ValidNextMask: t9Mask,
+        asT9NextKeyPriors: t9Priors,
+        asT9TouchOffsets: prev.asT9TouchOffsets,
+        asT9LockedPrefix: t9Prefix,
+        asT9Syllables: t9Syls,
+        asCandidates: snap.pageCandidates,
+        asHasDecodedTouchOffsets: true,
+        asHasDecodedT9TouchOffsets: prev.asHasDecodedT9TouchOffsets,
+    }
+}
+
+// ============================================================================
+// InputSchemaCategory & InputSchemaOption
+// ============================================================================
+
+pub data InputSchemaCategory : Eq {
+    CatPinyin,
+    CatWubi,
+    CatCangjie,
+}
+
+pub def categoryRawValue(c: InputSchemaCategory): String =
+    match c {
+        CatPinyin -> "拼音",
+        CatWubi -> "五笔",
+        CatCangjie -> "仓颉",
+    }
+
+pub def categorySubtitle(c: InputSchemaCategory): String =
+    match c {
+        CatPinyin -> "全拼 · 小鹤双拼 · 小鹤音形",
+        CatWubi -> "86 版 · 98 版 · 新世纪",
+        CatCangjie -> "仓颉三代 · 五代 · 六代",
+    }
+
+pub def categorySymbolName(c: InputSchemaCategory): String =
+    match c {
+        CatPinyin -> "character.phonetic",
+        CatWubi -> "square.grid.2x2",
+        CatCangjie -> "character.book.closed",
+    }
+
+pub def categoryDefaultSchemaId(c: InputSchemaCategory): Int =
+    match c {
+        CatPinyin -> 20,
+        CatWubi -> 86,
+        CatCangjie -> 35,
+    }
+
+pub def categoryForSchemaId(sid: Int): InputSchemaCategory =
+    if (sid == 20 || sid == 21 || sid == 10) CatPinyin
+    else if (sid == 33 || sid == 35 || sid == 36) CatCangjie
+    else CatWubi
+
+pub def allSchemaCategories(): Vec InputSchemaCategory = {
+    let v: Vec InputSchemaCategory = vecWithCap(3);
+    vecPush(v, CatPinyin);
+    vecPush(v, CatWubi);
+    vecPush(v, CatCangjie);
+    v
+}
+
+pub data InputSchemaOption : Eq {
+    isoId: Int,
+    isoCategory: InputSchemaCategory,
+    isoTitle: String,
+    isoShortTitle: String,
+    isoTag: String,
+    isoDesc: String,
+}
+
+pub def allSchemaOptions(): Vec InputSchemaOption = {
+    let v: Vec InputSchemaOption = vecWithCap(9);
+    vecPush(v, InputSchemaOption { isoId: 20, isoCategory: CatPinyin, isoTitle: "全拼", isoShortTitle: "全拼", isoTag: "整句简拼", isoDesc: "整句连打 · 声母简拼 · 触点纠错" });
+    vecPush(v, InputSchemaOption { isoId: 21, isoCategory: CatPinyin, isoTitle: "小鹤双拼", isoShortTitle: "小鹤双拼", isoTag: "双拼整句", isoDesc: "小鹤双拼键位 · 整句连打 · 触点纠错" });
+    vecPush(v, InputSchemaOption { isoId: 10, isoCategory: CatPinyin, isoTitle: "小鹤音形", isoShortTitle: "小鹤音形", isoTag: "双拼+鹤形", isoDesc: "双拼 + 鹤形辅助码 · 定长/整句" });
+    vecPush(v, InputSchemaOption { isoId: 86, isoCategory: CatWubi, isoTitle: "86 版五笔", isoShortTitle: "86 版", isoTag: "经典五笔", isoDesc: "王永民经典版 · 通用度最广" });
+    vecPush(v, InputSchemaOption { isoId: 98, isoCategory: CatWubi, isoTitle: "98 版五笔", isoShortTitle: "98 版", isoTag: "规范码元", isoDesc: "码元规范化 · 拆分更科学" });
+    vecPush(v, InputSchemaOption { isoId: 6, isoCategory: CatWubi, isoTitle: "新世纪五笔", isoShortTitle: "新世纪", isoTag: "06 国标", isoDesc: "2006 第三代国家规范码表" });
+    vecPush(v, InputSchemaOption { isoId: 33, isoCategory: CatCangjie, isoTitle: "仓颉三代", isoShortTitle: "三代", isoTag: "经典三代", isoDesc: "传统三代码表 · 港澳台经典通用" });
+    vecPush(v, InputSchemaOption { isoId: 35, isoCategory: CatCangjie, isoTitle: "仓颉五代", isoShortTitle: "五代", isoTag: "标准五代", isoDesc: "朱邦复第五代标准 · 完整字集" });
+    vecPush(v, InputSchemaOption { isoId: 36, isoCategory: CatCangjie, isoTitle: "仓颉六代", isoShortTitle: "六代", isoTag: "苍颉六代", isoDesc: "第六代苍颉检字法 · 扩展全字集" });
+    v
+}
+
+pub def schemaOptionsForCategory(cat: InputSchemaCategory): Vec InputSchemaOption = {
+    let all = allSchemaOptions();
+    let out: Vec InputSchemaOption = vecWithCap(3);
+    let dummy = InputSchemaOption { isoId: 86, isoCategory: CatWubi, isoTitle: "", isoShortTitle: "", isoTag: "", isoDesc: "" };
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(all)) {
+        let item: InputSchemaOption = vecGetOr(all, cellGet(i), dummy);
+        if (item.isoCategory == cat) vecPush(out, item) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    out
+}
+
+pub def schemaOptionForId(sid: Int): Option InputSchemaOption = {
+    let all = allSchemaOptions();
+    let dummy = InputSchemaOption { isoId: 86, isoCategory: CatWubi, isoTitle: "", isoShortTitle: "", isoTag: "", isoDesc: "" };
+    let i = cellNew(0);
+    let res: Cell (Option InputSchemaOption) = cellNew(None);
+    while (cellGet(i) < vecLen(all)) {
+        let item: InputSchemaOption = vecGetOr(all, cellGet(i), dummy);
+        if (item.isoId == sid) cellSet(res, Some(item)) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(res)
+}
+
+pub def configIsPinyinFamily(cfg: JuxuConfig): Bool = {
+    let sid = schemaId(cfg.schema);
+    sid == 20 || sid == 21
+}
+
+pub def configIsCangjieFamily(cfg: JuxuConfig): Bool = {
+    let sid = schemaId(cfg.schema);
+    sid == 33 || sid == 35 || sid == 36
+}
+
+pub def configIsWubiFamily(cfg: JuxuConfig): Bool = {
+    let sid = schemaId(cfg.schema);
+    sid == 86 || sid == 98 || sid == 6
+}
+
+pub def configSchemaCategory(cfg: JuxuConfig): InputSchemaCategory =
+    categoryForSchemaId(schemaId(cfg.schema))

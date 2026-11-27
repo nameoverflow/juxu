@@ -1,0 +1,1511 @@
+/// Complete 1:1 port of `Tests/IOSKeyboardTests.swift` (1,393 lines) covering:
+/// 1–4. iOS 26 440pt Pro Max 32-key grid, Voronoi hit-testing, Shift/CapsLock, `123`/`#+=` planes
+/// 5. `SpaceTrackpadAccumulator` + velocity boost + `IOSTextCursorNavigation`
+/// 6–10. End-to-end `JuxuSession` view-space touch slip rescue, `ergonomicThumbYBias`, dynamic `validNextMask`,
+///       top-edge Spacebar protection, Sacred Keycap Core (`3.0pt x 2.6pt`), 220pt portrait & 903pt transient clamp
+/// 11, 13, 15. `IOSClipboardParser`, `IOSClipboardSuggestionStore` (2-step lookup & denied pasteboard), `IOSClipboardVisibilityGate`
+/// 14. `WBAUX003` idle predictions & punctuation reset
+/// 16. Neural `nextKeyPriors` (Key #1 & valid-vs-valid tie) + personal 52-float `touchOffsets` + `compensatedLetterPoint`
+/// 17–19. Cangjie radicals, Wubi 86/98/06 radicals, T9 9-key Pinyin layout & T9 neural/personal priors
+/// 20. `IOSSwipeUp`, `IOSKeyAlternates`, `IOSLineClear`, `IOSLineClearUndo`, `IOSBackspaceChunkDelete`, `cleanIOSCandidateAnnotation`
+/// 21. `IOSInlineMarkedTextSession` (`YYTextViewDocumentMock` + `StandardUITextViewMock` + `TIKeyboardOutputProxyMock` + orphan sweep)
+/// 22. `IOSKeyboardTrackpadHold` & `spaceCommaKeyEnabled` WeChat bottom row (`1.85 / 1.0 / 3.6 / 1.15 / 1.85` pitches, `usesFunctionFill`).
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGet, vecGetOr, vecSet}
+use std.str.{intToStr, strContains, strStartsWith, strEndsWith}
+use std.math.{abs}
+use sys.fs.{fileExists}
+use sys.proc.{exit}
+use juxu_core.{
+    Candidate, MkCandidate,
+    defaultConfig,
+}
+use juxu_core.config.{MkJuxuConfig, configToTomlString, configFromTomlStr}
+use juxu_shared.{
+    CGPoint, CGRect, NSRange,
+    cgPoint, cgSize, cgRect, nsRange,
+    rectIntersectsRect, rectMidX, rectMidY, rectMaxX, rectMaxY,
+    strUtf16Len, utf8ToScalars, scalarsToUtf8, dropLastScalars,
+    AutoSpaceOptions,
+    autoSpaceTrackerNew, autoSpaceTrackerEffectiveBefore, autoSpaceTrackerPrepareCommit,
+    PunctuationAction, Plain, InsertPair, SkipClose,
+    closerForOpen, punctuationAction, punctuationShouldDeletePair, punctuationPruned, punctuationCursorStaysInPairs,
+    activeInlinePreedit,
+    bridgeNew, bridgeApplyAndSaveConfig, bridgeSwitchSchema,
+    bridgeSetKeyLayout52, bridgeHandleKey, bridgePushTouch,
+    bridgeClearComposition, bridgeAbandonComposition,
+    bridgeSetContext, bridgeAcceptPrediction, bridgePredictNextWords,
+}
+use layout_engine.{
+    IOSKeyPlane, PlaneLetters, PlaneNumbers, PlaneSymbols,
+    IOSShiftState, ShiftLower, ShiftUpperOnce, ShiftCapsLocked,
+    IOSKeyKind, KeyLetter, KeyT9, KeyT9Clear, KeySymbol, KeyShift, KeyBackspace,
+    KeyPlaneSwitch, KeyGlobe, KeyModeToggle, KeySpace, KeyReturn,
+    IOSKeySpec, keySpecSimple, rectEq, optStrEq,
+    LayoutSnapshot, IOSKeyboardLayoutEngine,
+    ergonomicThumbYBias, targetTrayHeight, targetRibbonHeight,
+    layoutEngineNew, layoutIsT9PinyinActive, layoutTapShift, layoutSwitchPlane,
+    shouldReturnToLettersAfterSymbol, computeLayout, compensatedLetterPoint,
+    hitTest, hitTestWithMask, hitTestFull,
+}
+use gestures_editing.{
+    swipeUpSymbolForLetter, swipeUpIsActive,
+    LineClearPlan, lineClearPlan, lineClearExpectedNew, lineClearExpectedIsSatisfied,
+    lineClearUndoMaxRecords, lineClearUndoNew, lineClearUndoCount,
+    lineClearUndoPush, lineClearUndoRestorableIndex, lineClearUndoTake,
+    acceleratedDeleteCount, backspaceShouldFireRepeat, backspaceShouldUseFastChunk,
+    verticalMoveOffset,
+    keyAlternatesOptions, keyAlternatesSymbolOptions, keyAlternatesStripFrame, keyAlternatesIndexAtX,
+    defaultAlternatesDelay, supportsTrackpadHold, trackpadHoldDelay, alternatesDelay,
+    shouldCancelAlternatesOnMove, shouldCancelAlternatesInTrackpad,
+    trackpadNew, trackpadBeginX, trackpadUpdateX, trackpadEnd,
+}
+use clipboard_suggestion.{
+    IOSClipboardSuggestion, optClipSuggestionEq,
+    clipboardParse,
+    inMemoryClipboardKVStore,
+    ClipboardLookupResult, ClipNone, ClipNeedsRead,
+    clipboardStoreNew, clipboardStoreLookup, clipboardStoreRecordRead,
+    clipboardStoreRefresh, clipboardStoreConsume, clipboardStoreDismiss,
+    clipboardGateNew, clipboardGateResetForAppearance, clipboardGateMarkUserTyped, clipboardGateShouldAllowDisplay,
+}
+use marked_text.{
+    IOSMarkedTextSink,
+    IOSInlineMarkedTextSession, resetSharedOrphanedState,
+    markedSessionNew, markedSessionMarkedCode,
+    markedSessionHasOrphanedMarked, markedSessionNeedsAppearanceSweep,
+    markedSessionRecordFocusLoss, markedSessionRecordKeyboardDisappear,
+    markedSessionSweepOrphanedMarkedText, markedSessionRestoreCaretAfterOrphanedSweepIfNeeded,
+    markedSessionReconcileExternalContext, markedSessionFlushTurnBoundary,
+    markedSessionInsertTextWithAutoSpace, markedSessionInsertPassthrough,
+    markedSessionCommitPendingFirst, markedSessionApplyEngineState,
+}
+use candidate_views.{cleanIOSCandidateAnnotation}
+
+def check(cond: Bool, msg: String): Void =
+    if (!cond) {
+        printLn("CHECK FAILED: " + msg);
+        exit(1)
+    } else ()
+
+def optIntEq(a: Option Int, b: Option Int): Bool =
+    match a {
+        None -> match b { None -> true, Some(_) -> false },
+        Some(x) -> match b { None -> false, Some(y) -> x == y },
+    }
+
+def dummyKey(): IOSKeySpec =
+    keySpecSimple("", KeySpace, cgRect(0.0, 0.0, 0.0, 0.0), "")
+
+def findKeyByKind(snap: LayoutSnapshot, kind: IOSKeyKind): IOSKeySpec = {
+    let n = vecLen(snap.lsKeys);
+    let i = cellNew(0);
+    let found: Cell (Option IOSKeySpec) = cellNew(None);
+    while (cellGet(i) < n && match cellGet(found) { None -> true, Some(_) -> false }) {
+        match vecGet(snap.lsKeys, cellGet(i)) {
+            Some(k) -> if (k.ksKind == kind) cellSet(found, Some(k)) else (),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    match cellGet(found) {
+        Some(k) -> k,
+        None -> {
+            check(false, "Expected key kind in snapshot");
+            dummyKey()
+        },
+    }
+}
+
+def findKeyOptById(snap: LayoutSnapshot, id: String): Option IOSKeySpec = {
+    let n = vecLen(snap.lsKeys);
+    let i = cellNew(0);
+    let found: Cell (Option IOSKeySpec) = cellNew(None);
+    while (cellGet(i) < n && match cellGet(found) { None -> true, Some(_) -> false }) {
+        match vecGet(snap.lsKeys, cellGet(i)) {
+            Some(k) -> if (k.ksId == id) cellSet(found, Some(k)) else (),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+def findKeyById(snap: LayoutSnapshot, id: String): IOSKeySpec =
+    match findKeyOptById(snap, id) {
+        Some(k) -> k,
+        None -> {
+            check(false, "Expected key id " + id);
+            dummyKey()
+        },
+    }
+
+def hasPrimaryLabel(snap: LayoutSnapshot, lbl: String): Bool = {
+    let n = vecLen(snap.lsKeys);
+    let i = cellNew(0);
+    let ok = cellNew(false);
+    while (cellGet(i) < n && !cellGet(ok)) {
+        match vecGet(snap.lsKeys, cellGet(i)) {
+            Some(k) -> if (k.ksPrimaryLabel == lbl) cellSet(ok, true) else (),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(ok)
+}
+
+def hasSymbolKey(snap: LayoutSnapshot, sym: String): Bool = {
+    let n = vecLen(snap.lsKeys);
+    let i = cellNew(0);
+    let ok = cellNew(false);
+    while (cellGet(i) < n && !cellGet(ok)) {
+        match vecGet(snap.lsKeys, cellGet(i)) {
+            Some(k) -> if (k.ksKind == KeySymbol(sym)) cellSet(ok, true) else (),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(ok)
+}
+
+def vecContainsStr(v: Vec String, target: String): Bool = {
+    let n = vecLen(v);
+    let i = cellNew(0);
+    let found = cellNew(false);
+    while (cellGet(i) < n && !cellGet(found)) {
+        if (vecGetOr(v, cellGet(i), "") == target) cellSet(found, true) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+def vecStrEquals(a: Vec String, b: Vec String): Bool =
+    if (vecLen(a) != vecLen(b)) false
+    else {
+        let i = cellNew(0);
+        let ok = cellNew(true);
+        while (cellGet(i) < vecLen(a) && cellGet(ok)) {
+            if (vecGetOr(a, cellGet(i), "") != vecGetOr(b, cellGet(i), "")) cellSet(ok, false) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(ok)
+    }
+
+def makeIntVecFilled(n: Int, val: Int): Vec Int = {
+    let v: Vec Int = vecWithCap(n);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        vecPush(v, val);
+        cellSet(i, cellGet(i) + 1)
+    };
+    v
+}
+
+def makeFloatVecFilled(n: Int, val: Float): Vec Float = {
+    let v: Vec Float = vecWithCap(n);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        vecPush(v, val);
+        cellSet(i, cellGet(i) + 1)
+    };
+    v
+}
+
+def repeatStr(unit: String, count: Int): String = {
+    let s = cellNew("");
+    let i = cellNew(0);
+    while (cellGet(i) < count) {
+        cellSet(s, cellGet(s) + unit);
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(s)
+}
+
+def containsAsciiLetter(s: String): Bool = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    let found = cellNew(false);
+    while (cellGet(i) < n && !cellGet(found)) {
+        let b = strByteAt(s, cellGet(i));
+        if ((b >= 65 && b <= 90) || (b >= 97 && b <= 122)) cellSet(found, true) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+// ============================================================================
+// Pure Geisha UTF-16 Document Mocks (`YYTextView` + `StandardUITextView` + `TIKeyboardOutput`)
+// ============================================================================
+
+data HostTextMock {
+    hmIsYY: Bool,
+    hmSimulateEmptyMarkedJump: Cell Bool,
+    hmStorage: Cell String,
+    hmSelLoc: Cell Int64,
+    hmSelLen: Cell Int64,
+    hmMarkedLoc: Cell Int64,
+    hmMarkedLen: Cell Int64,
+    hmHasMarked: Cell Bool,
+}
+
+def utf16ScalarIndexAt(scs: Vec Int, targetU16: Int64): Int = {
+    let n = vecLen(scs);
+    let u16 = cellNew(intToI64(0));
+    let idx = cellNew(0);
+    let stop = cellNew(false);
+    while (cellGet(idx) < n && !cellGet(stop)) {
+        if (cellGet(u16) >= targetU16) {
+            cellSet(stop, true)
+        } else {
+            let cp = vecGetOr(scs, cellGet(idx), 0);
+            let w = if (cp >= 0x10000) intToI64(2) else intToI64(1);
+            if (cellGet(u16) + w > targetU16) {
+                cellSet(stop, true)
+            } else {
+                cellSet(u16, cellGet(u16) + w);
+                cellSet(idx, cellGet(idx) + 1)
+            }
+        }
+    };
+    cellGet(idx)
+}
+
+def scalarIdxToUtf16(scs: Vec Int, scalarIdx: Int): Int64 = {
+    let n = vecLen(scs);
+    let end = if (scalarIdx < 0) 0 else if (scalarIdx > n) n else scalarIdx;
+    let u16 = cellNew(intToI64(0));
+    let i = cellNew(0);
+    while (cellGet(i) < end) {
+        let cp = vecGetOr(scs, cellGet(i), 0);
+        cellSet(u16, cellGet(u16) + (if (cp >= 0x10000) intToI64(2) else intToI64(1)));
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(u16)
+}
+
+def utf16Substring(s: String, locU16: Int64, lenU16: Int64): String = {
+    let scs = utf8ToScalars(s);
+    let sIdx = utf16ScalarIndexAt(scs, locU16);
+    let eIdx = utf16ScalarIndexAt(scs, locU16 + lenU16);
+    scalarsToUtf8(scs, sIdx, eIdx)
+}
+
+def utf16ReplaceRange(s: String, locU16: Int64, lenU16: Int64, replacement: String): String = {
+    let scs = utf8ToScalars(s);
+    let n = vecLen(scs);
+    let sIdx = utf16ScalarIndexAt(scs, locU16);
+    let eIdx = utf16ScalarIndexAt(scs, locU16 + lenU16);
+    scalarsToUtf8(scs, 0, sIdx) + replacement + scalarsToUtf8(scs, eIdx, n)
+}
+
+def hostMockNew(isYY: Bool, initialText: String, cursorOpt: Option Int64): HostTextMock = {
+    let initU16 = strUtf16Len(initialText);
+    let cur = match cursorOpt { Some(c) -> c, None -> initU16 };
+    HostTextMock {
+        hmIsYY: isYY,
+        hmSimulateEmptyMarkedJump: cellNew(false),
+        hmStorage: cellNew(initialText),
+        hmSelLoc: cellNew(cur),
+        hmSelLen: cellNew(intToI64(0)),
+        hmMarkedLoc: cellNew(intToI64(0)),
+        hmMarkedLen: cellNew(intToI64(0)),
+        hmHasMarked: cellNew(false),
+    }
+}
+
+def hostMockSink(m: HostTextMock): IOSMarkedTextSink =
+    IOSMarkedTextSink {
+        sinkGetBefore: () -> {
+            let loc = cellGet(m.hmSelLoc);
+            if (loc <= intToI64(0)) None
+            else Some(utf16Substring(cellGet(m.hmStorage), intToI64(0), loc))
+        },
+        sinkGetAfter: () -> {
+            let end = cellGet(m.hmSelLoc) + cellGet(m.hmSelLen);
+            let total = strUtf16Len(cellGet(m.hmStorage));
+            if (end >= total) None
+            else Some(utf16Substring(cellGet(m.hmStorage), end, total - end))
+        },
+        sinkGetSelected: () -> {
+            let sl = cellGet(m.hmSelLen);
+            if (sl <= intToI64(0)) None
+            else Some(utf16Substring(cellGet(m.hmStorage), cellGet(m.hmSelLoc), sl))
+        },
+        sinkSetMarkedText: (markedText: String, relSel: NSRange) -> {
+            let mLen = strUtf16Len(markedText);
+            if (m.hmIsYY) {
+                if (cellGet(m.hmSelLen) > intToI64(0)) {
+                    cellSet(m.hmStorage, utf16ReplaceRange(cellGet(m.hmStorage), cellGet(m.hmSelLoc), cellGet(m.hmSelLen), ""));
+                    cellSet(m.hmSelLen, intToI64(0))
+                } else ();
+                if (cellGet(m.hmHasMarked)) {
+                    let ml = cellGet(m.hmMarkedLoc);
+                    cellSet(m.hmStorage, utf16ReplaceRange(cellGet(m.hmStorage), ml, cellGet(m.hmMarkedLen), markedText));
+                    cellSet(m.hmMarkedLen, mLen);
+                    cellSet(m.hmSelLoc, ml + relSel.location);
+                    cellSet(m.hmSelLen, relSel.length)
+                } else {
+                    let start = cellGet(m.hmSelLoc) + cellGet(m.hmSelLen);
+                    cellSet(m.hmHasMarked, true);
+                    cellSet(m.hmMarkedLoc, start);
+                    cellSet(m.hmMarkedLen, mLen);
+                    cellSet(m.hmStorage, utf16ReplaceRange(cellGet(m.hmStorage), start, intToI64(0), markedText));
+                    cellSet(m.hmSelLoc, start + relSel.location);
+                    cellSet(m.hmSelLen, relSel.length)
+                };
+                if (mLen == intToI64(0)) {
+                    cellSet(m.hmHasMarked, false);
+                    cellSet(m.hmMarkedLen, intToI64(0))
+                } else ()
+            } else {
+                let tLoc = if (cellGet(m.hmHasMarked)) cellGet(m.hmMarkedLoc) else cellGet(m.hmSelLoc);
+                let tLen = if (cellGet(m.hmHasMarked)) cellGet(m.hmMarkedLen) else cellGet(m.hmSelLen);
+                cellSet(m.hmStorage, utf16ReplaceRange(cellGet(m.hmStorage), tLoc, tLen, markedText));
+                if (mLen == intToI64(0) && cellGet(m.hmSimulateEmptyMarkedJump)) {
+                    cellSet(m.hmHasMarked, false);
+                    cellSet(m.hmMarkedLen, intToI64(0));
+                    cellSet(m.hmSelLoc, intToI64(0));
+                    cellSet(m.hmSelLen, intToI64(0))
+                } else {
+                    cellSet(m.hmHasMarked, mLen > intToI64(0));
+                    cellSet(m.hmMarkedLoc, tLoc);
+                    cellSet(m.hmMarkedLen, mLen);
+                    cellSet(m.hmSelLoc, tLoc + relSel.location);
+                    cellSet(m.hmSelLen, relSel.length)
+                }
+            }
+        },
+        sinkUnmarkText: () -> {
+            cellSet(m.hmHasMarked, false);
+            cellSet(m.hmMarkedLen, intToI64(0))
+        },
+        sinkInsertText: (text: String) ->
+            if (strLen(text) > 0) {
+                let insLen = strUtf16Len(text);
+                if (m.hmIsYY) {
+                    let sLoc = cellGet(m.hmSelLoc);
+                    let sLen = cellGet(m.hmSelLen);
+                    cellSet(m.hmStorage, utf16ReplaceRange(cellGet(m.hmStorage), sLoc, sLen, text));
+                    if (cellGet(m.hmHasMarked) && sLoc <= cellGet(m.hmMarkedLoc)) {
+                        cellSet(m.hmMarkedLoc, cellGet(m.hmMarkedLoc) + insLen - sLen)
+                    } else ();
+                    cellSet(m.hmSelLoc, sLoc + insLen);
+                    cellSet(m.hmSelLen, intToI64(0))
+                } else {
+                    let tLoc = if (cellGet(m.hmHasMarked)) cellGet(m.hmMarkedLoc) else cellGet(m.hmSelLoc);
+                    let tLen = if (cellGet(m.hmHasMarked)) cellGet(m.hmMarkedLen) else cellGet(m.hmSelLen);
+                    cellSet(m.hmStorage, utf16ReplaceRange(cellGet(m.hmStorage), tLoc, tLen, text));
+                    cellSet(m.hmHasMarked, false);
+                    cellSet(m.hmMarkedLen, intToI64(0));
+                    cellSet(m.hmSelLoc, tLoc + insLen);
+                    cellSet(m.hmSelLen, intToI64(0))
+                }
+            } else (),
+        sinkAdjustTextPosition: (offset: Int) -> {
+            let scs = utf8ToScalars(cellGet(m.hmStorage));
+            let n = vecLen(scs);
+            let curScalar = utf16ScalarIndexAt(scs, cellGet(m.hmSelLoc));
+            let nextScalar = curScalar + offset;
+            let clamped = if (nextScalar < 0) 0 else if (nextScalar > n) n else nextScalar;
+            cellSet(m.hmSelLoc, scalarIdxToUtf16(scs, clamped));
+            cellSet(m.hmSelLen, intToI64(0))
+        },
+    }
+
+data TIKeyboardOutputMock {
+    tiHost: IOSMarkedTextSink,
+    tiInsertion: Cell String,
+    tiMarked: Cell (Option (String, NSRange)),
+    tiUnmark: Cell Bool,
+}
+
+def tiOutputMockNew(host: IOSMarkedTextSink): TIKeyboardOutputMock =
+    TIKeyboardOutputMock {
+        tiHost: host,
+        tiInsertion: cellNew(""),
+        tiMarked: cellNew(None),
+        tiUnmark: cellNew(false),
+    }
+
+def tiOutputSink(ti: TIKeyboardOutputMock): IOSMarkedTextSink =
+    IOSMarkedTextSink {
+        sinkGetBefore: () -> ti.tiHost.sinkGetBefore(),
+        sinkGetAfter: () -> ti.tiHost.sinkGetAfter(),
+        sinkGetSelected: () -> ti.tiHost.sinkGetSelected(),
+        sinkSetMarkedText: (txt: String, rng: NSRange) -> cellSet(ti.tiMarked, Some((txt, rng))),
+        sinkUnmarkText: () -> cellSet(ti.tiUnmark, true),
+        sinkInsertText: (txt: String) -> cellSet(ti.tiInsertion, cellGet(ti.tiInsertion) + txt),
+        sinkAdjustTextPosition: (off: Int) -> ti.tiHost.sinkAdjustTextPosition(off),
+    }
+
+def tiFlushXPCBatch(ti: TIKeyboardOutputMock): Void = {
+    let ins = cellGet(ti.tiInsertion);
+    let mkOpt = cellGet(ti.tiMarked);
+    let unm = cellGet(ti.tiUnmark);
+    cellSet(ti.tiInsertion, "");
+    cellSet(ti.tiMarked, None);
+    cellSet(ti.tiUnmark, false);
+    if (strLen(ins) > 0) ti.tiHost.sinkInsertText(ins) else ();
+    match mkOpt {
+        Some((txt, rng)) -> ti.tiHost.sinkSetMarkedText(txt, rng),
+        None -> (),
+    };
+    if (unm) ti.tiHost.sinkUnmarkText() else ()
+}
+
+def tiDrainTurn(ti: TIKeyboardOutputMock, session: IOSInlineMarkedTextSession): Void = {
+    tiFlushXPCBatch(ti);
+    markedSessionFlushTurnBoundary(session, tiOutputSink(ti));
+    tiFlushXPCBatch(ti)
+}
+
+// ============================================================================
+// Main Test Runner
+// ============================================================================
+
+def main(): Void = {
+    // 1. Exact iOS 26 440pt Pro Max grid alignment
+    let layout = layoutEngineNew();
+    let snap = computeLayout(layout, cgSize(440.0, 225.0));
+    check(vecLen(snap.lsKeys) == 32, "Expected 32 keys on 440x225 QWERTY");
+
+    let qKey = findKeyByKind(snap, KeyLetter(113));
+    check(qKey.ksPrimaryLabel == "q", "Expected lowercase q");
+    check(abs(qKey.ksFrame.size.width - 37.27) < 0.25, "Expected ~37.27pt key width");
+
+    let sKey = findKeyByKind(snap, KeyLetter(115));
+    let dKey = findKeyByKind(snap, KeyLetter(100));
+    let jKey = findKeyByKind(snap, KeyLetter(106));
+    let kKey = findKeyByKind(snap, KeyLetter(107));
+    let zKey = findKeyByKind(snap, KeyLetter(122));
+    let spaceKey = findKeyByKind(snap, KeySpace);
+    let returnKey = findKeyByKind(snap, KeyReturn);
+
+    check(abs(zKey.ksFrame.origin.x - sKey.ksFrame.origin.x) < 0.01, "z.minX == s.minX");
+    check(abs(spaceKey.ksFrame.origin.x - dKey.ksFrame.origin.x) < 0.01, "Space.minX == d.minX");
+    check(abs(rectMaxX(spaceKey.ksFrame) - rectMaxX(jKey.ksFrame)) < 0.01, "Space.maxX == j.maxX");
+    check(abs(returnKey.ksFrame.origin.x - kKey.ksFrame.origin.x) < 0.01, "Return.minX == k.minX");
+    check(optStrEq(spaceKey.ksCornerSubscript, Some("五")), "Space corner '五'");
+    check(optStrEq(returnKey.ksSystemSymbol, Some("return.left")), "Return symbol return.left");
+
+    // 2. Voronoi gutter hit-testing
+    let tKey = findKeyByKind(snap, KeyLetter(116));
+    let yKey = findKeyByKind(snap, KeyLetter(121));
+    let gutterMid = cgPoint((rectMaxX(tKey.ksFrame) + yKey.ksFrame.origin.x) * 0.5 - 0.5, rectMidY(tKey.ksFrame));
+    match hitTest(gutterMid, snap) {
+        Some(h) -> check(h.ksKind == KeyLetter(116), "Expected gutter hit 't'"),
+        None -> check(false, "Expected non-nil gutter hit"),
+    };
+
+    // 3. Shift -> Uppercase -> Double-tap CapsLock -> Lowercase
+    layoutTapShift(layout, 10.0);
+    check(cellGet(layout.leShiftState) == ShiftUpperOnce, "Shift upperOnce");
+    let upperSnap = computeLayout(layout, cgSize(440.0, 225.0));
+    check(findKeyByKind(upperSnap, KeyLetter(113)).ksPrimaryLabel == "Q", "Uppercase Q");
+    layoutTapShift(layout, 10.20);
+    check(cellGet(layout.leShiftState) == ShiftCapsLocked, "CapsLock within 340ms");
+    layoutTapShift(layout, 11.0);
+    check(cellGet(layout.leShiftState) == ShiftLower, "CapsLock -> lower");
+
+    // 4. Numbers (123) and Symbols (#+=) planes + stay-vs-return rules
+    layoutSwitchPlane(layout, PlaneNumbers);
+    let numSnap = computeLayout(layout, cgSize(440.0, 220.0));
+    check(hasPrimaryLabel(numSnap, "1") && hasPrimaryLabel(numSnap, "，") && hasPrimaryLabel(numSnap, "."), "123 plane labels");
+    check(!shouldReturnToLettersAfterSymbol("5", PlaneNumbers), "digit stays on 123");
+    check(!shouldReturnToLettersAfterSymbol("-", PlaneNumbers), "- stays on 123");
+    check(!shouldReturnToLettersAfterSymbol("/", PlaneNumbers), "/ stays on 123");
+    check(!shouldReturnToLettersAfterSymbol("：", PlaneNumbers), "： stays on 123");
+    check(!shouldReturnToLettersAfterSymbol(".", PlaneNumbers), ". stays on 123");
+    check(!shouldReturnToLettersAfterSymbol("￥", PlaneNumbers), "￥ stays on 123");
+    check(shouldReturnToLettersAfterSymbol("，", PlaneNumbers), "， returns");
+    check(shouldReturnToLettersAfterSymbol("。", PlaneNumbers), "。 returns");
+    check(shouldReturnToLettersAfterSymbol("（", PlaneNumbers), "（ returns");
+    check(shouldReturnToLettersAfterSymbol("；", PlaneNumbers), "； returns");
+
+    layoutSwitchPlane(layout, PlaneSymbols);
+    let symSnap = computeLayout(layout, cgSize(440.0, 220.0));
+    check(hasPrimaryLabel(symSnap, "《"), "#+= plane has 《");
+    check(!shouldReturnToLettersAfterSymbol("～", PlaneSymbols), "～ stays on #+=");
+    check(!shouldReturnToLettersAfterSymbol("…", PlaneSymbols), "… stays on #+=");
+    check(shouldReturnToLettersAfterSymbol("《", PlaneSymbols), "《 returns");
+    check(shouldReturnToLettersAfterSymbol("+", PlaneSymbols), "+ returns");
+    layoutSwitchPlane(layout, PlaneLetters);
+
+    // 5. SpaceTrackpadAccumulator & IOSTextCursorNavigation
+    let tp = trackpadNew();
+    trackpadBeginX(tp, 180.0);
+    check(trackpadUpdateX(tp, 200.0) == 2, "trackpad +2");
+    check(trackpadUpdateX(tp, 189.0) == -1, "trackpad -1");
+    trackpadEnd(tp);
+    check(optIntEq(verticalMoveOffset("第一行\n第二行", "", -1), Some(-4)), "vertical cursor up");
+    check(optIntEq(verticalMoveOffset("第一", "行\n第二行文字", 1), Some(4)), "vertical cursor down");
+
+    // 6. End-to-end iOS 26 view coordinates -> JuxuSession touch slip rescue
+    let dictsDir =
+        if (fileExists("../Resources/Dicts/wubi86.wbdict")) "../Resources/Dicts"
+        else "Resources/Dicts";
+    let bridge = bridgeNew(Some(dictsDir), true);
+    bridgeSetKeyLayout52(bridge, snap.lsCenters52, snap.lsOriginX, snap.lsOriginY, snap.lsPitchX, snap.lsPitchY);
+
+    let rKey = findKeyByKind(snap, KeyLetter(114));
+    let wKey = findKeyByKind(snap, KeyLetter(119));
+    let uKey = findKeyByKind(snap, KeyLetter(117));
+    let borderPt = cgPoint(yKey.ksFrame.origin.x + 1.2, rectMidY(tKey.ksFrame) + 1.5);
+    let _ = bridgePushTouch(bridge, 121, borderPt.x, borderPt.y, false, intToI64(1000));
+    let _ = bridgePushTouch(bridge, 114, rectMidX(rKey.ksFrame), rectMidY(rKey.ksFrame), false, intToI64(1070));
+    let _ = bridgePushTouch(bridge, 119, rectMidX(wKey.ksFrame), rectMidY(wKey.ksFrame), false, intToI64(1140));
+    let outSlip = bridgePushTouch(bridge, 117, rectMidX(uKey.ksFrame), rectMidY(uKey.ksFrame), false, intToI64(1210));
+    match vecGet(outSlip.asCandidates, 0) {
+        Some(c0) -> check(c0.text == "我们", "Expected slip rescue '我们', got " + c0.text),
+        None -> check(false, "Expected candidate for slip rescue"),
+    };
+
+    // 7. Mode toggle, ergonomic downward Y-bias, and dynamic Wubi valid-next-key hitbox expansion
+    let modeKey = findKeyByKind(snap, KeyModeToggle);
+    check(
+        modeKey.ksPrimaryLabel == "中"
+            && optStrEq(modeKey.ksSecondaryInlineLabel, Some("/英"))
+            && optStrEq(modeKey.ksSystemSymbol, None),
+        "Typographic mode toggle key"
+    );
+
+    let gKey = findKeyByKind(snap, KeyLetter(103));
+    let lowThumbTap = cgPoint(rectMidX(gKey.ksFrame), rectMaxY(gKey.ksFrame) + 6.5);
+    match hitTest(lowThumbTap, snap) {
+        Some(bh) -> check(bh.ksKind == KeyLetter(103), "Ergonomic Y-bias keeps low tap on 'g'"),
+        None -> check(false, "Expected hit on lowThumbTap"),
+    };
+
+    bridgeClearComposition(bridge);
+    let _ = bridgePushTouch(bridge, 116, rectMidX(tKey.ksFrame), rectMidY(tKey.ksFrame), false, intToI64(2000));
+    let _ = bridgePushTouch(bridge, 114, rectMidX(rKey.ksFrame), rectMidY(rKey.ksFrame), false, intToI64(2060));
+    let afterTrw = bridgePushTouch(bridge, 119, rectMidX(wKey.ksFrame), rectMidY(wKey.ksFrame), false, intToI64(2120));
+    let iKey = findKeyByKind(snap, KeyLetter(105));
+    let uBit = 1 << (117 - 97);
+    let iBit = 1 << (105 - 97);
+    check((afterTrw.asValidNextMask & uBit) != 0 && (afterTrw.asValidNextMask & iBit) == 0, "'u' valid and 'i' dead after 'trw'");
+
+    let edgeInsideI = cgPoint(iKey.ksFrame.origin.x + 2.4, rectMidY(uKey.ksFrame));
+    match hitTestWithMask(edgeInsideI, snap, afterTrw.asValidNextMask) {
+        Some(dh) -> check(dh.ksKind == KeyLetter(117), "Dynamic mask snaps i-bevel onto 'u'"),
+        None -> check(false, "Expected dynamic hit"),
+    };
+    let commitOut = bridgePushTouch(bridge, 117, edgeInsideI.x, edgeInsideI.y, false, intToI64(2180));
+    check(commitOut.asCommitText == "我们", "Expected auto-commit '我们'");
+
+    // 8. Top-edge Spacebar tap during short-code composing is NOT stolen by Row 2
+    bridgeClearComposition(bridge);
+    let kState = bridgePushTouch(bridge, 107, rectMidX(kKey.ksFrame), rectMidY(kKey.ksFrame), false, intToI64(3000));
+    let topEdgeSpaceTap = cgPoint(rectMidX(spaceKey.ksFrame), spaceKey.ksFrame.origin.y - 4.0);
+    match hitTestWithMask(topEdgeSpaceTap, snap, kState.asValidNextMask) {
+        Some(sh) -> check(sh.ksKind == KeySpace, "Top-edge Spacebar tap hits Space"),
+        None -> check(false, "Expected Space hit"),
+    };
+
+    // 9. Sacred Keycap Core (`>= 3.0pt` inside 'i' stays 'i')
+    let interiorInsideI = cgPoint(iKey.ksFrame.origin.x + 3.5, rectMidY(uKey.ksFrame));
+    match hitTestWithMask(interiorInsideI, snap, afterTrw.asValidNextMask) {
+        Some(sch) -> check(sch.ksKind == KeyLetter(105), "Sacred keycap core preserves 'i'"),
+        None -> check(false, "Expected sacred core hit"),
+    };
+
+    // 10. Portrait 220pt canvas + landscape tray dimensions + z-gutter preservation
+    let snap220 = computeLayout(layout, cgSize(440.0, 220.0));
+    let space220 = findKeyByKind(snap220, KeySpace);
+    let q220 = findKeyByKind(snap220, KeyLetter(113));
+    check(abs(q220.ksFrame.size.height - 45.0) < 0.01, "45pt key height on 220pt canvas");
+    check(220.0 - rectMaxY(space220.ksFrame) >= 6.5, ">= 6.5pt bottom catch margin");
+    check(targetTrayHeight(440.0) == 273.0 && targetTrayHeight(700.0) == 204.0, "Portrait 273pt vs Landscape 204pt");
+    check(targetRibbonHeight(440.0) == 53.0 && targetRibbonHeight(700.0) == 40.0, "Ribbon 53pt vs 40pt");
+
+    let bottomRimSpaceTap = cgPoint(rectMidX(space220.ksFrame), 219.5);
+    match hitTestWithMask(bottomRimSpaceTap, snap220, kState.asValidNextMask) {
+        Some(bh) -> check(bh.ksKind == KeySpace, "Bottom-rim tap at y=219.5 hits Spacebar"),
+        None -> check(false, "Expected bottom rim Space hit"),
+    };
+
+    bridgeClearComposition(bridge);
+    bridgeSetKeyLayout52(bridge, snap220.lsCenters52, snap220.lsOriginX, snap220.lsOriginY, snap220.lsPitchX, snap220.lsPitchY);
+    let z220 = findKeyByKind(snap220, KeyLetter(122));
+    match hitTest(cgPoint(z220.ksFrame.origin.x - 9.0, rectMidY(z220.ksFrame)), snap220) {
+        Some(sh) -> check(sh.ksKind == KeyShift, "Tap at z.minX - 9.0 hits Shift"),
+        None -> check(false, "Expected Shift hit"),
+    };
+    let zGutter = cgPoint(z220.ksFrame.origin.x - 2.0, rectMidY(z220.ksFrame));
+    match hitTest(zGutter, snap220) {
+        Some(zh) -> check(zh.ksKind == KeyLetter(122), "Tap at z.minX - 2.0 hits 'z'"),
+        None -> check(false, "Expected 'z' hit"),
+    };
+    let zOut = bridgePushTouch(bridge, 122, zGutter.x, zGutter.y, false, intToI64(4000));
+    check(zOut.asPreedit == "z", "View-space touch preserves 'z'");
+
+    // 11, 13 & 15. Clipboard parser, OTP extraction, store caching & visibility gate
+    match clipboardParse("  第一行\n\n  第二行\t内容  ", 1, false) {
+        Some(multi) -> {
+            check(!multi.csIsOTP && multi.csSubtitle == "来自剪贴板", "Normal clip subtitle");
+            check(multi.csInsertText == "  第一行\n\n  第二行\t内容  ", "Preserves raw insertText");
+            check(multi.csDisplayText == "第一行 第二行 内容", "Collapsed single-line preview")
+        },
+        None -> check(false, "Expected parsed multiline clipboard"),
+    };
+    check(optClipSuggestionEq(clipboardParse("  \n\t ", 1, false), None), "Whitespace-only clipboard -> None");
+
+    match clipboardParse("【招商银行】2026年11月19日您尾号8812的卡验证码为394810，5分钟内有效。", 2, false) {
+        Some(bank) -> check(bank.csIsOTP && bank.csInsertText == "394810" && bank.csSubtitle == "剪贴板验证码", "Bank SMS OTP"),
+        None -> check(false, "Expected bank SMS OTP"),
+    };
+    match clipboardParse("G-591024 is your Google verification code.", 3, false) {
+        Some(goog) -> check(goog.csIsOTP && goog.csInsertText == "591024", "Google SMS OTP"),
+        None -> check(false, "Expected Google OTP"),
+    };
+    match clipboardParse("Your Apple Account verification code is: 904 281", 4, false) {
+        Some(apple) -> check(apple.csIsOTP && apple.csInsertText == "904281", "Apple 3+3 grouped OTP"),
+        None -> check(false, "Expected Apple grouped OTP"),
+    };
+    match clipboardParse("2026年11月19日开会，房间号1024", 5, false) {
+        Some(note) -> check(!note.csIsOTP && note.csInsertText == "2026年11月19日开会，房间号1024", "Meeting note not OTP"),
+        None -> check(false, "Expected meeting note"),
+    };
+    match clipboardParse("https://example.com/otp/123456", 6, false) {
+        Some(u) -> check(!u.csIsOTP && u.csInsertText == "https://example.com/otp/123456", "URL not OTP"),
+        None -> check(false, "Expected URL suggestion"),
+    };
+    match clipboardParse("请打开 https://example.com/otp/123456 查看", 7, false) {
+        Some(su) -> check(!su.csIsOTP && su.csInsertText == "请打开 https://example.com/otp/123456 查看", "Sentence URL not OTP"),
+        None -> check(false, "Expected sentence URL suggestion"),
+    };
+    match clipboardParse("482916", 8, false) {
+        Some(pNorm) -> check(!pNorm.csIsOTP && pNorm.csInsertText == "482916", "Pure digits normal"),
+        None -> check(false, "Expected pure digits normal"),
+    };
+    match clipboardParse("482916", 8, true) {
+        Some(pOtp) -> check(pOtp.csIsOTP && pOtp.csSubtitle == "剪贴板验证码" && pOtp.csInsertText == "482916", "Pure digits prefersOTP"),
+        None -> check(false, "Expected pure digits OTP"),
+    };
+
+    let kv = inMemoryClipboardKVStore();
+    let clipStore = clipboardStoreNew(kv, 180.0);
+    let readCalls = cellNew(0);
+    let sNoAccess = clipboardStoreRefresh(clipStore, false, true, true, 10, false, 1000.0, () -> {
+        cellSet(readCalls, cellGet(readCalls) + 1);
+        Some("hello")
+    });
+    check(optClipSuggestionEq(sNoAccess, None) && cellGet(readCalls) == 0, "No full access never reads");
+
+    let s1 = clipboardStoreRefresh(clipStore, true, true, true, 10, false, 1000.0, () -> {
+        cellSet(readCalls, cellGet(readCalls) + 1);
+        Some("482916")
+    });
+    match s1 {
+        Some(v) -> check(v.csInsertText == "482916" && cellGet(readCalls) == 1, "First observation reads once"),
+        None -> check(false, "Expected s1"),
+    };
+    let s2 = clipboardStoreRefresh(clipStore, true, true, true, 10, true, 1030.0, () -> {
+        cellSet(readCalls, cellGet(readCalls) + 1);
+        Some("482916")
+    });
+    match s2 {
+        Some(v) -> check(v.csIsOTP && cellGet(readCalls) == 1, "Second observation uses cache & dynamic prefersOTP"),
+        None -> check(false, "Expected s2"),
+    };
+    let sExpired = clipboardStoreRefresh(clipStore, true, true, true, 10, false, 1200.0, () -> {
+        cellSet(readCalls, cellGet(readCalls) + 1);
+        Some("482916")
+    });
+    check(optClipSuggestionEq(sExpired, None) && cellGet(readCalls) == 1, "TTL expiry hides without re-read");
+
+    let s3 = clipboardStoreRefresh(clipStore, true, true, true, 11, false, 1300.0, () -> {
+        cellSet(readCalls, cellGet(readCalls) + 1);
+        Some("新复制文本")
+    });
+    match s3 {
+        Some(v) -> check(v.csInsertText == "新复制文本" && cellGet(readCalls) == 2, "New changeCount reads once"),
+        None -> check(false, "Expected s3"),
+    };
+    clipboardStoreConsume(clipStore, 11);
+    let sAfterConsume = clipboardStoreRefresh(clipStore, true, true, true, 11, false, 1305.0, () -> {
+        cellSet(readCalls, cellGet(readCalls) + 1);
+        Some("新复制文本")
+    });
+    check(optClipSuggestionEq(sAfterConsume, None) && cellGet(readCalls) == 2, "consume() suppresses changeCount");
+
+    // 13. Non-blocking 2-step lookup + denied read (`None`) suppresses re-prompt
+    check(clipboardStoreLookup(clipStore, true, true, true, 12, false, 1400.0) == ClipNeedsRead(12), "lookup -> NeedsRead(12)");
+    check(optClipSuggestionEq(clipboardStoreRecordRead(clipStore, 12, None, false, 1401.0), None), "denied read -> None");
+    check(clipboardStoreLookup(clipStore, true, true, true, 12, false, 1405.0) == ClipNone, "denied read never re-prompts");
+
+    // 15. Clipboard visibility gate
+    let clipGate = clipboardGateNew();
+    check(clipboardGateShouldAllowDisplay(clipGate, 20), "Initial allow cc=20");
+    clipboardGateMarkUserTyped(clipGate);
+    check(!clipboardGateShouldAllowDisplay(clipGate, 20), "Hidden after typing");
+    check(clipboardGateShouldAllowDisplay(clipGate, 21), "Fresh copy cc=21 lifts suppression");
+    clipboardGateMarkUserTyped(clipGate);
+    check(!clipboardGateShouldAllowDisplay(clipGate, 21), "Hidden after typing cc=21");
+    clipboardGateResetForAppearance(clipGate);
+    check(clipboardGateShouldAllowDisplay(clipGate, 21), "Reopen keyboard resets suppression");
+
+    // iOS auto-space composition flow with `overrideBefore`
+    let iosCompTracker = autoSpaceTrackerNew();
+    let onOpts = AutoSpaceOptions { asoEnabled: true, asoSpaceDigits: true };
+    let baseBeforeMarked = autoSpaceTrackerEffectiveBefore(iosCompTracker, Some("hello"), false);
+    let pushCommit = autoSpaceTrackerPrepareCommit(iosCompTracker, "国", Some("hello"), false, Some(baseBeforeMarked), true, onOpts);
+    check(pushCommit == " 国", "5th-code push leading space");
+    let nextBase = autoSpaceTrackerEffectiveBefore(iosCompTracker, Some("hello"), false);
+    check(nextBase == "hello 国", "nextBase == 'hello 国'");
+    let finalCommit = autoSpaceTrackerPrepareCommit(iosCompTracker, "我", Some("hello"), false, Some(nextBase), true, onOpts);
+    check(finalCommit == "我", "second CJK no extra space");
+    let digitCommit = autoSpaceTrackerPrepareCommit(iosCompTracker, "1", Some("hello 国我"), false, None, false, onOpts);
+    check(digitCommit == " 1", "digit after CJK");
+
+    // 12. Transient full-screen height guard (440x903)
+    let transientSnap = computeLayout(layout, cgSize(440.0, 903.0));
+    let transientQ = findKeyByKind(transientSnap, KeyLetter(113));
+    let transientSpace = findKeyByKind(transientSnap, KeySpace);
+    check(transientQ.ksFrame.size.height <= 48.0, "Transient 903pt height keyH <= 48pt");
+    check(rectMaxY(transientSpace.ksFrame) <= 220.0, "Transient 903pt space.maxY <= 220pt");
+
+    // 14. WBAUX003 idle next-word predictions
+    bridgeSetContext(bridge, "");
+    let starters = bridgePredictNextWords(bridge, 8);
+    check(vecLen(starters) == 8 && vecGetOr(starters, 0, "") == "我", "Idle starters");
+    bridgeSetContext(bridge, "小红");
+    let xhsPreds = bridgePredictNextWords(bridge, 8);
+    check(vecGetOr(xhsPreds, 0, "") == "书", "Expected '书' after '小红'");
+    bridgeSetContext(bridge, "情绪");
+    let moodPreds = bridgePredictNextWords(bridge, 8);
+    check(
+        vecGetOr(moodPreds, 0, "") == "价值"
+            || vecGetOr(moodPreds, 1, "") == "价值"
+            || vecGetOr(moodPreds, 2, "") == "价值",
+        "Expected '价值' in top-3 after '情绪'"
+    );
+    bridgeSetContext(bridge, "大模");
+    check(vecGetOr(bridgePredictNextWords(bridge, 8), 0, "") == "型", "Expected '型' after '大模'");
+    bridgeAcceptPrediction(bridge, "型", intToI64(3000));
+    let afterModel = bridgePredictNextWords(bridge, 8);
+    check(vecLen(afterModel) == 8 && vecGetOr(afterModel, 0, "") != "型", "Chained prediction advances");
+    bridgeSetContext(bridge, "大模型，");
+    check(vecStrEquals(bridgePredictNextWords(bridge, 8), starters), "Punctuation resets predictions");
+
+    // 16. Neural `nextKeyPriors` (Key #1 & valid-vs-valid tie) + Sacred Core + personal `touchOffsets` + `compensatedLetterPoint`
+    let f220 = findKeyByKind(snap220, KeyLetter(102));
+    let g220 = findKeyByKind(snap220, KeyLetter(103));
+    let fgMidGutter = cgPoint((rectMaxX(f220.ksFrame) + g220.ksFrame.origin.x) * 0.5 - 0.8, rectMidY(f220.ksFrame));
+    match hitTest(fgMidGutter, snap220) {
+        Some(nh1) -> check(nh1.ksKind == KeyLetter(102), "Neutral f/g gutter hits 'f'"),
+        None -> check(false, "Expected neutral hit"),
+    };
+    let priorsKey1 = makeIntVecFilled(26, 100);
+    vecSet(priorsKey1, 103 - 97, 162);
+    vecSet(priorsKey1, 102 - 97, 74);
+    match hitTestFull(fgMidGutter, snap220, 0x03FF_FFFF, priorsKey1, vecNew(), 0xFF, vecNew(), vecNew()) {
+        Some(nh) -> check(nh.ksKind == KeyLetter(103), "Key #1 neural prior pulls gutter tap to 'g'"),
+        None -> check(false, "Expected Key #1 neural hit"),
+    };
+
+    let bothFGValidMask = (1 << (102 - 97)) | (1 << (103 - 97));
+    let bevelInsideF = cgPoint(rectMaxX(f220.ksFrame) - 1.8, rectMidY(f220.ksFrame));
+    match hitTestWithMask(bevelInsideF, snap220, bothFGValidMask) {
+        Some(fh) -> check(fh.ksKind == KeyLetter(102), "Flat mask keeps bevel on 'f'"),
+        None -> check(false, "Expected flat mask hit"),
+    };
+    let priorsValidTie = makeIntVecFilled(26, 0);
+    vecSet(priorsValidTie, 103 - 97, 168);
+    vecSet(priorsValidTie, 102 - 97, 58);
+    match hitTestFull(bevelInsideF, snap220, bothFGValidMask, priorsValidTie, vecNew(), 0xFF, vecNew(), vecNew()) {
+        Some(th) -> check(th.ksKind == KeyLetter(103), "Valid-vs-valid neural prior snaps bevel to 'g'"),
+        None -> check(false, "Expected neural tie hit"),
+    };
+
+    let coreInsideF = cgPoint(rectMaxX(f220.ksFrame) - 3.6, rectMidY(f220.ksFrame));
+    match hitTestFull(coreInsideF, snap220, bothFGValidMask, priorsValidTie, vecNew(), 0xFF, vecNew(), vecNew()) {
+        Some(ch) -> check(ch.ksKind == KeyLetter(102), "Sacred core inside 'f' preserved against neural prior"),
+        None -> check(false, "Expected core hit"),
+    };
+
+    let personalOffsets = makeFloatVecFilled(52, 0.0);
+    vecSet(personalOffsets, (102 - 97) * 2, 0.16);
+    match hitTestFull(fgMidGutter, snap220, 0x03FF_FFFF, makeIntVecFilled(26, 100), personalOffsets, 0xFF, vecNew(), vecNew()) {
+        Some(ph) -> check(ph.ksKind == KeyLetter(102), "Personal right-shifted 'f' touchOffset captures gutter"),
+        None -> check(false, "Expected personal offset hit"),
+    };
+
+    let row1Comp = compensatedLetterPoint(cgPoint(rectMidX(f220.ksFrame), rectMidY(f220.ksFrame)), snap220);
+    check(abs((rectMidY(f220.ksFrame) - row1Comp.y) - ergonomicThumbYBias()) < 0.01, "compensatedLetterPoint 2.6pt bias");
+
+    // 17. Cangjie radical keycaps + ASCII / Shift / isZLookupActive / disabled fallback
+    let cjLayout = layoutEngineNew();
+    cellSet(cjLayout.leSchemaId, 35);
+    cellSet(cjLayout.leCangjieKeycapRadicals, true);
+    let cjSnap = computeLayout(cjLayout, cgSize(440.0, 220.0));
+    check(findKeyByKind(cjSnap, KeyLetter(113)).ksPrimaryLabel == "手", "Cangjie q -> 手");
+    check(findKeyByKind(cjSnap, KeyLetter(97)).ksPrimaryLabel == "日", "Cangjie a -> 日");
+    check(findKeyByKind(cjSnap, KeyLetter(122)).ksPrimaryLabel == "重", "Cangjie z -> 重");
+    check(optStrEq(findKeyByKind(cjSnap, KeySpace).ksCornerSubscript, Some("仓")), "Cangjie corner 仓");
+    cellSet(cjLayout.leAsciiMode, true);
+    check(findKeyByKind(computeLayout(cjLayout, cgSize(440.0, 220.0)), KeyLetter(113)).ksPrimaryLabel == "q", "Cangjie ASCII fallback");
+    cellSet(cjLayout.leAsciiMode, false);
+    cellSet(cjLayout.leIsZLookupActive, true);
+    check(findKeyByKind(computeLayout(cjLayout, cgSize(440.0, 220.0)), KeyLetter(113)).ksPrimaryLabel == "q", "Cangjie Z-lookup fallback");
+    cellSet(cjLayout.leIsZLookupActive, false);
+    cellSet(cjLayout.leCangjieKeycapRadicals, false);
+    check(findKeyByKind(computeLayout(cjLayout, cgSize(440.0, 220.0)), KeyLetter(113)).ksPrimaryLabel == "q", "Cangjie disabled fallback");
+
+    // 18. Wubi 86 / 98 / 06 radical tables
+    let wbLayout = layoutEngineNew();
+    cellSet(wbLayout.leSchemaId, 86);
+    cellSet(wbLayout.leWubiKeycapRadicals, true);
+    let wb86Snap = computeLayout(wbLayout, cgSize(440.0, 220.0));
+    check(optStrEq(findKeyByKind(wb86Snap, KeyLetter(103)).ksKeycapRadicals, Some("王戋\n五一")), "Wubi86 g radicals");
+    match findKeyByKind(wb86Snap, KeyLetter(109)).ksKeycapRadicals {
+        Some(r) -> check(strContains(r, "几"), "Wubi86 m contains 几"),
+        None -> check(false, "Expected Wubi86 m radicals"),
+    };
+    check(optStrEq(findKeyByKind(wb86Snap, KeyLetter(122)).ksKeycapRadicals, Some("万能")), "Wubi86 z 万能");
+
+    cellSet(wbLayout.leSchemaId, 98);
+    let wb98Snap = computeLayout(wbLayout, cgSize(440.0, 220.0));
+    match findKeyByKind(wb98Snap, KeyLetter(119)).ksKeycapRadicals {
+        Some(r) -> check(strContains(r, "几"), "Wubi98 w contains 几"),
+        None -> check(false, "Expected Wubi98 w radicals"),
+    };
+    match findKeyByKind(wb98Snap, KeyLetter(98)).ksKeycapRadicals {
+        Some(r) -> check(strContains(r, "皮"), "Wubi98 b contains 皮"),
+        None -> check(false, "Expected Wubi98 b radicals"),
+    };
+
+    cellSet(wbLayout.leSchemaId, 6);
+    let wb06Snap = computeLayout(wbLayout, cgSize(440.0, 220.0));
+    match findKeyByKind(wb06Snap, KeyLetter(121)).ksKeycapRadicals {
+        Some(r) -> check(strContains(r, "六"), "Wubi06 y contains 六"),
+        None -> check(false, "Expected Wubi06 y radicals"),
+    };
+    cellSet(wbLayout.leAsciiMode, true);
+    check(optStrEq(findKeyByKind(computeLayout(wbLayout, cgSize(440.0, 220.0)), KeyLetter(103)).ksKeycapRadicals, None), "Wubi ASCII fallback");
+
+    // 19. T9 9-key Pinyin layout, dynamic neural priors, personal T9 touchOffsets & ASCII fallback
+    let t9Layout = layoutEngineNew();
+    cellSet(t9Layout.leSchemaId, 20);
+    cellSet(t9Layout.lePinyinT9Layout, true);
+    check(layoutIsT9PinyinActive(t9Layout), "isT9PinyinActive");
+    let t9Snap = computeLayout(t9Layout, cgSize(440.0, 220.0));
+    check(t9Snap.lsIsT9Layout, "t9Snap.lsIsT9Layout");
+    check(t9Snap.lsT9SidebarFrame.size.width > 55.0 && t9Snap.lsT9SidebarFrame.size.height > 140.0, "t9SidebarFrame size");
+    let t9KeyCount = cellNew(0);
+    let hasT9Clear = cellNew(false);
+    let ti = cellNew(0);
+    while (cellGet(ti) < vecLen(t9Snap.lsKeys)) {
+        match vecGet(t9Snap.lsKeys, cellGet(ti)) {
+            Some(k) -> {
+                match k.ksKind {
+                    KeyT9(_) -> cellSet(t9KeyCount, cellGet(t9KeyCount) + 1),
+                    KeyT9Clear -> cellSet(hasT9Clear, true),
+                    _ -> (),
+                };
+                check(!rectIntersectsRect(k.ksFrame, t9Snap.lsT9SidebarFrame), "T9 key does not overlap sidebar");
+                check(rectMaxY(k.ksFrame) <= 220.0, "T9 key <= 220pt")
+            },
+            None -> (),
+        };
+        cellSet(ti, cellGet(ti) + 1)
+    };
+    check(cellGet(t9KeyCount) == 9 && cellGet(hasT9Clear), "9 T9 keys + T9 clear");
+    check(optStrEq(findKeyByKind(t9Snap, KeySpace).ksCornerSubscript, Some("九")), "T9 space corner 九");
+
+    let k5 = findKeyByKind(t9Snap, KeyT9(53));
+    let k6 = findKeyByKind(t9Snap, KeyT9(54));
+    let k56Gutter = cgPoint((rectMaxX(k5.ksFrame) + k6.ksFrame.origin.x) * 0.5, rectMidY(k5.ksFrame) + ergonomicThumbYBias());
+    let t9Priors = makeIntVecFilled(8, 100);
+    vecSet(t9Priors, 53 - 50, 78);
+    vecSet(t9Priors, 54 - 50, 165);
+    match hitTestFull(k56Gutter, t9Snap, 0x03FF_FFFF, vecNew(), vecNew(), 0xFF, t9Priors, vecNew()) {
+        Some(h6) -> check(h6.ksKind == KeyT9(54), "T9 neural prior pulls 5/6 gutter to '6'"),
+        None -> check(false, "Expected T9 neural hit"),
+    };
+    let t9Offsets = makeFloatVecFilled(16, 0.0);
+    vecSet(t9Offsets, (53 - 50) * 2, 0.16);
+    match hitTestFull(k56Gutter, t9Snap, 0x03FF_FFFF, vecNew(), vecNew(), 0xFF, makeIntVecFilled(8, 100), t9Offsets) {
+        Some(h5) -> check(h5.ksKind == KeyT9(53), "T9 personal touchOffset pulls 5/6 gutter to '5'"),
+        None -> check(false, "Expected T9 personal hit"),
+    };
+    cellSet(t9Layout.leAsciiMode, true);
+    check(!layoutIsT9PinyinActive(t9Layout) && !computeLayout(t9Layout, cgSize(440.0, 220.0)).lsIsT9Layout, "T9 ASCII restores 26-key");
+
+    // 20. IOSSwipeUp, IOSKeyAlternates, IOSLineClear, IOSLineClearUndo, PunctuationPairing, Candidate annotations
+    check(optStrEq(swipeUpSymbolForLetter(113, false), Some("1")), "swipe q -> 1");
+    check(optStrEq(swipeUpSymbolForLetter(112, true), Some("0")), "swipe p -> 0");
+    check(optStrEq(swipeUpSymbolForLetter(100, false), Some("：")), "swipe d zh -> ：");
+    check(optStrEq(swipeUpSymbolForLetter(100, true), Some(":")), "swipe d en -> :");
+    check(optStrEq(swipeUpSymbolForLetter(108, true), Some("\"")), "swipe l en -> \"");
+    let ab = cellNew(97);
+    while (cellGet(ab) <= 122) {
+        let ch = cellGet(ab);
+        match swipeUpSymbolForLetter(ch, false) { Some(_) -> (), None -> check(false, "Missing zh swipe") };
+        match swipeUpSymbolForLetter(ch, true) { Some(_) -> (), None -> check(false, "Missing en swipe") };
+        cellSet(ab, ch + 1)
+    };
+    let oPt = cgPoint(100.0, 100.0);
+    check(!swipeUpIsActive(oPt, cgPoint(101.0, 80.0), 45.0, false, false), "20pt roll stays tap");
+    check(swipeUpIsActive(oPt, cgPoint(103.0, 72.0), 45.0, false, false), "28pt vertical activates");
+    check(!swipeUpIsActive(oPt, cgPoint(120.0, 70.0), 45.0, false, false), "Diagonal rejected");
+    check(!swipeUpIsActive(oPt, cgPoint(100.0, 130.0), 45.0, false, false), "Downward rejected");
+    check(swipeUpIsActive(oPt, cgPoint(100.0, 82.0), 45.0, true, false), "Hysteresis keeps active");
+    check(!swipeUpIsActive(oPt, cgPoint(100.0, 86.0), 45.0, true, false), "Slide back cancels");
+    check(!swipeUpIsActive(oPt, cgPoint(103.0, 72.0), 45.0, false, true), "28pt rejected while composing");
+    check(swipeUpIsActive(oPt, cgPoint(102.0, 62.0), 45.0, false, true), "38pt activates while composing");
+
+    let (uItems, uDef) = keyAlternatesOptions(117, false);
+    check(vecLen(uItems) == 7 && vecGetOr(uItems, 0, "") == "ū" && vecGetOr(uItems, uDef, "") == "7", "u alternates");
+    let (vItems, vDef) = keyAlternatesOptions(118, true);
+    check(vecContainsStr(vItems, "ü") && vecGetOr(vItems, vDef, "") == "&", "v alternates");
+    let (bItems, bDef) = keyAlternatesOptions(98, false);
+    check(vecLen(bItems) == 3 && vecGetOr(bItems, 1, "") == "？" && bDef == 1, "b alternates");
+    let narrowStrip = keyAlternatesStripFrame(cgRect(300.0, 60.0, 30.0, 42.0), 8, 6, 320.0);
+    check(narrowStrip.origin.x >= 4.0 && rectMaxX(narrowStrip) <= 316.0, "Strip clamped to 320pt");
+    check(keyAlternatesIndexAtX(narrowStrip.origin.x - 50.0, narrowStrip, 8) == 0, "indexAtX left clamp");
+    check(keyAlternatesIndexAtX(rectMaxX(narrowStrip) + 50.0, narrowStrip, 8) == 7, "indexAtX right clamp");
+
+    match keyAlternatesSymbolOptions("0", false) {
+        Some((zIt, zDef)) -> check(vecLen(zIt) == 2 && vecGetOr(zIt, 1, "") == "°" && zDef == 0, "0 symbol alternates"),
+        None -> check(false, "Expected 0 alternates"),
+    };
+    match keyAlternatesSymbolOptions("￥", false) {
+        Some((rIt, rDef)) -> check(vecGetOr(rIt, 0, "") == "￥" && vecContainsStr(rIt, "$") && rDef == 0, "￥ alternates"),
+        None -> check(false, "Expected ￥ alternates"),
+    };
+    match keyAlternatesSymbolOptions("（", false) {
+        Some((pIt, pDef)) -> check(vecGetOr(pIt, 0, "") == "（" && vecContainsStr(pIt, "「") && pDef == 0, "（ alternates"),
+        None -> check(false, "Expected （ alternates"),
+    };
+    match keyAlternatesSymbolOptions("1", false) {
+        Some(_) -> check(false, "1 should have no symbol alternates"),
+        None -> (),
+    };
+
+    // LineClear & LineClearUndo & BackspaceChunkDelete
+    check(lineClearPlan("第一行\n第二行", 128) == LineClearPlan { lcpDeleteCount: 3, lcpReachesLineStart: true }, "LineClear multiline");
+    check(lineClearPlan("第一行\n", 128) == LineClearPlan { lcpDeleteCount: 0, lcpReachesLineStart: true }, "LineClear at line start");
+    check(lineClearPlan("没有换行", 128) == LineClearPlan { lcpDeleteCount: 4, lcpReachesLineStart: false }, "LineClear single line");
+    check(lineClearPlan("a\r\nbc", 128) == LineClearPlan { lcpDeleteCount: 2, lcpReachesLineStart: true }, "LineClear CRLF");
+    check(lineClearPlan(repeatStr("字", 300), 128) == LineClearPlan { lcpDeleteCount: 128, lcpReachesLineStart: false }, "LineClear 128 batch");
+
+    let partialExp = lineClearExpectedNew("abcdef", 2);
+    check(lineClearExpectedIsSatisfied(partialExp, "abcd") && lineClearExpectedIsSatisfied(partialExp, "zzabcd"), "partialExpected satisfied");
+    check(!lineClearExpectedIsSatisfied(partialExp, "abcdef") && !lineClearExpectedIsSatisfied(partialExp, "other"), "partialExpected stale/other");
+    let wholeExp = lineClearExpectedNew("abc", 3);
+    check(!lineClearExpectedIsSatisfied(wholeExp, "abc") && lineClearExpectedIsSatisfied(wholeExp, "上一行\n"), "wholeExpected");
+
+    let docA = Some("DOC-A");
+    let docB = Some("DOC-B");
+    let undo = lineClearUndoNew();
+    lineClearUndoPush(undo, "第二行", "第一行\n", docA);
+    lineClearUndoPush(undo, "第三行", "第一行\n第二行\n", docA);
+    match lineClearUndoRestorableIndex(undo, "第一行\n第二行\n", docB) {
+        Some(_) -> check(false, "Must not restore into docB"),
+        None -> (),
+    };
+    match lineClearUndoRestorableIndex(undo, "第一行\n第二行\n", None) {
+        Some(_) -> check(false, "Nil docID must never match"),
+        None -> (),
+    };
+    check(optStrEq(lineClearUndoTake(undo, "第一行\n第二行\n", docA), Some("第三行")), "Undo third line");
+    check(optStrEq(lineClearUndoTake(undo, "第一行\n", docA), Some("第二行")), "Undo second line");
+    check(optStrEq(lineClearUndoTake(undo, "第一行\n", docA), None), "Undo empty");
+
+    let startUndo = lineClearUndoNew();
+    lineClearUndoPush(startUndo, "整行", "", docA);
+    match lineClearUndoRestorableIndex(startUndo, "有字", docA) {
+        Some(_) -> check(false, "Empty context record must not match non-empty"),
+        None -> (),
+    };
+    check(optStrEq(lineClearUndoTake(startUndo, "", docA), Some("整行")), "Undo document-start");
+    lineClearUndoPush(startUndo, "", "", docA);
+    check(lineClearUndoCount(startUndo) == 0, "Empty text ignored");
+    let ui = cellNew(0);
+    while (cellGet(ui) < lineClearUndoMaxRecords() + 3) {
+        let idx = cellGet(ui);
+        lineClearUndoPush(startUndo, intToStr(idx), "x", docA);
+        cellSet(ui, idx + 1)
+    };
+    check(lineClearUndoCount(startUndo) == lineClearUndoMaxRecords(), "Capped at 8 records");
+    check(optStrEq(lineClearUndoTake(startUndo, "x", docA), Some(intToStr(lineClearUndoMaxRecords() + 2))), "Most recent record popped");
+
+    check(acceleratedDeleteCount("你好世界") == 3 && acceleratedDeleteCount("你好\n") == 1, "acceleratedDeleteCount");
+    check(!backspaceShouldFireRepeat(0.20) && backspaceShouldFireRepeat(0.36), "backspace initial delay");
+    check(!backspaceShouldUseFastChunk(1.20, false) && backspaceShouldUseFastChunk(1.60, false) && !backspaceShouldUseFastChunk(2.0, true), "backspace fast chunk");
+
+    let typoCand = MkCandidate { text: "我们", comment: "⌖trwu ⟲", badge: 2, confidence: 0.9, isExact: false };
+    check(cleanIOSCandidateAnnotation(typoCand) == "trwu", "cleanIOSCandidateAnnotation strips badge glyphs");
+
+    // Chinese punctuation pairing sanity
+    check(optStrEq(closerForOpen("“"), Some("”")) && optStrEq(closerForOpen("（"), Some("）")), "closerForOpen");
+    check(punctuationAction("（", "，后文", vecNew()) == InsertPair("）"), "InsertPair before comma");
+    check(punctuationAction("“", "已有文字", vecNew()) == Plain, "No auto-close before text");
+    let oneQuote: Vec String = vecWithCap(1);
+    vecPush(oneQuote, "”");
+    check(punctuationAction("”", "”", oneQuote) == SkipClose, "SkipClose");
+    check(punctuationShouldDeletePair("你好“", "”", oneQuote), "Delete empty pair");
+    check(!punctuationShouldDeletePair("你好“字", "”", oneQuote), "Keep non-empty pair");
+    check(punctuationPruned(oneQuote, "”") && !punctuationPruned(oneQuote, "别的"), "punctuationPruned");
+    check(punctuationCursorStaysInPairs(oneQuote, "，后文", "”，后文") && !punctuationCursorStaysInPairs(oneQuote, "，后文", "”别处"), "cursorStaysInPairs");
+
+    // 21. IOSInlineMarkedTextSession (`YYTextView` + `StandardUITextView` + `TIKeyboardOutput` + orphan sweep)
+    bridgeSwitchSchema(bridge, 86, false);
+    let baseCfg = defaultConfig();
+    let wb86ManualCfg = MkJuxuConfig {
+        schema: baseCfg.schema,
+        fourthCodeAutoCommit: false,
+        fifthCodePushCommit: baseCfg.fifthCodePushCommit,
+        fourthEmptyBehavior: baseCfg.fourthEmptyBehavior,
+        shortestCodeFirst: baseCfg.shortestCodeFirst,
+        strictShortcode: baseCfg.strictShortcode,
+        spaceless: false,
+        showShortcodeHint: baseCfg.showShortcodeHint,
+        dynamicWordFreq: baseCfg.dynamicWordFreq,
+        dynamicCharFreq: baseCfg.dynamicCharFreq,
+        autoPhrase: baseCfg.autoPhrase,
+        autoPhraseThreshold: baseCfg.autoPhraseThreshold,
+        zOmnipotent: baseCfg.zOmnipotent,
+        semicolonQuoteSelect: baseCfg.semicolonQuoteSelect,
+        smartPunctuation: baseCfg.smartPunctuation,
+        autoSpaceZhEn: baseCfg.autoSpaceZhEn,
+        autoSpaceDigits: baseCfg.autoSpaceDigits,
+        clipboardSuggestion: baseCfg.clipboardSuggestion,
+        cangjieKeycapRadicals: baseCfg.cangjieKeycapRadicals,
+        wubiKeycapRadicals: baseCfg.wubiKeycapRadicals,
+        keySwipeUpInput: baseCfg.keySwipeUpInput,
+        spaceCommaKey: baseCfg.spaceCommaKey,
+        keyLongPressAlternates: baseCfg.keyLongPressAlternates,
+        backspaceSwipeClear: baseCfg.backspaceSwipeClear,
+        keyboardHoldCursor: baseCfg.keyboardHoldCursor,
+        enableRareCharset: baseCfg.enableRareCharset,
+        pinyinInitialAbbr: baseCfg.pinyinInitialAbbr,
+        pinyinT9Layout: baseCfg.pinyinT9Layout,
+        shiftToggleMode: baseCfg.shiftToggleMode,
+        pageSize: baseCfg.pageSize,
+        orientation: baseCfg.orientation,
+        evalLogging: baseCfg.evalLogging,
+        emojiCandidates: baseCfg.emojiCandidates,
+        typo: baseCfg.typo,
+    };
+    bridgeApplyAndSaveConfig(bridge, wb86ManualCfg, false);
+
+    // 21a. Bilibili comment box repro #1 on BOTH YYTextView and StandardUITextView
+    let modeIdx = cellNew(0);
+    while (cellGet(modeIdx) < 2) {
+        let isYY = cellGet(modeIdx) == 0;
+        let host = hostMockNew(isYY, "", None);
+        let ti = tiOutputMockNew(hostMockSink(host));
+        let proxy = tiOutputSink(ti);
+        let sess = markedSessionNew();
+        bridgeClearComposition(bridge);
+
+        let dhfg = "dhfg";
+        let ci = cellNew(0);
+        while (cellGet(ci) < strLen(dhfg)) {
+            let st = bridgeHandleKey(bridge, 0, strByteAt(dhfg, cellGet(ci)), false, intToI64(8000));
+            let _ = markedSessionApplyEngineState(sess, st.asCommitText, activeInlinePreedit(st), onOpts, proxy);
+            tiDrainTurn(ti, sess);
+            cellSet(ci, cellGet(ci) + 1)
+        };
+        let commitPh = bridgeHandleKey(bridge, 0x31, 32, false, intToI64(8050));
+        check(commitPh.asCommitText == "破坏", "dhfg -> 破坏");
+        let _ = markedSessionApplyEngineState(sess, commitPh.asCommitText, activeInlinePreedit(commitPh), onOpts, proxy);
+        tiDrainTurn(ti, sess);
+
+        bridgeAcceptPrediction(bridge, "计算", intToI64(8080));
+        let _ = markedSessionInsertTextWithAutoSpace(sess, "计算", true, None, onOpts, proxy);
+        tiDrainTurn(ti, sess);
+
+        let sm = "sm";
+        let si = cellNew(0);
+        while (cellGet(si) < strLen(sm)) {
+            let st = bridgeHandleKey(bridge, 0, strByteAt(sm, cellGet(si)), false, intToI64(8100));
+            let _ = markedSessionApplyEngineState(sess, st.asCommitText, activeInlinePreedit(st), onOpts, proxy);
+            tiDrainTurn(ti, sess);
+            cellSet(si, cellGet(si) + 1)
+        };
+        let commitJi = bridgeHandleKey(bridge, 0x31, 32, false, intToI64(8150));
+        check(commitJi.asCommitText == "机", "sm -> 机");
+        let _ = markedSessionApplyEngineState(sess, commitJi.asCommitText, activeInlinePreedit(commitJi), onOpts, proxy);
+        tiDrainTurn(ti, sess);
+
+        check(cellGet(host.hmStorage) == "破坏计算机", "Expected '破坏计算机', got " + cellGet(host.hmStorage));
+        check(!cellGet(host.hmHasMarked), "Expected nil markedRange");
+        check(cellGet(host.hmSelLoc) == intToI64(5) && cellGet(host.hmSelLen) == intToI64(0), "Cursor at 5");
+        cellSet(modeIdx, cellGet(modeIdx) + 1)
+    };
+
+    // 21b. Spaceless Wubi streaming under TIKeyboardOutput coalescing
+    let wb86StreamCfg = configFromTomlStr(configToTomlString(wb86ManualCfg) + "\nspaceless = true\n");
+    bridgeApplyAndSaveConfig(bridge, wb86StreamCfg, false);
+
+    let smIdx = cellNew(0);
+    while (cellGet(smIdx) < 2) {
+        let isYY = cellGet(smIdx) == 0;
+        let host = hostMockNew(isYY, "", None);
+        let ti = tiOutputMockNew(hostMockSink(host));
+        let proxy = tiOutputSink(ti);
+        let streamSess = markedSessionNew();
+        bridgeClearComposition(bridge);
+        bridgeSetContext(bridge, "");
+
+        let codes = "dhfgytsmtxxyldjdaqtf" + "txxyldjdaqtf";
+        let ki = cellNew(0);
+        while (cellGet(ki) < strLen(codes)) {
+            let st = bridgeHandleKey(bridge, 0, strByteAt(codes, cellGet(ki)), false, intToI64(9000));
+            let _ = markedSessionApplyEngineState(streamSess, st.asCommitText, activeInlinePreedit(st), onOpts, proxy);
+            tiDrainTurn(ti, streamSess);
+            cellSet(ki, cellGet(ki) + 1)
+        };
+        let tailMarked = markedSessionMarkedCode(streamSess);
+        check(strLen(tailMarked) > 0, "Expected active inline tail in spaceless stream");
+        let curText = cellGet(host.hmStorage);
+        check(strStartsWith(curText, "破坏"), "Committed prefix at start");
+        check(strEndsWith(curText, tailMarked), "Marked tail at end");
+        let prefixBeforeMarked = dropLastScalars(curText, strLen(tailMarked));
+        check(!containsAsciiLetter(prefixBeforeMarked), "Zero leaked ASCII in committed prefix");
+
+        let finishSt = bridgeHandleKey(bridge, 0x31, 32, false, intToI64(9100));
+        let _ = markedSessionApplyEngineState(streamSess, finishSt.asCommitText, activeInlinePreedit(finishSt), onOpts, proxy);
+        tiDrainTurn(ti, streamSess);
+        check(!cellGet(host.hmHasMarked) && strLen(markedSessionMarkedCode(streamSess)) == 0, "Stream finalized cleanly");
+        check(!containsAsciiLetter(cellGet(host.hmStorage)) && strStartsWith(cellGet(host.hmStorage), "破坏计算机"), "Finalized text clean");
+        cellSet(smIdx, cellGet(smIdx) + 1)
+    };
+
+    // 21c. Mid-text insertion ("hello|后缀"), 5th-code push + same-turn `commitPendingFirst` + `insertPassthrough("，")`
+    bridgeApplyAndSaveConfig(bridge, wb86ManualCfg, false);
+    let midIdx = cellNew(0);
+    while (cellGet(midIdx) < 2) {
+        let isYY = cellGet(midIdx) == 0;
+        let host = hostMockNew(isYY, "hello后缀", Some(intToI64(5)));
+        let ti = tiOutputMockNew(hostMockSink(host));
+        let proxy = tiOutputSink(ti);
+        let midSess = markedSessionNew();
+        bridgeClearComposition(bridge);
+        markedSessionReconcileExternalContext(midSess, proxy.sinkGetBefore());
+
+        let lgyia = "lgyia";
+        let li = cellNew(0);
+        while (cellGet(li) < strLen(lgyia)) {
+            let st = bridgeHandleKey(bridge, 0, strByteAt(lgyia, cellGet(li)), false, intToI64(9200));
+            let _ = markedSessionApplyEngineState(midSess, st.asCommitText, activeInlinePreedit(st), onOpts, proxy);
+            tiDrainTurn(ti, midSess);
+            cellSet(li, cellGet(li) + 1)
+        };
+        check(cellGet(host.hmStorage) == "hello 国a后缀", "5th-code push in middle of text: " + cellGet(host.hmStorage));
+
+        let topCand = match vecGet(cellGet(bridge.jsState).asCandidates, 0) {
+            Some(c) -> c.text,
+            None -> "",
+        };
+        let _ = markedSessionCommitPendingFirst(midSess, topCand, onOpts, proxy);
+        let _ = markedSessionInsertPassthrough(midSess, "，", proxy);
+        bridgeClearComposition(bridge);
+        tiDrainTurn(ti, midSess);
+
+        markedSessionReconcileExternalContext(midSess, Some("hello 国"));
+        check(
+            autoSpaceTrackerEffectiveBefore(midSess.msAutoSpaceTracker, Some("hello 国"), false) == "hello 国工，",
+            "Stale XPC optimistic context preserved"
+        );
+        check(cellGet(host.hmStorage) == "hello 国工，后缀" && !cellGet(host.hmHasMarked), "Mid-text final: " + cellGet(host.hmStorage));
+        check(cellGet(host.hmSelLoc) == intToI64(9) && cellGet(host.hmSelLen) == intToI64(0), "Cursor at 9");
+        cellSet(midIdx, cellGet(midIdx) + 1)
+    };
+
+    // Restore default 4th-code auto-commit
+    bridgeApplyAndSaveConfig(bridge, defaultConfig(), false);
+
+    // Single-letter preedit + Backspace leaves empty text
+    let bsIdx = cellNew(0);
+    while (cellGet(bsIdx) < 2) {
+        let host = hostMockNew(cellGet(bsIdx) == 0, "", None);
+        let ti = tiOutputMockNew(hostMockSink(host));
+        let proxy = tiOutputSink(ti);
+        let bsSess = markedSessionNew();
+        bridgeClearComposition(bridge);
+        let st1 = bridgeHandleKey(bridge, 0, 100, false, intToI64(9300));
+        let _ = markedSessionApplyEngineState(bsSess, st1.asCommitText, activeInlinePreedit(st1), onOpts, proxy);
+        tiDrainTurn(ti, bsSess);
+        let stBs = bridgeHandleKey(bridge, 0x33, 0, false, intToI64(9350));
+        let _ = markedSessionApplyEngineState(bsSess, stBs.asCommitText, activeInlinePreedit(stBs), onOpts, proxy);
+        tiDrainTurn(ti, bsSess);
+        check(strLen(cellGet(host.hmStorage)) == 0 && !cellGet(host.hmHasMarked), "Single-letter backspace clean");
+        cellSet(bsIdx, cellGet(bsIdx) + 1)
+    };
+
+    // 21e. Focus-loss, keyboard disappear, cross-instance orphan sweep, TextKit 2 caret restore & selection guard
+    let foIdx = cellNew(0);
+    while (cellGet(foIdx) < 2) {
+        let isYY = cellGet(foIdx) == 0;
+        resetSharedOrphanedState();
+        bridgeClearComposition(bridge);
+        let host = hostMockNew(isYY, "", None);
+        let ti = tiOutputMockNew(hostMockSink(host));
+        let proxy = tiOutputSink(ti);
+        let focusSess = markedSessionNew();
+
+        let trwukhk = "trwukhk";
+        let fi = cellNew(0);
+        while (cellGet(fi) < strLen(trwukhk)) {
+            let st = bridgeHandleKey(bridge, 0, strByteAt(trwukhk, cellGet(fi)), false, intToI64(9400));
+            let _ = markedSessionApplyEngineState(focusSess, st.asCommitText, activeInlinePreedit(st), onOpts, proxy);
+            tiDrainTurn(ti, focusSess);
+            cellSet(fi, cellGet(fi) + 1)
+        };
+        check(
+            cellGet(host.hmStorage) == "我们khk"
+                && cellGet(host.hmHasMarked)
+                && cellGet(host.hmMarkedLoc) == intToI64(2)
+                && cellGet(host.hmMarkedLen) == intToI64(3),
+            "Pre-blur marked 'khk'"
+        );
+
+        markedSessionRecordKeyboardDisappear(focusSess);
+        bridgeAbandonComposition(bridge, intToI64(9450));
+        if (!isYY) cellSet(host.hmSimulateEmptyMarkedJump, true) else ();
+
+        let reopenedSess = markedSessionNew();
+        check(markedSessionNeedsAppearanceSweep(reopenedSess), "Cross-instance needsAppearanceSweep");
+        let (needsFlush, expTail) = markedSessionSweepOrphanedMarkedText(reopenedSess, proxy);
+        check(needsFlush && expTail == "我们", "Sweep outcome tail == '我们'");
+        tiDrainTurn(ti, reopenedSess);
+        markedSessionRestoreCaretAfterOrphanedSweepIfNeeded(reopenedSess, expTail, proxy);
+
+        check(
+            cellGet(host.hmStorage) == "我们"
+                && !cellGet(host.hmHasMarked)
+                && cellGet(host.hmSelLoc) == intToI64(2)
+                && cellGet(host.hmSelLen) == intToI64(0),
+            "Orphan cleared & TextKit 2 caret restored to {2, 0}"
+        );
+
+        let _ = markedSessionInsertPassthrough(reopenedSess, " ", proxy);
+        tiDrainTurn(ti, reopenedSess);
+        let trwu = "trwu";
+        let ti2 = cellNew(0);
+        while (cellGet(ti2) < strLen(trwu)) {
+            let st = bridgeHandleKey(bridge, 0, strByteAt(trwu, cellGet(ti2)), false, intToI64(9500));
+            let _ = markedSessionApplyEngineState(reopenedSess, st.asCommitText, activeInlinePreedit(st), onOpts, proxy);
+            tiDrainTurn(ti, reopenedSess);
+            cellSet(ti2, cellGet(ti2) + 1)
+        };
+        check(cellGet(host.hmStorage) == "我们 我们" && !cellGet(host.hmHasMarked), "Follow-up typing clean");
+
+        // Multi-field selection guard + same-turn refocus + key 't'
+        resetSharedOrphanedState();
+        bridgeClearComposition(bridge);
+        let field1 = hostMockNew(isYY, "你好", None);
+        let field2 = hostMockNew(isYY, "第二框", None);
+        let field3 = hostMockNew(isYY, "选中文字", Some(intToI64(0)));
+        cellSet(field3.hmSelLen, intToI64(2));
+
+        let ti1 = tiOutputMockNew(hostMockSink(field1));
+        let ti2m = tiOutputMockNew(hostMockSink(field2));
+        let ti3 = tiOutputMockNew(hostMockSink(field3));
+        let p1 = tiOutputSink(ti1);
+        let p2 = tiOutputSink(ti2m);
+        let p3 = tiOutputSink(ti3);
+
+        let mfSess = markedSessionNew();
+        markedSessionReconcileExternalContext(mfSess, p1.sinkGetBefore());
+        let khk = "khk";
+        let ki2 = cellNew(0);
+        while (cellGet(ki2) < strLen(khk)) {
+            let st = bridgeHandleKey(bridge, 0, strByteAt(khk, cellGet(ki2)), false, intToI64(9600));
+            let _ = markedSessionApplyEngineState(mfSess, st.asCommitText, activeInlinePreedit(st), onOpts, p1);
+            tiDrainTurn(ti1, mfSess);
+            cellSet(ki2, cellGet(ki2) + 1)
+        };
+        check(markedSessionRecordFocusLoss(mfSess), "recordFocusLoss true");
+        bridgeAbandonComposition(bridge, intToI64(9620));
+
+        let ki3 = cellNew(0);
+        while (cellGet(ki3) < strLen(trwu)) {
+            let st = bridgeHandleKey(bridge, 0, strByteAt(trwu, cellGet(ki3)), false, intToI64(9630));
+            let _ = markedSessionApplyEngineState(mfSess, st.asCommitText, activeInlinePreedit(st), onOpts, p2);
+            tiDrainTurn(ti2m, mfSess);
+            cellSet(ki3, cellGet(ki3) + 1)
+        };
+        check(cellGet(field2.hmStorage) == "第二框我们" && markedSessionHasOrphanedMarked(mfSess), "Field 2 clean + orphan flag preserved");
+
+        let selGuard = markedSessionNew();
+        let dummyHost = hostMockNew(false, "", None);
+        let _ = markedSessionApplyEngineState(selGuard, "", "khk", onOpts, hostMockSink(dummyHost));
+        let _ = markedSessionRecordFocusLoss(selGuard);
+        let _ = markedSessionSweepOrphanedMarkedText(selGuard, p3);
+        tiDrainTurn(ti3, selGuard);
+        check(
+            cellGet(field3.hmStorage) == "选中文字"
+                && cellGet(field3.hmSelLoc) == intToI64(0)
+                && cellGet(field3.hmSelLen) == intToI64(2),
+            "Active selection preserved during sweep"
+        );
+
+        let rearm = markedSessionNew();
+        markedSessionReconcileExternalContext(rearm, Some("你好"));
+        let _ = markedSessionApplyEngineState(rearm, "", "khk", onOpts, hostMockSink(hostMockNew(false, "你好", None)));
+        let _ = markedSessionRecordFocusLoss(rearm);
+
+        let _ = markedSessionSweepOrphanedMarkedText(mfSess, p1);
+        let stT = bridgeHandleKey(bridge, 0, 116, false, intToI64(9650));
+        let _ = markedSessionApplyEngineState(mfSess, stT.asCommitText, activeInlinePreedit(stT), onOpts, p1);
+        tiDrainTurn(ti1, mfSess);
+        check(
+            cellGet(field1.hmStorage) == "你好t"
+                && cellGet(field1.hmHasMarked)
+                && cellGet(field1.hmMarkedLoc) == intToI64(2)
+                && cellGet(field1.hmMarkedLen) == intToI64(1),
+            "Same-turn refocus + 't' clears 'khk' and marks 't'"
+        );
+
+        let rwu = "rwu";
+        let ri = cellNew(0);
+        while (cellGet(ri) < strLen(rwu)) {
+            let st = bridgeHandleKey(bridge, 0, strByteAt(rwu, cellGet(ri)), false, intToI64(9680));
+            let _ = markedSessionApplyEngineState(mfSess, st.asCommitText, activeInlinePreedit(st), onOpts, p1);
+            tiDrainTurn(ti1, mfSess);
+            cellSet(ri, cellGet(ri) + 1)
+        };
+        check(cellGet(field1.hmStorage) == "你好我们" && !cellGet(field1.hmHasMarked), "Field 1 finalized '你好我们'");
+
+        cellSet(foIdx, cellGet(foIdx) + 1)
+    };
+
+    // 22. IOSKeyboardTrackpadHold & `spaceCommaKeyEnabled` WeChat bottom row
+    check(supportsTrackpadHold(KeySpace, false), "Space always supports trackpad");
+    check(!supportsTrackpadHold(KeyLetter(97), false) && supportsTrackpadHold(KeyLetter(97), true), "Letter trackpad gated");
+    check(supportsTrackpadHold(KeySymbol("，"), true), "Symbol trackpad");
+    check(!supportsTrackpadHold(KeyBackspace, true), "Backspace keeps repeat delete");
+    check(!supportsTrackpadHold(KeyGlobe, true), "Globe keeps system switcher");
+    check(!supportsTrackpadHold(KeyPlaneSwitch { targetPlane: PlaneNumbers, switchLabel: "123" }, true), "PlaneSwitch keeps slide");
+    check(trackpadHoldDelay(true) < alternatesDelay(true), "Trackpad activates before alternates");
+    check(alternatesDelay(false) == defaultAlternatesDelay(), "Default alternates delay");
+    let holdStart = cgPoint(200.0, 180.0);
+    check(!shouldCancelAlternatesOnMove(holdStart, cgPoint(208.0, 184.0)), "Small jitter keeps alternates");
+    check(shouldCancelAlternatesOnMove(holdStart, cgPoint(215.0, 180.0)), ">12pt drag cancels alternates");
+    check(!shouldCancelAlternatesInTrackpad(holdStart, cgPoint(208.0, 184.0), 0, 0), "Stationary trackpad keeps alternates");
+    check(shouldCancelAlternatesInTrackpad(holdStart, cgPoint(210.0, 180.0), 1, 0), "dx=1 cancels alternates");
+    check(shouldCancelAlternatesInTrackpad(holdStart, cgPoint(200.0, 185.0), 0, 1), "dy=1 cancels alternates");
+
+    // Bottom-row comma key (`B_comma` tap `,`/`，`, swipe `.`/`。` regardless of `swipeUpInputEnabled`)
+    let commaSize = cgSize(440.0, 220.0);
+    let comboIdx = cellNew(0);
+    while (cellGet(comboIdx) < 4) {
+        let c = cellGet(comboIdx);
+        let ascii = (c & 1) != 0;
+        let swipeToggle = (c & 2) != 0;
+        let tapSym = if (ascii) "," else "，";
+        let swipeSym = if (ascii) "." else "。";
+        let eng = layoutEngineNew();
+        cellSet(eng.leSpaceCommaKeyEnabled, true);
+        cellSet(eng.leAsciiMode, ascii);
+        cellSet(eng.leSwipeUpInputEnabled, swipeToggle);
+        let cSnap = computeLayout(eng, commaSize);
+        let bComma = findKeyById(cSnap, "B_comma");
+        check(bComma.ksKind == KeySymbol(tapSym), "B_comma tap symbol");
+        check(optStrEq(bComma.ksSwipeUpSymbol, Some(swipeSym)), "B_comma swipe ignores swipeUpInputEnabled");
+        match hitTest(cgPoint(rectMidX(bComma.ksFrame), rectMidY(bComma.ksFrame)), cSnap) {
+            Some(hk) -> check(hk.ksId == "B_comma", "Center hit B_comma"),
+            None -> check(false, "Expected B_comma hit"),
+        };
+        let qCheck = findKeyByKind(cSnap, KeyLetter(113));
+        let hasLetterHint = match qCheck.ksSwipeUpSymbol { Some(_) -> true, None -> false };
+        check(hasLetterHint == swipeToggle, "Letter hints still follow swipeUpInputEnabled");
+        cellSet(comboIdx, c + 1)
+    };
+
+    let commaOn = layoutEngineNew();
+    cellSet(commaOn.leSpaceCommaKeyEnabled, true);
+    let onSnap = computeLayout(commaOn, commaSize);
+    let onPlane = findKeyById(onSnap, "B_plane");
+    let onComma = findKeyById(onSnap, "B_comma");
+    let onSpace = findKeyByKind(onSnap, KeySpace);
+    let onMode = findKeyById(onSnap, "B_mode");
+    let onReturn = findKeyByKind(onSnap, KeyReturn);
+    let onLetterQ = findKeyByKind(onSnap, KeyLetter(113));
+    let onLetterP = findKeyByKind(onSnap, KeyLetter(112));
+    let onPitch = onSnap.lsPitchX;
+    let onGap = onPitch - onLetterQ.ksFrame.size.width;
+
+    check(vecLen(onSnap.lsKeys) == 33, "33 keys with spaceCommaKey");
+    match findKeyOptById(onSnap, "B_period") {
+        Some(_) -> check(false, "No separate B_period"),
+        None -> (),
+    };
+    check(
+        abs(onPlane.ksFrame.origin.x - onLetterQ.ksFrame.origin.x) < 0.01
+            && abs(rectMaxX(onReturn.ksFrame) - rectMaxX(onLetterP.ksFrame)) < 0.01,
+        "Row 3 outer edges flush with q..p"
+    );
+    check(abs(onComma.ksFrame.origin.x - rectMaxX(onPlane.ksFrame) - onGap) < 0.01, "plane-comma gap");
+    check(abs(onSpace.ksFrame.origin.x - rectMaxX(onComma.ksFrame) - onGap) < 0.01, "comma-space gap");
+    check(abs(onMode.ksFrame.origin.x - rectMaxX(onSpace.ksFrame) - onGap) < 0.01, "space-mode gap");
+    check(abs(onReturn.ksFrame.origin.x - rectMaxX(onMode.ksFrame) - onGap) < 0.01, "mode-return gap");
+    check(abs(onComma.ksFrame.size.width - onLetterQ.ksFrame.size.width) < 0.01, "Comma width == 1 stdKeyW");
+    check(abs(onPlane.ksFrame.size.width / onPitch - 1.85) < 0.06, "B_plane == 1.85 pitches");
+    check(abs(onSpace.ksFrame.size.width / onPitch - 3.6) < 0.06, "B_space == 3.6 pitches");
+    check(abs(onMode.ksFrame.size.width / onPitch - 1.15) < 0.06, "B_mode == 1.15 pitches");
+    check(abs(onReturn.ksFrame.size.width / onPitch - 1.85) < 0.06, "B_return == 1.85 pitches");
+    check(onPlane.ksUsesFunctionFill && onReturn.ksUsesFunctionFill, "B_plane & B_return usesFunctionFill == true");
+    check(!onComma.ksUsesFunctionFill && !onSpace.ksUsesFunctionFill && !onMode.ksUsesFunctionFill, "B_comma/space/mode usesFunctionFill == false");
+    check(onMode.ksPrimaryLabel == "中" && optStrEq(onMode.ksCornerSubscript, Some("英")), "WeChat B_mode zh");
+
+    cellSet(commaOn.leAsciiMode, true);
+    let enMode = findKeyById(computeLayout(commaOn, commaSize), "B_mode");
+    check(enMode.ksPrimaryLabel == "英" && optStrEq(enMode.ksCornerSubscript, Some("中")), "WeChat B_mode en");
+
+    let commaGlobe = layoutEngineNew();
+    cellSet(commaGlobe.leSpaceCommaKeyEnabled, true);
+    cellSet(commaGlobe.leShowInlineGlobeKey, true);
+    let globeSnap = computeLayout(commaGlobe, commaSize);
+    check(rectEq(findKeyById(globeSnap, "B_globe").ksFrame, onMode.ksFrame), "B_globe takes B_mode frame");
+    match findKeyOptById(globeSnap, "B_mode") {
+        Some(_) -> check(false, "B_mode hidden when showInlineGlobeKey"),
+        None -> (),
+    };
+
+    // Toggle off: ALL 32 keys have `usesFunctionFill == false`!
+    let commaOff = layoutEngineNew();
+    cellSet(commaOff.leSpaceCommaKeyEnabled, false);
+    let plainSnap = computeLayout(commaOff, commaSize);
+    check(vecLen(plainSnap.lsKeys) == 32, "32 keys when spaceCommaKey == false");
+    match findKeyOptById(plainSnap, "B_comma") {
+        Some(_) -> check(false, "No B_comma when off"),
+        None -> (),
+    };
+    let pi = cellNew(0);
+    while (cellGet(pi) < vecLen(plainSnap.lsKeys)) {
+        match vecGet(plainSnap.lsKeys, cellGet(pi)) {
+            Some(pk) -> check(!pk.ksUsesFunctionFill, "usesFunctionFill must be false on all 32 keys when spaceCommaKey is off"),
+            None -> (),
+        };
+        cellSet(pi, cellGet(pi) + 1)
+    };
+
+    // On 123 & #+= planes with spaceCommaKey: B_comma omitted, Space expands, frames of B_plane/B_mode/B_return stay identical!
+    let onNum = layoutEngineNew();
+    cellSet(onNum.leSpaceCommaKeyEnabled, true);
+    layoutSwitchPlane(onNum, PlaneNumbers);
+    let onNumSnap = computeLayout(onNum, commaSize);
+    match findKeyOptById(onNumSnap, "B_comma") {
+        Some(_) -> check(false, "No B_comma on 123 plane"),
+        None -> (),
+    };
+    check(
+        rectEq(findKeyById(onNumSnap, "B_plane").ksFrame, onPlane.ksFrame)
+            && rectEq(findKeyById(onNumSnap, "B_mode").ksFrame, onMode.ksFrame)
+            && rectEq(findKeyById(onNumSnap, "B_return").ksFrame, onReturn.ksFrame),
+        "B_plane/B_mode/B_return frames invariant across planes"
+    );
+    check(hasSymbolKey(onNumSnap, "，") && !hasSymbolKey(onNumSnap, ","), "123 plane Chinese symbols");
+    cellSet(onNum.leAsciiMode, true);
+    let onNumEnSnap = computeLayout(onNum, commaSize);
+    check(hasSymbolKey(onNumEnSnap, ",") && !hasSymbolKey(onNumEnSnap, "，"), "123 plane English symbols in place");
+
+    printLn("✓ All 22 iOS Keyboard Geisha parity test suites passed!")
+}

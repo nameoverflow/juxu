@@ -1,0 +1,878 @@
+/// Tab 1 (`IOSHostTab.typing` — `"输入设置"`):
+/// 1:1 port of `HostAppViews.swift` lines 317-483 & 702-806.
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGetOr, vecClear}
+use std.str.{intToStr}
+use objc.{
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    msgSend0, msgSend2Ptr, msgSendBool0, msgSendI64_0,
+    msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
+}
+use juxu_core.{
+    JuxuConfig, schemaId,
+}
+use juxu_core.config.{MkJuxuConfig}
+use juxu_shared.{
+    FourthEmptyBehavior, FourthBlock, FourthClear,
+    cgSize, cgRect,
+    msgSendRect0,
+    msgSendVoid1Rect, msgSendVoid1Size,
+    msgSendVoid1Ptr1I64, msgSendVoid1Ptr1I64_1Bool, msgSendVoid1Ptr1Sel1U64,
+    objcSendSuperVoid0, objcSendSuperVoid1Bool,
+    nsStr, objcAllocInit, objcAllocInitFrame,
+    InputSchemaCategory, CatPinyin, CatWubi, CatCangjie,
+    categoryRawValue, categorySymbolName, categoryDefaultSchemaId, allSchemaCategories,
+    InputSchemaOption, schemaOptionsForCategory,
+    configIsPinyinFamily, configIsCangjieFamily, configIsWubiFamily, configSchemaCategory,
+    maxCodeChineseNumeral, pushCodeChineseNumeral, maxCodeDigits, pushCodeDigits,
+    bridgeShared, bridgeApplyAndSaveConfig, bridgeSwitchSchema,
+}
+use uikit_kit.{
+    attrFontKey,
+    colorSystemBackground, colorLabel, colorSecondaryLabel, colorAccent, colorWhite, colorClear,
+    colorWithAlpha, colorPrimary06,
+    fontWeightRegular, fontWeightMedium, fontWeightSemibold,
+    sysFont, hairlineHeight,
+    applyContinuousCorner, makeSettingsCard, makeDivider, removeAllSubviews,
+    makeLabel, measureViewSize, makeSymbolImageView, makeSwitch, makeScrollContainer,
+    layoutToggleRow, roundPx,
+}
+use tab_home.{refreshHomeTab}
+
+data CategorySegItem {
+    csiBtn: Ptr,
+    csiSym: Ptr,
+    csiLbl: Ptr,
+}
+
+data SchemaVerItem {
+    sviBtn: Ptr,
+    sviNameLbl: Ptr,
+    sviTagLbl: Ptr,
+}
+
+data CardRowItem {
+    RowToggle {
+        rtTitleLbl: Ptr,
+        rtSubLbl: Ptr,
+        rtSwitch: Ptr,
+    },
+    RowDivider {
+        rdView: Ptr,
+    },
+    RowEmptyPicker {
+        repTitleLbl: Ptr,
+        repSubLbl: Ptr,
+        repSeg: Ptr,
+    },
+}
+
+data TypingTabUi {
+    ttuVc: Ptr,
+    ttuScroll: Ptr,
+    // Card 1: Schema switcher
+    ttuSchemaCard: Ptr,
+    ttuCatHdrTitle: Ptr,
+    ttuActiveSchemaLbl: Ptr,
+    ttuCatPillBox: Ptr,
+    ttuCatItems: Vec CategorySegItem,
+    ttuSchemaDiv: Ptr,
+    ttuVerHdrTitle: Ptr,
+    ttuVerItems: Vec SchemaVerItem,
+    // Card 2: Fixed-code rules (`!isPinyinFamily`)
+    ttuHasCard2: Cell Bool,
+    ttuCard2: Ptr,
+    ttuCard2Rows: Vec CardRowItem,
+    // Card 3: Typing & keyboard features
+    ttuCard3: Ptr,
+    ttuCard3Rows: Vec CardRowItem,
+    // Structural snapshot to detect when `viewWillAppear:` needs card rebuild
+    ttuBuiltSchemaId: Cell Int,
+    ttuBuiltSpaceless: Cell Bool,
+    ttuBuiltAutoSpaceZhEn: Cell Bool,
+}
+
+def gTypingUi: Cell (Option TypingTabUi) = cellNew(None)
+
+// ============================================================================
+// Pure `JuxuConfig` Toggle Mutation by Tag (`1..21`)
+// ============================================================================
+
+def updateConfigToggleByTag(c: JuxuConfig, tag: Int, v: Bool): JuxuConfig =
+    MkJuxuConfig {
+        schema: c.schema,
+        fourthCodeAutoCommit: if (tag == 3) v else c.fourthCodeAutoCommit,
+        fifthCodePushCommit: if (tag == 4) v else c.fifthCodePushCommit,
+        fourthEmptyBehavior: c.fourthEmptyBehavior,
+        shortestCodeFirst: if (tag == 8) v else c.shortestCodeFirst,
+        strictShortcode: if (tag == 10) v else c.strictShortcode,
+        spaceless: if (tag == 7) v else c.spaceless,
+        showShortcodeHint: if (tag == 9) v else c.showShortcodeHint,
+        dynamicWordFreq: c.dynamicWordFreq,
+        dynamicCharFreq: c.dynamicCharFreq,
+        autoPhrase: c.autoPhrase,
+        autoPhraseThreshold: c.autoPhraseThreshold,
+        zOmnipotent: if (tag == 11) v else c.zOmnipotent,
+        semicolonQuoteSelect: c.semicolonQuoteSelect,
+        smartPunctuation: if (tag == 12) v else c.smartPunctuation,
+        autoSpaceZhEn: if (tag == 13) v else c.autoSpaceZhEn,
+        autoSpaceDigits: if (tag == 14) v else c.autoSpaceDigits,
+        clipboardSuggestion: if (tag == 15) v else c.clipboardSuggestion,
+        cangjieKeycapRadicals: if (tag == 1) v else c.cangjieKeycapRadicals,
+        wubiKeycapRadicals: if (tag == 2) v else c.wubiKeycapRadicals,
+        keySwipeUpInput: if (tag == 17) v else c.keySwipeUpInput,
+        spaceCommaKey: if (tag == 18) v else c.spaceCommaKey,
+        keyLongPressAlternates: if (tag == 19) v else c.keyLongPressAlternates,
+        backspaceSwipeClear: if (tag == 20) v else c.backspaceSwipeClear,
+        keyboardHoldCursor: if (tag == 21) v else c.keyboardHoldCursor,
+        enableRareCharset: c.enableRareCharset,
+        pinyinInitialAbbr: if (tag == 6) v else c.pinyinInitialAbbr,
+        pinyinT9Layout: if (tag == 5) v else c.pinyinT9Layout,
+        shiftToggleMode: c.shiftToggleMode,
+        pageSize: c.pageSize,
+        orientation: c.orientation,
+        evalLogging: c.evalLogging,
+        emojiCandidates: if (tag == 16) v else c.emojiCandidates,
+        typo: c.typo,
+    }
+
+def updateConfigFourthEmpty(c: JuxuConfig, beh: FourthEmptyBehavior): JuxuConfig =
+    MkJuxuConfig {
+        schema: c.schema,
+        fourthCodeAutoCommit: c.fourthCodeAutoCommit,
+        fifthCodePushCommit: c.fifthCodePushCommit,
+        fourthEmptyBehavior: beh,
+        shortestCodeFirst: c.shortestCodeFirst,
+        strictShortcode: c.strictShortcode,
+        spaceless: c.spaceless,
+        showShortcodeHint: c.showShortcodeHint,
+        dynamicWordFreq: c.dynamicWordFreq,
+        dynamicCharFreq: c.dynamicCharFreq,
+        autoPhrase: c.autoPhrase,
+        autoPhraseThreshold: c.autoPhraseThreshold,
+        zOmnipotent: c.zOmnipotent,
+        semicolonQuoteSelect: c.semicolonQuoteSelect,
+        smartPunctuation: c.smartPunctuation,
+        autoSpaceZhEn: c.autoSpaceZhEn,
+        autoSpaceDigits: c.autoSpaceDigits,
+        clipboardSuggestion: c.clipboardSuggestion,
+        cangjieKeycapRadicals: c.cangjieKeycapRadicals,
+        wubiKeycapRadicals: c.wubiKeycapRadicals,
+        keySwipeUpInput: c.keySwipeUpInput,
+        spaceCommaKey: c.spaceCommaKey,
+        keyLongPressAlternates: c.keyLongPressAlternates,
+        backspaceSwipeClear: c.backspaceSwipeClear,
+        keyboardHoldCursor: c.keyboardHoldCursor,
+        enableRareCharset: c.enableRareCharset,
+        pinyinInitialAbbr: c.pinyinInitialAbbr,
+        pinyinT9Layout: c.pinyinT9Layout,
+        shiftToggleMode: c.shiftToggleMode,
+        pageSize: c.pageSize,
+        orientation: c.orientation,
+        evalLogging: c.evalLogging,
+        emojiCandidates: c.emojiCandidates,
+        typo: c.typo,
+    }
+
+// ============================================================================
+// Row Construction Helpers
+// ============================================================================
+
+def appendToggleRow(
+    card: Ptr,
+    rows: Vec CardRowItem,
+    vc: Ptr,
+    title: String,
+    sub: String,
+    isOn: Bool,
+    tag: Int
+): Void = {
+    let tLbl = makeLabel(title, sysFont(14.5, fontWeightMedium()), colorLabel(), 0);
+    let sLbl = makeLabel(sub, sysFont(11.5, fontWeightRegular()), colorSecondaryLabel(), 0);
+    let sw = makeSwitch(title, isOn, vc, objcSel("onTypingSwitchChanged:"));
+    msgSendVoid1I64(sw, objcSel("setTag:"), intToI64(tag));
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), tLbl);
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), sLbl);
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), sw);
+    vecPush(rows, RowToggle { rtTitleLbl: tLbl, rtSubLbl: sLbl, rtSwitch: sw })
+}
+
+def appendDividerRow(card: Ptr, rows: Vec CardRowItem): Void = {
+    let d = makeDivider();
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), d);
+    vecPush(rows, RowDivider { rdView: d })
+}
+
+def appendEmptyPickerRow(
+    card: Ptr,
+    rows: Vec CardRowItem,
+    vc: Ptr,
+    maxCodeLabel: String,
+    maxCodeDigit: String,
+    curBeh: FourthEmptyBehavior
+): Void = {
+    let tLbl = makeLabel(maxCodeLabel + "码空码行为", sysFont(15.0, fontWeightRegular()), colorLabel(), 0);
+    let sLbl = makeLabel("无匹配且无高置信度纠错时的动作", sysFont(12.0, fontWeightRegular()), colorSecondaryLabel(), 0);
+    let seg = objcAllocInit("UISegmentedControl");
+    msgSendVoid1Ptr1I64_1Bool(
+        seg,
+        objcSel("insertSegmentWithTitle:atIndex:animated:"),
+        nsStr("阻断第" + maxCodeDigit + "码"),
+        intToI64(0),
+        false
+    );
+    msgSendVoid1Ptr1I64_1Bool(
+        seg,
+        objcSel("insertSegmentWithTitle:atIndex:animated:"),
+        nsStr("清空重输"),
+        intToI64(1),
+        false
+    );
+    let attrs = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
+    let _ = msgSend2Ptr(attrs, objcSel("setObject:forKey:"), sysFont(12.0, fontWeightMedium()), attrFontKey());
+    msgSendVoid1Ptr1I64(seg, objcSel("setTitleTextAttributes:forState:"), attrs, intToI64(0));
+    msgSendVoid1I64(seg, objcSel("setSelectedSegmentIndex:"), intToI64(if (curBeh == FourthClear) 1 else 0));
+    msgSendVoid1Ptr1Sel1U64(seg, objcSel("addTarget:action:forControlEvents:"), vc, objcSel("onTypingFourthEmptyChanged:"), intToI64(4096));
+
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), tLbl);
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), sLbl);
+    msgSendVoid1Ptr(card, objcSel("addSubview:"), seg);
+    vecPush(rows, RowEmptyPicker { repTitleLbl: tLbl, repSubLbl: sLbl, repSeg: seg })
+}
+
+// ============================================================================
+// Dynamic Rebuild of Cards 1, 2 & 3 (`rebuildTypingCards`)
+// ============================================================================
+
+def rebuildTypingCards(ui: TypingTabUi): Void = {
+    let s = bridgeShared();
+    let cfg = cellGet(s.jsConfig);
+    let st = cellGet(s.jsState);
+    let sid = schemaId(cfg.schema);
+    let activeCat = configSchemaCategory(cfg);
+    let isPinyin = configIsPinyinFamily(cfg);
+    let isCangjie = configIsCangjieFamily(cfg);
+    let isWubi = configIsWubiFamily(cfg);
+    let maxCodeLabel = maxCodeChineseNumeral(isCangjie);
+    let pushCodeLabel = pushCodeChineseNumeral(isCangjie);
+    let maxCodeDigit = intToStr(maxCodeDigits(isCangjie));
+    let pushCodeDigit = intToStr(pushCodeDigits(isCangjie));
+
+    cellSet(ui.ttuBuiltSchemaId, sid);
+    cellSet(ui.ttuBuiltSpaceless, cfg.spaceless);
+    cellSet(ui.ttuBuiltAutoSpaceZhEn, cfg.autoSpaceZhEn);
+
+    // 1. Update Card 1 (Category pills + Version buttons)
+    msgSendVoid1Ptr(ui.ttuActiveSchemaLbl, objcSel("setText:"), nsStr(st.asSchemaName));
+    let cats = allSchemaCategories();
+    let dummyCatItem = CategorySegItem { csiBtn: ptrNull(), csiSym: ptrNull(), csiLbl: ptrNull() };
+    let ci = cellNew(0);
+    while (cellGet(ci) < vecLen(ui.ttuCatItems)) {
+        let idx = cellGet(ci);
+        let cat = vecGetOr(cats, idx, CatWubi);
+        let cItem = vecGetOr(ui.ttuCatItems, idx, dummyCatItem);
+        let active = cat == activeCat;
+        msgSendVoid1Ptr(cItem.csiBtn, objcSel("setBackgroundColor:"), if (active) colorAccent() else colorClear());
+        let fg = if (active) colorWhite() else colorLabel();
+        msgSendVoid1Ptr(cItem.csiSym, objcSel("setTintColor:"), fg);
+        msgSendVoid1Ptr(cItem.csiLbl, objcSel("setTextColor:"), fg);
+        cellSet(ci, idx + 1)
+    };
+
+    msgSendVoid1Ptr(ui.ttuVerHdrTitle, objcSel("setText:"), nsStr(categoryRawValue(activeCat) + "方案版本"));
+    let opts = schemaOptionsForCategory(activeCat);
+    let dummyOpt = InputSchemaOption { isoId: 86, isoCategory: CatWubi, isoTitle: "", isoShortTitle: "", isoTag: "", isoDesc: "" };
+    let dummyVer = SchemaVerItem { sviBtn: ptrNull(), sviNameLbl: ptrNull(), sviTagLbl: ptrNull() };
+    let vi = cellNew(0);
+    while (cellGet(vi) < vecLen(ui.ttuVerItems)) {
+        let idx = cellGet(vi);
+        let opt = vecGetOr(opts, idx, dummyOpt);
+        let vItem = vecGetOr(ui.ttuVerItems, idx, dummyVer);
+        let active = sid == opt.isoId;
+        msgSendVoid1I64(vItem.sviBtn, objcSel("setTag:"), intToI64(opt.isoId));
+        msgSendVoid1Ptr(vItem.sviBtn, objcSel("setBackgroundColor:"), if (active) colorAccent() else colorPrimary06());
+        msgSendVoid1Ptr(vItem.sviBtn, objcSel("setAccessibilityLabel:"), nsStr(opt.isoShortTitle + ", " + opt.isoTag));
+        msgSendVoid1Ptr(vItem.sviNameLbl, objcSel("setText:"), nsStr(opt.isoShortTitle));
+        msgSendVoid1Ptr(vItem.sviTagLbl, objcSel("setText:"), nsStr(opt.isoTag));
+        msgSendVoid1Ptr(vItem.sviNameLbl, objcSel("setTextColor:"), if (active) colorWhite() else colorLabel());
+        msgSendVoid1Ptr(
+            vItem.sviTagLbl,
+            objcSel("setTextColor:"),
+            if (active) colorWithAlpha(colorWhite(), 0.8) else colorWithAlpha(colorLabel(), 0.8)
+        );
+        cellSet(vi, idx + 1)
+    };
+
+    // 2. Rebuild Card 2 (`!isPinyinFamily`)
+    removeAllSubviews(ui.ttuCard2);
+    vecClear(ui.ttuCard2Rows);
+    if (!isPinyin) {
+        cellSet(ui.ttuHasCard2, true);
+        msgSendVoid1Bool(ui.ttuCard2, objcSel("setHidden:"), false);
+        if (isCangjie) {
+            appendToggleRow(
+                ui.ttuCard2,
+                ui.ttuCard2Rows,
+                ui.ttuVc,
+                "键盘键帽显示仓颉码",
+                "将字母键替换为仓颉字根（日月金木水火土…），切英文或大写时自动恢复字母",
+                cfg.cangjieKeycapRadicals,
+                1
+            );
+            appendDividerRow(ui.ttuCard2, ui.ttuCard2Rows)
+        } else if (isWubi) {
+            appendToggleRow(
+                ui.ttuCard2,
+                ui.ttuCard2Rows,
+                ui.ttuVc,
+                "键盘键帽显示五笔字根",
+                "在字母键下方显示当前五笔版本（86 / 98 / 新世纪）的核心字根，切英文或大写时自动隐藏",
+                cfg.wubiKeycapRadicals,
+                2
+            );
+            appendDividerRow(ui.ttuCard2, ui.ttuCard2Rows)
+        } else ();
+        appendToggleRow(
+            ui.ttuCard2,
+            ui.ttuCard2Rows,
+            ui.ttuVc,
+            maxCodeLabel + "码唯一自动上屏",
+            "精确" + maxCodeLabel + "码唯一匹配时直接上屏",
+            cfg.fourthCodeAutoCommit,
+            3
+        );
+        appendDividerRow(ui.ttuCard2, ui.ttuCard2Rows);
+        appendToggleRow(
+            ui.ttuCard2,
+            ui.ttuCard2Rows,
+            ui.ttuVc,
+            "第" + pushCodeLabel + "码自动顶字",
+            maxCodeLabel + "码重码时敲第 " + pushCodeDigit + " 码将首选词顶上屏",
+            cfg.fifthCodePushCommit,
+            4
+        );
+        appendDividerRow(ui.ttuCard2, ui.ttuCard2Rows);
+        appendEmptyPickerRow(
+            ui.ttuCard2,
+            ui.ttuCard2Rows,
+            ui.ttuVc,
+            maxCodeLabel,
+            maxCodeDigit,
+            cfg.fourthEmptyBehavior
+        )
+    } else {
+        cellSet(ui.ttuHasCard2, false);
+        msgSendVoid1Bool(ui.ttuCard2, objcSel("setHidden:"), true)
+    };
+
+    // 3. Rebuild Card 3 (Schema-specific + 10 Common Toggles)
+    removeAllSubviews(ui.ttuCard3);
+    vecClear(ui.ttuCard3Rows);
+    if (isPinyin) {
+        if (sid == 20) {
+            appendToggleRow(
+                ui.ttuCard3,
+                ui.ttuCard3Rows,
+                ui.ttuVc,
+                "九宫格全拼键盘（T9）",
+                "触屏中文全拼切为九宫格，支持键级高斯触点纠错、动态热区与左侧音节筛选；切英文自动恢复 26 键",
+                cfg.pinyinT9Layout,
+                5
+            );
+            appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows)
+        } else ();
+        let abbrSub =
+            if (sid == 21) "支持单键声母简拼（u/i/v 对应 sh/ch/zh，如 urf → 输入法）"
+            else "支持首字母简拼及混拼（如 srf / shurf → 输入法）";
+        appendToggleRow(ui.ttuCard3, ui.ttuCard3Rows, ui.ttuVc, "声母简拼", abbrSub, cfg.pinyinInitialAbbr, 6);
+        appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows)
+    } else {
+        appendToggleRow(
+            ui.ttuCard3,
+            ui.ttuCard3Rows,
+            ui.ttuVc,
+            "流式无空格连打（实验）",
+            "连续输入词组和简码。标点确认中文，回车输入原始字母",
+            cfg.spaceless,
+            7
+        );
+        appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+        appendToggleRow(
+            ui.ttuCard3,
+            ui.ttuCard3Rows,
+            ui.ttuVc,
+            "最短编码（简码）优先",
+            if (isCangjie) "1–4 码精确匹配始终排在补全项之前" else "1–3 码简码始终排在补全项之前",
+            cfg.shortestCodeFirst,
+            8
+        );
+        appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+        appendToggleRow(
+            ui.ttuCard3,
+            ui.ttuCard3Rows,
+            ui.ttuVc,
+            "全码显示 ⚡ 简码提示",
+            "打全码时提示更短简码",
+            cfg.showShortcodeHint,
+            9
+        );
+        appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+        let strictSub =
+            if (cfg.spaceless) "优先按首选简码切分单字，较长的编码仍可出字"
+            else "有首选简码的单字在" + maxCodeLabel + "码全码时后置";
+        appendToggleRow(ui.ttuCard3, ui.ttuCard3Rows, ui.ttuVc, "出简不出全", strictSub, cfg.strictShortcode, 10);
+        if (isWubi || isCangjie) {
+            appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+            appendToggleRow(
+                ui.ttuCard3,
+                ui.ttuCard3Rows,
+                ui.ttuVc,
+                if (isCangjie) "z 键拼音反查" else "z 键通配与拼音反查",
+                if (isCangjie) "首键按重(z)后自动切字母键帽，输拼音反查当前仓颉拆码" else "z 查码 + 输拼音反查五笔拆码",
+                cfg.zOmnipotent,
+                11
+            )
+        } else ();
+        appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows)
+    };
+
+    // Common Toggles (exact lines 456-477 of `HostAppViews.swift`)
+    appendToggleRow(
+        ui.ttuCard3,
+        ui.ttuCard3Rows,
+        ui.ttuVc,
+        "中文标点与引号智能配对",
+        "打左引号、括号或书名号时自动补全右半边，光标停在中间",
+        cfg.smartPunctuation,
+        12
+    );
+    appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+    appendToggleRow(
+        ui.ttuCard3,
+        ui.ttuCard3Rows,
+        ui.ttuVc,
+        "中英文之间自动加空格",
+        "中英混输、直输英文及剪贴板插入时自动补全空格",
+        cfg.autoSpaceZhEn,
+        13
+    );
+    if (cfg.autoSpaceZhEn) {
+        appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+        appendToggleRow(
+            ui.ttuCard3,
+            ui.ttuCard3Rows,
+            ui.ttuVc,
+            "数字与中文之间也加空格",
+            "在汉字与数字边界自动加空格（如「iOS 26 版」）",
+            cfg.autoSpaceDigits,
+            14
+        )
+    } else ();
+    appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+    appendToggleRow(
+        ui.ttuCard3,
+        ui.ttuCard3Rows,
+        ui.ttuVc,
+        "候选栏剪贴板提示",
+        "空闲时在候选栏中央显示最近复制内容，并自动提取剪贴板验证码（需开启完全访问）",
+        cfg.clipboardSuggestion,
+        15
+    );
+    appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+    appendToggleRow(
+        ui.ttuCard3,
+        ui.ttuCard3Rows,
+        ui.ttuVc,
+        "Emoji 候选",
+        "输入时，在匹配的词语后显示 Emoji 作为次要候选（如 思考 → 🤔）",
+        cfg.emojiCandidates,
+        16
+    );
+    appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+    appendToggleRow(
+        ui.ttuCard3,
+        ui.ttuCard3Rows,
+        ui.ttuVc,
+        "上滑输入数字和符号",
+        "在字母键上滑，输入键帽顶部的小字符",
+        cfg.keySwipeUpInput,
+        17
+    );
+    appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+    appendToggleRow(
+        ui.ttuCard3,
+        ui.ttuCard3Rows,
+        ui.ttuVc,
+        "空格旁逗号键（上滑句号）",
+        "在 26 键空格左侧显示逗号键，点按输入逗号，上滑输入句号；不受上一项开关影响",
+        cfg.spaceCommaKey,
+        18
+    );
+    appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+    appendToggleRow(
+        ui.ttuCard3,
+        ui.ttuCard3Rows,
+        ui.ttuVc,
+        "长按弹出更多字符",
+        "长按字母键后左右滑动，选择声调字母、大小写、数字或符号",
+        cfg.keyLongPressAlternates,
+        19
+    );
+    appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+    appendToggleRow(
+        ui.ttuCard3,
+        ui.ttuCard3Rows,
+        ui.ttuVc,
+        "退格键上滑清空本行",
+        "上滑删除光标左侧到行首的内容，下滑依次撤回；正在输入拼音时只清空拼音",
+        cfg.backspaceSwipeClear,
+        20
+    );
+    appendDividerRow(ui.ttuCard3, ui.ttuCard3Rows);
+    appendToggleRow(
+        ui.ttuCard3,
+        ui.ttuCard3Rows,
+        ui.ttuVc,
+        "全键盘长按移动光标",
+        "在键盘任意键上长按即可滑动光标；继续按住不放则会弹出按键的特殊字符",
+        cfg.keyboardHoldCursor,
+        21
+    );
+
+    layoutTypingTab(ui)
+}
+
+def layoutCardRows(card: Ptr, rows: Vec CardRowItem, cardX: Float, cardY: Float, cardW: Float): Float = {
+    let pad = 14.0;
+    let innerW = cardW - pad * 2.0;
+    let curY = cellNew(pad);
+    let n = vecLen(rows);
+    let dummy = RowDivider { rdView: ptrNull() };
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        if (idx > 0) {
+            cellSet(curY, cellGet(curY) + 12.0)
+        } else ();
+        let item = vecGetOr(rows, idx, dummy);
+        match item {
+            RowToggle { rtTitleLbl, rtSubLbl, rtSwitch } -> {
+                let nextY = layoutToggleRow(rtTitleLbl, rtSubLbl, rtSwitch, pad, cellGet(curY), innerW);
+                cellSet(curY, nextY)
+            },
+            RowDivider { rdView } -> {
+                let hh = hairlineHeight();
+                msgSendVoid1Rect(rdView, objcSel("setFrame:"), cgRect(pad, cellGet(curY), innerW, hh));
+                cellSet(curY, cellGet(curY) + hh)
+            },
+            RowEmptyPicker { repTitleLbl, repSubLbl, repSeg } -> {
+                let segSz = measureViewSize(repSeg, 180.0);
+                let segW = if (segSz.width > 120.0) segSz.width else 148.0;
+                let segH = if (segSz.height > 26.0) segSz.height else 30.0;
+                let txtW = innerW - segW - 10.0;
+                let tSz = measureViewSize(repTitleLbl, txtW);
+                let sSz = measureViewSize(repSubLbl, txtW);
+                let txtH = tSz.height + 2.0 + sSz.height;
+                let rowH = if (txtH > segH) txtH else segH;
+                let txtTop = cellGet(curY) + roundPx((rowH - txtH) * 0.5);
+                msgSendVoid1Rect(repTitleLbl, objcSel("setFrame:"), cgRect(pad, txtTop, txtW, tSz.height));
+                msgSendVoid1Rect(repSubLbl, objcSel("setFrame:"), cgRect(pad, txtTop + tSz.height + 2.0, txtW, sSz.height));
+                let segTop = cellGet(curY) + roundPx((rowH - segH) * 0.5);
+                msgSendVoid1Rect(repSeg, objcSel("setFrame:"), cgRect(pad + innerW - segW, segTop, segW, segH));
+                cellSet(curY, cellGet(curY) + rowH)
+            },
+        };
+        cellSet(i, idx + 1)
+    };
+    let cardH = cellGet(curY) + pad;
+    msgSendVoid1Rect(card, objcSel("setFrame:"), cgRect(cardX, cardY, cardW, cardH));
+    cardH
+}
+
+def layoutTypingTab(ui: TypingTabUi): Void = {
+    let view = msgSend0(ui.ttuVc, objcSel("view"));
+    if (!ptrIsNull(view)) {
+        let bounds = msgSendRect0(view, objcSel("bounds"));
+        let viewW = bounds.size.width;
+        if (viewW > 40.0) {
+            let outerPad = 16.0;
+            let contentW = viewW - outerPad * 2.0;
+            let cardPad = 14.0;
+            let innerW = contentW - cardPad * 2.0;
+
+            // Card 1: 2-Level Schema Switcher (`spacing: 12`)
+            let c1HdrSz = measureViewSize(ui.ttuCatHdrTitle, innerW * 0.5);
+            let actSz = measureViewSize(ui.ttuActiveSchemaLbl, innerW * 0.5);
+            let hdrH = if (c1HdrSz.height > actSz.height) c1HdrSz.height else actSz.height;
+            msgSendVoid1Rect(ui.ttuCatHdrTitle, objcSel("setFrame:"), cgRect(cardPad, cardPad, c1HdrSz.width, hdrH));
+            msgSendVoid1Rect(
+                ui.ttuActiveSchemaLbl,
+                objcSel("setFrame:"),
+                cgRect(cardPad + innerW - actSz.width, cardPad, actSz.width, hdrH)
+            );
+
+            let pillBoxY = cardPad + hdrH + 8.0;
+            let pillBtnH = 34.0;
+            let pillBoxH = pillBtnH + 6.0;
+            msgSendVoid1Rect(ui.ttuCatPillBox, objcSel("setFrame:"), cgRect(cardPad, pillBoxY, innerW, pillBoxH));
+            let catBtnW = (innerW - 6.0 - 12.0) / 3.0;
+            let dummyCatItem = CategorySegItem { csiBtn: ptrNull(), csiSym: ptrNull(), csiLbl: ptrNull() };
+            let ci = cellNew(0);
+            while (cellGet(ci) < vecLen(ui.ttuCatItems)) {
+                let idx = cellGet(ci);
+                let cItem = vecGetOr(ui.ttuCatItems, idx, dummyCatItem);
+                let bx = 3.0 + intToFloat(idx) * (catBtnW + 6.0);
+                msgSendVoid1Rect(cItem.csiBtn, objcSel("setFrame:"), cgRect(bx, 3.0, catBtnW, pillBtnH));
+                let lSz = measureViewSize(cItem.csiLbl, catBtnW - 20.0);
+                let comboW = 14.0 + 5.0 + lSz.width;
+                let startX = roundPx((catBtnW - comboW) * 0.5);
+                msgSendVoid1Rect(cItem.csiSym, objcSel("setFrame:"), cgRect(startX, roundPx((pillBtnH - 14.0) * 0.5), 14.0, 14.0));
+                msgSendVoid1Rect(
+                    cItem.csiLbl,
+                    objcSel("setFrame:"),
+                    cgRect(startX + 19.0, roundPx((pillBtnH - lSz.height) * 0.5), lSz.width, lSz.height)
+                );
+                cellSet(ci, idx + 1)
+            };
+
+            let divY = pillBoxY + pillBoxH + 12.0;
+            let hh = hairlineHeight();
+            msgSendVoid1Rect(ui.ttuSchemaDiv, objcSel("setFrame:"), cgRect(cardPad, divY, innerW, hh));
+
+            let verHdrY = divY + hh + 12.0;
+            let verHdrSz = measureViewSize(ui.ttuVerHdrTitle, innerW);
+            msgSendVoid1Rect(ui.ttuVerHdrTitle, objcSel("setFrame:"), cgRect(cardPad, verHdrY, innerW, verHdrSz.height));
+
+            let verBtnY = verHdrY + verHdrSz.height + 8.0;
+            let verBtnW = (innerW - 16.0) / 3.0;
+            let verBtnH = 51.0;
+            let dummyVer = SchemaVerItem { sviBtn: ptrNull(), sviNameLbl: ptrNull(), sviTagLbl: ptrNull() };
+            let vi = cellNew(0);
+            while (cellGet(vi) < vecLen(ui.ttuVerItems)) {
+                let idx = cellGet(vi);
+                let vItem = vecGetOr(ui.ttuVerItems, idx, dummyVer);
+                let vx = cardPad + intToFloat(idx) * (verBtnW + 8.0);
+                msgSendVoid1Rect(vItem.sviBtn, objcSel("setFrame:"), cgRect(vx, verBtnY, verBtnW, verBtnH));
+                let nSz = measureViewSize(vItem.sviNameLbl, verBtnW - 8.0);
+                let tSz = measureViewSize(vItem.sviTagLbl, verBtnW - 8.0);
+                let stackH = nSz.height + 3.0 + tSz.height;
+                let topOff = roundPx((verBtnH - stackH) * 0.5);
+                msgSendVoid1Rect(vItem.sviNameLbl, objcSel("setFrame:"), cgRect(4.0, topOff, verBtnW - 8.0, nSz.height));
+                msgSendVoid1Rect(vItem.sviTagLbl, objcSel("setFrame:"), cgRect(4.0, topOff + nSz.height + 3.0, verBtnW - 8.0, tSz.height));
+                cellSet(vi, idx + 1)
+            };
+
+            let c1H = verBtnY + verBtnH + cardPad;
+            msgSendVoid1Rect(ui.ttuSchemaCard, objcSel("setFrame:"), cgRect(outerPad, outerPad, contentW, c1H));
+
+            let curY = cellNew(outerPad + c1H + 14.0);
+            if (cellGet(ui.ttuHasCard2)) {
+                let c2H = layoutCardRows(ui.ttuCard2, ui.ttuCard2Rows, outerPad, cellGet(curY), contentW);
+                cellSet(curY, cellGet(curY) + c2H + 14.0)
+            } else ();
+
+            let c3H = layoutCardRows(ui.ttuCard3, ui.ttuCard3Rows, outerPad, cellGet(curY), contentW);
+            let totalH = cellGet(curY) + c3H + outerPad;
+            msgSendVoid1Size(ui.ttuScroll, objcSel("setContentSize:"), cgSize(viewW, totalH))
+        } else ()
+    } else ()
+}
+
+pub def refreshTypingTab(): Void =
+    match cellGet(gTypingUi) {
+        Some(ui) -> rebuildTypingCards(ui),
+        None -> (),
+    }
+
+// ============================================================================
+// Objective-C Callbacks on `JuxuTypingTabVC`
+// ============================================================================
+
+def typingOnCategoryTap(_self: Ptr, _cmd: Ptr, sender: Ptr): Void =
+    match cellGet(gTypingUi) {
+        Some(ui) -> {
+            let idx = i64ToInt(msgSendI64_0(sender, objcSel("tag")));
+            let cat = if (idx == 0) CatPinyin else if (idx == 2) CatCangjie else CatWubi;
+            let s = bridgeShared();
+            if (configSchemaCategory(cellGet(s.jsConfig)) != cat) {
+                bridgeSwitchSchema(s, categoryDefaultSchemaId(cat), true);
+                rebuildTypingCards(ui);
+                refreshHomeTab()
+            } else ()
+        },
+        None -> (),
+    }
+
+def typingOnSchemaTap(_self: Ptr, _cmd: Ptr, sender: Ptr): Void =
+    match cellGet(gTypingUi) {
+        Some(ui) -> {
+            let sid = i64ToInt(msgSendI64_0(sender, objcSel("tag")));
+            let s = bridgeShared();
+            bridgeSwitchSchema(s, sid, true);
+            rebuildTypingCards(ui);
+            refreshHomeTab()
+        },
+        None -> (),
+    }
+
+def typingOnSwitchChanged(_self: Ptr, _cmd: Ptr, sender: Ptr): Void =
+    match cellGet(gTypingUi) {
+        Some(ui) -> {
+            let tag = i64ToInt(msgSendI64_0(sender, objcSel("tag")));
+            let isOn = msgSendBool0(sender, objcSel("isOn"));
+            let s = bridgeShared();
+            let nextCfg = updateConfigToggleByTag(cellGet(s.jsConfig), tag, isOn);
+            bridgeApplyAndSaveConfig(s, nextCfg, true);
+            // Rebuild dynamic rows if `spaceless` (tag 7) or `autoSpaceZhEn` (tag 13) changed
+            if (tag == 7 || tag == 13) {
+                rebuildTypingCards(ui)
+            } else ()
+        },
+        None -> (),
+    }
+
+def typingOnFourthEmptyChanged(_self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
+    let idx = i64ToInt(msgSendI64_0(sender, objcSel("selectedSegmentIndex")));
+    let beh = if (idx == 1) FourthClear else FourthBlock;
+    let s = bridgeShared();
+    let nextCfg = updateConfigFourthEmpty(cellGet(s.jsConfig), beh);
+    bridgeApplyAndSaveConfig(s, nextCfg, true)
+}
+
+def typingVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIViewController", objcSel("viewDidLoad"));
+    let view = msgSend0(self, objcSel("view"));
+    msgSendVoid1Ptr(view, objcSel("setBackgroundColor:"), colorSystemBackground());
+
+    let sv = makeScrollContainer(false);
+    msgSendVoid1Rect(sv, objcSel("setFrame:"), msgSendRect0(view, objcSel("bounds")));
+    msgSendVoid1Ptr(view, objcSel("addSubview:"), sv);
+
+    // Card 1: 2-Level Schema Switcher
+    let schemaCard = makeSettingsCard();
+    let catHdrTitle = makeLabel("方案大类", sysFont(13.0, fontWeightSemibold()), colorSecondaryLabel(), 1);
+    let activeSchemaLbl = makeLabel("", sysFont(12.0, fontWeightMedium()), colorAccent(), 1);
+    let catPillBox = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 300.0, 40.0));
+    msgSendVoid1Ptr(catPillBox, objcSel("setBackgroundColor:"), colorPrimary06());
+    applyContinuousCorner(catPillBox, 11.0);
+
+    let cats = allSchemaCategories();
+    let catItems: Vec CategorySegItem = vecWithCap(3);
+    let ci = cellNew(0);
+    while (cellGet(ci) < 3) {
+        let idx = cellGet(ci);
+        let cat = vecGetOr(cats, idx, CatWubi);
+        let btn = objcAllocInitFrame("UIButton", cgRect(0.0, 0.0, 90.0, 34.0));
+        applyContinuousCorner(btn, 8.5);
+        msgSendVoid1I64(btn, objcSel("setTag:"), intToI64(idx));
+        msgSendVoid1Bool(btn, objcSel("setIsAccessibilityElement:"), true);
+        msgSendVoid1Ptr(btn, objcSel("setAccessibilityLabel:"), nsStr(categoryRawValue(cat)));
+        msgSendVoid1Ptr1Sel1U64(btn, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onTypingCategoryTap:"), intToI64(64));
+
+        let sym = makeSymbolImageView(categorySymbolName(cat), 12.0, 6, colorLabel());
+        msgSendVoid1Bool(sym, objcSel("setUserInteractionEnabled:"), false);
+        msgSendVoid1Bool(sym, objcSel("setIsAccessibilityElement:"), false);
+        let lbl = makeLabel(categoryRawValue(cat), sysFont(14.0, fontWeightSemibold()), colorLabel(), 1);
+        msgSendVoid1Bool(lbl, objcSel("setUserInteractionEnabled:"), false);
+        msgSendVoid1Bool(lbl, objcSel("setIsAccessibilityElement:"), false);
+        msgSendVoid1Ptr(btn, objcSel("addSubview:"), sym);
+        msgSendVoid1Ptr(btn, objcSel("addSubview:"), lbl);
+        msgSendVoid1Ptr(catPillBox, objcSel("addSubview:"), btn);
+        vecPush(catItems, CategorySegItem { csiBtn: btn, csiSym: sym, csiLbl: lbl });
+        cellSet(ci, idx + 1)
+    };
+
+    let schemaDiv = makeDivider();
+    let verHdrTitle = makeLabel("五笔方案版本", sysFont(13.0, fontWeightSemibold()), colorSecondaryLabel(), 1);
+
+    let verItems: Vec SchemaVerItem = vecWithCap(3);
+    let vi = cellNew(0);
+    while (cellGet(vi) < 3) {
+        let idx = cellGet(vi);
+        let btn = objcAllocInitFrame("UIButton", cgRect(0.0, 0.0, 90.0, 51.0));
+        applyContinuousCorner(btn, 10.0);
+        msgSendVoid1Bool(btn, objcSel("setIsAccessibilityElement:"), true);
+        msgSendVoid1Ptr1Sel1U64(btn, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onTypingSchemaTap:"), intToI64(64));
+
+        let nLbl = makeLabel("", sysFont(14.0, fontWeightSemibold()), colorLabel(), 1);
+        // NSTextAlignmentCenter = 1
+        msgSendVoid1I64(nLbl, objcSel("setTextAlignment:"), intToI64(1));
+        msgSendVoid1Bool(nLbl, objcSel("setUserInteractionEnabled:"), false);
+        msgSendVoid1Bool(nLbl, objcSel("setIsAccessibilityElement:"), false);
+
+        let tLbl = makeLabel("", sysFont(10.5, fontWeightRegular()), colorSecondaryLabel(), 1);
+        msgSendVoid1I64(tLbl, objcSel("setTextAlignment:"), intToI64(1));
+        msgSendVoid1Bool(tLbl, objcSel("setUserInteractionEnabled:"), false);
+        msgSendVoid1Bool(tLbl, objcSel("setIsAccessibilityElement:"), false);
+
+        msgSendVoid1Ptr(btn, objcSel("addSubview:"), nLbl);
+        msgSendVoid1Ptr(btn, objcSel("addSubview:"), tLbl);
+        msgSendVoid1Ptr(schemaCard, objcSel("addSubview:"), btn);
+        vecPush(verItems, SchemaVerItem { sviBtn: btn, sviNameLbl: nLbl, sviTagLbl: tLbl });
+        cellSet(vi, idx + 1)
+    };
+
+    msgSendVoid1Ptr(schemaCard, objcSel("addSubview:"), catHdrTitle);
+    msgSendVoid1Ptr(schemaCard, objcSel("addSubview:"), activeSchemaLbl);
+    msgSendVoid1Ptr(schemaCard, objcSel("addSubview:"), catPillBox);
+    msgSendVoid1Ptr(schemaCard, objcSel("addSubview:"), schemaDiv);
+    msgSendVoid1Ptr(schemaCard, objcSel("addSubview:"), verHdrTitle);
+
+    let card2 = makeSettingsCard();
+    let card3 = makeSettingsCard();
+
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), schemaCard);
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), card2);
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), card3);
+
+    let ui = TypingTabUi {
+        ttuVc: self,
+        ttuScroll: sv,
+        ttuSchemaCard: schemaCard,
+        ttuCatHdrTitle: catHdrTitle,
+        ttuActiveSchemaLbl: activeSchemaLbl,
+        ttuCatPillBox: catPillBox,
+        ttuCatItems: catItems,
+        ttuSchemaDiv: schemaDiv,
+        ttuVerHdrTitle: verHdrTitle,
+        ttuVerItems: verItems,
+        ttuHasCard2: cellNew(true),
+        ttuCard2: card2,
+        ttuCard2Rows: vecNew(),
+        ttuCard3: card3,
+        ttuCard3Rows: vecNew(),
+        ttuBuiltSchemaId: cellNew(-1),
+        ttuBuiltSpaceless: cellNew(false),
+        ttuBuiltAutoSpaceZhEn: cellNew(false),
+    };
+    cellSet(gTypingUi, Some(ui));
+    rebuildTypingCards(ui)
+}
+
+def typingVcViewWillAppear(self: Ptr, _cmd: Ptr, animated: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIViewController", objcSel("viewWillAppear:"), animated);
+    refreshTypingTab()
+}
+
+def typingVcViewDidLayoutSubviews(self: Ptr, _cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIViewController", objcSel("viewDidLayoutSubviews"));
+    match cellGet(gTypingUi) {
+        Some(ui) -> layoutTypingTab(ui),
+        None -> (),
+    }
+}
+
+pub def registerTypingTabClass(): Void = {
+    let cls = objcAllocateClass("UIViewController", "JuxuTypingTabVC");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "viewDidLoad", cFnPtr(typingVcViewDidLoad), "v@:");
+        let _ = objcAddMethod(cls, "viewWillAppear:", cFnPtr(typingVcViewWillAppear), "v@:B");
+        let _ = objcAddMethod(cls, "viewDidLayoutSubviews", cFnPtr(typingVcViewDidLayoutSubviews), "v@:");
+        let _ = objcAddMethod(cls, "onTypingCategoryTap:", cFnPtr(typingOnCategoryTap), "v@:@");
+        let _ = objcAddMethod(cls, "onTypingSchemaTap:", cFnPtr(typingOnSchemaTap), "v@:@");
+        let _ = objcAddMethod(cls, "onTypingSwitchChanged:", cFnPtr(typingOnSwitchChanged), "v@:@");
+        let _ = objcAddMethod(cls, "onTypingFourthEmptyChanged:", cFnPtr(typingOnFourthEmptyChanged), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}

@@ -14,6 +14,16 @@ bundle_name      = "Juxu"
 version          = "0.2.0"
 min_os           = "16.0"
 info_plist       = "Info.plist"
-frameworks       = ["UIKit", "Foundation", "QuartzCore", "Security"]
+entitlements     = "JuxuApp.entitlements"
+c_sources        = ["csrc/sim_entitlements.c"]
+c_flags          = ["-O2"]
+frameworks       = ["UIKit", "Foundation", "QuartzCore", "CoreGraphics", "Security", "WebKit"]
+resources        = [
+    "../Resources/Dicts",
+    "../Resources/Icons/AppIcon60x60@2x.png",
+    "../Resources/Icons/AppIcon60x60@3x.png",
+    "../Resources/Icons/AppIcon76x76@2x~ipad.png",
+    "../Resources/Icons/AppIcon83.5x83.5@2x~ipad.png",
+]
 embed_extensions = ["../ios-keyboard/build/JuxuKeyboard.appex"]
 codesign         = "-"

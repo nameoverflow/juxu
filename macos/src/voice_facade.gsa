@@ -1,0 +1,188 @@
+/// Unified macOS Voice Facade (`voice_facade.gsa`) connecting `main.gsa`, `input_controller.gsa`,
+/// and `settings_window.gsa` with `voice_common`, `voice_prompt`, `voice_session`, `voice_hud`,
+/// and `voice_settings_view`.
+
+use juxu_shared.{CGRect, JuxuSession}
+use voice_common.{
+    VoicePreferences, VoiceProviderMode, VpmCloudBYOK, VpmLocal, vpmDisplayName,
+    VoiceOutputMode, VomSmartPolish, VomRawDictation,
+    defaultVoicePreferences, voicePrefsGet, voicePrefsUpdate, voicePrefsSetInMemoryForTesting,
+}
+use voice_session.{
+    voiceInstallBackendHooks, voiceSyncGlobalHotkey, vscUnloadAll,
+    vscSetImSink, vscClearImSink, vscHandleDeactivate, vscHandleImkEvent,
+}
+use voice_hud.{voiceHUDInitHooks}
+use voice_settings_view.{
+    voiceBuildSettingsPageView as buildVoicePageViewImpl,
+    voiceOnSettingsWindowClosed as onVoiceWindowClosedImpl,
+}
+
+def gVoiceHooksWired: Cell Bool = cellNew(false)
+
+def ensureVoiceHooksWired(): Void =
+    if (!cellGet(gVoiceHooksWired)) {
+        cellSet(gVoiceHooksWired, true);
+        voiceHUDInitHooks();
+        voiceInstallBackendHooks()
+    } else ()
+
+pub def voiceInitOnLaunch(): Void = {
+    ensureVoiceHooksWired();
+    let prefs = voicePrefsGet();
+    if (prefs.vpEnabled) voiceSyncGlobalHotkey(prefs) else ()
+}
+
+pub def voiceShutdownOnTerminate(): Void =
+    vscUnloadAll()
+
+pub def voiceSetInputMethodSink(owner: Ptr, sink: (String, Bool) -> Bool): Void =
+    vscSetImSink(owner, sink)
+
+pub def voiceClearInputMethodSink(owner: Ptr): Void =
+    vscClearImSink(owner)
+
+pub def voiceHandleDeactivate(): Void =
+    vscHandleDeactivate()
+
+pub def voiceHandleImkEvent(
+    nsEvent: Ptr,
+    client: Ptr,
+    caretRectFn: () -> CGRect,
+    windowLevel: Int64,
+    beforeContextFn: () -> String,
+    onCommitFn: (String, Bool) -> Void
+): Bool =
+    vscHandleImkEvent(nsEvent, client, caretRectFn, windowLevel, beforeContextFn, onCommitFn)
+
+pub def voiceIsEnabled(): Bool =
+    (voicePrefsGet()).vpEnabled
+
+pub def voiceProviderDisplayName(): String =
+    vpmDisplayName((voicePrefsGet()).vpProviderMode)
+
+pub def voiceIsSmartPolishEnabled(): Bool =
+    (voicePrefsGet()).vpOutputMode == VomSmartPolish
+
+pub def voiceToggleProviderMode(): Void = {
+    let p = voicePrefsGet();
+    let nextMode = match p.vpProviderMode {
+        VpmCloudBYOK -> VpmLocal,
+        VpmLocal     -> VpmCloudBYOK,
+    };
+    voicePrefsUpdate(VoicePreferences {
+        vpEnabled: p.vpEnabled,
+        vpProviderMode: nextMode,
+        vpTriggerKey: p.vpTriggerKey,
+        vpOutputMode: p.vpOutputMode,
+        vpToneMode: p.vpToneMode,
+        vpLanguage: p.vpLanguage,
+        vpSpeakToEditSelection: p.vpSpeakToEditSelection,
+        vpSyncJuxuLexicon: p.vpSyncJuxuLexicon,
+        vpCustomVocabulary: p.vpCustomVocabulary,
+        vpCloudPreset: p.vpCloudPreset,
+        vpCloudPolishEnabled: p.vpCloudPolishEnabled,
+        vpCustomBaseURL: p.vpCustomBaseURL,
+        vpCustomASRModel: p.vpCustomASRModel,
+        vpCustomLLMModel: p.vpCustomLLMModel,
+        vpCustomSplitLLM: p.vpCustomSplitLLM,
+        vpCustomLLMBaseURL: p.vpCustomLLMBaseURL,
+        vpLocalASRPreset: p.vpLocalASRPreset,
+        vpLocalAppleLocale: p.vpLocalAppleLocale,
+        vpLocalAppleRequireOnDevice: p.vpLocalAppleRequireOnDevice,
+        vpLocalHTTPASRBaseURL: p.vpLocalHTTPASRBaseURL,
+        vpLocalHTTPASRModel: p.vpLocalHTTPASRModel,
+        vpLocalLLMPreset: p.vpLocalLLMPreset,
+        vpLocalHTTPLLMBaseURL: p.vpLocalHTTPLLMBaseURL,
+        vpLocalHTTPLLMModel: p.vpLocalHTTPLLMModel,
+        vpGlobalVoiceHotkey: p.vpGlobalVoiceHotkey,
+        vpVoiceCues: p.vpVoiceCues,
+        vpContextCapture: p.vpContextCapture,
+        vpContextBlacklist: p.vpContextBlacklist,
+        vpScreenContextToCloud: p.vpScreenContextToCloud,
+    }, true)
+}
+
+pub def voiceToggleSmartPolish(): Void = {
+    let p = voicePrefsGet();
+    let nextOut = match p.vpOutputMode {
+        VomSmartPolish  -> VomRawDictation,
+        VomRawDictation -> VomSmartPolish,
+    };
+    voicePrefsUpdate(VoicePreferences {
+        vpEnabled: p.vpEnabled,
+        vpProviderMode: p.vpProviderMode,
+        vpTriggerKey: p.vpTriggerKey,
+        vpOutputMode: nextOut,
+        vpToneMode: p.vpToneMode,
+        vpLanguage: p.vpLanguage,
+        vpSpeakToEditSelection: p.vpSpeakToEditSelection,
+        vpSyncJuxuLexicon: p.vpSyncJuxuLexicon,
+        vpCustomVocabulary: p.vpCustomVocabulary,
+        vpCloudPreset: p.vpCloudPreset,
+        vpCloudPolishEnabled: p.vpCloudPolishEnabled,
+        vpCustomBaseURL: p.vpCustomBaseURL,
+        vpCustomASRModel: p.vpCustomASRModel,
+        vpCustomLLMModel: p.vpCustomLLMModel,
+        vpCustomSplitLLM: p.vpCustomSplitLLM,
+        vpCustomLLMBaseURL: p.vpCustomLLMBaseURL,
+        vpLocalASRPreset: p.vpLocalASRPreset,
+        vpLocalAppleLocale: p.vpLocalAppleLocale,
+        vpLocalAppleRequireOnDevice: p.vpLocalAppleRequireOnDevice,
+        vpLocalHTTPASRBaseURL: p.vpLocalHTTPASRBaseURL,
+        vpLocalHTTPASRModel: p.vpLocalHTTPASRModel,
+        vpLocalLLMPreset: p.vpLocalLLMPreset,
+        vpLocalHTTPLLMBaseURL: p.vpLocalHTTPLLMBaseURL,
+        vpLocalHTTPLLMModel: p.vpLocalHTTPLLMModel,
+        vpGlobalVoiceHotkey: p.vpGlobalVoiceHotkey,
+        vpVoiceCues: p.vpVoiceCues,
+        vpContextCapture: p.vpContextCapture,
+        vpContextBlacklist: p.vpContextBlacklist,
+        vpScreenContextToCloud: p.vpScreenContextToCloud,
+    }, true)
+}
+
+pub def voiceBuildSettingsPageView(session: JuxuSession, width: Float): Ptr = {
+    ensureVoiceHooksWired();
+    buildVoicePageViewImpl(session, width)
+}
+
+pub def voiceOnSettingsWindowClosed(): Void =
+    onVoiceWindowClosedImpl()
+
+pub def voiceConfigurePreviewState(cloudMode: Bool): Void = {
+    ensureVoiceHooksWired();
+    voicePrefsSetInMemoryForTesting(true);
+    let d = defaultVoicePreferences();
+    voicePrefsUpdate(VoicePreferences {
+        vpEnabled: true,
+        vpProviderMode: if (cloudMode) VpmCloudBYOK else VpmLocal,
+        vpTriggerKey: d.vpTriggerKey,
+        vpOutputMode: d.vpOutputMode,
+        vpToneMode: d.vpToneMode,
+        vpLanguage: d.vpLanguage,
+        vpSpeakToEditSelection: d.vpSpeakToEditSelection,
+        vpSyncJuxuLexicon: d.vpSyncJuxuLexicon,
+        vpCustomVocabulary: d.vpCustomVocabulary,
+        vpCloudPreset: d.vpCloudPreset,
+        vpCloudPolishEnabled: d.vpCloudPolishEnabled,
+        vpCustomBaseURL: d.vpCustomBaseURL,
+        vpCustomASRModel: d.vpCustomASRModel,
+        vpCustomLLMModel: d.vpCustomLLMModel,
+        vpCustomSplitLLM: d.vpCustomSplitLLM,
+        vpCustomLLMBaseURL: d.vpCustomLLMBaseURL,
+        vpLocalASRPreset: d.vpLocalASRPreset,
+        vpLocalAppleLocale: d.vpLocalAppleLocale,
+        vpLocalAppleRequireOnDevice: d.vpLocalAppleRequireOnDevice,
+        vpLocalHTTPASRBaseURL: d.vpLocalHTTPASRBaseURL,
+        vpLocalHTTPASRModel: d.vpLocalHTTPASRModel,
+        vpLocalLLMPreset: d.vpLocalLLMPreset,
+        vpLocalHTTPLLMBaseURL: d.vpLocalHTTPLLMBaseURL,
+        vpLocalHTTPLLMModel: d.vpLocalHTTPLLMModel,
+        vpGlobalVoiceHotkey: d.vpGlobalVoiceHotkey,
+        vpVoiceCues: d.vpVoiceCues,
+        vpContextCapture: d.vpContextCapture,
+        vpContextBlacklist: d.vpContextBlacklist,
+        vpScreenContextToCloud: d.vpScreenContextToCloud,
+    }, false)
+}

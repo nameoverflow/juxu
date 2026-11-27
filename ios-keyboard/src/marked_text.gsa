@@ -1,71 +1,480 @@
-/// iOS inline marked-text session (`IOSInlineMarkedTextSession`).
-/// Preserves Juxu's critical iOS UITextDocumentProxy invariants:
-/// - Clearing marked text ALWAYS sends `setMarkedText("", selectedRange: (0,0))` + `unmarkText()`.
-/// - Committing while marked text is active atomically replaces it via `setMarkedText(text, ...)` + `unmarkText()`
-///   (compatible with `YYTextView` and TextKit 2).
-/// - Tracks orphan marked text across `KeyboardViewController` teardown/recreation.
+/// Complete 1:1 port of `iOS/Shared/IOSInlineMarkedTextSession.swift` (364 lines):
+/// - `IOSMarkedTextSink` abstraction + `UITextDocumentProxy` adapter + crash-safe nullable `documentIdentifier`
+/// - `YYTextView`-safe atomic `setMarkedText(committed, selectedRange: (utf16Len, 0))` + `unmarkText()`
+/// - `TIKeyboardOutput` XPC turn-boundary coalescing protection (`deferredInlinePreedit` + `flushTurnBoundary`)
+/// - Cross-instance process-wide orphaned `markedText` sweep (preserving `selectedText`) + TextKit 2 caret restoration.
 
-use objc.{objcSel, msgSendVoid0, msgSendVoid1Ptr}
-use juxu_shared.{nsRange, nsStr, msgSendVoid1Ptr1Range}
+use std.option.{Option, Some, None}
+use objc.{objcSel, msgSend0, msgSendVoid0, msgSendVoid1Ptr}
+use juxu_shared.{
+    NSRange, nsRange, nsStr, nsStrPtrToOpt, strUtf16Len,
+    msgSendVoid1Ptr1Range, msgSendVoid1I64, msgSendBool1Ptr,
+    utf8ScalarCount, tailScalars,
+    AutoSpaceOptions, AutoSpaceContextTracker,
+    autoSpaceTrackerNew, autoSpaceTrackerInvalidate, autoSpaceTrackerCurrentShadowBefore,
+    autoSpaceTrackerEffectiveBefore, autoSpaceTrackerPrepareCommit, autoSpaceTrackerRecordPassthrough,
+    autoSpaceTrackerReconcileExternal,
+}
 
-def gHasMarkedText: Cell Bool = cellNew(false)
-def gOrphanMarkedText: Cell String = cellNew("")
+// ============================================================================
+// Document Sink Interface & `UITextDocumentProxy` Adapter
+// ============================================================================
 
-/// Clear inline marked text safely on `proxy` (`UITextDocumentProxy`).
-pub def proxyClearMarkedText(proxy: Ptr): Void =
-    if (!ptrIsNull(proxy)) {
-        if (cellGet(gHasMarkedText)) {
-            msgSendVoid1Ptr1Range(proxy, objcSel("setMarkedText:selectedRange:"), nsStr(""), nsRange(intToI64(0), intToI64(0)));
-            msgSendVoid0(proxy, objcSel("unmarkText"));
-            cellSet(gHasMarkedText, false);
-            cellSet(gOrphanMarkedText, "")
+pub data IOSMarkedTextSink {
+    sinkGetBefore: () -> Option String,
+    sinkGetAfter: () -> Option String,
+    sinkGetSelected: () -> Option String,
+    sinkSetMarkedText: (String, NSRange) -> Void,
+    sinkUnmarkText: () -> Void,
+    sinkInsertText: (String) -> Void,
+    sinkAdjustTextPosition: (Int) -> Void,
+}
+
+pub def makeProxyDocumentSink(proxy: Ptr): IOSMarkedTextSink =
+    IOSMarkedTextSink {
+        sinkGetBefore: () ->
+            if (ptrIsNull(proxy)) None
+            else nsStrPtrToOpt(msgSend0(proxy, objcSel("documentContextBeforeInput"))),
+        sinkGetAfter: () ->
+            if (ptrIsNull(proxy)) None
+            else nsStrPtrToOpt(msgSend0(proxy, objcSel("documentContextAfterInput"))),
+        sinkGetSelected: () ->
+            if (ptrIsNull(proxy)) None
+            else nsStrPtrToOpt(msgSend0(proxy, objcSel("selectedText"))),
+        sinkSetMarkedText: (markedText: String, selRange: NSRange) ->
+            if (!ptrIsNull(proxy)) {
+                msgSendVoid1Ptr1Range(proxy, objcSel("setMarkedText:selectedRange:"), nsStr(markedText), selRange)
+            } else (),
+        sinkUnmarkText: () ->
+            if (!ptrIsNull(proxy)) {
+                msgSendVoid0(proxy, objcSel("unmarkText"))
+            } else (),
+        sinkInsertText: (text: String) ->
+            if (!ptrIsNull(proxy)) {
+                msgSendVoid1Ptr(proxy, objcSel("insertText:"), nsStr(text))
+            } else (),
+        sinkAdjustTextPosition: (offset: Int) ->
+            if (!ptrIsNull(proxy)) {
+                msgSendVoid1I64(proxy, objcSel("adjustTextPositionByCharacterOffset:"), intToI64(offset))
+            } else (),
+    }
+
+/// Safely reads `UITextDocumentProxy.documentIdentifier.UUIDString` without trapping when UIKit's
+/// `_UITextDocumentInterface` returns Objective-C `nil` during focus transitions or orphan `markedTextRange`.
+pub def proxyDocumentIdentifier(proxy: Ptr): Option String =
+    if (ptrIsNull(proxy)) None
+    else if (!msgSendBool1Ptr(proxy, objcSel("respondsToSelector:"), objcSel("documentIdentifier"))) None
+    else {
+        let uuidObj = msgSend0(proxy, objcSel("documentIdentifier"));
+        if (ptrIsNull(uuidObj)) None
+        else nsStrPtrToOpt(msgSend0(uuidObj, objcSel("UUIDString")))
+    }
+
+// ============================================================================
+// Process-Wide Orphaned MarkedText State
+// ============================================================================
+
+def gSharedHasOrphanedMarked: Cell Bool = cellNew(false)
+def gSharedNeedsAppearanceSweep: Cell Bool = cellNew(false)
+def gSharedOrphanedExpectedBeforeTail: Cell String = cellNew("")
+
+pub def resetSharedOrphanedState(): Void = {
+    cellSet(gSharedHasOrphanedMarked, false);
+    cellSet(gSharedNeedsAppearanceSweep, false);
+    cellSet(gSharedOrphanedExpectedBeforeTail, "")
+}
+
+// ============================================================================
+// IOSInlineMarkedTextSession
+// ============================================================================
+
+pub data IOSInlineMarkedTextSession {
+    msHostMarkedCode: Cell String,
+    msTurnUnmarkedCommit: Cell (Option String),
+    msDeferredInlinePreedit: Cell (Option String),
+    msAutoSpaceTracker: AutoSpaceContextTracker,
+    msCompositionBaseContext: Cell (Option String),
+}
+
+pub def markedSessionNew(): IOSInlineMarkedTextSession =
+    IOSInlineMarkedTextSession {
+        msHostMarkedCode: cellNew(""),
+        msTurnUnmarkedCommit: cellNew(None),
+        msDeferredInlinePreedit: cellNew(None),
+        msAutoSpaceTracker: autoSpaceTrackerNew(),
+        msCompositionBaseContext: cellNew(None),
+    }
+
+pub def markedSessionMarkedCode(s: IOSInlineMarkedTextSession): String =
+    match cellGet(s.msDeferredInlinePreedit) {
+        Some(d) -> d,
+        None -> cellGet(s.msHostMarkedCode),
+    }
+
+pub def markedSessionHasOrphanedMarked(s: IOSInlineMarkedTextSession): Bool = {
+    let _ = s;
+    cellGet(gSharedHasOrphanedMarked)
+}
+
+pub def markedSessionNeedsAppearanceSweep(s: IOSInlineMarkedTextSession): Bool = {
+    let _ = s;
+    cellGet(gSharedNeedsAppearanceSweep)
+}
+
+pub def markedSessionCompositionBaseContext(s: IOSInlineMarkedTextSession): Option String =
+    cellGet(s.msCompositionBaseContext)
+
+pub def markedSessionDeferredInlinePreedit(s: IOSInlineMarkedTextSession): Option String =
+    cellGet(s.msDeferredInlinePreedit)
+
+pub def markedSessionReset(s: IOSInlineMarkedTextSession): Void = {
+    cellSet(s.msHostMarkedCode, "");
+    cellSet(s.msTurnUnmarkedCommit, None);
+    cellSet(s.msDeferredInlinePreedit, None);
+    autoSpaceTrackerInvalidate(s.msAutoSpaceTracker);
+    cellSet(s.msCompositionBaseContext, None)
+}
+
+pub def markedSessionResetForAppearance(s: IOSInlineMarkedTextSession): Void = {
+    cellSet(s.msHostMarkedCode, "");
+    match cellGet(s.msTurnUnmarkedCommit) {
+        None -> cellSet(s.msDeferredInlinePreedit, None),
+        Some(_) -> (),
+    };
+    autoSpaceTrackerInvalidate(s.msAutoSpaceTracker);
+    cellSet(s.msCompositionBaseContext, None)
+}
+
+pub def markedSessionRecordFocusLoss(s: IOSInlineMarkedTextSession): Bool = {
+    let hadMarked = strLen(markedSessionMarkedCode(s)) > 0;
+    if (hadMarked) {
+        cellSet(gSharedHasOrphanedMarked, true);
+        let base = match cellGet(s.msCompositionBaseContext) {
+            Some(b) -> b,
+            None -> autoSpaceTrackerCurrentShadowBefore(s.msAutoSpaceTracker),
+        };
+        cellSet(gSharedOrphanedExpectedBeforeTail, tailScalars(base, 32))
+    } else ();
+    markedSessionReset(s);
+    hadMarked
+}
+
+pub def markedSessionRecordKeyboardDisappear(s: IOSInlineMarkedTextSession): Void = {
+    if (strLen(markedSessionMarkedCode(s)) > 0) {
+        cellSet(gSharedHasOrphanedMarked, true);
+        let base = match cellGet(s.msCompositionBaseContext) {
+            Some(b) -> b,
+            None -> autoSpaceTrackerCurrentShadowBefore(s.msAutoSpaceTracker),
+        };
+        cellSet(gSharedOrphanedExpectedBeforeTail, tailScalars(base, 32))
+    } else ();
+    if (cellGet(gSharedHasOrphanedMarked)) {
+        cellSet(gSharedNeedsAppearanceSweep, true)
+    } else ();
+    markedSessionReset(s)
+}
+
+def isOptNone(opt: Option String): Bool =
+    match opt {
+        None -> true,
+        Some(_) -> false,
+    }
+
+/// Clears any orphaned `markedTextRange` left in a refocused field from a prior aborted composition,
+/// without disturbing active range selections (`selectedText`).
+/// Returns `(needsAsyncFlush, expectedBeforeTail)`.
+pub def markedSessionSweepOrphanedMarkedText(
+    s: IOSInlineMarkedTextSession,
+    sink: IOSMarkedTextSink
+): (Bool, String) =
+    if (!cellGet(gSharedHasOrphanedMarked)) (false, "")
+    else if (!(strLen(cellGet(s.msHostMarkedCode)) == 0
+        && isOptNone(cellGet(s.msDeferredInlinePreedit))
+        && isOptNone(cellGet(s.msTurnUnmarkedCommit)))) {
+        (false, "")
+    } else {
+        let tail = cellGet(gSharedOrphanedExpectedBeforeTail);
+        cellSet(gSharedHasOrphanedMarked, false);
+        cellSet(gSharedNeedsAppearanceSweep, false);
+        cellSet(gSharedOrphanedExpectedBeforeTail, "");
+        let selectedTxt = match sink.sinkGetSelected() {
+            Some(t) -> t,
+            None -> "",
+        };
+        if (strLen(selectedTxt) == 0) {
+            cellSet(s.msTurnUnmarkedCommit, Some(""));
+            sink.sinkSetMarkedText("", nsRange(intToI64(0), intToI64(0)));
+            sink.sinkUnmarkText();
+            (true, tail)
+        } else {
+            sink.sinkUnmarkText();
+            (false, "")
+        }
+    }
+
+def findFirstSubstringEndByte(haystack: String, needle: String): Option Int = {
+    let hLen = strLen(haystack);
+    let nLen = strLen(needle);
+    if (nLen == 0 || hLen < nLen) None
+    else {
+        let i = cellNew(0);
+        let found: Cell (Option Int) = cellNew(None);
+        while (cellGet(i) <= hLen - nLen && match cellGet(found) { None -> true, Some(_) -> false }) {
+            let idx = cellGet(i);
+            if (strSlice(haystack, idx, idx + nLen) == needle) {
+                cellSet(found, Some(idx + nLen))
+            } else ();
+            cellSet(i, idx + 1)
+        };
+        cellGet(found)
+    }
+}
+
+/// Restores the caret after `sweepOrphanedMarkedText` on iOS 26 TextKit 2 (`UITextField`/`UITextView`),
+/// which resets `selectedTextRange` to `{0, 0}` when `setMarkedText("", ...)` clears an orphaned range.
+pub def markedSessionRestoreCaretAfterOrphanedSweepIfNeeded(
+    s: IOSInlineMarkedTextSession,
+    expectedBeforeTail: String,
+    sink: IOSMarkedTextSink
+): Void =
+    if (strLen(expectedBeforeTail) > 0
+        && strLen(cellGet(s.msHostMarkedCode)) == 0
+        && isOptNone(cellGet(s.msDeferredInlinePreedit))) {
+        let before = match sink.sinkGetBefore() { Some(b) -> b, None -> "" };
+        if (strLen(before) == 0) {
+            let after = match sink.sinkGetAfter() { Some(a) -> a, None -> "" };
+            match findFirstSubstringEndByte(after, expectedBeforeTail) {
+                Some(endByte) -> {
+                    let prefix = strSlice(after, 0, endByte);
+                    let offset = utf8ScalarCount(prefix);
+                    if (offset > 0) {
+                        sink.sinkAdjustTextPosition(offset);
+                        autoSpaceTrackerReconcileExternal(s.msAutoSpaceTracker, Some(prefix))
+                    } else ()
+                },
+                None -> (),
+            }
         } else ()
     } else ()
 
-/// Commit `text` to `proxy` (atomically replacing any active marked text).
-pub def proxyCommitText(proxy: Ptr, text: String): Void =
-    if (!ptrIsNull(proxy) && strLen(text) > 0) {
-        if (cellGet(gHasMarkedText)) {
-            msgSendVoid1Ptr1Range(
-                proxy,
-                objcSel("setMarkedText:selectedRange:"),
-                nsStr(text),
-                nsRange(intToI64(strLen(text)), intToI64(0))
-            );
-            msgSendVoid0(proxy, objcSel("unmarkText"));
-            cellSet(gHasMarkedText, false);
-            cellSet(gOrphanMarkedText, "")
-        } else {
-            msgSendVoid1Ptr(proxy, objcSel("insertText:"), nsStr(text))
+pub def markedSessionReconcileExternalContext(
+    s: IOSInlineMarkedTextSession,
+    hostBeforeOpt: Option String
+): Void =
+    if (strLen(cellGet(s.msHostMarkedCode)) == 0
+        && isOptNone(cellGet(s.msDeferredInlinePreedit))
+        && isOptNone(cellGet(s.msTurnUnmarkedCommit))) {
+        autoSpaceTrackerReconcileExternal(s.msAutoSpaceTracker, hostBeforeOpt)
+    } else ()
+
+pub def markedSessionFlushTurnBoundary(
+    s: IOSInlineMarkedTextSession,
+    sink: IOSMarkedTextSink
+): Void = {
+    cellSet(s.msTurnUnmarkedCommit, None);
+    match cellGet(s.msDeferredInlinePreedit) {
+        None -> (),
+        Some(pending) -> {
+            cellSet(s.msDeferredInlinePreedit, None);
+            if (strLen(pending) > 0) {
+                sink.sinkSetMarkedText(pending, nsRange(strUtf16Len(pending), intToI64(0)));
+                cellSet(s.msHostMarkedCode, pending)
+            } else ()
+        },
+    }
+}
+
+pub def markedSessionCancelMarkedCode(
+    s: IOSInlineMarkedTextSession,
+    sink: IOSMarkedTextSink
+): Void = {
+    cellSet(s.msDeferredInlinePreedit, None);
+    if (isOptNone(cellGet(s.msTurnUnmarkedCommit)) && strLen(cellGet(s.msHostMarkedCode)) > 0) {
+        sink.sinkSetMarkedText("", nsRange(intToI64(0), intToI64(0)));
+        sink.sinkUnmarkText();
+        cellSet(s.msHostMarkedCode, "")
+    } else ();
+    cellSet(s.msCompositionBaseContext, None)
+}
+
+def prepareFormattedCommit(
+    s: IOSInlineMarkedTextSession,
+    text: String,
+    splitInternal: Bool,
+    overrideBeforeOpt: Option String,
+    opts: AutoSpaceOptions,
+    sink: IOSMarkedTextSink
+): String =
+    autoSpaceTrackerPrepareCommit(
+        s.msAutoSpaceTracker,
+        text,
+        sink.sinkGetBefore(),
+        false,
+        overrideBeforeOpt,
+        splitInternal,
+        opts
+    )
+
+def commitReplacingMarkedIfNeeded(
+    s: IOSInlineMarkedTextSession,
+    formatted: String,
+    sink: IOSMarkedTextSink
+): Bool =
+    match cellGet(s.msTurnUnmarkedCommit) {
+        Some(prev) -> {
+            let combined = prev + formatted;
+            cellSet(s.msTurnUnmarkedCommit, Some(combined));
+            cellSet(s.msDeferredInlinePreedit, None);
+            sink.sinkSetMarkedText(combined, nsRange(strUtf16Len(combined), intToI64(0)));
+            sink.sinkUnmarkText();
+            cellSet(s.msHostMarkedCode, "");
+            true
+        },
+        None ->
+            if (strLen(cellGet(s.msHostMarkedCode)) > 0) {
+                cellSet(s.msTurnUnmarkedCommit, Some(formatted));
+                cellSet(s.msDeferredInlinePreedit, None);
+                sink.sinkSetMarkedText(formatted, nsRange(strUtf16Len(formatted), intToI64(0)));
+                sink.sinkUnmarkText();
+                cellSet(s.msHostMarkedCode, "");
+                true
+            } else {
+                sink.sinkInsertText(formatted);
+                false
+            },
+    }
+
+pub def markedSessionInsertTextWithAutoSpace(
+    s: IOSInlineMarkedTextSession,
+    text: String,
+    splitInternal: Bool,
+    overrideBeforeOpt: Option String,
+    opts: AutoSpaceOptions,
+    sink: IOSMarkedTextSink
+): Bool =
+    if (strLen(text) == 0) false
+    else {
+        let effectiveOverride = match overrideBeforeOpt {
+            Some(ov) -> Some(ov),
+            None -> match cellGet(s.msTurnUnmarkedCommit) {
+                Some(_) -> Some(autoSpaceTrackerCurrentShadowBefore(s.msAutoSpaceTracker)),
+                None -> None,
+            },
+        };
+        let formatted = prepareFormattedCommit(s, text, splitInternal, effectiveOverride, opts, sink);
+        match cellGet(s.msTurnUnmarkedCommit) {
+            Some(prev) -> {
+                let combined = prev + formatted;
+                cellSet(s.msTurnUnmarkedCommit, Some(combined));
+                sink.sinkSetMarkedText(combined, nsRange(strUtf16Len(combined), intToI64(0)));
+                sink.sinkUnmarkText();
+                true
+            },
+            None -> {
+                sink.sinkInsertText(formatted);
+                false
+            },
         }
-    } else ()
+    }
 
-/// Set or clear inline marked text on `proxy`.
-pub def proxySetMarkedText(proxy: Ptr, preedit: String): Void =
-    if (!ptrIsNull(proxy)) {
-        if (strLen(preedit) == 0) {
-            proxyClearMarkedText(proxy)
-        } else {
-            msgSendVoid1Ptr1Range(
-                proxy,
-                objcSel("setMarkedText:selectedRange:"),
-                nsStr(preedit),
-                nsRange(intToI64(strLen(preedit)), intToI64(0))
-            );
-            cellSet(gHasMarkedText, true);
-            cellSet(gOrphanMarkedText, preedit)
+pub def markedSessionInsertPassthrough(
+    s: IOSInlineMarkedTextSession,
+    text: String,
+    sink: IOSMarkedTextSink
+): Bool =
+    if (strLen(text) == 0) false
+    else {
+        let sameTurnBase = match cellGet(s.msTurnUnmarkedCommit) {
+            Some(_) -> Some(autoSpaceTrackerCurrentShadowBefore(s.msAutoSpaceTracker)),
+            None -> None,
+        };
+        autoSpaceTrackerRecordPassthrough(
+            s.msAutoSpaceTracker,
+            text,
+            sink.sinkGetBefore(),
+            false,
+            sameTurnBase
+        );
+        match cellGet(s.msTurnUnmarkedCommit) {
+            Some(prev) -> {
+                let combined = prev + text;
+                cellSet(s.msTurnUnmarkedCommit, Some(combined));
+                sink.sinkSetMarkedText(combined, nsRange(strUtf16Len(combined), intToI64(0)));
+                sink.sinkUnmarkText();
+                true
+            },
+            None -> {
+                sink.sinkInsertText(text);
+                false
+            },
         }
-    } else ()
+    }
 
-/// Delete one character backward on `proxy`.
-pub def proxyDeleteBackward(proxy: Ptr): Void =
-    if (!ptrIsNull(proxy)) msgSendVoid0(proxy, objcSel("deleteBackward")) else ()
+pub def markedSessionCommitPendingFirst(
+    s: IOSInlineMarkedTextSession,
+    rawText: String,
+    opts: AutoSpaceOptions,
+    sink: IOSMarkedTextSink
+): Bool =
+    if (strLen(rawText) == 0) {
+        markedSessionCancelMarkedCode(s, sink);
+        false
+    } else {
+        let hadMarked = strLen(markedSessionMarkedCode(s)) > 0;
+        let base = if (hadMarked) cellGet(s.msCompositionBaseContext) else None;
+        let formatted = prepareFormattedCommit(s, rawText, true, base, opts, sink);
+        let usedTurnUnmark = commitReplacingMarkedIfNeeded(s, formatted, sink);
+        cellSet(s.msCompositionBaseContext, None);
+        usedTurnUnmark
+    }
 
-/// Clean up any orphan marked text left over from a prior extension lifecycle.
-pub def proxyCleanupOrphanIfNeeded(proxy: Ptr): Void =
-    if (!ptrIsNull(proxy) && strLen(cellGet(gOrphanMarkedText)) > 0) {
-        msgSendVoid1Ptr1Range(proxy, objcSel("setMarkedText:selectedRange:"), nsStr(""), nsRange(intToI64(0), intToI64(0)));
-        msgSendVoid0(proxy, objcSel("unmarkText"));
-        cellSet(gHasMarkedText, false);
-        cellSet(gOrphanMarkedText, "")
-    } else ()
+/// Applies `EngineSnapshot` commit & inline preedit to `sink`; returns `(didCommit, needsAsyncFlush)`.
+pub def markedSessionApplyEngineState(
+    s: IOSInlineMarkedTextSession,
+    commitText: String,
+    inlinePreedit: String,
+    opts: AutoSpaceOptions,
+    sink: IOSMarkedTextSink
+): (Bool, Bool) = {
+    let didCommit = cellNew(false);
+    let needsAsyncFlush = cellNew(false);
+    let committedShadow: Cell (Option String) = cellNew(None);
+
+    if (strLen(commitText) > 0) {
+        let hadMarked = strLen(markedSessionMarkedCode(s)) > 0;
+        let base = if (hadMarked) cellGet(s.msCompositionBaseContext) else None;
+        let formatted = prepareFormattedCommit(s, commitText, true, base, opts, sink);
+        if (commitReplacingMarkedIfNeeded(s, formatted, sink)) {
+            cellSet(needsAsyncFlush, true)
+        } else ();
+        cellSet(committedShadow, Some(autoSpaceTrackerCurrentShadowBefore(s.msAutoSpaceTracker)));
+        cellSet(didCommit, true)
+    } else ();
+
+    if (strLen(inlinePreedit) == 0) {
+        markedSessionCancelMarkedCode(s, sink)
+    } else if (!isOptNone(cellGet(s.msTurnUnmarkedCommit))) {
+        let nextBase = match cellGet(committedShadow) {
+            Some(cs) -> cs,
+            None -> match cellGet(s.msCompositionBaseContext) {
+                Some(cb) -> cb,
+                None -> autoSpaceTrackerCurrentShadowBefore(s.msAutoSpaceTracker),
+            },
+        };
+        cellSet(s.msCompositionBaseContext, Some(nextBase));
+        cellSet(s.msDeferredInlinePreedit, Some(inlinePreedit));
+        cellSet(needsAsyncFlush, true)
+    } else if (inlinePreedit != cellGet(s.msHostMarkedCode)) {
+        if (strLen(cellGet(s.msHostMarkedCode)) == 0) {
+            let nextBase = match cellGet(committedShadow) {
+                Some(cs) -> cs,
+                None -> autoSpaceTrackerEffectiveBefore(s.msAutoSpaceTracker, sink.sinkGetBefore(), false),
+            };
+            cellSet(s.msCompositionBaseContext, Some(nextBase))
+        } else ();
+        sink.sinkSetMarkedText(inlinePreedit, nsRange(strUtf16Len(inlinePreedit), intToI64(0)));
+        cellSet(s.msHostMarkedCode, inlinePreedit)
+    } else ();
+
+    (cellGet(didCommit), cellGet(needsAsyncFlush))
+}

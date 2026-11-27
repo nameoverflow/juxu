@@ -1,0 +1,1772 @@
+/// 1:1 Geisha port of `Sources/VoiceHUDPanel.swift` (1,127 lines):
+/// - `VoiceHUDMetrics` (`576x112` canvas, `pillBottom=9`, `pillHeight=28`, `listeningWidth=64`, `processingWidth=87`,
+///   `barCount=11`, `barWidth=2`, `barMinHeight=2`, `barPitch=3.6`, `barMaxHeight=19.6`, `barsInset=13`, caption card geometry)
+/// - `VoiceHUDTextFit` (`attributes`, `lineCount`, binary-search `tailFitting` with `"…"` prefix)
+/// - `VoiceLevelMeter` (adaptive noise floor & peak ceiling dB loudness meter)
+/// - `VoiceSpectrumAnalyzer` (11-band speech formant/fricative vDSP FFT analyzer backed by `csrc/voice_fft.c`)
+/// - `JuxuGeishaVoiceHUDContentView` (`NSView` subclass, `isFlipped = YES`, `drawRect:`, zero-retaining `CADisplayLink`/`NSTimer` 60fps step)
+/// - `JuxuGeishaVoiceHUDPanel` & `VoiceHUDPanelController` (lazy on-demand borderless non-activating `NSPanel` + `HUDBackdropView`s)
+/// - `voiceHUDInitHooks()` wiring `gVoiceHUDShowHook`, `gVoiceHUDHideHook`, `gVoiceHUDUnloadHook`, `gVoiceHUDEnqueueSpectrumHook`.
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGetOr, vecSet, vecClear}
+use std.math.{pi, exp, log, sin, cos, pow, abs, floor, ceil}
+use std.str.{strContains, strTrim}
+use std.buf.{bufNew, bufPushByte, bufToString}
+use objc.{
+    Id, NSObject,
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    objcSetAssocHandle, objcGetAssocHandle, objcReleaseRaw, idAdopt,
+    msgSend0, msgSend1Ptr, msgSend1Float, msgSendBool0, msgSendI64_0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
+}
+use juxu_shared.{
+    CGPoint, CGSize, CGRect, NSRange, cgPoint, cgSize, cgRect, nsRange,
+    rectContainsPoint, rectIntersectsRect, rectMidX, rectMidY, rectMaxX, rectMaxY,
+    nsStr, nsStrPtrToString, objcAllocInitFrame,
+    utf8ToScalars, scalarsToUtf8,
+    msgSendRect0, msgSendSize0, msgSendInitFrame, msgSend1Rect1U64_1I64_1Bool,
+    msgSend2Float, msgSend4Float, msgSend2Ptr, msgSend1I64_1Ptr,
+    msgSendVoid1Rect, msgSendVoid1Ptr1Range,
+    objcSendSuperVoid0, dispatchMainAfterMs,
+}
+use voice_common.{
+    VoiceHUDState, VhsHidden, VhsRecording, VhsTranscribing, VhsPolishing, VhsNotice,
+    gVoiceHUDShowHook, gVoiceHUDHideHook, gVoiceHUDUnloadHook, gVoiceHUDEnqueueSpectrumHook,
+}
+
+// ============================================================================
+// C11 / Accelerate / CoreGraphics / Weak DisplayLink Imports (`csrc/voice_fft.c`)
+// ============================================================================
+
+extern "juxu_voice_f32_buf_alloc" def c_f32BufAlloc(count: Int): Ptr
+extern "juxu_voice_f32_buf_free" def c_f32BufFree(buf: Ptr): Void
+extern noalloc "juxu_voice_f32_buf_set" def c_f32BufSet(buf: Ptr, idx: Int, val: Float32): Void
+extern noalloc "juxu_voice_f32_buf_get" def c_f32BufGet(buf: Ptr, idx: Int): Float32
+
+extern "juxu_voice_spectrum_new" def c_spectrumNew(): Ptr
+extern "juxu_voice_spectrum_free" def c_spectrumFree(ptr: Ptr): Void
+extern noalloc "juxu_voice_spectrum_frame_cap" def c_spectrumFrameCap(count: Int, sampleRate: Float): Int
+extern "juxu_voice_spectrum_process" def c_spectrumProcess(
+    ptr: Ptr, samples: Ptr, count: Int, sampleRate: Float, outBars: Ptr, maxFrames: Int
+): Int
+extern "juxu_voice_spectrum_process_frame" def c_spectrumProcessFrame(
+    ptr: Ptr, samples: Ptr, count: Int, sampleRate: Float, hasSeconds: Bool, seconds: Float32, outBars11: Ptr
+): Void
+
+extern noalloc "juxu_voice_ui_floating_window_level" def c_floatingWindowLevel(): Int64
+extern "juxu_voice_ui_reduce_motion" def c_reduceMotion(): Bool
+extern "juxu_voice_ui_layer_continuous_corner" def c_layerContinuousCorner(layer: Ptr, radius: Float, masks: Bool): Void
+extern "juxu_voice_ui_layer_border_rgba" def c_layerBorderRgba(layer: Ptr, width: Float, r: Float, g: Float, b: Float, a: Float): Void
+extern "juxu_voice_ui_bounding_rect" def c_boundingRect(nsStrPtr: Ptr, maxW: Float, attrs: Ptr, outRect4: Ptr): Void
+extern "juxu_voice_ui_clip_save_rounded" def c_clipSaveRounded(x: Float, y: Float, w: Float, h: Float, radius: Float): Void
+extern "juxu_voice_ui_clip_restore" def c_clipRestore(): Void
+extern "juxu_voice_ui_draw_spoke" def c_drawSpoke(cx: Float, cy: Float, angleRad: Float, r: Float, g: Float, b: Float, a: Float): Void
+extern "juxu_voice_ui_start_display_link" def c_startDisplayLink(viewPtr: Ptr, stepFnPtr: Ptr): Ptr
+extern "juxu_voice_ui_stop_display_link" def c_stopDisplayLink(handlePtr: Ptr): Void
+extern "juxu_voice_ui_weak_box_new" def c_weakBoxNew(objPtr: Ptr): Ptr
+extern "juxu_voice_ui_weak_box_is_alive" def c_weakBoxIsAlive(slotPtr: Ptr): Bool
+extern "juxu_voice_ui_weak_box_free" def c_weakBoxFree(slotPtr: Ptr): Void
+
+extern "objc_msgSend" def msgSendSetFrameDisplayAnimHud(win: Ptr, sel: Ptr, r: CGRect, disp: Bool, anim: Bool): Void
+extern "objc_msgSend" def msgSendBezRoundedHud(cls: Ptr, sel: Ptr, r: CGRect, rx: Float, ry: Float): Ptr
+extern "objc_msgSend" def msgSendDrawInRectAttrHud(attrStr: Ptr, sel: Ptr, r: CGRect): Void
+extern "objc_msgSend" def msgSendSizeWithAttrsHud(nsStrObj: Ptr, sel: Ptr, attrs: Ptr): CGSize
+extern "objc_msgSend" def msgSendAddAttrRangeHud(mutAttr: Ptr, sel: Ptr, name: Ptr, val: Ptr, r: NSRange): Void
+extern "objc_msgSend" def msgSendRunAnimGroupHud(cls: Ptr, sel: Ptr, blk: ScopedPtr): Void
+
+// ============================================================================
+// Math & AppKit Color / Font Helpers
+// ============================================================================
+
+def roundHud(x: Float): Float =
+    if (x >= 0.0) floor(x + 0.5) else ceil(x - 0.5)
+
+def maxHud(a: Float, b: Float): Float = if (a >= b) a else b
+def minHud(a: Float, b: Float): Float = if (a <= b) a else b
+def clampHud(v: Float, lo: Float, hi: Float): Float =
+    if (v < lo) lo else if (v > hi) hi else v
+
+def log10Hud(x: Float): Float = log(x) / log(10.0)
+
+def hudFontSystem(size: Float, weight: Float): Ptr =
+    msgSend2Float(objcClass("NSFont"), objcSel("systemFontOfSize:weight:"), size, weight)
+
+def hudColorRgba(r: Float, g: Float, b: Float, a: Float): Ptr =
+    msgSend4Float(objcClass("NSColor"), objcSel("colorWithSRGBRed:green:blue:alpha:"), r, g, b, a)
+
+def hudColorAlpha(col: Ptr, a: Float): Ptr =
+    if (ptrIsNull(col)) col else msgSend1Float(col, objcSel("colorWithAlphaComponent:"), clampHud(a, 0.0, 1.0))
+
+def hudColorWhite(): Ptr = msgSend0(objcClass("NSColor"), objcSel("whiteColor"))
+def hudColorClear(): Ptr = msgSend0(objcClass("NSColor"), objcSel("clearColor"))
+def hudColorSystemRed(): Ptr = msgSend0(objcClass("NSColor"), objcSel("systemRedColor"))
+
+def hudViewIsDark(view: Ptr): Bool =
+    if (ptrIsNull(view)) false
+    else {
+        let app = msgSend0(view, objcSel("effectiveAppearance"));
+        if (ptrIsNull(app)) false
+        else {
+            let names = msgSend0(objcClass("NSMutableArray"), objcSel("array"));
+            msgSendVoid1Ptr(names, objcSel("addObject:"), nsStr("NSAppearanceNameAqua"));
+            msgSendVoid1Ptr(names, objcSel("addObject:"), nsStr("NSAppearanceNameDarkAqua"));
+            let best = msgSend1Ptr(app, objcSel("bestMatchFromAppearancesWithNames:"), names);
+            strContains(nsStrPtrToString(best), "Dark")
+        }
+    }
+
+def hudFillRoundedRect(r: CGRect, radius: Float, color: Ptr): Void =
+    if (!ptrIsNull(color) && r.size.width > 0.0 && r.size.height > 0.0) {
+        let maxR = 0.5 * minHud(r.size.width, r.size.height);
+        let rad = clampHud(radius, 0.0, maxR);
+        msgSendVoid0(color, objcSel("setFill"));
+        let p = msgSendBezRoundedHud(
+            objcClass("NSBezierPath"),
+            objcSel("bezierPathWithRoundedRect:xRadius:yRadius:"),
+            r, rad, rad
+        );
+        msgSendVoid0(p, objcSel("fill"))
+    } else ()
+
+// ============================================================================
+// 1. VoiceHUDMetrics (`VoiceHUDPanel.swift` lines 13-35)
+// ============================================================================
+
+pub data VoiceHUDMetricsSpec {
+    vhmCanvasWidth: Float,
+    vhmCanvasHeight: Float,
+    vhmPillBottom: Float,
+    vhmPillHeight: Float,
+    vhmListeningWidth: Float,
+    vhmProcessingWidth: Float,
+    vhmBarCount: Int,
+    vhmBarWidth: Float,
+    vhmBarMinHeight: Float,
+    vhmBarPitch: Float,
+    vhmBarMaxHeight: Float,
+    vhmBarsInset: Float,
+    vhmCardGap: Float,
+    vhmCardMaxWidth: Float,
+    vhmCardLineHeight: Float,
+    vhmCardPadX: Float,
+    vhmCardPadY: Float,
+    vhmNoticeMaxTextWidth: Float,
+    vhmFadeDuration: Float,
+    vhmPillResizeDuration: Float,
+    vhmCaptionFadeDuration: Float,
+    vhmCaptionMaxStagger: Float,
+}
+
+pub def vhmCanvasWidth(): Float = 576.0
+pub def vhmCanvasHeight(): Float = 112.0
+pub def vhmCanvasSize(): CGSize = cgSize(576.0, 112.0)
+pub def vhmPillBottom(): Float = 9.0
+pub def vhmPillHeight(): Float = 28.0
+pub def vhmListeningWidth(): Float = 64.0
+pub def vhmProcessingWidth(): Float = 87.0
+pub def vhmBarCount(): Int = 11
+pub def vhmBarWidth(): Float = 2.0
+pub def vhmBarMinHeight(): Float = 2.0
+pub def vhmBarPitch(): Float = 3.6
+pub def vhmBarMaxHeight(): Float = 19.6
+pub def vhmBarsInset(): Float = 13.0
+pub def vhmCardGap(): Float = 8.0
+pub def vhmCardMaxWidth(): Float = 520.0
+pub def vhmCardLineHeight(): Float = 20.0
+pub def vhmCardPadX(): Float = 14.0
+pub def vhmCardPadY(): Float = 9.0
+pub def vhmNoticeMaxTextWidth(): Float = 360.0
+pub def vhmFadeDuration(): Float = 0.14
+pub def vhmPillResizeDuration(): Float = 0.18
+pub def vhmCaptionFadeDuration(): Float = 0.11
+pub def vhmCaptionMaxStagger(): Float = 0.05
+
+pub def voiceHUDMetrics(): VoiceHUDMetricsSpec = VoiceHUDMetricsSpec {
+    vhmCanvasWidth: vhmCanvasWidth(),
+    vhmCanvasHeight: vhmCanvasHeight(),
+    vhmPillBottom: vhmPillBottom(),
+    vhmPillHeight: vhmPillHeight(),
+    vhmListeningWidth: vhmListeningWidth(),
+    vhmProcessingWidth: vhmProcessingWidth(),
+    vhmBarCount: vhmBarCount(),
+    vhmBarWidth: vhmBarWidth(),
+    vhmBarMinHeight: vhmBarMinHeight(),
+    vhmBarPitch: vhmBarPitch(),
+    vhmBarMaxHeight: vhmBarMaxHeight(),
+    vhmBarsInset: vhmBarsInset(),
+    vhmCardGap: vhmCardGap(),
+    vhmCardMaxWidth: vhmCardMaxWidth(),
+    vhmCardLineHeight: vhmCardLineHeight(),
+    vhmCardPadX: vhmCardPadX(),
+    vhmCardPadY: vhmCardPadY(),
+    vhmNoticeMaxTextWidth: vhmNoticeMaxTextWidth(),
+    vhmFadeDuration: vhmFadeDuration(),
+    vhmPillResizeDuration: vhmPillResizeDuration(),
+    vhmCaptionFadeDuration: vhmCaptionFadeDuration(),
+    vhmCaptionMaxStagger: vhmCaptionMaxStagger(),
+}
+
+// ============================================================================
+// 2. VoiceHUDTextFit (`VoiceHUDPanel.swift` lines 37-74)
+// ============================================================================
+
+pub def voiceHUDTextFitAttributes(font: Ptr, lineHeight: Float, color: Ptr): Ptr = {
+    let style = msgSend0(msgSend0(objcClass("NSMutableParagraphStyle"), objcSel("alloc")), objcSel("init"));
+    msgSendVoid1Float(style, objcSel("setMinimumLineHeight:"), lineHeight);
+    msgSendVoid1Float(style, objcSel("setMaximumLineHeight:"), lineHeight);
+    // NSLineBreakByCharWrapping == 1
+    msgSendVoid1I64(style, objcSel("setLineBreakMode:"), intToI64(1));
+
+    let dict = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
+    if (!ptrIsNull(font)) {
+        let _ = msgSend2Ptr(dict, objcSel("setObject:forKey:"), font, nsStr("NSFont"));
+        ()
+    } else ();
+    let col = if (ptrIsNull(color)) hudColorWhite() else color;
+    if (!ptrIsNull(col)) {
+        let _ = msgSend2Ptr(dict, objcSel("setObject:forKey:"), col, nsStr("NSColor"));
+        ()
+    } else ();
+    let _ = msgSend2Ptr(dict, objcSel("setObject:forKey:"), style, nsStr("NSParagraphStyle"));
+    objcReleaseRaw(style);
+    dict
+}
+
+pub def voiceHUDTextFitLineCount(text: String, attrs: Ptr, width: Float, lineHeight: Float): Int = {
+    let outBuf = ptrAllocBytes(32);
+    c_boundingRect(nsStr(text), width, attrs, outBuf);
+    let h = ptrReadF64Le(outBuf, 24);
+    let lines = floatToInt(ceil((h - 0.5) / lineHeight));
+    if (lines < 1) 1 else lines
+}
+
+/// Longest suffix of `text` that fits in `maxLines`, prefixed with `"…"` when cut.
+pub def voiceHUDTextFitTailFitting(
+    text: String,
+    attrs: Ptr,
+    width: Float,
+    lineHeight: Float,
+    maxLines: Int
+): String =
+    if (voiceHUDTextFitLineCount(text, attrs, width, lineHeight) <= maxLines) text
+    else {
+        let chars = utf8ToScalars(text);
+        let total = vecLen(chars);
+        let low = cellNew(0);
+        let high = cellNew(total);
+        while (cellGet(low) < cellGet(high)) {
+            let mid = (cellGet(low) + cellGet(high) + 1) / 2;
+            let cand = "…" + scalarsToUtf8(chars, total - mid, total);
+            if (voiceHUDTextFitLineCount(cand, attrs, width, lineHeight) <= maxLines) {
+                cellSet(low, mid)
+            } else {
+                cellSet(high, mid - 1)
+            }
+        };
+        let keep = cellGet(low);
+        "…" + scalarsToUtf8(chars, total - keep, total)
+    }
+
+// ============================================================================
+// 3. VoiceLevelMeter (`VoiceHUDPanel.swift` lines 681-717)
+// ============================================================================
+
+pub data VoiceLevelMeter {
+    vlmNoiseFloorDB: Cell (Option Float),
+    vlmPeakCeilingDB: Cell (Option Float),
+}
+
+pub def vlmQuietestDB(): Float = -58.0
+pub def vlmLowestFloorDB(): Float = -65.0
+pub def vlmHighestFloorDB(): Float = -41.0
+pub def vlmFloorMarginDB(): Float = 3.5
+pub def vlmMinSpanDB(): Float = 12.0
+pub def vlmInitialCeilingDB(): Float = -25.0
+pub def vlmMaxCeilingDB(): Float = -4.0
+
+pub def voiceLevelMeterNew(): VoiceLevelMeter = VoiceLevelMeter {
+    vlmNoiseFloorDB: cellNew(None),
+    vlmPeakCeilingDB: cellNew(None),
+}
+
+pub def voiceLevelMeterProcess(m: VoiceLevelMeter, rms: Float, seconds: Float): Float = {
+    let safeRms = maxHud(rms, 1.0e-6);
+    let db = 20.0 * log10Hud(safeRms);
+    let clamped = minHud(vlmHighestFloorDB(), maxHud(vlmLowestFloorDB(), db));
+
+    let nextFloor = match cellGet(m.vlmNoiseFloorDB) {
+        Some(fl) -> {
+            let tau = if (clamped < fl) 0.15 else 6.0;
+            fl + (clamped - fl) * (1.0 - exp((0.0 - seconds) / tau))
+        },
+        None -> clamped,
+    };
+    cellSet(m.vlmNoiseFloorDB, Some(nextFloor));
+
+    let bottom = maxHud(vlmQuietestDB(), nextFloor + vlmFloorMarginDB());
+    let minTop = minHud(vlmMaxCeilingDB(), maxHud(bottom + vlmMinSpanDB(), vlmInitialCeilingDB()));
+    let targetPeak = minHud(vlmMaxCeilingDB(), maxHud(minTop, db));
+
+    let nextPeak = match cellGet(m.vlmPeakCeilingDB) {
+        Some(pk) -> {
+            let tau = if (targetPeak > pk) 0.25 else 5.0;
+            pk + (targetPeak - pk) * (1.0 - exp((0.0 - seconds) / tau))
+        },
+        None -> minTop,
+    };
+    cellSet(m.vlmPeakCeilingDB, Some(nextPeak));
+
+    let top = maxHud(minTop, nextPeak);
+    clampHud((db - bottom) / (top - bottom), 0.0, 1.0)
+}
+
+// ============================================================================
+// 4. VoiceSpectrumAnalyzer (`VoiceHUDPanel.swift` lines 722-901)
+// ============================================================================
+
+def gSpectrumObjKey: Cell Ptr = cellNew(ptrNull())
+
+def spectrumObjAssocKey(): Ptr = {
+    let k = cellGet(gSpectrumObjKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gSpectrumObjKey, nk); nk }
+}
+
+data SpectrumRawBox {
+    srbPtr: Cell Ptr,
+}
+
+def spectrumHolderDealloc(self: Ptr, cmd: Ptr): Void = {
+    let h = objcGetAssocHandle(self, spectrumObjAssocKey());
+    if (h != intToI64(0)) {
+        let box: SpectrumRawBox = gcHandleGet(h);
+        let raw = cellGet(box.srbPtr);
+        if (!ptrIsNull(raw)) {
+            cellSet(box.srbPtr, ptrNull());
+            c_spectrumFree(raw)
+        } else ()
+    } else ();
+    objcSendSuperVoid0(self, "NSObject", cmd)
+}
+
+pub data VoiceSpectrumAnalyzer {
+    vsaHolder: Id NSObject,
+    vsaRawPtr: Ptr,
+}
+
+pub def voiceSpectrumFrameDuration(): Float = 0.025
+pub def voiceSpectrumBarCount(): Int = 11
+
+pub def voiceSpectrumBandEdgesHz(): Vec Float = {
+    let v = vecWithCap(12);
+    vecPush(v, 130.0); vecPush(v, 210.0); vecPush(v, 310.0); vecPush(v, 450.0);
+    vecPush(v, 650.0); vecPush(v, 920.0); vecPush(v, 1300.0); vecPush(v, 1800.0);
+    vecPush(v, 2400.0); vecPush(v, 3100.0); vecPush(v, 3900.0); vecPush(v, 4800.0);
+    v
+}
+
+pub def voiceSpectrumBarToBand(): Vec Int = {
+    let v = vecWithCap(11);
+    vecPush(v, 9); vecPush(v, 7); vecPush(v, 0); vecPush(v, 5); vecPush(v, 2);
+    vecPush(v, 3); vecPush(v, 4); vecPush(v, 1); vecPush(v, 6); vecPush(v, 8); vecPush(v, 10);
+    v
+}
+
+pub def voiceSpectrumBarTaper(): Vec Float = {
+    let v = vecWithCap(11);
+    vecPush(v, 0.66); vecPush(v, 0.78); vecPush(v, 0.88); vecPush(v, 0.94); vecPush(v, 0.98);
+    vecPush(v, 1.00); vecPush(v, 0.98); vecPush(v, 0.94); vecPush(v, 0.88); vecPush(v, 0.78); vecPush(v, 0.66);
+    v
+}
+
+pub def voiceSpectrumNew(): VoiceSpectrumAnalyzer = {
+    let raw = c_spectrumNew();
+    let obj = msgSend0(msgSend0(objcClass("JuxuGeishaVoiceSpectrumHolder"), objcSel("alloc")), objcSel("init"));
+    let box = SpectrumRawBox { srbPtr: cellNew(raw) };
+    objcSetAssocHandle(obj, spectrumObjAssocKey(), gcHandleNew(box));
+    VoiceSpectrumAnalyzer {
+        vsaHolder: idAdopt(obj),
+        vsaRawPtr: raw,
+    }
+}
+
+/// Slice a raw `float*` PCM buffer into ~25ms sub-windows and return one 11-bar `Vec Float` per slice.
+pub def voiceSpectrumProcessPtr(
+    vsa: VoiceSpectrumAnalyzer,
+    samplesF32Ptr: Ptr,
+    count: Int,
+    sampleRate: Float
+): Vec (Vec Float) = {
+    let _keep = vsa.vsaHolder;
+    let out: Vec (Vec Float) = vecNew();
+    if (count <= 0 || sampleRate <= 0.0 || ptrIsNull(samplesF32Ptr) || ptrIsNull(vsa.vsaRawPtr)) out
+    else {
+        let cap = c_spectrumFrameCap(count, sampleRate);
+        if (cap <= 0) out
+        else {
+            let outBuf = c_f32BufAlloc(cap * 11);
+            let nFrames = c_spectrumProcess(vsa.vsaRawPtr, samplesF32Ptr, count, sampleRate, outBuf, cap);
+            let f = cellNew(0);
+            while (cellGet(f) < nFrames) {
+                let fi = cellGet(f);
+                let bars = vecWithCap(11);
+                let b = cellNew(0);
+                while (cellGet(b) < 11) {
+                    let bi = cellGet(b);
+                    vecPush(bars, f32ToFloat(c_f32BufGet(outBuf, fi * 11 + bi)));
+                    cellSet(b, bi + 1)
+                };
+                vecPush(out, bars);
+                cellSet(f, fi + 1)
+            };
+            c_f32BufFree(outBuf);
+            out
+        }
+    }
+}
+
+/// Process a `Vec Float` PCM buffer into ~25ms 11-bar frames.
+pub def voiceSpectrumProcessVec(
+    vsa: VoiceSpectrumAnalyzer,
+    samples: Vec Float,
+    sampleRate: Float
+): Vec (Vec Float) = {
+    let n = vecLen(samples);
+    if (n <= 0 || sampleRate <= 0.0) vecNew()
+    else {
+        let inBuf = c_f32BufAlloc(n);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let idx = cellGet(i);
+            c_f32BufSet(inBuf, idx, floatToF32(vecGetOr(samples, idx, 0.0)));
+            cellSet(i, idx + 1)
+        };
+        let res = voiceSpectrumProcessPtr(vsa, inBuf, n, sampleRate);
+        c_f32BufFree(inBuf);
+        res
+    }
+}
+
+/// Convenience helper for single-frame array inputs and deterministic unit tests.
+pub def voiceSpectrumProcessFrame(
+    vsa: VoiceSpectrumAnalyzer,
+    samples: Vec Float,
+    sampleRate: Float,
+    secondsOpt: Option Float
+): Vec Float = {
+    let _keep = vsa.vsaHolder;
+    let bars = vecWithCap(11);
+    let n = vecLen(samples);
+    if (n <= 0 || sampleRate <= 0.0 || ptrIsNull(vsa.vsaRawPtr)) {
+        let z = cellNew(0);
+        while (cellGet(z) < 11) {
+            vecPush(bars, 0.0);
+            cellSet(z, cellGet(z) + 1)
+        };
+        bars
+    } else {
+        let inBuf = c_f32BufAlloc(n);
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let idx = cellGet(i);
+            c_f32BufSet(inBuf, idx, floatToF32(vecGetOr(samples, idx, 0.0)));
+            cellSet(i, idx + 1)
+        };
+        let outBuf = c_f32BufAlloc(11);
+        let (hasSec, secVal) = match secondsOpt {
+            Some(s) -> (true, floatToF32(s)),
+            None    -> (false, floatToF32(0.0)),
+        };
+        c_spectrumProcessFrame(vsa.vsaRawPtr, inBuf, n, sampleRate, hasSec, secVal, outBuf);
+        let b = cellNew(0);
+        while (cellGet(b) < 11) {
+            let bi = cellGet(b);
+            vecPush(bars, f32ToFloat(c_f32BufGet(outBuf, bi)));
+            cellSet(b, bi + 1)
+        };
+        c_f32BufFree(outBuf);
+        c_f32BufFree(inBuf);
+        bars
+    }
+}
+
+// ============================================================================
+// 5. HUDBackdropView (`JuxuGeishaVoiceHudBackdropView`, Liquid Glass + Menu fallback)
+// ============================================================================
+
+data VoiceHudBackdropData {
+    vhbdContentContainer: Ptr,
+    vhbdBackdrop: Ptr,
+    vhbdUsesGlass: Bool,
+    vhbdCornerRadius: Cell Float,
+    vhbdShowsHairlineBorder: Cell Bool,
+}
+
+def gVoiceBackdropKey: Cell Ptr = cellNew(ptrNull())
+
+def voiceBackdropAssocKey(): Ptr = {
+    let k = cellGet(gVoiceBackdropKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gVoiceBackdropKey, nk); nk }
+}
+
+def applyVoiceBackdropBorder(view: Ptr, st: VoiceHudBackdropData): Void =
+    if (!st.vhbdUsesGlass) {
+        let layer = msgSend0(st.vhbdBackdrop, objcSel("layer"));
+        if (!ptrIsNull(layer)) {
+            if (!cellGet(st.vhbdShowsHairlineBorder)) {
+                c_layerBorderRgba(layer, 0.0, 0.0, 0.0, 0.0, 0.0)
+            } else if (hudViewIsDark(view)) {
+                c_layerBorderRgba(layer, 0.5, 1.0, 1.0, 1.0, 0.16)
+            } else {
+                c_layerBorderRgba(layer, 0.5, 0.0, 0.0, 0.0, 0.11)
+            }
+        } else ()
+    } else ()
+
+def applyVoiceBackdropCorner(st: VoiceHudBackdropData): Void = {
+    let r = cellGet(st.vhbdCornerRadius);
+    if (st.vhbdUsesGlass) {
+        msgSendVoid1Float(st.vhbdBackdrop, objcSel("setCornerRadius:"), r)
+    } else {
+        let layer = msgSend0(st.vhbdBackdrop, objcSel("layer"));
+        if (!ptrIsNull(layer)) {
+            c_layerContinuousCorner(layer, r, true)
+        } else ()
+    }
+}
+
+def syncVoiceBackdropFrames(view: Ptr, st: VoiceHudBackdropData): Void = {
+    let b = msgSendRect0(view, objcSel("bounds"));
+    let full = cgRect(0.0, 0.0, b.size.width, b.size.height);
+    msgSendVoid1Rect(st.vhbdBackdrop, objcSel("setFrame:"), full);
+    msgSendVoid1Rect(st.vhbdContentContainer, objcSel("setFrame:"), full)
+}
+
+def voiceBackdropLayout(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "NSView", cmd);
+    let h = objcGetAssocHandle(self, voiceBackdropAssocKey());
+    if (h != intToI64(0)) {
+        let st: VoiceHudBackdropData = gcHandleGet(h);
+        syncVoiceBackdropFrames(self, st)
+    } else ()
+}
+
+def voiceBackdropDidChangeAppearance(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "NSView", cmd);
+    let h = objcGetAssocHandle(self, voiceBackdropAssocKey());
+    if (h != intToI64(0)) {
+        let st: VoiceHudBackdropData = gcHandleGet(h);
+        applyVoiceBackdropBorder(self, st)
+    } else ()
+}
+
+def voiceHudBackdropCreate(frameRect: CGRect, cornerRadius: Float, showsHairlineBorder: Bool): Ptr = {
+    let zeroBounds = cgRect(0.0, 0.0, frameRect.size.width, frameRect.size.height);
+    let container = objcAllocInitFrame("NSView", zeroBounds);
+    msgSendVoid1I64(container, objcSel("setAutoresizingMask:"), intToI64(18));
+
+    let glassCls = objcClass("NSGlassEffectView");
+    let (backdrop, usesGlass) =
+        if (!ptrIsNull(glassCls)) {
+            let g = msgSendInitFrame(msgSend0(glassCls, objcSel("alloc")), objcSel("initWithFrame:"), zeroBounds);
+            msgSendVoid1Ptr(g, objcSel("setContentView:"), container);
+            (g, true)
+        } else {
+            let eff = objcAllocInitFrame("NSVisualEffectView", zeroBounds);
+            // material: .menu = 5, blendingMode: .behindWindow = 0, state: .active = 1
+            msgSendVoid1I64(eff, objcSel("setMaterial:"), intToI64(5));
+            msgSendVoid1I64(eff, objcSel("setBlendingMode:"), intToI64(0));
+            msgSendVoid1I64(eff, objcSel("setState:"), intToI64(1));
+            msgSendVoid1Bool(eff, objcSel("setWantsLayer:"), true);
+            msgSendVoid1Ptr(eff, objcSel("addSubview:"), container);
+            (eff, false)
+        };
+    objcReleaseRaw(container);
+
+    let wrapper = objcAllocInitFrame("JuxuGeishaVoiceHudBackdropView", frameRect);
+    msgSendVoid1Bool(wrapper, objcSel("setWantsLayer:"), true);
+    msgSendVoid1I64(backdrop, objcSel("setAutoresizingMask:"), intToI64(18));
+    msgSendVoid1Ptr(wrapper, objcSel("addSubview:"), backdrop);
+    objcReleaseRaw(backdrop);
+
+    let st = VoiceHudBackdropData {
+        vhbdContentContainer: container,
+        vhbdBackdrop: backdrop,
+        vhbdUsesGlass: usesGlass,
+        vhbdCornerRadius: cellNew(cornerRadius),
+        vhbdShowsHairlineBorder: cellNew(showsHairlineBorder),
+    };
+    objcSetAssocHandle(wrapper, voiceBackdropAssocKey(), gcHandleNew(st));
+    applyVoiceBackdropCorner(st);
+    applyVoiceBackdropBorder(wrapper, st);
+    wrapper
+}
+
+// ============================================================================
+// 6. JuxuGeishaVoiceHUDContentView (`VoiceHUDContentView`, lines 81-674)
+// ============================================================================
+
+pub data VoiceHUDMode : Eq {
+    VhmListening,
+    VhmProcessing,
+    VhmNotice,
+}
+
+pub data VoiceHUDContentViewState {
+    vhcvMode: Cell VoiceHUDMode,
+    vhcvTargetLevel: Cell Float,
+    vhcvSmoothedLevel: Cell Float,
+    vhcvTargetBands: Vec Float,
+    vhcvBarHeights: Vec Float,
+    vhcvBarEnvelope: Vec Float,
+    vhcvSpectrumQueue: Vec (Vec Float),
+    vhcvSpectrumStepElapsed: Cell Float,
+    vhcvSpectrumStaleElapsed: Cell Float,
+    vhcvHasSpectrumInput: Cell Bool,
+    vhcvBarsAlpha: Cell Float,
+    vhcvSpinnerAlpha: Cell Float,
+    vhcvSpinnerFrom: Cell Float,
+    vhcvSpinnerTarget: Cell Float,
+    vhcvSpinnerElapsed: Cell Float,
+    vhcvGroupOpacity: Cell Float,
+    vhcvClock: Cell Float,
+    vhcvLastTimestamp: Cell (Option Float),
+    vhcvDisplayLink: Cell Ptr,
+    vhcvCurrentPartial: Cell String,
+    vhcvCurrentTentativeCount: Cell Int,
+    vhcvCaptionSource: Cell String,
+    vhcvCaptionFitted: Cell String,
+    vhcvCaptionFadeCount: Cell Int,
+    vhcvCaptionFadeElapsed: Cell Float,
+    vhcvCardWidthFloor: Cell Float,
+    vhcvCardLinesFloor: Cell Int,
+    vhcvCurrentNotice: Cell String,
+    vhcvCurrentNoticeIsError: Cell Bool,
+    vhcvPillWidth: Cell Float,
+    vhcvPillWidthFrom: Cell Float,
+    vhcvPillWidthTarget: Cell Float,
+    vhcvPillResizeElapsed: Cell Float,
+    vhcvNoticeTextWidth: Cell Float,
+    vhcvReduceMotion: Cell Bool,
+    vhcvPillFrame: Cell CGRect,
+    vhcvCardFrameOpt: Cell (Option CGRect),
+    vhcvOnBackdropLayout: Cell ((CGRect, Option CGRect) -> Void),
+}
+
+def gHudContentKey: Cell Ptr = cellNew(ptrNull())
+
+def hudContentAssocKey(): Ptr = {
+    let k = cellGet(gHudContentKey);
+    if (!ptrIsNull(k)) k else { let nk = ptrAllocBytes(8); cellSet(gHudContentKey, nk); nk }
+}
+
+def replaceNewlinesWithSpaces(s: String): String = {
+    let n = strLen(s);
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let ch = strByteAt(s, idx);
+        if (ch == 10 || ch == 13) bufPushByte(b, 32) else bufPushByte(b, ch);
+        cellSet(i, idx + 1)
+    };
+    bufToString(b)
+}
+
+def commonScalarPrefixLen(a: String, b: String): Int = {
+    let sa = utf8ToScalars(a);
+    let sb = utf8ToScalars(b);
+    let lim = if (vecLen(sa) < vecLen(sb)) vecLen(sa) else vecLen(sb);
+    let k = cellNew(0);
+    while (cellGet(k) < lim && vecGetOr(sa, cellGet(k), -1) == vecGetOr(sb, cellGet(k), -2)) {
+        cellSet(k, cellGet(k) + 1)
+    };
+    cellGet(k)
+}
+
+/// Compute cumulative UTF-16 code-unit offsets of length `vecLen(scalars) + 1`.
+def scalarUtf16Offsets(scalars: Vec Int): Vec Int64 = {
+    let n = vecLen(scalars);
+    let offs = vecWithCap(n + 1);
+    let cur = cellNew(intToI64(0));
+    vecPush(offs, cellGet(cur));
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let cp = vecGetOr(scalars, cellGet(i), 0);
+        let step = if (cp >= 0x10000) intToI64(2) else intToI64(1);
+        cellSet(cur, cellGet(cur) + step);
+        vecPush(offs, cellGet(cur));
+        cellSet(i, cellGet(i) + 1)
+    };
+    offs
+}
+
+def hudPillTopFlipped(): Float =
+    vhmCanvasHeight() - vhmPillBottom() - vhmPillHeight()
+
+def hudIsResizingPill(st: VoiceHUDContentViewState): Bool =
+    abs(cellGet(st.vhcvPillWidth) - cellGet(st.vhcvPillWidthTarget)) > 0.001
+
+def hudIsFadingSpinner(st: VoiceHUDContentViewState): Bool =
+    abs(cellGet(st.vhcvSpinnerAlpha) - cellGet(st.vhcvSpinnerTarget)) > 0.001
+
+def hudNeedsFrames(st: VoiceHUDContentViewState): Bool =
+    cellGet(st.vhcvMode) != VhmNotice
+        || hudIsResizingPill(st)
+        || hudIsFadingSpinner(st)
+        || cellGet(st.vhcvCaptionFadeCount) > 0
+
+pub def voiceHUDViewReportBackdropLayout(st: VoiceHUDContentViewState): Void = {
+    let cb = cellGet(st.vhcvOnBackdropLayout);
+    cb(cellGet(st.vhcvPillFrame), cellGet(st.vhcvCardFrameOpt))
+}
+
+def hudSetPillWidth(st: VoiceHUDContentViewState, width: Float): Void = {
+    cellSet(st.vhcvPillWidth, width);
+    let pf = cgRect(
+        roundHud((vhmCanvasWidth() - width) * 0.5),
+        hudPillTopFlipped(),
+        width,
+        vhmPillHeight()
+    );
+    cellSet(st.vhcvPillFrame, pf);
+    voiceHUDViewReportBackdropLayout(st)
+}
+
+def hudLayoutPill(view: Ptr, st: VoiceHUDContentViewState, animated: Bool): Void = {
+    let mode = cellGet(st.vhcvMode);
+    let dotSpace = if (cellGet(st.vhcvCurrentNoticeIsError)) 12.0 else 0.0;
+    let width =
+        if (mode == VhmProcessing) vhmProcessingWidth()
+        else if (mode == VhmNotice) {
+            let noticeFont = hudFontSystem(12.5, 0.23);
+            let d = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
+            if (!ptrIsNull(noticeFont)) {
+                let _ = msgSend2Ptr(d, objcSel("setObject:forKey:"), noticeFont, nsStr("NSFont"));
+                ()
+            } else ();
+            let sz = msgSendSizeWithAttrsHud(nsStr(cellGet(st.vhcvCurrentNotice)), objcSel("sizeWithAttributes:"), d);
+            let ntw = minHud(vhmNoticeMaxTextWidth(), ceil(sz.width) + 1.0);
+            cellSet(st.vhcvNoticeTextWidth, ntw);
+            maxHud(vhmListeningWidth(), ntw + dotSpace + 28.0)
+        } else vhmListeningWidth();
+
+    cellSet(st.vhcvPillWidthTarget, width);
+    if (animated) {
+        cellSet(st.vhcvPillWidthFrom, cellGet(st.vhcvPillWidth));
+        cellSet(st.vhcvPillResizeElapsed, 0.0)
+    } else {
+        hudSetPillWidth(st, width)
+    };
+
+    let spinTarget = if (mode == VhmProcessing) 1.0 else 0.0;
+    cellSet(st.vhcvSpinnerTarget, spinTarget);
+    if (animated) {
+        cellSet(st.vhcvSpinnerFrom, cellGet(st.vhcvSpinnerAlpha));
+        cellSet(st.vhcvSpinnerElapsed, 0.0)
+    } else {
+        cellSet(st.vhcvSpinnerAlpha, spinTarget);
+        cellSet(st.vhcvSpinnerFrom, spinTarget);
+        cellSet(st.vhcvSpinnerElapsed, vhmPillResizeDuration())
+    };
+
+    if (!ptrIsNull(view)) {
+        msgSendVoid1Bool(view, objcSel("setNeedsDisplay:"), true)
+    } else ()
+}
+
+def hudLayoutCard(view: Ptr, st: VoiceHUDContentViewState): Void = {
+    let text = strTrim(replaceNewlinesWithSpaces(cellGet(st.vhcvCurrentPartial)));
+    if (cellGet(st.vhcvMode) != VhmListening || strLen(text) == 0) {
+        cellSet(st.vhcvCardFrameOpt, None);
+        cellSet(st.vhcvCaptionSource, "");
+        cellSet(st.vhcvCaptionFitted, "");
+        cellSet(st.vhcvCaptionFadeCount, 0);
+        voiceHUDViewReportBackdropLayout(st);
+        if (!ptrIsNull(view)) msgSendVoid1Bool(view, objcSel("setNeedsDisplay:"), true) else ()
+    } else {
+        let cardFont = hudFontSystem(14.0, 0.0);
+        let attrs = voiceHUDTextFitAttributes(cardFont, vhmCardLineHeight(), hudColorWhite());
+        let maxTextWidth = vhmCardMaxWidth() - vhmCardPadX() * 2.0;
+        let fitted = voiceHUDTextFitTailFitting(
+            text,
+            attrs,
+            maxTextWidth - 8.0,
+            vhmCardLineHeight(),
+            2
+        );
+        let naturalSz = msgSendSizeWithAttrsHud(nsStr(fitted), objcSel("sizeWithAttributes:"), attrs);
+        let natural = ceil(naturalSz.width) + 8.0;
+        let stepped = minHud(maxTextWidth, ceil(natural / 24.0) * 24.0);
+        let nextWidthFloor = maxHud(cellGet(st.vhcvCardWidthFloor), stepped);
+        cellSet(st.vhcvCardWidthFloor, nextWidthFloor);
+
+        let lines = voiceHUDTextFitLineCount(fitted, attrs, nextWidthFloor - 8.0, vhmCardLineHeight());
+        let clampedLines = if (lines > 2) 2 else lines;
+        let nextLinesFloor = if (clampedLines > cellGet(st.vhcvCardLinesFloor)) clampedLines else cellGet(st.vhcvCardLinesFloor);
+        cellSet(st.vhcvCardLinesFloor, nextLinesFloor);
+
+        let cardWidth = nextWidthFloor + vhmCardPadX() * 2.0;
+        let textHeight = intToFloat(nextLinesFloor) * vhmCardLineHeight();
+        let cardHeight = textHeight + vhmCardPadY() * 2.0;
+        let cardY = hudPillTopFlipped() - vhmCardGap() - cardHeight;
+        let cf = cgRect(
+            roundHud((vhmCanvasWidth() - cardWidth) * 0.5),
+            cardY,
+            cardWidth,
+            cardHeight
+        );
+        cellSet(st.vhcvCardFrameOpt, Some(cf));
+
+        let prevSource = cellGet(st.vhcvCaptionSource);
+        let unchanged = commonScalarPrefixLen(prevSource, text);
+        let textScalarCount = vecLen(utf8ToScalars(text));
+        let fittedScalarCount = vecLen(utf8ToScalars(fitted));
+        let diffCount = if (textScalarCount - unchanged > 0) textScalarCount - unchanged else 0;
+        let fadeCnt =
+            if (cellGet(st.vhcvReduceMotion)) 0
+            else if (diffCount < fittedScalarCount) diffCount else fittedScalarCount;
+        cellSet(st.vhcvCaptionFadeCount, fadeCnt);
+        cellSet(st.vhcvCaptionFadeElapsed, 0.0);
+        cellSet(st.vhcvCaptionSource, text);
+        cellSet(st.vhcvCaptionFitted, fitted);
+
+        voiceHUDViewReportBackdropLayout(st);
+        if (!ptrIsNull(view)) msgSendVoid1Bool(view, objcSel("setNeedsDisplay:"), true) else ()
+    }
+}
+
+def hudBuildCaptionAttributedString(view: Ptr, st: VoiceHUDContentViewState): Ptr = {
+    let isDark = hudViewIsDark(view);
+    let fgBase = if (isDark) hudColorWhite() else hudColorRgba(0.1, 0.1, 0.1, 1.0);
+    let groupOp = cellGet(st.vhcvGroupOpacity);
+    let fg = hudColorAlpha(fgBase, groupOp);
+    let cardFont = hudFontSystem(14.0, 0.0);
+    let attrs = voiceHUDTextFitAttributes(cardFont, vhmCardLineHeight(), fg);
+    let fitted = cellGet(st.vhcvCaptionFitted);
+
+    let mutCls = objcClass("NSMutableAttributedString");
+    let caption = msgSend2Ptr(
+        msgSend0(mutCls, objcSel("alloc")),
+        objcSel("initWithString:attributes:"),
+        nsStr(fitted),
+        attrs
+    );
+
+    let scs = utf8ToScalars(fitted);
+    let total = vecLen(scs);
+    let u16Offs = scalarUtf16Offsets(scs);
+    let tent = cellGet(st.vhcvCurrentTentativeCount);
+    let dimmed = if (tent < 0) 0 else if (tent > total) total else tent;
+
+    if (dimmed > 0) {
+        let startScalar = total - dimmed;
+        let uStart = vecGetOr(u16Offs, startScalar, intToI64(0));
+        let uEnd = vecGetOr(u16Offs, total, intToI64(0));
+        msgSendAddAttrRangeHud(
+            caption,
+            objcSel("addAttribute:value:range:"),
+            nsStr("NSColor"),
+            hudColorAlpha(fgBase, 0.55 * groupOp),
+            nsRange(uStart, uEnd - uStart)
+        )
+    } else ();
+
+    let fadeCount = cellGet(st.vhcvCaptionFadeCount);
+    if (fadeCount > 0 && fadeCount <= total) {
+        let stagger = minHud(0.012, vhmCaptionMaxStagger() / intToFloat(fadeCount));
+        let elapsed = cellGet(st.vhcvCaptionFadeElapsed);
+        let k = cellNew(0);
+        while (cellGet(k) < fadeCount) {
+            let ki = cellGet(k);
+            let scIdx = total - fadeCount + ki;
+            let u0 = vecGetOr(u16Offs, scIdx, intToI64(0));
+            let u1 = vecGetOr(u16Offs, scIdx + 1, u0);
+            let progress = clampHud((elapsed - stagger * intToFloat(ki)) / vhmCaptionFadeDuration(), 0.0, 1.0);
+            let baseAlpha = if (fadeCount - ki <= dimmed) 0.55 else 1.0;
+            msgSendAddAttrRangeHud(
+                caption,
+                objcSel("addAttribute:value:range:"),
+                nsStr("NSColor"),
+                hudColorAlpha(fgBase, baseAlpha * progress * groupOp),
+                nsRange(u0, u1 - u0)
+            );
+            cellSet(k, ki + 1)
+        }
+    } else ();
+
+    caption
+}
+
+def hudContentIsFlipped(_self: Ptr, _cmd: Ptr): Bool = true
+
+def hudContentDrawRect(self: Ptr, _cmd: Ptr, _dirty: CGRect): Void = {
+    let h = objcGetAssocHandle(self, hudContentAssocKey());
+    if (h != intToI64(0)) {
+        let st: VoiceHUDContentViewState = gcHandleGet(h);
+        let groupOp = cellGet(st.vhcvGroupOpacity);
+        if (groupOp > 0.001) {
+            let isDark = hudViewIsDark(self);
+            let fgR = if (isDark) 1.0 else 0.1;
+            let fgG = if (isDark) 1.0 else 0.1;
+            let fgB = if (isDark) 1.0 else 0.1;
+            let mode = cellGet(st.vhcvMode);
+
+            // 1. Caption bubble card (when listening with non-empty partial)
+            match cellGet(st.vhcvCardFrameOpt) {
+                Some(cf) -> if (strLen(cellGet(st.vhcvCaptionFitted)) > 0) {
+                    c_clipSaveRounded(cf.origin.x, cf.origin.y, cf.size.width, cf.size.height, 12.0);
+                    let textRect = cgRect(
+                        cf.origin.x + vhmCardPadX(),
+                        cf.origin.y + vhmCardPadY(),
+                        cellGet(st.vhcvCardWidthFloor),
+                        intToFloat(cellGet(st.vhcvCardLinesFloor)) * vhmCardLineHeight()
+                    );
+                    let captionAttr = hudBuildCaptionAttributedString(self, st);
+                    msgSendDrawInRectAttrHud(captionAttr, objcSel("drawInRect:"), textRect);
+                    objcReleaseRaw(captionAttr);
+                    c_clipRestore()
+                } else (),
+                None -> (),
+            };
+
+            // 2. Pill contents (clipped to pill rounded rect so widening notice never spills outside glass)
+            let pf = cellGet(st.vhcvPillFrame);
+            c_clipSaveRounded(pf.origin.x, pf.origin.y, pf.size.width, pf.size.height, vhmPillHeight() * 0.5);
+
+            if (mode != VhmNotice) {
+                let barCol = hudColorRgba(fgR, fgG, fgB, clampHud(cellGet(st.vhcvBarsAlpha) * groupOp, 0.0, 1.0));
+                let i = cellNew(0);
+                while (cellGet(i) < vhmBarCount()) {
+                    let bi = cellGet(i);
+                    let bh = maxHud(vhmBarMinHeight(), vecGetOr(st.vhcvBarHeights, bi, vhmBarWidth()));
+                    let bx = pf.origin.x + vhmBarsInset() + intToFloat(bi) * vhmBarPitch();
+                    let by = pf.origin.y + (vhmPillHeight() - bh) * 0.5;
+                    hudFillRoundedRect(cgRect(bx, by, vhmBarWidth(), bh), 0.7, barCol);
+                    cellSet(i, bi + 1)
+                }
+            } else ();
+
+            let spinAlpha = cellGet(st.vhcvSpinnerAlpha);
+            if (spinAlpha > 0.001) {
+                let cx = pf.origin.x + pf.size.width - 17.0;
+                let cy = pf.origin.y + vhmPillHeight() * 0.5;
+                let head = if (cellGet(st.vhcvReduceMotion)) 0 else (floatToInt(floor(cellGet(st.vhcvClock) * 12.0)) % 8);
+                let s = cellNew(0);
+                while (cellGet(s) < 8) {
+                    let si = cellGet(s);
+                    let age = (head - si + 8) % 8;
+                    let spokeOp = (1.0 - 0.6 * intToFloat(age) / 7.0) * spinAlpha * groupOp;
+                    // Clockwise step around circle in flipped coordinates
+                    let theta = intToFloat(si) * pi() * 0.25;
+                    let sx = cx + 5.4 * sin(theta);
+                    let sy = cy - 5.4 * cos(theta);
+                    c_drawSpoke(sx, sy, theta, fgR, fgG, fgB, clampHud(spokeOp, 0.0, 1.0));
+                    cellSet(s, si + 1)
+                }
+            } else ();
+
+            if (mode == VhmNotice) {
+                let isErr = cellGet(st.vhcvCurrentNoticeIsError);
+                let dotSpace = if (isErr) 12.0 else 0.0;
+                if (isErr) {
+                    let redCol = hudColorAlpha(hudColorSystemRed(), groupOp);
+                    hudFillRoundedRect(cgRect(pf.origin.x + 14.0, pf.origin.y + 11.0, 6.0, 6.0), 3.0, redCol)
+                } else ();
+
+                let noticeFont = hudFontSystem(12.5, 0.23);
+                let pStyle = msgSend0(msgSend0(objcClass("NSMutableParagraphStyle"), objcSel("alloc")), objcSel("init"));
+                // NSLineBreakByTruncatingTail == 4
+                msgSendVoid1I64(pStyle, objcSel("setLineBreakMode:"), intToI64(4));
+                let nDict = msgSend0(objcClass("NSMutableDictionary"), objcSel("dictionary"));
+                if (!ptrIsNull(noticeFont)) {
+                    let _ = msgSend2Ptr(nDict, objcSel("setObject:forKey:"), noticeFont, nsStr("NSFont"));
+                    ()
+                } else ();
+                let _ = msgSend2Ptr(nDict, objcSel("setObject:forKey:"), hudColorRgba(fgR, fgG, fgB, groupOp), nsStr("NSColor"));
+                let _ = msgSend2Ptr(nDict, objcSel("setObject:forKey:"), pStyle, nsStr("NSParagraphStyle"));
+                objcReleaseRaw(pStyle);
+
+                let nAttr = msgSend2Ptr(
+                    msgSend0(objcClass("NSAttributedString"), objcSel("alloc")),
+                    objcSel("initWithString:attributes:"),
+                    nsStr(cellGet(st.vhcvCurrentNotice)),
+                    nDict
+                );
+                let ntw = cellGet(st.vhcvNoticeTextWidth);
+                msgSendDrawInRectAttrHud(
+                    nAttr,
+                    objcSel("drawInRect:"),
+                    cgRect(pf.origin.x + 14.0 + dotSpace, pf.origin.y + 6.0, ntw, 16.0)
+                );
+                objcReleaseRaw(nAttr)
+            } else ();
+
+            c_clipRestore()
+        } else ()
+    } else ()
+}
+
+def hudContentDidChangeAppearance(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "NSView", cmd);
+    msgSendVoid1Bool(self, objcSel("setNeedsDisplay:"), true)
+}
+
+def hudContentDealloc(self: Ptr, cmd: Ptr): Void = {
+    let h = objcGetAssocHandle(self, hudContentAssocKey());
+    if (h != intToI64(0)) {
+        let st: VoiceHUDContentViewState = gcHandleGet(h);
+        let dl = cellGet(st.vhcvDisplayLink);
+        if (!ptrIsNull(dl)) {
+            cellSet(st.vhcvDisplayLink, ptrNull());
+            c_stopDisplayLink(dl)
+        } else ()
+    } else ();
+    objcSendSuperVoid0(self, "NSView", cmd)
+}
+
+pub def voiceHUDViewCreate(frame: CGRect): (Ptr, VoiceHUDContentViewState) = {
+    let count = vhmBarCount();
+    let centre = intToFloat(count - 1) * 0.5;
+    let env = vecWithCap(count);
+    let heights = vecWithCap(count);
+    let bands = vecWithCap(count);
+    let i = cellNew(0);
+    while (cellGet(i) < count) {
+        let idx = cellGet(i);
+        vecPush(env, 1.0 - pow(abs(intToFloat(idx) - centre) / (centre + 1.0), 1.5));
+        vecPush(heights, vhmBarWidth());
+        vecPush(bands, 0.0);
+        cellSet(i, idx + 1)
+    };
+
+    let initPill = cgRect(
+        roundHud((vhmCanvasWidth() - vhmListeningWidth()) * 0.5),
+        hudPillTopFlipped(),
+        vhmListeningWidth(),
+        vhmPillHeight()
+    );
+
+    let st = VoiceHUDContentViewState {
+        vhcvMode: cellNew(VhmListening),
+        vhcvTargetLevel: cellNew(0.0),
+        vhcvSmoothedLevel: cellNew(0.0),
+        vhcvTargetBands: bands,
+        vhcvBarHeights: heights,
+        vhcvBarEnvelope: env,
+        vhcvSpectrumQueue: vecNew(),
+        vhcvSpectrumStepElapsed: cellNew(0.0),
+        vhcvSpectrumStaleElapsed: cellNew(0.0),
+        vhcvHasSpectrumInput: cellNew(false),
+        vhcvBarsAlpha: cellNew(1.0),
+        vhcvSpinnerAlpha: cellNew(0.0),
+        vhcvSpinnerFrom: cellNew(0.0),
+        vhcvSpinnerTarget: cellNew(0.0),
+        vhcvSpinnerElapsed: cellNew(0.0),
+        vhcvGroupOpacity: cellNew(1.0),
+        vhcvClock: cellNew(0.0),
+        vhcvLastTimestamp: cellNew(None),
+        vhcvDisplayLink: cellNew(ptrNull()),
+        vhcvCurrentPartial: cellNew(""),
+        vhcvCurrentTentativeCount: cellNew(0),
+        vhcvCaptionSource: cellNew(""),
+        vhcvCaptionFitted: cellNew(""),
+        vhcvCaptionFadeCount: cellNew(0),
+        vhcvCaptionFadeElapsed: cellNew(0.0),
+        vhcvCardWidthFloor: cellNew(0.0),
+        vhcvCardLinesFloor: cellNew(1),
+        vhcvCurrentNotice: cellNew(""),
+        vhcvCurrentNoticeIsError: cellNew(false),
+        vhcvPillWidth: cellNew(vhmListeningWidth()),
+        vhcvPillWidthFrom: cellNew(vhmListeningWidth()),
+        vhcvPillWidthTarget: cellNew(vhmListeningWidth()),
+        vhcvPillResizeElapsed: cellNew(0.0),
+        vhcvNoticeTextWidth: cellNew(0.0),
+        vhcvReduceMotion: cellNew(false),
+        vhcvPillFrame: cellNew(initPill),
+        vhcvCardFrameOpt: cellNew(None),
+        vhcvOnBackdropLayout: cellNew((_p, _c) -> ()),
+    };
+
+    let v = objcAllocInitFrame("JuxuGeishaVoiceHUDContentView", frame);
+    objcSetAssocHandle(v, hudContentAssocKey(), gcHandleNew(st));
+    hudLayoutPill(v, st, false);
+    (v, st)
+}
+
+pub def voiceHUDViewSetOnBackdropLayout(
+    st: VoiceHUDContentViewState,
+    cb: (CGRect, Option CGRect) -> Void
+): Void =
+    cellSet(st.vhcvOnBackdropLayout, cb)
+
+def hudApplyBandTargets(st: VoiceHUDContentViewState, frame: Vec Float): Void = {
+    let lim = if (vecLen(st.vhcvTargetBands) < vecLen(frame)) vecLen(st.vhcvTargetBands) else vecLen(frame);
+    let i = cellNew(0);
+    while (cellGet(i) < lim) {
+        let idx = cellGet(i);
+        vecSet(st.vhcvTargetBands, idx, clampHud(vecGetOr(frame, idx, 0.0), 0.0, 1.0));
+        cellSet(i, idx + 1)
+    }
+}
+
+def hudPopFirstSpectrumFrame(q: Vec (Vec Float)): Vec Float = {
+    let empty: Vec Float = vecNew();
+    let n = vecLen(q);
+    if (n <= 0) empty
+    else {
+        let first = vecGetOr(q, 0, empty);
+        let tmp: Vec (Vec Float) = vecWithCap(n);
+        let i = cellNew(1);
+        while (cellGet(i) < n) {
+            vecPush(tmp, vecGetOr(q, cellGet(i), empty));
+            cellSet(i, cellGet(i) + 1)
+        };
+        vecClear(q);
+        let j = cellNew(0);
+        while (cellGet(j) < vecLen(tmp)) {
+            vecPush(q, vecGetOr(tmp, cellGet(j), empty));
+            cellSet(j, cellGet(j) + 1)
+        };
+        first
+    }
+}
+
+pub def voiceHUDViewEnqueueSpectrumFrames(
+    view: Ptr,
+    st: VoiceHUDContentViewState,
+    frames: Vec (Vec Float)
+): Void = {
+    let n = vecLen(frames);
+    if (n > 0) {
+        let empty: Vec Float = vecNew();
+        cellSet(st.vhcvHasSpectrumInput, true);
+        cellSet(st.vhcvSpectrumStaleElapsed, 0.0);
+        if (vecLen(st.vhcvSpectrumQueue) == 0) {
+            hudApplyBandTargets(st, vecGetOr(frames, 0, empty));
+            let i = cellNew(1);
+            while (cellGet(i) < n) {
+                vecPush(st.vhcvSpectrumQueue, vecGetOr(frames, cellGet(i), empty));
+                cellSet(i, cellGet(i) + 1)
+            };
+            cellSet(st.vhcvSpectrumStepElapsed, 0.0)
+        } else {
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                vecPush(st.vhcvSpectrumQueue, vecGetOr(frames, cellGet(i), empty));
+                cellSet(i, cellGet(i) + 1)
+            };
+            while (vecLen(st.vhcvSpectrumQueue) > 8) {
+                let _ = hudPopFirstSpectrumFrame(st.vhcvSpectrumQueue);
+                ()
+            }
+        };
+        if (!ptrIsNull(view)) msgSendVoid1Bool(view, objcSel("setNeedsDisplay:"), true) else ()
+    } else ()
+}
+
+pub def voiceHUDViewResetForPresentation(view: Ptr, st: VoiceHUDContentViewState): Void = {
+    cellSet(st.vhcvSmoothedLevel, 0.0);
+    cellSet(st.vhcvTargetLevel, 0.0);
+    vecClear(st.vhcvSpectrumQueue);
+    cellSet(st.vhcvSpectrumStepElapsed, 0.0);
+    cellSet(st.vhcvSpectrumStaleElapsed, 0.0);
+    cellSet(st.vhcvHasSpectrumInput, false);
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(st.vhcvTargetBands)) {
+        let idx = cellGet(i);
+        vecSet(st.vhcvTargetBands, idx, 0.0);
+        vecSet(st.vhcvBarHeights, idx, vhmBarWidth());
+        cellSet(i, idx + 1)
+    };
+    cellSet(st.vhcvBarsAlpha, 1.0);
+    cellSet(st.vhcvLastTimestamp, None);
+    cellSet(st.vhcvCurrentPartial, "");
+    cellSet(st.vhcvCaptionFadeCount, 0);
+    cellSet(st.vhcvCardWidthFloor, 0.0);
+    cellSet(st.vhcvCardLinesFloor, 1);
+    if (hudIsResizingPill(st)) {
+        cellSet(st.vhcvPillResizeElapsed, 0.0);
+        hudSetPillWidth(st, cellGet(st.vhcvPillWidthTarget))
+    } else ();
+    hudLayoutCard(view, st)
+}
+
+pub def voiceHUDViewApply(
+    view: Ptr,
+    st: VoiceHUDContentViewState,
+    hudState: VoiceHUDState,
+    animated: Bool
+): Void =
+    match hudState {
+        VhsHidden -> (),
+        _ -> {
+            let (newMode, lvl, partial, tent, notice, isErr) = match hudState {
+                VhsRecording(level, _elapsed, text, _modeLbl, tentative) ->
+                    (VhmListening, clampHud(level, 0.0, 1.0), text, tentative, "", false),
+                VhsTranscribing(_modeLbl) ->
+                    (VhmProcessing, 0.0, "", 0, "", false),
+                VhsPolishing(_preview) ->
+                    (VhmProcessing, 0.0, "", 0, "", false),
+                VhsNotice(text, errFlag) ->
+                    (VhmNotice, 0.0, "", 0, text, errFlag),
+                VhsHidden ->
+                    (VhmListening, 0.0, "", 0, "", false),
+            };
+            cellSet(st.vhcvTargetLevel, lvl);
+            let modeChanged = newMode != cellGet(st.vhcvMode);
+            let noticeChanged = notice != cellGet(st.vhcvCurrentNotice) || isErr != cellGet(st.vhcvCurrentNoticeIsError);
+            cellSet(st.vhcvMode, newMode);
+            cellSet(st.vhcvCurrentNotice, notice);
+            cellSet(st.vhcvCurrentNoticeIsError, isErr);
+            if (modeChanged || noticeChanged) {
+                hudLayoutPill(view, st, animated && !cellGet(st.vhcvReduceMotion))
+            } else ();
+            if (partial != cellGet(st.vhcvCurrentPartial) || tent != cellGet(st.vhcvCurrentTentativeCount)) {
+                cellSet(st.vhcvCurrentPartial, partial);
+                cellSet(st.vhcvCurrentTentativeCount, tent);
+                if (strLen(partial) == 0) {
+                    cellSet(st.vhcvCardWidthFloor, 0.0);
+                    cellSet(st.vhcvCardLinesFloor, 1)
+                } else ();
+                hudLayoutCard(view, st)
+            } else if (modeChanged) {
+                hudLayoutCard(view, st)
+            } else ()
+        },
+    }
+
+/// Advance waveform, pill smoothstep resize, caption character fade, and 8-spoke spinner by `dt` seconds.
+pub def voiceHUDViewAdvance(view: Ptr, st: VoiceHUDContentViewState, dt: Float): Void = {
+    cellSet(st.vhcvClock, cellGet(st.vhcvClock) + dt);
+
+    if (hudIsResizingPill(st)) {
+        let nextEl = cellGet(st.vhcvPillResizeElapsed) + dt;
+        cellSet(st.vhcvPillResizeElapsed, nextEl);
+        let t = minHud(1.0, nextEl / vhmPillResizeDuration());
+        let eased = t * t * (3.0 - 2.0 * t);
+        let fromW = cellGet(st.vhcvPillWidthFrom);
+        let targetW = cellGet(st.vhcvPillWidthTarget);
+        let w = if (t >= 1.0) targetW else roundHud(fromW + (targetW - fromW) * eased);
+        hudSetPillWidth(st, w);
+        if (t >= 1.0) cellSet(st.vhcvPillWidth, targetW) else ()
+    } else ();
+
+    if (hudIsFadingSpinner(st)) {
+        let nextSpEl = cellGet(st.vhcvSpinnerElapsed) + dt;
+        cellSet(st.vhcvSpinnerElapsed, nextSpEl);
+        let stT = minHud(1.0, nextSpEl / vhmPillResizeDuration());
+        let spFrom = cellGet(st.vhcvSpinnerFrom);
+        let spTgt = cellGet(st.vhcvSpinnerTarget);
+        cellSet(st.vhcvSpinnerAlpha, if (stT >= 1.0) spTgt else spFrom + (spTgt - spFrom) * stT)
+    } else ();
+
+    let dot = vhmBarWidth();
+    let span = vhmBarMaxHeight() - dot;
+    let mode = cellGet(st.vhcvMode);
+
+    if (mode != VhmListening) {
+        vecClear(st.vhcvSpectrumQueue);
+        cellSet(st.vhcvSpectrumStepElapsed, 0.0);
+        let z = cellNew(0);
+        while (cellGet(z) < vecLen(st.vhcvTargetBands)) {
+            vecSet(st.vhcvTargetBands, cellGet(z), 0.0);
+            cellSet(z, cellGet(z) + 1)
+        }
+    } else if (cellGet(st.vhcvHasSpectrumInput)) {
+        cellSet(st.vhcvSpectrumStepElapsed, cellGet(st.vhcvSpectrumStepElapsed) + dt);
+        let popped = cellNew(false);
+        while (cellGet(st.vhcvSpectrumStepElapsed) >= voiceSpectrumFrameDuration()
+               && vecLen(st.vhcvSpectrumQueue) > 0) {
+            let fr = hudPopFirstSpectrumFrame(st.vhcvSpectrumQueue);
+            hudApplyBandTargets(st, fr);
+            cellSet(st.vhcvSpectrumStepElapsed, cellGet(st.vhcvSpectrumStepElapsed) - voiceSpectrumFrameDuration());
+            cellSet(popped, true)
+        };
+        if (cellGet(popped)) {
+            cellSet(st.vhcvSpectrumStaleElapsed, 0.0)
+        } else if (vecLen(st.vhcvSpectrumQueue) == 0) {
+            cellSet(st.vhcvSpectrumStepElapsed, minHud(cellGet(st.vhcvSpectrumStepElapsed), voiceSpectrumFrameDuration()));
+            let stale = cellGet(st.vhcvSpectrumStaleElapsed) + dt;
+            cellSet(st.vhcvSpectrumStaleElapsed, stale);
+            if (stale > 0.16) {
+                let decay = exp((0.0 - dt) / 0.08);
+                let k = cellNew(0);
+                while (cellGet(k) < vecLen(st.vhcvTargetBands)) {
+                    let ki = cellGet(k);
+                    vecSet(st.vhcvTargetBands, ki, vecGetOr(st.vhcvTargetBands, ki, 0.0) * decay);
+                    cellSet(k, ki + 1)
+                }
+            } else ()
+        } else ()
+    } else {
+        let curSm = cellGet(st.vhcvSmoothedLevel);
+        let tgtLv = cellGet(st.vhcvTargetLevel);
+        let levelTau = if (tgtLv > curSm) 0.03 else 0.13;
+        cellSet(st.vhcvSmoothedLevel, curSm + (tgtLv - curSm) * (1.0 - exp((0.0 - dt) / levelTau)))
+    };
+
+    let energy = maxHud(0.0, (cellGet(st.vhcvSmoothedLevel) - 0.02) / 0.98);
+    let reduce = cellGet(st.vhcvReduceMotion);
+    let hasSpec = cellGet(st.vhcvHasSpectrumInput);
+    let clk = cellGet(st.vhcvClock);
+
+    let b = cellNew(0);
+    while (cellGet(b) < vhmBarCount()) {
+        let bi = cellGet(b);
+        let target =
+            if (mode == VhmListening) {
+                if (hasSpec) {
+                    let band = vecGetOr(st.vhcvTargetBands, bi, 0.0);
+                    if (band > 0.015) dot + span * band else dot
+                } else if (energy > 0.0) {
+                    let phase = intToFloat(bi) * 2.399;
+                    let wobble =
+                        if (reduce) 1.0
+                        else 0.74 + 0.26 * (0.5 + 0.5 * sin(clk * 11.0 + phase) * cos(clk * 6.7 + phase * 1.7));
+                    dot + span * energy * vecGetOr(st.vhcvBarEnvelope, bi, 1.0) * wobble
+                } else dot
+            } else dot;
+
+        let attackTau = if (reduce) 0.06 else if (hasSpec) 0.020 else 0.028;
+        let releaseTau = if (reduce) 0.14 else if (hasSpec) 0.068 else 0.10;
+        let prevH = vecGetOr(st.vhcvBarHeights, bi, dot);
+        let tau = if (target > prevH) attackTau else releaseTau;
+        let nextH = prevH + (target - prevH) * (1.0 - exp((0.0 - dt) / tau));
+        vecSet(st.vhcvBarHeights, bi, maxHud(dot, nextH));
+        cellSet(b, bi + 1)
+    };
+
+    let alphaTarget = if (mode == VhmProcessing) 0.42 else 1.0;
+    let prevAlpha = cellGet(st.vhcvBarsAlpha);
+    cellSet(st.vhcvBarsAlpha, prevAlpha + (alphaTarget - prevAlpha) * (1.0 - exp((0.0 - dt) / 0.09)));
+
+    if (cellGet(st.vhcvCaptionFadeCount) > 0) {
+        let nextFadeEl = cellGet(st.vhcvCaptionFadeElapsed) + dt;
+        cellSet(st.vhcvCaptionFadeElapsed, nextFadeEl);
+        if (nextFadeEl >= vhmCaptionFadeDuration() + vhmCaptionMaxStagger()) {
+            cellSet(st.vhcvCaptionFadeCount, 0)
+        } else ()
+    } else ();
+
+    if (!ptrIsNull(view)) {
+        msgSendVoid1Bool(view, objcSel("setNeedsDisplay:"), true)
+    } else ()
+}
+
+pub def voiceHUDViewIsAnimating(st: VoiceHUDContentViewState): Bool =
+    !ptrIsNull(cellGet(st.vhcvDisplayLink))
+
+pub def voiceHUDViewStopAnimating(st: VoiceHUDContentViewState): Void = {
+    let dl = cellGet(st.vhcvDisplayLink);
+    if (!ptrIsNull(dl)) {
+        cellSet(st.vhcvDisplayLink, ptrNull());
+        c_stopDisplayLink(dl)
+    } else ();
+    cellSet(st.vhcvLastTimestamp, None)
+}
+
+def hudDisplayLinkStepCallback(viewPtr: Ptr, nowTs: Float): Void =
+    if (!ptrIsNull(viewPtr)) {
+        let h = objcGetAssocHandle(viewPtr, hudContentAssocKey());
+        if (h != intToI64(0)) {
+            let st: VoiceHUDContentViewState = gcHandleGet(h);
+            let dt = match cellGet(st.vhcvLastTimestamp) {
+                Some(prev) -> clampHud(nowTs - prev, 0.001, 0.1),
+                None       -> 1.0 / 60.0,
+            };
+            cellSet(st.vhcvLastTimestamp, Some(nowTs));
+            voiceHUDViewAdvance(viewPtr, st, dt);
+            if (!hudNeedsFrames(st)) {
+                voiceHUDViewStopAnimating(st)
+            } else ()
+        } else ()
+    } else ()
+
+pub def voiceHUDViewStartAnimating(view: Ptr, st: VoiceHUDContentViewState): Void =
+    if (!ptrIsNull(view) && hudNeedsFrames(st) && ptrIsNull(cellGet(st.vhcvDisplayLink))) {
+        cellSet(st.vhcvLastTimestamp, None);
+        let dl = c_startDisplayLink(view, cFnPtr(hudDisplayLinkStepCallback));
+        cellSet(st.vhcvDisplayLink, dl)
+    } else ()
+
+/// Test helper exposing Objective-C zeroing weak reference liveness check.
+pub def voiceHUDWeakBoxNew(objPtr: Ptr): Ptr = c_weakBoxNew(objPtr)
+pub def voiceHUDWeakBoxIsAlive(slotPtr: Ptr): Bool = c_weakBoxIsAlive(slotPtr)
+pub def voiceHUDWeakBoxFree(slotPtr: Ptr): Void = c_weakBoxFree(slotPtr)
+
+// ============================================================================
+// 7. JuxuGeishaVoiceHUDPanel & VoiceHUDPanelController (`VoiceHUDPanel.swift` lines 906-1127)
+// ============================================================================
+
+def hudPanelCanBecomeKey(_self: Ptr, _cmd: Ptr): Bool = false
+
+pub data VoiceHUDPanelController {
+    vhpcPanel: Ptr,
+    vhpcContainer: Ptr,
+    vhpcContentView: Ptr,
+    vhpcContentState: VoiceHUDContentViewState,
+    vhpcPillBackdrop: Ptr,
+    vhpcCardBackdrop: Ptr,
+    vhpcHideGen: Cell Int64,
+    vhpcOrderOutGen: Cell Int64,
+    vhpcIsHiding: Cell Bool,
+}
+
+def gSharedHUDController: Cell (Option VoiceHUDPanelController) = cellNew(None)
+
+pub def voiceHUDControllerIsLoaded(): Bool =
+    match cellGet(gSharedHUDController) {
+        Some(_) -> true,
+        None    -> false,
+    }
+
+def rectEqHud(a: CGRect, b: CGRect): Bool =
+    abs(a.origin.x - b.origin.x) < 0.01
+        && abs(a.origin.y - b.origin.y) < 0.01
+        && abs(a.size.width - b.size.width) < 0.01
+        && abs(a.size.height - b.size.height) < 0.01
+
+def hudLayoutBackdrops(pillView: Ptr, cardView: Ptr, pillFrame: CGRect, cardFrameOpt: Option CGRect): Void = {
+    let curPill = msgSendRect0(pillView, objcSel("frame"));
+    if (!rectEqHud(curPill, pillFrame)) {
+        msgSendVoid1Rect(pillView, objcSel("setFrame:"), pillFrame);
+        msgSendVoid0(pillView, objcSel("layoutSubtreeIfNeeded"))
+    } else ();
+    match cardFrameOpt {
+        Some(cf) -> {
+            let curCard = msgSendRect0(cardView, objcSel("frame"));
+            if (!rectEqHud(curCard, cf)) {
+                msgSendVoid1Rect(cardView, objcSel("setFrame:"), cf)
+            } else ();
+            msgSendVoid1Bool(cardView, objcSel("setHidden:"), false)
+        },
+        None -> msgSendVoid1Bool(cardView, objcSel("setHidden:"), true),
+    }
+}
+
+def voiceHUDCreateController(): VoiceHUDPanelController = {
+    let sz = vhmCanvasSize();
+    let initialFrame = cgRect(0.0, 0.0, sz.width, sz.height);
+    let (content, contentSt) = voiceHUDViewCreate(initialFrame);
+    let pill = voiceHudBackdropCreate(cgRect(0.0, 0.0, 0.0, 0.0), vhmPillHeight() * 0.5, true);
+    let card = voiceHudBackdropCreate(cgRect(0.0, 0.0, 0.0, 0.0), 12.0, true);
+    msgSendVoid1Bool(card, objcSel("setHidden:"), true);
+
+    let container = objcAllocInitFrame("JuxuGeishaVoiceFlippedView", initialFrame);
+    msgSendVoid1Ptr(container, objcSel("addSubview:"), card);
+    msgSendVoid1Ptr(container, objcSel("addSubview:"), pill);
+    msgSendVoid1Ptr(container, objcSel("addSubview:"), content);
+    objcReleaseRaw(card);
+    objcReleaseRaw(pill);
+    objcReleaseRaw(content);
+
+    let alloc = msgSend0(objcClass("JuxuGeishaVoiceHUDPanel"), objcSel("alloc"));
+    // styleMask: [.borderless (0), .nonactivatingPanel (128)] = 128; backing: .buffered = 2; defer: true
+    let p = msgSend1Rect1U64_1I64_1Bool(
+        alloc,
+        objcSel("initWithContentRect:styleMask:backing:defer:"),
+        initialFrame,
+        intToI64(128),
+        intToI64(2),
+        true
+    );
+    msgSendVoid1Bool(p, objcSel("setReleasedWhenClosed:"), false);
+    // NSWindowAnimationBehaviorNone = 2
+    msgSendVoid1I64(p, objcSel("setAnimationBehavior:"), intToI64(2));
+    msgSendVoid1I64(p, objcSel("setLevel:"), c_floatingWindowLevel());
+    msgSendVoid1Bool(p, objcSel("setOpaque:"), false);
+    msgSendVoid1Ptr(p, objcSel("setBackgroundColor:"), hudColorClear());
+    msgSendVoid1Bool(p, objcSel("setHasShadow:"), false);
+    msgSendVoid1Bool(p, objcSel("setMovable:"), false);
+    msgSendVoid1Bool(p, objcSel("setIgnoresMouseEvents:"), true);
+    msgSendVoid1Bool(p, objcSel("setHidesOnDeactivate:"), false);
+    msgSendVoid1Bool(p, objcSel("setWorksWhenModal:"), true);
+    // [.canJoinAllSpaces (1), .transient (8), .ignoresCycle (64), .fullScreenAuxiliary (256)] = 329
+    msgSendVoid1I64(p, objcSel("setCollectionBehavior:"), intToI64(329));
+    msgSendVoid1Ptr(p, objcSel("setContentView:"), container);
+    objcReleaseRaw(container);
+
+    voiceHUDViewSetOnBackdropLayout(contentSt, (pf, cfOpt) -> {
+        hudLayoutBackdrops(pill, card, pf, cfOpt)
+    });
+    voiceHUDViewReportBackdropLayout(contentSt);
+
+    VoiceHUDPanelController {
+        vhpcPanel: p,
+        vhpcContainer: container,
+        vhpcContentView: content,
+        vhpcContentState: contentSt,
+        vhpcPillBackdrop: pill,
+        vhpcCardBackdrop: card,
+        vhpcHideGen: cellNew(intToI64(0)),
+        vhpcOrderOutGen: cellNew(intToI64(0)),
+        vhpcIsHiding: cellNew(false),
+    }
+}
+
+pub def voiceHUDControllerShared(): VoiceHUDPanelController =
+    match cellGet(gSharedHUDController) {
+        Some(existing) -> existing,
+        None -> {
+            let created = voiceHUDCreateController();
+            cellSet(gSharedHUDController, Some(created));
+            created
+        },
+    }
+
+/// Resolve bottom-center HUD origin on the screen containing `caretRect` (or primary screen when `caretRect == .zero`),
+/// clamped strictly inside `visibleFrame`.
+pub def voiceHUDResolvedPanelOrigin(caretRect: CGRect, visibleOverrideOpt: Option CGRect): CGPoint = {
+    let visible = match visibleOverrideOpt {
+        Some(v) -> v,
+        None -> {
+            let isZero = caretRect.origin.x == 0.0 && caretRect.origin.y == 0.0
+                && caretRect.size.width == 0.0 && caretRect.size.height == 0.0;
+            let caretPt = cgPoint(rectMidX(caretRect), rectMidY(caretRect));
+            let scCls = objcClass("NSScreen");
+            let fallback = cgRect(0.0, 0.0, 1440.0, 900.0);
+            if (ptrIsNull(scCls)) fallback
+            else {
+                let screens = msgSend0(scCls, objcSel("screens"));
+                let chosen = cellNew(ptrNull());
+                if (!isZero && !ptrIsNull(screens)) {
+                    let n = i64ToInt(msgSendI64_0(screens, objcSel("count")));
+                    let i = cellNew(0);
+                    while (cellGet(i) < n && ptrIsNull(cellGet(chosen))) {
+                        let sc = msgSend1I64_1Ptr(screens, objcSel("objectAtIndex:"), intToI64(cellGet(i)), ptrNull());
+                        if (!ptrIsNull(sc)) {
+                            let sf = msgSendRect0(sc, objcSel("frame"));
+                            if (rectContainsPoint(sf, caretPt) || rectIntersectsRect(sf, caretRect)) {
+                                cellSet(chosen, sc)
+                            } else ()
+                        } else ();
+                        cellSet(i, cellGet(i) + 1)
+                    }
+                } else ();
+                if (ptrIsNull(cellGet(chosen))) {
+                    let mainSc = msgSend0(scCls, objcSel("mainScreen"));
+                    if (!ptrIsNull(mainSc)) cellSet(chosen, mainSc)
+                    else if (!ptrIsNull(screens) && msgSendI64_0(screens, objcSel("count")) > intToI64(0)) {
+                        cellSet(chosen, msgSend1I64_1Ptr(screens, objcSel("objectAtIndex:"), intToI64(0), ptrNull()))
+                    } else ()
+                } else ();
+                let sc = cellGet(chosen);
+                if (ptrIsNull(sc)) fallback else msgSendRect0(sc, objcSel("visibleFrame"))
+            }
+        },
+    };
+    let sz = vhmCanvasSize();
+    let rawX = roundHud(rectMidX(visible) - sz.width * 0.5);
+    let rawY = roundHud(visible.origin.y);
+    let maxX = maxHud(visible.origin.x, rectMaxX(visible) - sz.width);
+    let maxY = maxHud(visible.origin.y, rectMaxY(visible) - sz.height);
+    cgPoint(clampHud(rawX, visible.origin.x, maxX), clampHud(rawY, visible.origin.y, maxY))
+}
+
+def hudPanelJustOrdered(opacity: Float): Bool =
+    opacity >= 0.999 || opacity <= 0.001
+
+def hudAnimateGroup(ctrl: VoiceHUDPanelController, visible: Bool): Void = {
+    let fromOp = cellGet(ctrl.vhpcContentState.vhcvGroupOpacity);
+    let startAlpha = if (visible && hudPanelJustOrdered(fromOp)) 0.0 else fromOp;
+    let targetAlpha = if (visible) 1.0 else 0.0;
+    cellSet(ctrl.vhpcContentState.vhcvGroupOpacity, targetAlpha);
+    msgSendVoid1Bool(ctrl.vhpcContentView, objcSel("setNeedsDisplay:"), true);
+
+    msgSendVoid1Float(ctrl.vhpcPillBackdrop, objcSel("setAlphaValue:"), startAlpha);
+    msgSendVoid1Float(ctrl.vhpcCardBackdrop, objcSel("setAlphaValue:"), startAlpha);
+    msgSendVoid1Float(ctrl.vhpcContentView, objcSel("setAlphaValue:"), startAlpha);
+
+    let pill = ctrl.vhpcPillBackdrop;
+    let card = ctrl.vhpcCardBackdrop;
+    let cv = ctrl.vhpcContentView;
+    let blk = objc.objcBlock1Ptr((ctx: Ptr) -> {
+        if (!ptrIsNull(ctx)) {
+            msgSendVoid1Float(ctx, objcSel("setDuration:"), vhmFadeDuration())
+        } else ();
+        let pAnim = msgSend0(pill, objcSel("animator"));
+        let cAnim = msgSend0(card, objcSel("animator"));
+        let vAnim = msgSend0(cv, objcSel("animator"));
+        if (!ptrIsNull(pAnim)) msgSendVoid1Float(pAnim, objcSel("setAlphaValue:"), targetAlpha) else ();
+        if (!ptrIsNull(cAnim)) msgSendVoid1Float(cAnim, objcSel("setAlphaValue:"), targetAlpha) else ();
+        if (!ptrIsNull(vAnim)) msgSendVoid1Float(vAnim, objcSel("setAlphaValue:"), targetAlpha) else ()
+    });
+    msgSendRunAnimGroupHud(objcClass("NSAnimationContext"), objcSel("runAnimationGroup:"), blk)
+}
+
+def hudFinishHide(ctrl: VoiceHUDPanelController): Void = {
+    cellSet(ctrl.vhpcIsHiding, false);
+    voiceHUDViewStopAnimating(ctrl.vhpcContentState);
+    cellSet(ctrl.vhpcContentState.vhcvGroupOpacity, 0.0);
+    msgSendVoid1Float(ctrl.vhpcPillBackdrop, objcSel("setAlphaValue:"), 0.0);
+    msgSendVoid1Float(ctrl.vhpcCardBackdrop, objcSel("setAlphaValue:"), 0.0);
+    msgSendVoid1Float(ctrl.vhpcContentView, objcSel("setAlphaValue:"), 0.0);
+    msgSendVoid1Ptr(ctrl.vhpcPanel, objcSel("orderOut:"), ptrNull())
+}
+
+def hudHideImmediately(ctrl: VoiceHUDPanelController): Void = {
+    cellSet(ctrl.vhpcHideGen, cellGet(ctrl.vhpcHideGen) + intToI64(1));
+    cellSet(ctrl.vhpcOrderOutGen, cellGet(ctrl.vhpcOrderOutGen) + intToI64(1));
+    hudFinishHide(ctrl)
+}
+
+pub def voiceHUDControllerHide(): Void =
+    match cellGet(gSharedHUDController) {
+        None -> (),
+        Some(ctrl) -> {
+            cellSet(ctrl.vhpcHideGen, cellGet(ctrl.vhpcHideGen) + intToI64(1));
+            voiceHUDViewStopAnimating(ctrl.vhpcContentState);
+            if (msgSendBool0(ctrl.vhpcPanel, objcSel("isVisible")) && !cellGet(ctrl.vhpcIsHiding)) {
+                cellSet(ctrl.vhpcIsHiding, true);
+                hudAnimateGroup(ctrl, false);
+                let ordGen = cellGet(ctrl.vhpcOrderOutGen) + intToI64(1);
+                cellSet(ctrl.vhpcOrderOutGen, ordGen);
+                let fadeMs = floatToInt(roundHud(vhmFadeDuration() * 1000.0));
+                dispatchMainAfterMs(fadeMs, () -> {
+                    if (cellGet(ctrl.vhpcOrderOutGen) == ordGen && cellGet(ctrl.vhpcIsHiding)) {
+                        hudFinishHide(ctrl)
+                    } else ()
+                })
+            } else ()
+        },
+    }
+
+pub def voiceHUDControllerUnload(): Void =
+    match cellGet(gSharedHUDController) {
+        None -> (),
+        Some(ctrl) -> {
+            hudHideImmediately(ctrl);
+            msgSendVoid0(ctrl.vhpcPanel, objcSel("close"));
+            objcReleaseRaw(ctrl.vhpcPanel);
+            cellSet(gSharedHUDController, None)
+        },
+    }
+
+pub def voiceHUDControllerEnqueueSpectrum(frames: Vec (Vec Float)): Void =
+    match cellGet(gSharedHUDController) {
+        None -> (),
+        Some(ctrl) -> voiceHUDViewEnqueueSpectrumFrames(ctrl.vhpcContentView, ctrl.vhpcContentState, frames),
+    }
+
+pub def voiceHUDControllerShow(
+    state: VoiceHUDState,
+    caretRect: CGRect,
+    clientWindowLevelOpt: Option Int64,
+    autoHideAfterOpt: Option Float
+): Void =
+    if (state == VhsHidden) {
+        voiceHUDControllerHide()
+    } else {
+        let ctrl = voiceHUDControllerShared();
+        let nextHideGen = cellGet(ctrl.vhpcHideGen) + intToI64(1);
+        cellSet(ctrl.vhpcHideGen, nextHideGen);
+
+        let wasHiding = cellGet(ctrl.vhpcIsHiding);
+        cellSet(ctrl.vhpcOrderOutGen, cellGet(ctrl.vhpcOrderOutGen) + intToI64(1));
+        cellSet(ctrl.vhpcIsHiding, false);
+
+        let isVis = msgSendBool0(ctrl.vhpcPanel, objcSel("isVisible"));
+        let isPresenting = !isVis || wasHiding;
+
+        cellSet(ctrl.vhpcContentState.vhcvReduceMotion, c_reduceMotion());
+        if (isPresenting) {
+            voiceHUDViewResetForPresentation(ctrl.vhpcContentView, ctrl.vhpcContentState)
+        } else ();
+        voiceHUDViewApply(ctrl.vhpcContentView, ctrl.vhpcContentState, state, !isPresenting);
+
+        let targetOrigin = voiceHUDResolvedPanelOrigin(caretRect, None);
+        let sz = vhmCanvasSize();
+        let baseLevel = c_floatingWindowLevel();
+        let targetLevel = match clientWindowLevelOpt {
+            Some(cLvl) -> {
+                let raised = cLvl + intToI64(1);
+                if (raised > baseLevel) raised else baseLevel
+            },
+            None -> baseLevel,
+        };
+        if (msgSendI64_0(ctrl.vhpcPanel, objcSel("level")) != targetLevel) {
+            msgSendVoid1I64(ctrl.vhpcPanel, objcSel("setLevel:"), targetLevel)
+        } else ();
+
+        let curFrame = msgSendRect0(ctrl.vhpcPanel, objcSel("frame"));
+        let nextFrame = cgRect(targetOrigin.x, targetOrigin.y, sz.width, sz.height);
+        if (!rectEqHud(curFrame, nextFrame)) {
+            msgSendSetFrameDisplayAnimHud(ctrl.vhpcPanel, objcSel("setFrame:display:animate:"), nextFrame, false, false)
+        } else ();
+
+        if (!isVis) {
+            msgSendVoid1Ptr(ctrl.vhpcPanel, objcSel("orderFrontRegardless"), ptrNull())
+        } else ();
+        if (isPresenting) {
+            hudAnimateGroup(ctrl, true)
+        } else ();
+
+        voiceHUDViewStartAnimating(ctrl.vhpcContentView, ctrl.vhpcContentState);
+
+        match autoHideAfterOpt {
+            Some(secs) -> if (secs > 0.0) {
+                let ms = floatToInt(roundHud(secs * 1000.0));
+                dispatchMainAfterMs(ms, () -> {
+                    if (cellGet(ctrl.vhpcHideGen) == nextHideGen) {
+                        voiceHUDControllerHide()
+                    } else ()
+                })
+            } else (),
+            None -> (),
+        }
+    }
+
+/// Wire `gVoiceHUDShowHook`, `gVoiceHUDHideHook`, `gVoiceHUDUnloadHook`, and `gVoiceHUDEnqueueSpectrumHook`
+/// in `voice_common` without eagerly allocating the `NSPanel`.
+pub def voiceHUDInitHooks(): Void = {
+    cellSet(gVoiceHUDShowHook, (st, caretRect, winLvlOpt, autoHide) -> {
+        let hideOpt = if (autoHide > 0.0) Some(autoHide) else None;
+        voiceHUDControllerShow(st, caretRect, winLvlOpt, hideOpt)
+    });
+    cellSet(gVoiceHUDHideHook, () -> voiceHUDControllerHide());
+    cellSet(gVoiceHUDUnloadHook, () -> voiceHUDControllerUnload());
+    cellSet(gVoiceHUDEnqueueSpectrumHook, (frames) -> voiceHUDControllerEnqueueSpectrum(frames))
+}
+
+// ============================================================================
+// Objective-C Subclass Registrations (`extern init(104)`)
+// ============================================================================
+
+extern init(104) def registerVoiceHUDClasses(): Void = {
+    let spCls = objcAllocateClass("NSObject", "JuxuGeishaVoiceSpectrumHolder");
+    if (!ptrIsNull(spCls)) {
+        let _ = objcAddMethod(spCls, "dealloc", cFnPtr(spectrumHolderDealloc), "v@:");
+        objcRegisterClass(spCls)
+    } else ();
+
+    let flCls = objcAllocateClass("NSView", "JuxuGeishaVoiceFlippedView");
+    if (!ptrIsNull(flCls)) {
+        let _ = objcAddMethod(flCls, "isFlipped", cFnPtr(hudContentIsFlipped), "B@:");
+        objcRegisterClass(flCls)
+    } else ();
+
+    let bdCls = objcAllocateClass("NSView", "JuxuGeishaVoiceHudBackdropView");
+    if (!ptrIsNull(bdCls)) {
+        let _ = objcAddMethod(bdCls, "isFlipped", cFnPtr(hudContentIsFlipped), "B@:");
+        let _ = objcAddMethod(bdCls, "layout", cFnPtr(voiceBackdropLayout), "v@:");
+        let _ = objcAddMethod(bdCls, "viewDidChangeEffectiveAppearance", cFnPtr(voiceBackdropDidChangeAppearance), "v@:");
+        objcRegisterClass(bdCls)
+    } else ();
+
+    let cvCls = objcAllocateClass("NSView", "JuxuGeishaVoiceHUDContentView");
+    if (!ptrIsNull(cvCls)) {
+        let _ = objcAddMethod(cvCls, "isFlipped", cFnPtr(hudContentIsFlipped), "B@:");
+        let _ = objcAddMethod(cvCls, "drawRect:", cFnPtr(hudContentDrawRect), "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+        let _ = objcAddMethod(cvCls, "viewDidChangeEffectiveAppearance", cFnPtr(hudContentDidChangeAppearance), "v@:");
+        let _ = objcAddMethod(cvCls, "dealloc", cFnPtr(hudContentDealloc), "v@:");
+        objcRegisterClass(cvCls)
+    } else ();
+
+    let pnCls = objcAllocateClass("NSPanel", "JuxuGeishaVoiceHUDPanel");
+    if (!ptrIsNull(pnCls)) {
+        let _ = objcAddMethod(pnCls, "canBecomeKeyWindow", cFnPtr(hudPanelCanBecomeKey), "B@:");
+        let _ = objcAddMethod(pnCls, "canBecomeMainWindow", cFnPtr(hudPanelCanBecomeKey), "B@:");
+        objcRegisterClass(pnCls)
+    } else ()
+}

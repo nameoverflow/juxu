@@ -1,0 +1,1322 @@
+/// Shared types, preferences store, keychain store, session timeline, partial stabilizer,
+/// and cross-layer hooks for the macOS Voice subsystem (`Voice*.swift`).
+/// All record fields use unique prefixes (`vp*`, `vpd*`, `vst*`, `vps*`, `vlcs*`, `vcs*`, `vgp*`)
+/// to satisfy Geisha's whole-program record field inference rule.
+
+use std.option.{Option, Some, None}
+use std.result.{Ok, Err}
+use std.list.{listRev}
+use std.generic
+use std.vec.{Vec, vecNew, vecLen, vecPush, vecGetOr, vecSet}
+use std.buf.{bufNew, bufPushStr, bufPushByte, bufToString}
+use std.str.{intToStr, strTrim}
+use std.path.{pathDirname}
+use std.codec.{Value, VBool, VStr, VObj}
+use std.json.{parse, stringifyPretty}
+use sys.fs.{fileExists, mkdirAll, readFile, writeFileAtomic}
+use juxu_shared.{
+    CGRect, nsStr, nsStrPtrToString, appleHomeDirectory,
+}
+
+def decodeUtf8Scalars(s: String): Vec Int = {
+    let out = vecNew();
+    let n = strLen(s);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let b0 = strByteAt(s, idx) & 0xFF;
+        if (b0 < 0x80) {
+            vecPush(out, b0);
+            cellSet(i, idx + 1)
+        } else if ((b0 & 0xE0) == 0xC0 && idx + 1 < n) {
+            let b1 = strByteAt(s, idx + 1) & 0x3F;
+            vecPush(out, ((b0 & 0x1F) << 6) | b1);
+            cellSet(i, idx + 2)
+        } else if ((b0 & 0xF0) == 0xE0 && idx + 2 < n) {
+            let b1 = strByteAt(s, idx + 1) & 0x3F;
+            let b2 = strByteAt(s, idx + 2) & 0x3F;
+            vecPush(out, ((b0 & 0x0F) << 12) | (b1 << 6) | b2);
+            cellSet(i, idx + 3)
+        } else if ((b0 & 0xF8) == 0xF0 && idx + 3 < n) {
+            let b1 = strByteAt(s, idx + 1) & 0x3F;
+            let b2 = strByteAt(s, idx + 2) & 0x3F;
+            let b3 = strByteAt(s, idx + 3) & 0x3F;
+            vecPush(out, ((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3);
+            cellSet(i, idx + 4)
+        } else {
+            cellSet(i, idx + 1)
+        }
+    };
+    out
+}
+
+extern "juxu_voice_kc_delete_ns" def c_voiceKcDeleteNs(nsAcc: Ptr): Bool
+extern "juxu_voice_kc_write_ns" def c_voiceKcWriteNs(nsAcc: Ptr, nsVal: Ptr): Bool
+extern "juxu_voice_kc_read_ns" def c_voiceKcReadNs(nsAcc: Ptr): Ptr
+extern "juxu_voice_cf_absolute_time" def c_voiceCfAbsoluteTime(): Float
+extern "juxu_voice_ax_is_trusted" def c_voiceAxIsTrusted(): Bool
+
+pub def voiceCfAbsoluteTime(): Float = c_voiceCfAbsoluteTime()
+pub def voiceAxIsTrusted(): Bool = c_voiceAxIsTrusted()
+
+// ---------------------------------------------------------------------------
+// 1. Enums & Presets (`VoicePreferences.swift` + `VoiceASREngine.swift`)
+// ---------------------------------------------------------------------------
+
+pub data VoiceProviderMode : Eq {
+    VpmCloudBYOK,
+    VpmLocal,
+}
+
+pub def vpmToRaw(m: VoiceProviderMode): String = match m {
+    VpmCloudBYOK -> "cloud_byok",
+    VpmLocal     -> "local",
+}
+pub def vpmFromRaw(s: String): VoiceProviderMode =
+    if (s == "local") VpmLocal else VpmCloudBYOK
+pub def vpmDisplayName(m: VoiceProviderMode): String = match m {
+    VpmCloudBYOK -> "云端 BYOK",
+    VpmLocal     -> "本地模型",
+}
+pub def vpmSummary(m: VoiceProviderMode): String = match m {
+    VpmCloudBYOK -> "预设服务填 Key 即用，或自定义 URL",
+    VpmLocal     -> "一键下载本机依赖与模型，离线按需运行",
+}
+
+pub data VoiceCloudPreset : Eq {
+    VcpGroq,
+    VcpOpenAI,
+    VcpSiliconFlow,
+    VcpCustom,
+}
+
+pub def vcpAllCases(): Vec VoiceCloudPreset = {
+    let v = vecNew();
+    vecPush(v, VcpGroq);
+    vecPush(v, VcpOpenAI);
+    vecPush(v, VcpSiliconFlow);
+    vecPush(v, VcpCustom);
+    v
+}
+
+pub def vcpToRaw(p: VoiceCloudPreset): String = match p {
+    VcpGroq        -> "groq",
+    VcpOpenAI      -> "openai",
+    VcpSiliconFlow -> "siliconflow",
+    VcpCustom      -> "custom",
+}
+pub def vcpFromRaw(s: String): VoiceCloudPreset =
+    if (s == "openai") VcpOpenAI
+    else if (s == "siliconflow") VcpSiliconFlow
+    else if (s == "custom") VcpCustom
+    else VcpGroq
+
+pub def vcpDisplayName(p: VoiceCloudPreset): String = match p {
+    VcpGroq        -> "Groq（推荐 · 极速）",
+    VcpOpenAI      -> "OpenAI",
+    VcpSiliconFlow -> "硅基流动（国内直连）",
+    VcpCustom      -> "自定义（OpenAI 兼容）",
+}
+pub def vcpDefaultBaseURL(p: VoiceCloudPreset): String = match p {
+    VcpGroq        -> "https://api.groq.com/openai/v1",
+    VcpOpenAI      -> "https://api.openai.com/v1",
+    VcpSiliconFlow -> "https://api.siliconflow.cn/v1",
+    VcpCustom      -> "https://api.openai.com/v1",
+}
+pub def vcpDefaultASRModel(p: VoiceCloudPreset): String = match p {
+    VcpGroq        -> "whisper-large-v3-turbo",
+    VcpOpenAI      -> "gpt-4o-mini-transcribe",
+    VcpSiliconFlow -> "FunAudioLLM/SenseVoiceSmall",
+    VcpCustom      -> "whisper-1",
+}
+pub def vcpDefaultLLMModel(p: VoiceCloudPreset): String = match p {
+    VcpGroq        -> "llama-3.3-70b-versatile",
+    VcpOpenAI      -> "gpt-4o-mini",
+    VcpSiliconFlow -> "Qwen/Qwen2.5-7B-Instruct",
+    VcpCustom      -> "gpt-4o-mini",
+}
+pub def vcpKeyPlaceholder(p: VoiceCloudPreset): String = match p {
+    VcpGroq -> "gsk_...",
+    _       -> "sk-...",
+}
+pub def vcpSubtitle(p: VoiceCloudPreset): String = match p {
+    VcpGroq        -> "单个 Key 同时驱动 Whisper v3 Turbo 识别 + Llama 3.3 极速整理",
+    VcpOpenAI      -> "单个 Key 同时驱动 gpt-4o-mini-transcribe + gpt-4o-mini 整理",
+    VcpSiliconFlow -> "国内直连，单个 Key 同时驱动 SenseVoice 识别 + Qwen2.5 整理",
+    VcpCustom      -> "自由填写 OpenAI 兼容 Base URL、模型名与 API Key",
+}
+
+pub data VoiceKeychainAccount : Eq {
+    VkaGroq,
+    VkaOpenAI,
+    VkaSiliconFlow,
+    VkaCustomASR,
+    VkaCustomLLM,
+}
+
+pub def vkaToRaw(a: VoiceKeychainAccount): String = match a {
+    VkaGroq        -> "cloud-key-groq",
+    VkaOpenAI      -> "cloud-key-openai",
+    VkaSiliconFlow -> "cloud-key-siliconflow",
+    VkaCustomASR   -> "cloud-key-custom-asr",
+    VkaCustomLLM   -> "cloud-key-custom-llm",
+}
+
+pub def vcpKeychainAccount(p: VoiceCloudPreset): VoiceKeychainAccount = match p {
+    VcpGroq        -> VkaGroq,
+    VcpOpenAI      -> VkaOpenAI,
+    VcpSiliconFlow -> VkaSiliconFlow,
+    VcpCustom      -> VkaCustomASR,
+}
+
+pub data VoiceLocalASRModelPreset : Eq {
+    VlaQwen3ASR,
+    VlaWhisperTurbo,
+    VlaWhisperBase,
+    VlaAppleSpeech,
+    VlaCustomHTTP,
+}
+
+pub def vlaAllCases(): Vec VoiceLocalASRModelPreset = {
+    let v = vecNew();
+    vecPush(v, VlaQwen3ASR);
+    vecPush(v, VlaWhisperTurbo);
+    vecPush(v, VlaWhisperBase);
+    vecPush(v, VlaAppleSpeech);
+    vecPush(v, VlaCustomHTTP);
+    v
+}
+
+pub def vlaToRaw(p: VoiceLocalASRModelPreset): String = match p {
+    VlaQwen3ASR     -> "qwen3_asr",
+    VlaWhisperTurbo -> "whisper_turbo",
+    VlaWhisperBase  -> "whisper_base",
+    VlaAppleSpeech  -> "apple_speech",
+    VlaCustomHTTP   -> "custom_http",
+}
+pub def vlaFromRaw(s: String): VoiceLocalASRModelPreset =
+    if (s == "qwen3_asr") VlaQwen3ASR
+    else if (s == "whisper_base") VlaWhisperBase
+    else if (s == "apple_speech") VlaAppleSpeech
+    else if (s == "custom_http") VlaCustomHTTP
+    else VlaWhisperTurbo
+
+pub def vlaDisplayName(p: VoiceLocalASRModelPreset): String = match p {
+    VlaQwen3ASR     -> "Qwen3-ASR 0.6B（推荐）",
+    VlaWhisperTurbo -> "Whisper v3 Turbo",
+    VlaWhisperBase  -> "Whisper Base（轻量极速）",
+    VlaAppleSpeech  -> "Apple 端侧语音（免下载）",
+    VlaCustomHTTP   -> "已有本地 HTTP 服务",
+}
+pub def vlaSizeLabel(p: VoiceLocalASRModelPreset): String = match p {
+    VlaQwen3ASR     -> "1.9 GB",
+    VlaWhisperTurbo -> "547 MB",
+    VlaWhisperBase  -> "142 MB",
+    VlaAppleSpeech  -> "0 MB",
+    VlaCustomHTTP   -> "0 MB",
+}
+pub def vlaEngineLabel(p: VoiceLocalASRModelPreset): String = match p {
+    VlaQwen3ASR     -> "Qwen 引擎",
+    VlaWhisperTurbo -> "whisper.cpp",
+    VlaWhisperBase  -> "whisper.cpp",
+    VlaAppleSpeech  -> "",
+    VlaCustomHTTP   -> "",
+}
+pub def vlaModelFilename(p: VoiceLocalASRModelPreset): Option String = match p {
+    VlaQwen3ASR     -> Some("Qwen3-ASR-0.6B-5eb1441"),
+    VlaWhisperTurbo -> Some("ggml-large-v3-turbo-q5_0.bin"),
+    VlaWhisperBase  -> Some("ggml-base.bin"),
+    VlaAppleSpeech  -> None,
+    VlaCustomHTTP   -> None,
+}
+pub def vlaIsEngineBackend(p: VoiceLocalASRModelPreset): Bool = match p {
+    VlaQwen3ASR     -> true,
+    VlaWhisperTurbo -> true,
+    VlaWhisperBase  -> true,
+    _               -> false,
+}
+
+pub data VoiceLocalLLMPreset : Eq {
+    VllQwen15B,
+    VllOllamaHTTP,
+    VllNone,
+}
+
+pub def vllAllCases(): Vec VoiceLocalLLMPreset = {
+    let v = vecNew();
+    vecPush(v, VllQwen15B);
+    vecPush(v, VllOllamaHTTP);
+    vecPush(v, VllNone);
+    v
+}
+
+pub def vllToRaw(p: VoiceLocalLLMPreset): String = match p {
+    VllQwen15B    -> "qwen_1_5b",
+    VllOllamaHTTP -> "ollama_http",
+    VllNone       -> "none",
+}
+pub def vllFromRaw(s: String): VoiceLocalLLMPreset =
+    if (s == "ollama_http") VllOllamaHTTP
+    else if (s == "none") VllNone
+    else VllQwen15B
+
+pub def vllDisplayName(p: VoiceLocalLLMPreset): String = match p {
+    VllQwen15B    -> "本地 Qwen2.5-1.5B（AI 整理）",
+    VllOllamaHTTP -> "已有本地服务（Ollama 等）",
+    VllNone       -> "不整理（原话直出）",
+}
+pub def vllSizeLabel(p: VoiceLocalLLMPreset): String = match p {
+    VllQwen15B -> "1.0 GB",
+    _          -> "0 MB",
+}
+pub def vllModelFilename(p: VoiceLocalLLMPreset): Option String = match p {
+    VllQwen15B -> Some("qwen2.5-1.5b-instruct-q4_k_m.gguf"),
+    _          -> None,
+}
+
+pub data VoiceTriggerKey : Eq {
+    VtkRightOption,
+    VtkRightCommand,
+    VtkFnKey,
+    VtkOptionSpace,
+}
+
+pub def vtkAllCases(): Vec VoiceTriggerKey = {
+    let v = vecNew();
+    vecPush(v, VtkRightOption);
+    vecPush(v, VtkRightCommand);
+    vecPush(v, VtkFnKey);
+    vecPush(v, VtkOptionSpace);
+    v
+}
+
+pub def vtkToRaw(k: VoiceTriggerKey): String = match k {
+    VtkRightOption  -> "right_option",
+    VtkRightCommand -> "right_command",
+    VtkFnKey        -> "fn_key",
+    VtkOptionSpace  -> "option_space",
+}
+pub def vtkFromRaw(s: String): VoiceTriggerKey =
+    if (s == "right_command") VtkRightCommand
+    else if (s == "fn_key") VtkFnKey
+    else if (s == "option_space") VtkOptionSpace
+    else VtkRightOption
+
+pub def vtkDisplayName(k: VoiceTriggerKey): String = match k {
+    VtkRightOption  -> "按住右 Option 键",
+    VtkRightCommand -> "按住右 Command 键",
+    VtkFnKey        -> "按住 Fn / 地球键",
+    VtkOptionSpace  -> "点按 Option + Space 启停",
+}
+pub def vtkIsHoldToTalk(k: VoiceTriggerKey): Bool = match k {
+    VtkOptionSpace -> false,
+    _              -> true,
+}
+pub def vtkModifierKeyCode(k: VoiceTriggerKey): Option Int = match k {
+    VtkRightOption  -> Some(0x3D),
+    VtkRightCommand -> Some(0x36),
+    VtkFnKey        -> Some(0x3F),
+    VtkOptionSpace  -> None,
+}
+
+pub data VoiceOutputMode : Eq {
+    VomSmartPolish,
+    VomRawDictation,
+}
+
+pub def vomAllCases(): Vec VoiceOutputMode = {
+    let v = vecNew();
+    vecPush(v, VomSmartPolish);
+    vecPush(v, VomRawDictation);
+    v
+}
+pub def vomToRaw(m: VoiceOutputMode): String = match m {
+    VomSmartPolish  -> "smart_polish",
+    VomRawDictation -> "raw_dictation",
+}
+pub def vomFromRaw(s: String): VoiceOutputMode =
+    if (s == "raw_dictation") VomRawDictation else VomSmartPolish
+pub def vomDisplayName(m: VoiceOutputMode): String = match m {
+    VomSmartPolish  -> "智能整理（推荐）",
+    VomRawDictation -> "原始听写（原话直出）",
+}
+
+pub data VoiceToneMode : Eq {
+    VtmAutoByApp,
+    VtmCasual,
+    VtmProfessional,
+    VtmConcise,
+}
+
+pub def vtmAllCases(): Vec VoiceToneMode = {
+    let v = vecNew();
+    vecPush(v, VtmAutoByApp);
+    vecPush(v, VtmCasual);
+    vecPush(v, VtmProfessional);
+    vecPush(v, VtmConcise);
+    v
+}
+pub def vtmToRaw(t: VoiceToneMode): String = match t {
+    VtmAutoByApp    -> "auto_by_app",
+    VtmCasual       -> "casual",
+    VtmProfessional -> "professional",
+    VtmConcise      -> "concise",
+}
+pub def vtmFromRaw(s: String): VoiceToneMode =
+    if (s == "casual") VtmCasual
+    else if (s == "professional") VtmProfessional
+    else if (s == "concise") VtmConcise
+    else VtmAutoByApp
+pub def vtmDisplayName(t: VoiceToneMode): String = match t {
+    VtmAutoByApp    -> "按当前应用自动适配",
+    VtmCasual       -> "自然口语（聊天）",
+    VtmProfessional -> "清晰书面（邮件/文档）",
+    VtmConcise      -> "精炼要点（列表/结论）",
+}
+
+// ---------------------------------------------------------------------------
+// 2. VoicePreferences & Keychain & Store
+// ---------------------------------------------------------------------------
+
+pub data VoicePreferences {
+    vpEnabled: Bool,
+    vpProviderMode: VoiceProviderMode,
+    vpTriggerKey: VoiceTriggerKey,
+    vpOutputMode: VoiceOutputMode,
+    vpToneMode: VoiceToneMode,
+    vpLanguage: String,
+    vpSpeakToEditSelection: Bool,
+    vpSyncJuxuLexicon: Bool,
+    vpCustomVocabulary: String,
+    vpCloudPreset: VoiceCloudPreset,
+    vpCloudPolishEnabled: Bool,
+    vpCustomBaseURL: String,
+    vpCustomASRModel: String,
+    vpCustomLLMModel: String,
+    vpCustomSplitLLM: Bool,
+    vpCustomLLMBaseURL: String,
+    vpLocalASRPreset: VoiceLocalASRModelPreset,
+    vpLocalAppleLocale: String,
+    vpLocalAppleRequireOnDevice: Bool,
+    vpLocalHTTPASRBaseURL: String,
+    vpLocalHTTPASRModel: String,
+    vpLocalLLMPreset: VoiceLocalLLMPreset,
+    vpLocalHTTPLLMBaseURL: String,
+    vpLocalHTTPLLMModel: String,
+    vpGlobalVoiceHotkey: Option Bool,
+    vpVoiceCues: Option Bool,
+    vpContextCapture: Option Bool,
+    vpContextBlacklist: Option Bool,
+    vpScreenContextToCloud: Option Bool,
+}
+
+pub def defaultVoicePreferences(): VoicePreferences = VoicePreferences {
+    vpEnabled: false,
+    vpProviderMode: VpmCloudBYOK,
+    vpTriggerKey: VtkRightOption,
+    vpOutputMode: VomSmartPolish,
+    vpToneMode: VtmAutoByApp,
+    vpLanguage: "zh",
+    vpSpeakToEditSelection: true,
+    vpSyncJuxuLexicon: true,
+    vpCustomVocabulary: "",
+    vpCloudPreset: VcpGroq,
+    vpCloudPolishEnabled: true,
+    vpCustomBaseURL: "https://api.openai.com/v1",
+    vpCustomASRModel: "whisper-1",
+    vpCustomLLMModel: "gpt-4o-mini",
+    vpCustomSplitLLM: false,
+    vpCustomLLMBaseURL: "https://api.deepseek.com/v1",
+    vpLocalASRPreset: VlaWhisperTurbo,
+    vpLocalAppleLocale: "zh-CN",
+    vpLocalAppleRequireOnDevice: true,
+    vpLocalHTTPASRBaseURL: "http://127.0.0.1:8080/v1",
+    vpLocalHTTPASRModel: "whisper-1",
+    vpLocalLLMPreset: VllQwen15B,
+    vpLocalHTTPLLMBaseURL: "http://127.0.0.1:11434/v1",
+    vpLocalHTTPLLMModel: "qwen2.5:3b",
+    vpGlobalVoiceHotkey: None,
+    vpVoiceCues: None,
+    vpContextCapture: None,
+    vpContextBlacklist: None,
+    vpScreenContextToCloud: None,
+}
+
+pub def vpIsGlobalHotkeyEnabled(p: VoicePreferences): Bool = match p.vpGlobalVoiceHotkey {
+    Some(b) -> b,
+    None    -> false,
+}
+pub def vpAreVoiceCuesEnabled(p: VoicePreferences): Bool = match p.vpVoiceCues {
+    Some(b) -> b,
+    None    -> true,
+}
+pub def vpIsContextCaptureEnabled(p: VoicePreferences): Bool = match p.vpContextCapture {
+    Some(b) -> b,
+    None    -> true,
+}
+pub def vpRespectsContextBlacklist(p: VoicePreferences): Bool = match p.vpContextBlacklist {
+    Some(b) -> b,
+    None    -> true,
+}
+pub def vpSendsScreenContextToCloud(p: VoicePreferences): Bool = match p.vpScreenContextToCloud {
+    Some(b) -> b,
+    None    -> false,
+}
+
+pub def vpEffectiveCloudASRBaseURL(p: VoicePreferences): String = match p.vpCloudPreset {
+    VcpCustom -> p.vpCustomBaseURL,
+    preset    -> vcpDefaultBaseURL(preset),
+}
+pub def vpEffectiveCloudASRModel(p: VoicePreferences): String = match p.vpCloudPreset {
+    VcpCustom -> p.vpCustomASRModel,
+    preset    -> vcpDefaultASRModel(preset),
+}
+pub def vpEffectiveCloudLLMBaseURL(p: VoicePreferences): String = match p.vpCloudPreset {
+    VcpCustom -> if (p.vpCustomSplitLLM) p.vpCustomLLMBaseURL else p.vpCustomBaseURL,
+    preset    -> vcpDefaultBaseURL(preset),
+}
+pub def vpEffectiveCloudLLMModel(p: VoicePreferences): String = match p.vpCloudPreset {
+    VcpCustom -> p.vpCustomLLMModel,
+    preset    -> vcpDefaultLLMModel(preset),
+}
+pub def vpEffectiveCloudASRKeyAccount(p: VoicePreferences): VoiceKeychainAccount =
+    vcpKeychainAccount(p.vpCloudPreset)
+pub def vpEffectiveCloudLLMKeyAccount(p: VoicePreferences): VoiceKeychainAccount = match p.vpCloudPreset {
+    VcpCustom -> if (p.vpCustomSplitLLM) VkaCustomLLM else VkaCustomASR,
+    preset    -> vcpKeychainAccount(preset),
+}
+
+def pushCodepointUtf8(b: std.buf.StringBuf, cp: Int): Void =
+    if (cp < 0x80) {
+        bufPushByte(b, cp)
+    } else if (cp < 0x800) {
+        bufPushByte(b, 0xC0 | (cp >> 6));
+        bufPushByte(b, 0x80 | (cp & 0x3F))
+    } else if (cp < 0x10000) {
+        bufPushByte(b, 0xE0 | (cp >> 12));
+        bufPushByte(b, 0x80 | ((cp >> 6) & 0x3F));
+        bufPushByte(b, 0x80 | (cp & 0x3F))
+    } else {
+        bufPushByte(b, 0xF0 | (cp >> 18));
+        bufPushByte(b, 0x80 | ((cp >> 12) & 0x3F));
+        bufPushByte(b, 0x80 | ((cp >> 6) & 0x3F));
+        bufPushByte(b, 0x80 | (cp & 0x3F))
+    }
+
+def isVocabSep(cp: Int): Bool =
+    cp == 44 || cp == 0xFF0C || cp == 10 || cp == 13 || cp == 59 || cp == 0xFF1B
+
+pub def vpParsedCustomVocabulary(p: VoicePreferences): Vec String = {
+    let cps = decodeUtf8Scalars(p.vpCustomVocabulary);
+    let out = vecNew();
+    let cur = cellNew(bufNew());
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(cps)) {
+        let idx = cellGet(i);
+        let cp = vecGetOr(cps, idx, 0);
+        if (isVocabSep(cp)) {
+            let s = strTrim(bufToString(cellGet(cur)));
+            if (strLen(s) > 0) vecPush(out, s) else ();
+            cellSet(cur, bufNew())
+        } else {
+            pushCodepointUtf8(cellGet(cur), cp)
+        };
+        cellSet(i, idx + 1)
+    };
+    let tail = strTrim(bufToString(cellGet(cur)));
+    if (strLen(tail) > 0) vecPush(out, tail) else ();
+    out
+}
+
+pub def voiceKeychainRead(acc: VoiceKeychainAccount): String = {
+    let p = c_voiceKcReadNs(nsStr(vkaToRaw(acc)));
+    if (ptrIsNull(p)) "" else nsStrPtrToString(p)
+}
+
+pub def voiceKeychainWrite(val: String, acc: VoiceKeychainAccount): Bool = {
+    let trimmed = strTrim(val);
+    if (strLen(trimmed) == 0) {
+        c_voiceKcDeleteNs(nsStr(vkaToRaw(acc)))
+    } else {
+        c_voiceKcWriteNs(nsStr(vkaToRaw(acc)), nsStr(trimmed))
+    }
+}
+
+pub def voiceKeychainDelete(acc: VoiceKeychainAccount): Bool =
+    c_voiceKcDeleteNs(nsStr(vkaToRaw(acc)))
+
+def jsonListGetBool(fields: List (String, Value), key: String, defVal: Bool): Bool = {
+    let cur = cellNew(fields);
+    let res = cellNew(defVal);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((k, v), tail) -> {
+                if (k == key) {
+                    match v {
+                        VBool(b) -> cellSet(res, b),
+                        _ -> (),
+                    }
+                } else ();
+                cellSet(cur, tail)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(res)
+}
+
+def jsonListGetOptBool(fields: List (String, Value), key: String): Option Bool = {
+    let cur = cellNew(fields);
+    let res: Cell (Option Bool) = cellNew(None);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((k, v), tail) -> {
+                if (k == key) {
+                    match v {
+                        VBool(b) -> cellSet(res, Some(b)),
+                        _ -> (),
+                    }
+                } else ();
+                cellSet(cur, tail)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(res)
+}
+
+def jsonListGetStr(fields: List (String, Value), key: String, defVal: String): String = {
+    let cur = cellNew(fields);
+    let res = cellNew(defVal);
+    while (match cellGet(cur) { Nil -> false, _ -> true }) {
+        match cellGet(cur) {
+            Cons((k, v), tail) -> {
+                if (k == key) {
+                    match v {
+                        VStr(s) -> cellSet(res, s),
+                        _ -> (),
+                    }
+                } else ();
+                cellSet(cur, tail)
+            },
+            Nil -> (),
+        }
+    };
+    cellGet(res)
+}
+
+pub def decodeVoicePreferences(rawJson: String): Option VoicePreferences =
+    match parse(rawJson) {
+        Ok(VObj(fields)) -> {
+            let d = defaultVoicePreferences();
+            Some(VoicePreferences {
+                vpEnabled: jsonListGetBool(fields, "enabled", d.vpEnabled),
+                vpProviderMode: vpmFromRaw(jsonListGetStr(fields, "providerMode", vpmToRaw(d.vpProviderMode))),
+                vpTriggerKey: vtkFromRaw(jsonListGetStr(fields, "triggerKey", vtkToRaw(d.vpTriggerKey))),
+                vpOutputMode: vomFromRaw(jsonListGetStr(fields, "outputMode", vomToRaw(d.vpOutputMode))),
+                vpToneMode: vtmFromRaw(jsonListGetStr(fields, "toneMode", vtmToRaw(d.vpToneMode))),
+                vpLanguage: jsonListGetStr(fields, "language", d.vpLanguage),
+                vpSpeakToEditSelection: jsonListGetBool(fields, "speakToEditSelection", d.vpSpeakToEditSelection),
+                vpSyncJuxuLexicon: jsonListGetBool(fields, "syncJuxuLexicon", d.vpSyncJuxuLexicon),
+                vpCustomVocabulary: jsonListGetStr(fields, "customVocabulary", d.vpCustomVocabulary),
+                vpCloudPreset: vcpFromRaw(jsonListGetStr(fields, "cloudPreset", vcpToRaw(d.vpCloudPreset))),
+                vpCloudPolishEnabled: jsonListGetBool(fields, "cloudPolishEnabled", d.vpCloudPolishEnabled),
+                vpCustomBaseURL: jsonListGetStr(fields, "customBaseURL", d.vpCustomBaseURL),
+                vpCustomASRModel: jsonListGetStr(fields, "customASRModel", d.vpCustomASRModel),
+                vpCustomLLMModel: jsonListGetStr(fields, "customLLMModel", d.vpCustomLLMModel),
+                vpCustomSplitLLM: jsonListGetBool(fields, "customSplitLLM", d.vpCustomSplitLLM),
+                vpCustomLLMBaseURL: jsonListGetStr(fields, "customLLMBaseURL", d.vpCustomLLMBaseURL),
+                vpLocalASRPreset: vlaFromRaw(jsonListGetStr(fields, "localASRPreset", vlaToRaw(d.vpLocalASRPreset))),
+                vpLocalAppleLocale: jsonListGetStr(fields, "localAppleLocale", d.vpLocalAppleLocale),
+                vpLocalAppleRequireOnDevice: jsonListGetBool(fields, "localAppleRequireOnDevice", d.vpLocalAppleRequireOnDevice),
+                vpLocalHTTPASRBaseURL: jsonListGetStr(fields, "localHTTPASRBaseURL", d.vpLocalHTTPASRBaseURL),
+                vpLocalHTTPASRModel: jsonListGetStr(fields, "localHTTPASRModel", d.vpLocalHTTPASRModel),
+                vpLocalLLMPreset: vllFromRaw(jsonListGetStr(fields, "localLLMPreset", vllToRaw(d.vpLocalLLMPreset))),
+                vpLocalHTTPLLMBaseURL: jsonListGetStr(fields, "localHTTPLLMBaseURL", d.vpLocalHTTPLLMBaseURL),
+                vpLocalHTTPLLMModel: jsonListGetStr(fields, "localHTTPLLMModel", d.vpLocalHTTPLLMModel),
+                vpGlobalVoiceHotkey: jsonListGetOptBool(fields, "globalVoiceHotkey"),
+                vpVoiceCues: jsonListGetOptBool(fields, "voiceCues"),
+                vpContextCapture: jsonListGetOptBool(fields, "contextCapture"),
+                vpContextBlacklist: jsonListGetOptBool(fields, "contextBlacklist"),
+                vpScreenContextToCloud: jsonListGetOptBool(fields, "screenContextToCloud"),
+            })
+        },
+        _ -> None,
+    }
+
+pub def encodeVoicePreferences(p: VoicePreferences): String = {
+    let acc: Cell (List (String, Value)) = cellNew(Nil);
+    let addField = (k, v) -> cellSet(acc, Cons((k, v), cellGet(acc)));
+    addField("cloudPolishEnabled", VBool(p.vpCloudPolishEnabled));
+    addField("cloudPreset", VStr(vcpToRaw(p.vpCloudPreset)));
+    match p.vpContextBlacklist { Some(b) -> addField("contextBlacklist", VBool(b)), None -> () };
+    match p.vpContextCapture   { Some(b) -> addField("contextCapture", VBool(b)), None -> () };
+    addField("customASRModel", VStr(p.vpCustomASRModel));
+    addField("customBaseURL", VStr(p.vpCustomBaseURL));
+    addField("customLLMBaseURL", VStr(p.vpCustomLLMBaseURL));
+    addField("customLLMModel", VStr(p.vpCustomLLMModel));
+    addField("customSplitLLM", VBool(p.vpCustomSplitLLM));
+    addField("customVocabulary", VStr(p.vpCustomVocabulary));
+    addField("enabled", VBool(p.vpEnabled));
+    match p.vpGlobalVoiceHotkey { Some(b) -> addField("globalVoiceHotkey", VBool(b)), None -> () };
+    addField("language", VStr(p.vpLanguage));
+    addField("localASRPreset", VStr(vlaToRaw(p.vpLocalASRPreset)));
+    addField("localAppleLocale", VStr(p.vpLocalAppleLocale));
+    addField("localAppleRequireOnDevice", VBool(p.vpLocalAppleRequireOnDevice));
+    addField("localHTTPASRBaseURL", VStr(p.vpLocalHTTPASRBaseURL));
+    addField("localHTTPASRModel", VStr(p.vpLocalHTTPASRModel));
+    addField("localHTTPLLMBaseURL", VStr(p.vpLocalHTTPLLMBaseURL));
+    addField("localHTTPLLMModel", VStr(p.vpLocalHTTPLLMModel));
+    addField("localLLMPreset", VStr(vllToRaw(p.vpLocalLLMPreset)));
+    addField("outputMode", VStr(vomToRaw(p.vpOutputMode)));
+    addField("providerMode", VStr(vpmToRaw(p.vpProviderMode)));
+    match p.vpScreenContextToCloud { Some(b) -> addField("screenContextToCloud", VBool(b)), None -> () };
+    addField("speakToEditSelection", VBool(p.vpSpeakToEditSelection));
+    addField("syncJuxuLexicon", VBool(p.vpSyncJuxuLexicon));
+    addField("toneMode", VStr(vtmToRaw(p.vpToneMode)));
+    addField("triggerKey", VStr(vtkToRaw(p.vpTriggerKey)));
+    match p.vpVoiceCues { Some(b) -> addField("voiceCues", VBool(b)), None -> () };
+    stringifyPretty(VObj(listRev(cellGet(acc))))
+}
+
+pub def voiceDefaultPrefsPath(): String =
+    appleHomeDirectory() + "/Library/Application Support/Juxu/voice.json"
+
+def gVoicePrefsLoaded: Cell Bool = cellNew(false)
+def gVoicePrefsInMemory: Cell Bool = cellNew(false)
+def gVoicePrefsPath: Cell String = cellNew("")
+def gVoicePrefsCurrent: Cell VoicePreferences = cellNew(defaultVoicePreferences())
+pub def gVoiceOnUnloadHook: Cell (() -> Void) = cellNew(() -> ())
+pub def gVoiceOnHotkeySyncHook: Cell (VoicePreferences -> Void) = cellNew((_p) -> ())
+pub def gVoicePrefsObservers: Vec (VoicePreferences -> Void) = vecNew()
+
+pub def voicePrefsEnsureLoaded(): Void =
+    if (!cellGet(gVoicePrefsLoaded)) {
+        cellSet(gVoicePrefsLoaded, true);
+        let p = if (strLen(cellGet(gVoicePrefsPath)) > 0) cellGet(gVoicePrefsPath) else voiceDefaultPrefsPath();
+        cellSet(gVoicePrefsPath, p);
+        if (!cellGet(gVoicePrefsInMemory) && fileExists(p)) {
+            match readFile(p) {
+                Ok(txt) -> match decodeVoicePreferences(txt) {
+                    Some(decoded) -> cellSet(gVoicePrefsCurrent, decoded),
+                    None          -> (),
+                },
+                Err(_) -> (),
+            }
+        } else ()
+    } else ()
+
+pub def voicePrefsGet(): VoicePreferences = {
+    voicePrefsEnsureLoaded();
+    cellGet(gVoicePrefsCurrent)
+}
+
+pub def voicePrefsFilePath(): String = {
+    voicePrefsEnsureLoaded();
+    cellGet(gVoicePrefsPath)
+}
+
+pub def voicePrefsSetInMemoryForTesting(inMem: Bool): Void = {
+    cellSet(gVoicePrefsInMemory, inMem);
+    cellSet(gVoicePrefsLoaded, true);
+    cellSet(gVoicePrefsCurrent, defaultVoicePreferences())
+}
+
+pub def voicePrefsUpdate(newPrefs: VoicePreferences, persist: Bool): Void = {
+    voicePrefsEnsureLoaded();
+    let wasEnabled = (cellGet(gVoicePrefsCurrent)).vpEnabled;
+    cellSet(gVoicePrefsCurrent, newPrefs);
+    if (persist && !cellGet(gVoicePrefsInMemory)) {
+        let p = cellGet(gVoicePrefsPath);
+        let dir = pathDirname(p);
+        if (strLen(dir) > 0) {
+            let _ = mkdirAll(dir);
+            ()
+        } else ();
+        let _ = writeFileAtomic(p, encodeVoicePreferences(newPrefs));
+        ()
+    } else ();
+    if (wasEnabled && !newPrefs.vpEnabled) {
+        let unloadFn = cellGet(gVoiceOnUnloadHook);
+        unloadFn()
+    } else ();
+    let syncFn = cellGet(gVoiceOnHotkeySyncHook);
+    syncFn(newPrefs);
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(gVoicePrefsObservers)) {
+        let idx = cellGet(i);
+        let obs = vecGetOr(gVoicePrefsObservers, idx, (_p) -> ());
+        obs(newPrefs);
+        cellSet(i, idx + 1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. VoiceSessionTimeline (`VoiceSessionTimeline.swift`)
+// ---------------------------------------------------------------------------
+
+pub data VoiceTimelineMark : Eq {
+    VtmKeyDown,
+    VtmHoldFired,
+    VtmHudShown,
+    VtmEngineReady,
+    VtmMicRunning,
+    VtmFirstBuffer,
+    VtmFirstRequest,
+    VtmFirstResult,
+    VtmFirstDraw,
+    VtmRelease,
+    VtmFinalDone,
+    VtmInserted,
+}
+
+pub def vtmMarkIndex(m: VoiceTimelineMark): Int = match m {
+    VtmKeyDown      -> 0,
+    VtmHoldFired    -> 1,
+    VtmHudShown     -> 2,
+    VtmEngineReady  -> 3,
+    VtmMicRunning   -> 4,
+    VtmFirstBuffer  -> 5,
+    VtmFirstRequest -> 6,
+    VtmFirstResult  -> 7,
+    VtmFirstDraw    -> 8,
+    VtmRelease      -> 9,
+    VtmFinalDone    -> 10,
+    VtmInserted     -> 11,
+}
+
+pub def vtmMarkName(idx: Int): String =
+    if (idx == 0) "keyDown"
+    else if (idx == 1) "holdFired"
+    else if (idx == 2) "hudShown"
+    else if (idx == 3) "engineReady"
+    else if (idx == 4) "micRunning"
+    else if (idx == 5) "firstBuffer"
+    else if (idx == 6) "firstRequest"
+    else if (idx == 7) "firstResult"
+    else if (idx == 8) "firstDraw"
+    else if (idx == 9) "release"
+    else if (idx == 10) "finalDone"
+    else "inserted"
+
+pub data VoiceSessionTimeline {
+    vstTimes: Vec (Option Float),
+    vstPasses: Cell Int,
+    vstLevelSummary: Cell String,
+}
+
+pub def vstNew(): VoiceSessionTimeline = {
+    let arr = vecNew();
+    let i = cellNew(0);
+    while (cellGet(i) < 12) {
+        vecPush(arr, None);
+        cellSet(i, cellGet(i) + 1)
+    };
+    VoiceSessionTimeline {
+        vstTimes: arr,
+        vstPasses: cellNew(0),
+        vstLevelSummary: cellNew(""),
+    }
+}
+
+pub def vstBegin(t: VoiceSessionTimeline): Void = {
+    let i = cellNew(0);
+    while (cellGet(i) < 12) {
+        let idx = cellGet(i);
+        vecSet(t.vstTimes, idx, if (idx == 0) Some(voiceCfAbsoluteTime()) else None);
+        cellSet(i, idx + 1)
+    };
+    cellSet(t.vstPasses, 0);
+    cellSet(t.vstLevelSummary, "")
+}
+
+pub def vstMarkAt(t: VoiceSessionTimeline, m: VoiceTimelineMark, time: Float): Void = {
+    let idx = vtmMarkIndex(m);
+    match vecGetOr(t.vstTimes, idx, None) {
+        None    -> vecSet(t.vstTimes, idx, Some(time)),
+        Some(_) -> (),
+    }
+}
+
+pub def vstMark(t: VoiceSessionTimeline, m: VoiceTimelineMark): Void =
+    vstMarkAt(t, m, voiceCfAbsoluteTime())
+
+pub def vstCountPass(t: VoiceSessionTimeline): Void =
+    cellSet(t.vstPasses, cellGet(t.vstPasses) + 1)
+
+pub def vstHas(t: VoiceSessionTimeline, m: VoiceTimelineMark): Bool =
+    match vecGetOr(t.vstTimes, vtmMarkIndex(m), None) {
+        Some(_) -> true,
+        None    -> false,
+    }
+
+pub def vstSummary(t: VoiceSessionTimeline): String =
+    match vecGetOr(t.vstTimes, 0, None) {
+        None -> "",
+        Some(start) -> {
+            let b = bufNew();
+            let first = cellNew(true);
+            let pushPart = (s) -> {
+                if (!cellGet(first)) bufPushByte(b, 32) else ();
+                cellSet(first, false);
+                bufPushStr(b, s)
+            };
+            let i = cellNew(0);
+            while (cellGet(i) < 12) {
+                let idx = cellGet(i);
+                match vecGetOr(t.vstTimes, idx, None) {
+                    Some(ts) -> {
+                        let ms = floatToInt((ts - start) * 1000.0);
+                        pushPart(vtmMarkName(idx) + "=" + intToStr(ms))
+                    },
+                    None -> (),
+                };
+                cellSet(i, idx + 1)
+            };
+            pushPart("passes=" + intToStr(cellGet(t.vstPasses)));
+            let lvl = cellGet(t.vstLevelSummary);
+            if (strLen(lvl) > 0) pushPart(lvl) else ();
+            bufToString(b)
+        },
+    }
+
+// ---------------------------------------------------------------------------
+// 4. VoicePartialStabilizer (`VoicePartialStabilizer.swift`)
+// ---------------------------------------------------------------------------
+
+pub data VoicePartialDisplay : Eq {
+    vpdText: String,
+    vpdTentativeCount: Int,
+}
+
+pub data VoicePartialStabilizer {
+    vpsLocked: Cell (Vec Int),
+    vpsTail: Cell (Vec Int),
+    vpsStartsMidUtterance: Cell Bool,
+    vpsMisses: Cell Int,
+}
+
+pub def vpsNew(): VoicePartialStabilizer = VoicePartialStabilizer {
+    vpsLocked: cellNew(vecNew()),
+    vpsTail: cellNew(vecNew()),
+    vpsStartsMidUtterance: cellNew(false),
+    vpsMisses: cellNew(0),
+}
+
+def isAsciiLetterCp(cp: Int): Bool =
+    (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122)
+
+def isCoreCp(cp: Int): Bool =
+    isAsciiLetterCp(cp)
+    || (cp >= 48 && cp <= 57)
+    || (cp >= 0x00C0 && cp <= 0x02AF)
+    || (cp >= 0x0370 && cp <= 0x1FFF)
+    || (cp >= 0x3040 && cp <= 0x30FF)
+    || (cp >= 0x3400 && cp <= 0x9FFF)
+    || (cp >= 0xAC00 && cp <= 0xD7AF)
+    || (cp >= 0xF900 && cp <= 0xFAFF)
+    || (cp >= 0x20000 && cp <= 0x2FA1F)
+
+def toLowerCp(cp: Int): Int =
+    if (cp >= 65 && cp <= 90) cp + 32 else cp
+
+def isClauseEnderCp(cp: Int): Bool =
+    cp == 0xFF0C || cp == 0x3002 || cp == 0xFF01 || cp == 0xFF1F || cp == 0xFF1B
+    || cp == 44 || cp == 46 || cp == 33 || cp == 63 || cp == 59
+
+def isSpaceCp(cp: Int): Bool =
+    cp == 32 || cp == 9 || cp == 10 || cp == 13 || cp == 0x3000
+
+def scalarsVecToStr(cps: Vec Int): String = {
+    let b = bufNew();
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(cps)) {
+        let idx = cellGet(i);
+        pushCodepointUtf8(b, vecGetOr(cps, idx, 0));
+        cellSet(i, idx + 1)
+    };
+    bufToString(b)
+}
+
+def sliceIntVec(arr: Vec Int, fromIdx: Int, toIdx: Int): Vec Int = {
+    let out = vecNew();
+    let i = cellNew(if (fromIdx < 0) 0 else fromIdx);
+    let end = if (toIdx > vecLen(arr)) vecLen(arr) else toIdx;
+    while (cellGet(i) < end) {
+        let idx = cellGet(i);
+        vecPush(out, vecGetOr(arr, idx, 0));
+        cellSet(i, idx + 1)
+    };
+    out
+}
+
+def extractCore(cps: Vec Int): (Vec Int, Vec Int) = {
+    let chars = vecNew();
+    let indices = vecNew();
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(cps)) {
+        let idx = cellGet(i);
+        let cp = vecGetOr(cps, idx, 0);
+        if (isCoreCp(cp)) {
+            vecPush(chars, toLowerCp(cp));
+            vecPush(indices, idx)
+        } else ();
+        cellSet(i, idx + 1)
+    };
+    (chars, indices)
+}
+
+def subRangeEq(a: Vec Int, aStart: Int, b: Vec Int, bStart: Int, len: Int): Bool = {
+    let ok = cellNew(true);
+    let k = cellNew(0);
+    while (cellGet(ok) && cellGet(k) < len) {
+        let off = cellGet(k);
+        if (vecGetOr(a, aStart + off, -1) != vecGetOr(b, bStart + off, -2)) {
+            cellSet(ok, false)
+        } else ();
+        cellSet(k, off + 1)
+    };
+    cellGet(ok)
+}
+
+def vpsContinuation(locked: Vec Int, current: Vec Int): Option (Vec Int) =
+    if (vecLen(locked) == 0) Some(current)
+    else {
+        let (lockedCore, _) = extractCore(locked);
+        let (currentCore, indices) = extractCore(current);
+        if (vecLen(lockedCore) == 0) Some(current)
+        else {
+            let needed = if (4 < vecLen(lockedCore)) 4 else vecLen(lockedCore);
+            let maxSlack = if (2 < vecLen(lockedCore) - needed) 2 else vecLen(lockedCore) - needed;
+            let found: Cell (Option (Vec Int)) = cellNew(None);
+            let slack = cellNew(0);
+            while (cellGet(slack) <= maxSlack && (match cellGet(found) { None -> true, Some(_) -> false })) {
+                let sl = cellGet(slack);
+                let end = vecLen(lockedCore) - sl;
+                let m1 = if (48 < end) 48 else end;
+                let longest = if (m1 < vecLen(currentCore)) m1 else vecLen(currentCore);
+                if (longest >= needed) {
+                    let length = cellNew(longest);
+                    while (cellGet(length) >= needed && (match cellGet(found) { None -> true, Some(_) -> false })) {
+                        let l = cellGet(length);
+                        let start = cellNew(vecLen(currentCore) - l);
+                        while (cellGet(start) >= 0 && (match cellGet(found) { None -> true, Some(_) -> false })) {
+                            let st = cellGet(start);
+                            if (subRangeEq(currentCore, st, lockedCore, end - l, l)) {
+                                let ns = cellNew(vecGetOr(indices, st + l - 1, 0) + 1);
+                                let lastLocked = vecGetOr(locked, vecLen(locked) - 1, 0);
+                                if (!isCoreCp(lastLocked)) {
+                                    while (cellGet(ns) < vecLen(current) && !isCoreCp(vecGetOr(current, cellGet(ns), 0))) {
+                                        cellSet(ns, cellGet(ns) + 1)
+                                    }
+                                } else ();
+                                cellSet(found, Some(sliceIntVec(current, cellGet(ns), vecLen(current))))
+                            } else ();
+                            cellSet(start, st - 1)
+                        };
+                        cellSet(length, l - 1)
+                    }
+                } else ();
+                cellSet(slack, sl + 1)
+            };
+            cellGet(found)
+        }
+    }
+
+def vpsAgreedPrefix(previous: Vec Int, next: Vec Int): Int = {
+    let (aChars, _) = extractCore(previous);
+    let (bChars, bIndices) = extractCore(next);
+    let matched = cellNew(0);
+    while (cellGet(matched) < vecLen(aChars)
+           && cellGet(matched) < vecLen(bChars)
+           && vecGetOr(aChars, cellGet(matched), -1) == vecGetOr(bChars, cellGet(matched), -2)) {
+        cellSet(matched, cellGet(matched) + 1)
+    };
+    while (cellGet(matched) > 0
+           && cellGet(matched) < vecLen(bChars)
+           && isAsciiLetterCp(vecGetOr(bChars, cellGet(matched) - 1, 0))
+           && isAsciiLetterCp(vecGetOr(bChars, cellGet(matched), 0))
+           && vecGetOr(bIndices, cellGet(matched), 0) == vecGetOr(bIndices, cellGet(matched) - 1, 0) + 1) {
+        cellSet(matched, cellGet(matched) - 1)
+    };
+    let m = cellGet(matched);
+    if (m == 0) 0 else vecGetOr(bIndices, m - 1, 0) + 1
+}
+
+def vpsLockablePrefix(next: Vec Int, agreed: Int): Int =
+    if (agreed <= 0) 0
+    else {
+        let punctIdx = cellNew(-1);
+        let i = cellNew(agreed - 1);
+        while (cellGet(i) >= 0 && cellGet(punctIdx) < 0) {
+            let idx = cellGet(i);
+            if (isClauseEnderCp(vecGetOr(next, idx, 0))) cellSet(punctIdx, idx) else ();
+            cellSet(i, idx - 1)
+        };
+        if (cellGet(punctIdx) >= 0) {
+            let end = cellNew(cellGet(punctIdx) + 1);
+            while (cellGet(end) < vecLen(next) && isSpaceCp(vecGetOr(next, cellGet(end), 0))) {
+                cellSet(end, cellGet(end) + 1)
+            };
+            cellGet(end)
+        } else if (vecLen(next) <= 28) {
+            0
+        } else {
+            let rem = vecLen(next) - 12;
+            let cap = if (agreed < rem) agreed else rem;
+            if (cap <= 0) 0
+            else {
+                let end = cellNew(cap);
+                while (cellGet(end) > 0
+                       && cellGet(end) < vecLen(next)
+                       && isAsciiLetterCp(vecGetOr(next, cellGet(end) - 1, 0))
+                       && isAsciiLetterCp(vecGetOr(next, cellGet(end), 0))) {
+                    cellSet(end, cellGet(end) - 1)
+                };
+                cellGet(end)
+            }
+        }
+    }
+
+def vpsLooksLikeAbruptNoise(previous: Vec Int, current: Vec Int): Bool =
+    if (vecLen(previous) < 4 || vecLen(current) * 2 >= vecLen(previous)) false
+    else {
+        let (prevCore, _) = extractCore(previous);
+        let (currCore, _) = extractCore(current);
+        let anyOverlap = cellNew(false);
+        let i = cellNew(0);
+        while (!cellGet(anyOverlap) && cellGet(i) < vecLen(currCore)) {
+            let c = vecGetOr(currCore, cellGet(i), -1);
+            let j = cellNew(0);
+            while (!cellGet(anyOverlap) && cellGet(j) < vecLen(prevCore)) {
+                if (vecGetOr(prevCore, cellGet(j), -2) == c) cellSet(anyOverlap, true) else ();
+                cellSet(j, cellGet(j) + 1)
+            };
+            cellSet(i, cellGet(i) + 1)
+        };
+        !cellGet(anyOverlap)
+    }
+
+def vpsDisplay(s: VoicePartialStabilizer): VoicePartialDisplay = {
+    let locked = cellGet(s.vpsLocked);
+    let tail = cellGet(s.vpsTail);
+    let tailEnd = cellNew(vecLen(tail));
+    while (cellGet(tailEnd) > 0 && !isCoreCp(vecGetOr(tail, cellGet(tailEnd) - 1, 0))) {
+        cellSet(tailEnd, cellGet(tailEnd) - 1)
+    };
+    let shownTail = sliceIntVec(tail, 0, cellGet(tailEnd));
+    let prefix = if (cellGet(s.vpsStartsMidUtterance)) "…" else "";
+    VoicePartialDisplay {
+        vpdText: prefix + scalarsVecToStr(locked) + scalarsVecToStr(shownTail),
+        vpdTentativeCount: vecLen(shownTail),
+    }
+}
+
+pub def vpsUpdate(s: VoicePartialStabilizer, text: String, windowed: Bool): VoicePartialDisplay = {
+    let current = decodeUtf8Scalars(text);
+    let locked = cellGet(s.vpsLocked);
+    let tail = cellGet(s.vpsTail);
+    if (vecLen(locked) == 0 && vpsLooksLikeAbruptNoise(tail, current)) {
+        let m = cellGet(s.vpsMisses) + 1;
+        cellSet(s.vpsMisses, m);
+        if (m < 2) vpsDisplay(s)
+        else {
+            cellSet(s.vpsMisses, 0);
+            cellSet(s.vpsTail, current);
+            vpsDisplay(s)
+        }
+    } else {
+        match vpsContinuation(locked, current) {
+            None -> {
+                let m = cellGet(s.vpsMisses) + 1;
+                cellSet(s.vpsMisses, m);
+                if (m < 2) vpsDisplay(s)
+                else {
+                    cellSet(s.vpsMisses, 0);
+                    if (windowed) {
+                        cellSet(s.vpsLocked, vecNew());
+                        cellSet(s.vpsStartsMidUtterance, true);
+                        cellSet(s.vpsTail, current)
+                    } else {
+                        let agreed = vpsAgreedPrefix(locked, current);
+                        let lc = vpsLockablePrefix(current, agreed);
+                        cellSet(s.vpsLocked, sliceIntVec(current, 0, lc));
+                        cellSet(s.vpsStartsMidUtterance, false);
+                        cellSet(s.vpsTail, sliceIntVec(current, lc, vecLen(current)))
+                    };
+                    vpsDisplay(s)
+                }
+            },
+            Some(next) -> {
+                cellSet(s.vpsMisses, 0);
+                if (vecLen(locked) == 0 && windowed) {
+                    cellSet(s.vpsStartsMidUtterance, true)
+                } else ();
+                let agreed = vpsAgreedPrefix(tail, next);
+                let lockCount = vpsLockablePrefix(next, agreed);
+                if (lockCount > 0) {
+                    let newLocked = sliceIntVec(locked, 0, vecLen(locked));
+                    let k = cellNew(0);
+                    while (cellGet(k) < lockCount) {
+                        let idx = cellGet(k);
+                        vecPush(newLocked, vecGetOr(next, idx, 0));
+                        cellSet(k, idx + 1)
+                    };
+                    cellSet(s.vpsLocked, newLocked);
+                    cellSet(s.vpsTail, sliceIntVec(next, lockCount, vecLen(next)))
+                } else {
+                    cellSet(s.vpsTail, next)
+                };
+                vpsDisplay(s)
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Cross-Layer Data Types & Hooks (`HUD`, `Installer`, `Inspector`, `Permissions`)
+// ---------------------------------------------------------------------------
+
+pub data VoiceHUDState : Eq {
+    VhsHidden,
+    VhsRecording(Float, Float, String, String, Int),
+    VhsTranscribing(String),
+    VhsPolishing(String),
+    VhsNotice(String, Bool),
+}
+
+pub def gVoiceHUDShowHook: Cell ((VoiceHUDState, CGRect, Option Int64, Float) -> Void) =
+    cellNew((_st, _rect, _lvl, _autoHide) -> ())
+pub def gVoiceHUDHideHook: Cell (() -> Void) = cellNew(() -> ())
+pub def gVoiceHUDUnloadHook: Cell (() -> Void) = cellNew(() -> ())
+pub def gVoiceHUDEnqueueSpectrumHook: Cell ((Vec (Vec Float)) -> Void) =
+    cellNew((_frames) -> ())
+
+pub def voiceHUDShow(st: VoiceHUDState, caretRect: CGRect, winLevel: Option Int64, autoHide: Float): Void = {
+    let f = cellGet(gVoiceHUDShowHook);
+    f(st, caretRect, winLevel, autoHide)
+}
+pub def voiceHUDHide(): Void = { let f = cellGet(gVoiceHUDHideHook); f() }
+pub def voiceHUDUnload(): Void = { let f = cellGet(gVoiceHUDUnloadHook); f() }
+pub def voiceHUDEnqueueSpectrum(frames: Vec (Vec Float)): Void = {
+    let f = cellGet(gVoiceHUDEnqueueSpectrumHook);
+    f(frames)
+}
+
+pub data VoiceLocalComponentStatus {
+    vlcsDependencyInstalled: Bool,
+    vlcsDependencyPath: Option String,
+    vlcsModelInstalled: Bool,
+    vlcsModelPath: Option String,
+    vlcsModelSizeBytes: Int64,
+}
+
+pub def vlcsIsReady(s: VoiceLocalComponentStatus): Bool =
+    s.vlcsDependencyInstalled && s.vlcsModelInstalled
+
+pub def vlcsFormattedModelSize(s: VoiceLocalComponentStatus): String = {
+    let b = i64ToInt(s.vlcsModelSizeBytes);
+    if (b <= 0) ""
+    else if (b >= 1000000000) {
+        let gb10 = (b + 50000000) / 100000000;
+        intToStr(gb10 / 10) + "." + intToStr(gb10 % 10) + " GB"
+    } else {
+        let mb = (b + 500000) / 1000000;
+        intToStr(mb) + " MB"
+    }
+}
+
+pub data VoiceInstallPhase : Eq {
+    VipIdle,
+    VipInstallingDep(String),
+    VipDownloadingModel(String, Float, String),
+    VipCompleted(String),
+    VipFailed(String),
+}
+
+pub def vipIsBusy(p: VoiceInstallPhase): Bool = match p {
+    VipInstallingDep(_)          -> true,
+    VipDownloadingModel(_, _, _) -> true,
+    _                            -> false,
+}
+
+pub data VoiceGlobalPermStatus : Eq {
+    vgpInputMonitoring: Bool,
+    vgpAccessibility: Bool,
+}
+
+pub data VoiceContextSummary {
+    vcsAppName: String,
+    vcsAppIdentifier: String,
+    vcsAppType: String,
+    vcsWindowTitle: String,
+    vcsWebURL: Option String,
+    vcsEnhancedUI: Bool,
+    vcsRole: String,
+    vcsIsEditable: Bool,
+    vcsIsBlacklisted: Bool,
+    vcsBlacklistReason: Option String,
+    vcsIsSecureInput: Bool,
+    vcsSelectedText: String,
+    vcsTextBeforeCursor: String,
+    vcsTextAfterCursor: String,
+    vcsTextBeforeArea: String,
+    vcsTextAfterArea: String,
+    vcsVisibleScreenContent: Option String,
+    vcsElapsedMs: Int,
+    vcsPrettyJSON: String,
+    vcsAsrTargetLabel: String,
+    vcsAsrContext: String,
+    vcsPolishBudgetLabel: String,
+    vcsPolishContext: String,
+}
+
+pub def gVoiceAsrStatusHook: Cell (VoiceLocalASRModelPreset -> VoiceLocalComponentStatus) =
+    cellNew((_p) -> VoiceLocalComponentStatus {
+        vlcsDependencyInstalled: false, vlcsDependencyPath: None,
+        vlcsModelInstalled: false, vlcsModelPath: None, vlcsModelSizeBytes: intToI64(0),
+    })
+pub def gVoiceLlmStatusHook: Cell (VoiceLocalLLMPreset -> VoiceLocalComponentStatus) =
+    cellNew((_p) -> VoiceLocalComponentStatus {
+        vlcsDependencyInstalled: false, vlcsDependencyPath: None,
+        vlcsModelInstalled: false, vlcsModelPath: None, vlcsModelSizeBytes: intToI64(0),
+    })
+pub def gVoiceInstallPhaseCell: Cell VoiceInstallPhase = cellNew(VipIdle)
+pub def gVoiceInstallRefreshObservers: Vec (() -> Void) = vecNew()
+pub def voiceNotifyInstallerChanged(): Void = {
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(gVoiceInstallRefreshObservers)) {
+        let idx = cellGet(i);
+        let fnObs = vecGetOr(gVoiceInstallRefreshObservers, idx, () -> ());
+        fnObs();
+        cellSet(i, idx + 1)
+    }
+}
+pub def gVoiceInstallASRHook: Cell (VoiceLocalASRModelPreset -> Void) = cellNew((_p) -> ())
+pub def gVoiceInstallLLMHook: Cell (VoiceLocalLLMPreset -> Void) = cellNew((_p) -> ())
+pub def gVoiceDeleteModelHook: Cell (String -> Void) = cellNew((_f) -> ())
+pub def gVoiceCancelInstallHook: Cell (() -> Void) = cellNew(() -> ())
+
+pub def gVoiceGlobalPermCurrentHook: Cell (() -> VoiceGlobalPermStatus) =
+    cellNew(() -> VoiceGlobalPermStatus { vgpInputMonitoring: false, vgpAccessibility: voiceAxIsTrusted() })
+pub def gVoiceGlobalPermRequestHook: Cell (() -> Void) = cellNew(() -> ())
+
+pub def gVoiceTestConfigHook: Cell (((Bool, String) -> Void) -> Void) =
+    cellNew((cb) -> cb(false, "语音模块尚未加载"))
+
+pub def gVoiceInspectorPresented: Cell Bool = cellNew(false)
+pub def gVoiceInspectorCapturing: Cell Bool = cellNew(false)
+pub def gVoiceInspectorCountdown: Cell Int = cellNew(0)
+pub def gVoiceInspectorLastSummary: Cell (Option VoiceContextSummary) = cellNew(None)
+pub def gVoiceInspectorObservers: Vec (() -> Void) = vecNew()
+pub def voiceNotifyInspectorChanged(): Void = {
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(gVoiceInspectorObservers)) {
+        let idx = cellGet(i);
+        let fnObs = vecGetOr(gVoiceInspectorObservers, idx, () -> ());
+        fnObs();
+        cellSet(i, idx + 1)
+    }
+}
+pub def gVoiceInspectorTriggerHook: Cell ((Int, Bool) -> Void) = cellNew((_sec, _bl) -> ())
+pub def gVoiceInspectorCancelHook: Cell (() -> Void) = cellNew(() -> ())

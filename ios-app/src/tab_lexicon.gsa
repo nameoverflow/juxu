@@ -1,0 +1,646 @@
+/// Tab 3 (`IOSHostTab.lexicon` — `"个人词库"`):
+/// 1:1 port of `HostAppViews.swift` lines 95-100 & 601-672 + `SharedUserPhraseCodePill`.
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGetOr, vecClear}
+use std.str.{intToStr}
+use objc.{
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcAddProtocol, objcRegisterClass,
+    msgSend0, msgSendBool0, msgSendI64_0,
+    msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
+}
+use juxu_core.{
+    JuxuConfig, UserPhraseInfo, UserPhrase,
+}
+use juxu_core.config.{MkJuxuConfig}
+use juxu_core.user_data.{MkUserPhrase}
+use juxu_shared.{
+    cgSize, cgRect,
+    msgSendRect0,
+    msgSendVoid1Rect, msgSendVoid1Size,
+    msgSendVoid1Ptr1I64, msgSendVoid1Ptr1Sel, msgSendVoid1Ptr1Sel1U64, msgSendVoid1Ptr1Sel2Ptr,
+    objcSendSuperVoid0, objcSendSuperVoid1Bool,
+    nsStr, nsStrPtrToString, objcAllocInit, objcAllocInitFrame,
+    utf8ScalarCount,
+    bridgeShared, bridgeLoadConfigAndUser, bridgeApplyAndSaveConfig,
+    bridgeAddUserPhrase, bridgeRemoveUserPhrase,
+}
+use uikit_kit.{
+    colorSystemBackground, colorLabel, colorSecondaryLabel, colorTertiaryLabel,
+    colorAccent, colorTeal, colorWhite, colorClear,
+    colorPrimary06, colorPrimary08,
+    fontWeightRegular, fontWeightMedium, fontWeightSemibold,
+    sysFont, sysFontMonospaced, hairlineHeight,
+    notifTextFieldDidChange, notifKeyboardWillChangeFrame, notifKeyboardWillHide,
+    applyContinuousCorner, makeSettingsCard, makeDivider, removeAllSubviews,
+    makeLabel, measureViewSize, makeSymbolImageView, makeSwitch, makeRoundedTextField,
+    makeScrollContainer, updateScrollKeyboardInset,
+    layoutToggleRow, dismissAllKeyboards, trimUnicodeWhitespace, setButtonPlainTitle, roundPx,
+}
+
+data PhraseRowViews {
+    prvDiv: Ptr,
+    prvRowBox: Ptr,
+    prvTextLbl: Ptr,
+    prvCodePillBox: Ptr,
+    prvCodeLbl: Ptr,
+    prvAutoLbl: Ptr,
+    prvHasAuto: Bool,
+    prvCountLbl: Ptr,
+    prvDelBtn: Ptr,
+    prvDelSym: Ptr,
+    prvPhraseText: String,
+}
+
+data LexiconTabUi {
+    lxuVc: Ptr,
+    lxuScroll: Ptr,
+    // Card 1: 3 switches
+    lxuCard1: Ptr,
+    lxuSw1Title: Ptr, lxuSw1Sub: Ptr, lxuSw1: Ptr,
+    lxuDiv1: Ptr,
+    lxuSw2Title: Ptr, lxuSw2Sub: Ptr, lxuSw2: Ptr,
+    lxuDiv2: Ptr,
+    lxuSw3Title: Ptr, lxuSw3Sub: Ptr, lxuSw3: Ptr,
+    // Card 2: Personal phrases
+    lxuCard2: Ptr,
+    lxuHdrLbl: Ptr,
+    lxuWordField: Ptr,
+    lxuAddBtn: Ptr,
+    lxuFeedbackLbl: Ptr,
+    lxuRowsContainer: Ptr,
+    lxuPhraseRows: Vec PhraseRowViews,
+    // State
+    lxuWordFocused: Cell Bool,
+    lxuFeedbackText: Cell String,
+}
+
+def gLexiconUi: Cell (Option LexiconTabUi) = cellNew(None)
+
+def updateLexiconToggle(c: JuxuConfig, tag: Int, v: Bool): JuxuConfig =
+    MkJuxuConfig {
+        schema: c.schema,
+        fourthCodeAutoCommit: c.fourthCodeAutoCommit,
+        fifthCodePushCommit: c.fifthCodePushCommit,
+        fourthEmptyBehavior: c.fourthEmptyBehavior,
+        shortestCodeFirst: c.shortestCodeFirst,
+        strictShortcode: c.strictShortcode,
+        spaceless: c.spaceless,
+        showShortcodeHint: c.showShortcodeHint,
+        dynamicWordFreq: if (tag == 2) v else c.dynamicWordFreq,
+        dynamicCharFreq: if (tag == 3) v else c.dynamicCharFreq,
+        autoPhrase: if (tag == 1) v else c.autoPhrase,
+        autoPhraseThreshold: c.autoPhraseThreshold,
+        zOmnipotent: c.zOmnipotent,
+        semicolonQuoteSelect: c.semicolonQuoteSelect,
+        smartPunctuation: c.smartPunctuation,
+        autoSpaceZhEn: c.autoSpaceZhEn,
+        autoSpaceDigits: c.autoSpaceDigits,
+        clipboardSuggestion: c.clipboardSuggestion,
+        cangjieKeycapRadicals: c.cangjieKeycapRadicals,
+        wubiKeycapRadicals: c.wubiKeycapRadicals,
+        keySwipeUpInput: c.keySwipeUpInput,
+        spaceCommaKey: c.spaceCommaKey,
+        keyLongPressAlternates: c.keyLongPressAlternates,
+        backspaceSwipeClear: c.backspaceSwipeClear,
+        keyboardHoldCursor: c.keyboardHoldCursor,
+        enableRareCharset: c.enableRareCharset,
+        pinyinInitialAbbr: c.pinyinInitialAbbr,
+        pinyinT9Layout: c.pinyinT9Layout,
+        shiftToggleMode: c.shiftToggleMode,
+        pageSize: c.pageSize,
+        orientation: c.orientation,
+        evalLogging: c.evalLogging,
+        emojiCandidates: c.emojiCandidates,
+        typo: c.typo,
+    }
+
+def syncAddButtonState(ui: LexiconTabUi): Void = {
+    let raw = nsStrPtrToString(msgSend0(ui.lxuWordField, objcSel("text")));
+    let trimmed = trimUnicodeWhitespace(raw);
+    let canAdd = utf8ScalarCount(trimmed) >= 2;
+    msgSendVoid1Bool(ui.lxuAddBtn, objcSel("setEnabled:"), canAdd);
+    msgSendVoid1Ptr(ui.lxuAddBtn, objcSel("setBackgroundColor:"), if (canAdd) colorAccent() else colorPrimary08())
+}
+
+pub def dismissLexiconKeyboardState(): Void = {
+    match cellGet(gLexiconUi) {
+        Some(ui) -> cellSet(ui.lxuWordFocused, false),
+        None -> (),
+    };
+    dismissAllKeyboards()
+}
+
+def rebuildPhraseRows(ui: LexiconTabUi): Void = {
+    removeAllSubviews(ui.lxuRowsContainer);
+    vecClear(ui.lxuPhraseRows);
+
+    let s = bridgeShared();
+    let phrases = cellGet(s.userPhrases);
+    let total = vecLen(phrases);
+    let limit = if (total < 20) total else 20;
+    let dummyPhrase = UserPhraseInfo {
+        phrase: MkUserPhrase { text: "", count: 0, lastSeq: intToI64(0), autoComposed: false },
+        encodedCode: "",
+    };
+
+    let i = cellNew(0);
+    while (cellGet(i) < limit) {
+        let idx = cellGet(i);
+        let info = vecGetOr(phrases, idx, dummyPhrase);
+        let pText = info.phrase.text;
+
+        let div = makeDivider();
+        let rowBox = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 260.0, 30.0));
+        msgSendVoid1Ptr(rowBox, objcSel("setBackgroundColor:"), colorClear());
+        msgSendVoid1I64(rowBox, objcSel("setTag:"), intToI64(idx));
+
+        // Left-swipe gesture (`UISwipeGestureRecognizerDirectionLeft = 2`) for swipe-to-delete
+        let swipeGr = objcAllocInit("UISwipeGestureRecognizer");
+        msgSendVoid1Ptr1Sel(swipeGr, objcSel("addTarget:action:"), ui.lxuVc, objcSel("onLexiconSwipeDelete:"));
+        msgSendVoid1I64(swipeGr, objcSel("setDirection:"), intToI64(2));
+        msgSendVoid1Ptr(rowBox, objcSel("addGestureRecognizer:"), swipeGr);
+
+        let textLbl = makeLabel(pText, sysFont(15.0, fontWeightMedium()), colorLabel(), 1);
+
+        let codePillBox = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 44.0, 18.0));
+        msgSendVoid1Ptr(codePillBox, objcSel("setBackgroundColor:"), colorPrimary06());
+        let codeLbl = makeLabel(info.encodedCode, sysFontMonospaced(11.5, fontWeightRegular()), colorSecondaryLabel(), 1);
+        msgSendVoid1Ptr(codePillBox, objcSel("addSubview:"), codeLbl);
+
+        let autoLbl =
+            if (info.phrase.autoComposed) {
+                let al = makeLabel("自动组词", sysFont(10.0, fontWeightRegular()), colorTeal(), 1);
+                msgSendVoid1Ptr(rowBox, objcSel("addSubview:"), al);
+                al
+            } else ptrNull();
+
+        let countLbl = makeLabel(intToStr(info.phrase.count) + " 次", sysFont(12.0, fontWeightRegular()), colorSecondaryLabel(), 1);
+        // NSTextAlignmentRight = 2
+        msgSendVoid1I64(countLbl, objcSel("setTextAlignment:"), intToI64(2));
+
+        let delBtn = objcAllocInitFrame("UIButton", cgRect(0.0, 0.0, 22.0, 22.0));
+        msgSendVoid1I64(delBtn, objcSel("setTag:"), intToI64(idx));
+        msgSendVoid1Bool(delBtn, objcSel("setIsAccessibilityElement:"), true);
+        msgSendVoid1Ptr(delBtn, objcSel("setAccessibilityLabel:"), nsStr("删除 " + pText));
+        msgSendVoid1Ptr1Sel1U64(delBtn, objcSel("addTarget:action:forControlEvents:"), ui.lxuVc, objcSel("onLexiconTapDelete:"), intToI64(64));
+
+        let delSym = makeSymbolImageView("xmark.circle.fill", 13.5, 4, colorTertiaryLabel());
+        msgSendVoid1Bool(delSym, objcSel("setUserInteractionEnabled:"), false);
+        msgSendVoid1Bool(delSym, objcSel("setIsAccessibilityElement:"), false);
+        msgSendVoid1Ptr(delBtn, objcSel("addSubview:"), delSym);
+
+        msgSendVoid1Ptr(rowBox, objcSel("addSubview:"), textLbl);
+        msgSendVoid1Ptr(rowBox, objcSel("addSubview:"), codePillBox);
+        msgSendVoid1Ptr(rowBox, objcSel("addSubview:"), countLbl);
+        msgSendVoid1Ptr(rowBox, objcSel("addSubview:"), delBtn);
+
+        msgSendVoid1Ptr(ui.lxuRowsContainer, objcSel("addSubview:"), div);
+        msgSendVoid1Ptr(ui.lxuRowsContainer, objcSel("addSubview:"), rowBox);
+
+        vecPush(ui.lxuPhraseRows, PhraseRowViews {
+            prvDiv: div,
+            prvRowBox: rowBox,
+            prvTextLbl: textLbl,
+            prvCodePillBox: codePillBox,
+            prvCodeLbl: codeLbl,
+            prvAutoLbl: autoLbl,
+            prvHasAuto: info.phrase.autoComposed,
+            prvCountLbl: countLbl,
+            prvDelBtn: delBtn,
+            prvDelSym: delSym,
+            prvPhraseText: pText,
+        });
+        cellSet(i, idx + 1)
+    }
+}
+
+def syncLexiconFromSession(ui: LexiconTabUi): Void = {
+    let s = bridgeShared();
+    let cfg = cellGet(s.jsConfig);
+    msgSendVoid1Bool(ui.lxuSw1, objcSel("setOn:"), cfg.autoPhrase);
+    msgSendVoid1Bool(ui.lxuSw2, objcSel("setOn:"), cfg.dynamicWordFreq);
+    msgSendVoid1Bool(ui.lxuSw3, objcSel("setOn:"), cfg.dynamicCharFreq);
+    syncAddButtonState(ui);
+
+    let fb = cellGet(ui.lxuFeedbackText);
+    msgSendVoid1Ptr(ui.lxuFeedbackLbl, objcSel("setText:"), nsStr(fb));
+    msgSendVoid1Bool(ui.lxuFeedbackLbl, objcSel("setHidden:"), strLen(fb) == 0);
+
+    rebuildPhraseRows(ui);
+    layoutLexiconTab(ui)
+}
+
+pub def syncLexiconTabUiOnly(): Void =
+    match cellGet(gLexiconUi) {
+        Some(ui) -> syncLexiconFromSession(ui),
+        None -> (),
+    }
+
+pub def refreshLexiconTab(): Void =
+    match cellGet(gLexiconUi) {
+        Some(ui) -> {
+            let s = bridgeShared();
+            bridgeLoadConfigAndUser(s, true);
+            syncLexiconFromSession(ui)
+        },
+        None -> (),
+    }
+
+def layoutLexiconTab(ui: LexiconTabUi): Void = {
+    let view = msgSend0(ui.lxuVc, objcSel("view"));
+    if (!ptrIsNull(view)) {
+        let bounds = msgSendRect0(view, objcSel("bounds"));
+        let viewW = bounds.size.width;
+        if (viewW > 40.0) {
+            let outerPad = 16.0;
+            let contentW = viewW - outerPad * 2.0;
+            let cardPad = 14.0;
+            let innerW = contentW - cardPad * 2.0;
+            let hh = hairlineHeight();
+
+            // Card 1: 3 Switches (`spacing: 12`)
+            let y1 = layoutToggleRow(ui.lxuSw1Title, ui.lxuSw1Sub, ui.lxuSw1, cardPad, cardPad, innerW);
+            let d1Y = y1 + 12.0;
+            msgSendVoid1Rect(ui.lxuDiv1, objcSel("setFrame:"), cgRect(cardPad, d1Y, innerW, hh));
+
+            let y2 = layoutToggleRow(ui.lxuSw2Title, ui.lxuSw2Sub, ui.lxuSw2, cardPad, d1Y + hh + 12.0, innerW);
+            let d2Y = y2 + 12.0;
+            msgSendVoid1Rect(ui.lxuDiv2, objcSel("setFrame:"), cgRect(cardPad, d2Y, innerW, hh));
+
+            let y3 = layoutToggleRow(ui.lxuSw3Title, ui.lxuSw3Sub, ui.lxuSw3, cardPad, d2Y + hh + 12.0, innerW);
+            let c1H = y3 + cardPad;
+            msgSendVoid1Rect(ui.lxuCard1, objcSel("setFrame:"), cgRect(outerPad, outerPad, contentW, c1H));
+
+            // Card 2: Personal Phrases (`spacing: 10`)
+            let c2Y = outerPad + c1H + 14.0;
+            let hdrSz = measureViewSize(ui.lxuHdrLbl, innerW);
+            msgSendVoid1Rect(ui.lxuHdrLbl, objcSel("setFrame:"), cgRect(cardPad, cardPad, innerW, hdrSz.height));
+
+            let inpY = cardPad + hdrSz.height + 10.0;
+            let addW = 62.0;
+            let inpH = 34.0;
+            let tfW = innerW - addW - 8.0;
+            msgSendVoid1Rect(ui.lxuWordField, objcSel("setFrame:"), cgRect(cardPad, inpY, tfW, inpH));
+            msgSendVoid1Rect(ui.lxuAddBtn, objcSel("setFrame:"), cgRect(cardPad + tfW + 8.0, inpY, addW, inpH));
+
+            let curY = cellNew(inpY + inpH);
+            let fb = cellGet(ui.lxuFeedbackText);
+            if (strLen(fb) > 0) {
+                let fbSz = measureViewSize(ui.lxuFeedbackLbl, innerW);
+                msgSendVoid1Rect(ui.lxuFeedbackLbl, objcSel("setFrame:"), cgRect(cardPad, cellGet(curY) + 10.0, innerW, fbSz.height));
+                cellSet(curY, cellGet(curY) + 10.0 + fbSz.height)
+            } else ();
+
+            let rowsN = vecLen(ui.lxuPhraseRows);
+            if (rowsN > 0) {
+                let rowsStart = cellGet(curY) + 10.0;
+                let rCurY = cellNew(0.0);
+                let dummyRow = PhraseRowViews {
+                    prvDiv: ptrNull(), prvRowBox: ptrNull(), prvTextLbl: ptrNull(),
+                    prvCodePillBox: ptrNull(), prvCodeLbl: ptrNull(), prvAutoLbl: ptrNull(),
+                    prvHasAuto: false, prvCountLbl: ptrNull(), prvDelBtn: ptrNull(),
+                    prvDelSym: ptrNull(), prvPhraseText: "",
+                };
+                let i = cellNew(0);
+                while (cellGet(i) < rowsN) {
+                    let idx = cellGet(i);
+                    if (idx > 0) {
+                        cellSet(rCurY, cellGet(rCurY) + 10.0)
+                    } else ();
+                    let rItem = vecGetOr(ui.lxuPhraseRows, idx, dummyRow);
+                    msgSendVoid1Rect(rItem.prvDiv, objcSel("setFrame:"), cgRect(0.0, cellGet(rCurY), innerW, hh));
+                    let rowTop = cellGet(rCurY) + hh + 10.0;
+                    let rowH = 24.0;
+                    msgSendVoid1Rect(rItem.prvRowBox, objcSel("setFrame:"), cgRect(0.0, rowTop, innerW, rowH));
+
+                    let delSz = 22.0;
+                    msgSendVoid1Rect(rItem.prvDelBtn, objcSel("setFrame:"), cgRect(innerW - delSz, roundPx((rowH - delSz) * 0.5), delSz, delSz));
+                    msgSendVoid1Rect(rItem.prvDelSym, objcSel("setFrame:"), cgRect(3.0, 3.0, 16.0, 16.0));
+
+                    let cntSz = measureViewSize(rItem.prvCountLbl, 80.0);
+                    let cntX = innerW - delSz - 6.0 - cntSz.width;
+                    msgSendVoid1Rect(
+                        rItem.prvCountLbl,
+                        objcSel("setFrame:"),
+                        cgRect(cntX, roundPx((rowH - cntSz.height) * 0.5), cntSz.width, cntSz.height)
+                    );
+
+                    let codeSz = measureViewSize(rItem.prvCodeLbl, 100.0);
+                    let pillW = codeSz.width + 12.0;
+                    let pillH = codeSz.height + 3.0;
+                    let autoW =
+                        if (rItem.prvHasAuto && !ptrIsNull(rItem.prvAutoLbl)) {
+                            measureViewSize(rItem.prvAutoLbl, 64.0).width + 6.0
+                        } else 0.0;
+                    let maxPhraseW = cntX - pillW - autoW - 14.0;
+                    let rawTxtSz = measureViewSize(rItem.prvTextLbl, if (maxPhraseW > 30.0) maxPhraseW else 30.0);
+                    let txtW = if (rawTxtSz.width < maxPhraseW) rawTxtSz.width else maxPhraseW;
+                    msgSendVoid1Rect(
+                        rItem.prvTextLbl,
+                        objcSel("setFrame:"),
+                        cgRect(0.0, roundPx((rowH - rawTxtSz.height) * 0.5), txtW, rawTxtSz.height)
+                    );
+
+                    let pillX = txtW + 6.0;
+                    msgSendVoid1Rect(
+                        rItem.prvCodePillBox,
+                        objcSel("setFrame:"),
+                        cgRect(pillX, roundPx((rowH - pillH) * 0.5), pillW, pillH)
+                    );
+                    let pillLayer = msgSend0(rItem.prvCodePillBox, objcSel("layer"));
+                    if (!ptrIsNull(pillLayer)) {
+                        msgSendVoid1Float(pillLayer, objcSel("setCornerRadius:"), pillH * 0.5)
+                    } else ();
+                    msgSendVoid1Rect(rItem.prvCodeLbl, objcSel("setFrame:"), cgRect(6.0, 1.5, codeSz.width, codeSz.height));
+
+                    if (rItem.prvHasAuto && !ptrIsNull(rItem.prvAutoLbl)) {
+                        let aSz = measureViewSize(rItem.prvAutoLbl, 64.0);
+                        msgSendVoid1Rect(
+                            rItem.prvAutoLbl,
+                            objcSel("setFrame:"),
+                            cgRect(pillX + pillW + 6.0, roundPx((rowH - aSz.height) * 0.5), aSz.width, aSz.height)
+                        )
+                    } else ();
+
+                    cellSet(rCurY, rowTop + rowH);
+                    cellSet(i, idx + 1)
+                };
+                msgSendVoid1Bool(ui.lxuRowsContainer, objcSel("setHidden:"), false);
+                msgSendVoid1Rect(ui.lxuRowsContainer, objcSel("setFrame:"), cgRect(cardPad, rowsStart, innerW, cellGet(rCurY)));
+                cellSet(curY, rowsStart + cellGet(rCurY))
+            } else {
+                msgSendVoid1Bool(ui.lxuRowsContainer, objcSel("setHidden:"), true)
+            };
+
+            let c2H = cellGet(curY) + cardPad;
+            msgSendVoid1Rect(ui.lxuCard2, objcSel("setFrame:"), cgRect(outerPad, c2Y, contentW, c2H));
+
+            let totalH = c2Y + c2H + outerPad;
+            msgSendVoid1Size(ui.lxuScroll, objcSel("setContentSize:"), cgSize(viewW, totalH))
+        } else ()
+    } else ()
+}
+
+def deletePhraseByRowIdx(ui: LexiconTabUi, idx: Int): Void =
+    if (idx >= 0 && idx < vecLen(ui.lxuPhraseRows)) {
+        let dummyRow = PhraseRowViews {
+            prvDiv: ptrNull(), prvRowBox: ptrNull(), prvTextLbl: ptrNull(),
+            prvCodePillBox: ptrNull(), prvCodeLbl: ptrNull(), prvAutoLbl: ptrNull(),
+            prvHasAuto: false, prvCountLbl: ptrNull(), prvDelBtn: ptrNull(),
+            prvDelSym: ptrNull(), prvPhraseText: "",
+        };
+        let rItem = vecGetOr(ui.lxuPhraseRows, idx, dummyRow);
+        if (strLen(rItem.prvPhraseText) > 0) {
+            let s = bridgeShared();
+            bridgeRemoveUserPhrase(s, rItem.prvPhraseText, true);
+            rebuildPhraseRows(ui);
+            layoutLexiconTab(ui)
+        } else ()
+    } else ()
+
+// ============================================================================
+// Objective-C Callbacks on `JuxuLexiconTabVC`
+// ============================================================================
+
+def lexiconOnSwitchChanged(_self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
+    let tag = i64ToInt(msgSendI64_0(sender, objcSel("tag")));
+    let isOn = msgSendBool0(sender, objcSel("isOn"));
+    let s = bridgeShared();
+    let nextCfg = updateLexiconToggle(cellGet(s.jsConfig), tag, isOn);
+    bridgeApplyAndSaveConfig(s, nextCfg, true)
+}
+
+def lexiconOnTextChanged(_self: Ptr, _cmd: Ptr, _arg: Ptr): Void =
+    match cellGet(gLexiconUi) {
+        Some(ui) -> syncAddButtonState(ui),
+        None -> (),
+    }
+
+def lexiconOnAddTap(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    match cellGet(gLexiconUi) {
+        Some(ui) -> {
+            let raw = nsStrPtrToString(msgSend0(ui.lxuWordField, objcSel("text")));
+            let s = bridgeShared();
+            let code = bridgeAddUserPhrase(s, raw, true);
+            if (strLen(code) > 0) {
+                cellSet(ui.lxuFeedbackText, "✓ 已添加「" + raw + "」(" + code + ")");
+                msgSendVoid1Ptr(ui.lxuFeedbackLbl, objcSel("setText:"), nsStr(cellGet(ui.lxuFeedbackText)));
+                msgSendVoid1Bool(ui.lxuFeedbackLbl, objcSel("setHidden:"), false);
+                msgSendVoid1Ptr(ui.lxuWordField, objcSel("setText:"), nsStr(""));
+                syncAddButtonState(ui);
+                dismissLexiconKeyboardState();
+                rebuildPhraseRows(ui);
+                layoutLexiconTab(ui)
+            } else ()
+        },
+        None -> (),
+    }
+
+def lexiconOnTapDelete(_self: Ptr, _cmd: Ptr, sender: Ptr): Void =
+    match cellGet(gLexiconUi) {
+        Some(ui) -> {
+            let idx = i64ToInt(msgSendI64_0(sender, objcSel("tag")));
+            deletePhraseByRowIdx(ui, idx)
+        },
+        None -> (),
+    }
+
+def lexiconOnSwipeDelete(_self: Ptr, _cmd: Ptr, gr: Ptr): Void =
+    match cellGet(gLexiconUi) {
+        Some(ui) -> {
+            let rowView = msgSend0(gr, objcSel("view"));
+            if (!ptrIsNull(rowView)) {
+                let idx = i64ToInt(msgSendI64_0(rowView, objcSel("tag")));
+                deletePhraseByRowIdx(ui, idx)
+            } else ()
+        },
+        None -> (),
+    }
+
+def lexiconOnBgTap(_self: Ptr, _cmd: Ptr, _gr: Ptr): Void =
+    match cellGet(gLexiconUi) {
+        Some(ui) ->
+            if (cellGet(ui.lxuWordFocused)) {
+                dismissLexiconKeyboardState()
+            } else (),
+        None -> (),
+    }
+
+def lexiconTextFieldDidBeginEditing(_self: Ptr, _cmd: Ptr, _tf: Ptr): Void =
+    match cellGet(gLexiconUi) {
+        Some(ui) -> cellSet(ui.lxuWordFocused, true),
+        None -> (),
+    }
+
+def lexiconTextFieldDidEndEditing(_self: Ptr, _cmd: Ptr, _tf: Ptr): Void =
+    match cellGet(gLexiconUi) {
+        Some(ui) -> cellSet(ui.lxuWordFocused, false),
+        None -> (),
+    }
+
+def lexiconTextFieldShouldReturn(_self: Ptr, _cmd: Ptr, _tf: Ptr): Bool = {
+    dismissLexiconKeyboardState();
+    true
+}
+
+def lexiconOnKeyboardWillChange(self: Ptr, _cmd: Ptr, notif: Ptr): Void =
+    match cellGet(gLexiconUi) {
+        Some(ui) -> updateScrollKeyboardInset(ui.lxuScroll, msgSend0(self, objcSel("view")), notif, false),
+        None -> (),
+    }
+
+def lexiconOnKeyboardWillHide(self: Ptr, _cmd: Ptr, notif: Ptr): Void =
+    match cellGet(gLexiconUi) {
+        Some(ui) -> updateScrollKeyboardInset(ui.lxuScroll, msgSend0(self, objcSel("view")), notif, true),
+        None -> (),
+    }
+
+def lexiconVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIViewController", objcSel("viewDidLoad"));
+    let s = bridgeShared();
+    let cfg = cellGet(s.jsConfig);
+
+    let view = msgSend0(self, objcSel("view"));
+    msgSendVoid1Ptr(view, objcSel("setBackgroundColor:"), colorSystemBackground());
+
+    let sv = makeScrollContainer(true);
+    msgSendVoid1Rect(sv, objcSel("setFrame:"), msgSendRect0(view, objcSel("bounds")));
+    msgSendVoid1Ptr(view, objcSel("addSubview:"), sv);
+
+    let tapGr = objcAllocInit("UITapGestureRecognizer");
+    msgSendVoid1Ptr1Sel(tapGr, objcSel("addTarget:action:"), self, objcSel("onLexiconBgTap:"));
+    msgSendVoid1Bool(tapGr, objcSel("setCancelsTouchesInView:"), false);
+    msgSendVoid1Ptr(sv, objcSel("addGestureRecognizer:"), tapGr);
+
+    // Card 1: 3 Switches
+    let card1 = makeSettingsCard();
+    let sw1T = makeLabel("连打单字自动组词", sysFont(14.5, fontWeightMedium()), colorLabel(), 0);
+    let sw1S = makeLabel("重复连打双字/三字组合后自动加入个人词库", sysFont(11.5, fontWeightRegular()), colorSecondaryLabel(), 0);
+    let sw1 = makeSwitch("连打单字自动组词", cfg.autoPhrase, self, objcSel("onLexiconSwitchChanged:"));
+    msgSendVoid1I64(sw1, objcSel("setTag:"), intToI64(1));
+    let div1 = makeDivider();
+
+    let sw2T = makeLabel("词组动态调频", sysFont(14.5, fontWeightMedium()), colorLabel(), 0);
+    let sw2S = makeLabel("常用词组与上下文高频搭配自动前移", sysFont(11.5, fontWeightRegular()), colorSecondaryLabel(), 0);
+    let sw2 = makeSwitch("词组动态调频", cfg.dynamicWordFreq, self, objcSel("onLexiconSwitchChanged:"));
+    msgSendVoid1I64(sw2, objcSel("setTag:"), intToI64(2));
+    let div2 = makeDivider();
+
+    let sw3T = makeLabel("单字动态调频", sysFont(14.5, fontWeightMedium()), colorLabel(), 0);
+    let sw3S = makeLabel("建议关闭以保持单字重码顺序稳定", sysFont(11.5, fontWeightRegular()), colorSecondaryLabel(), 0);
+    let sw3 = makeSwitch("单字动态调频", cfg.dynamicCharFreq, self, objcSel("onLexiconSwitchChanged:"));
+    msgSendVoid1I64(sw3, objcSel("setTag:"), intToI64(3));
+
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), sw1T);
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), sw1S);
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), sw1);
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), div1);
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), sw2T);
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), sw2S);
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), sw2);
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), div2);
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), sw3T);
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), sw3S);
+    msgSendVoid1Ptr(card1, objcSel("addSubview:"), sw3);
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), card1);
+
+    // Card 2: Personal Phrase Manager
+    let card2 = makeSettingsCard();
+    let hdrLbl = makeLabel(
+        "跨版本个人词条（切 86/98/新世纪自动重算编码）",
+        sysFont(14.0, fontWeightSemibold()),
+        colorLabel(),
+        0
+    );
+    let wordField = makeRoundedTextField(
+        "输入新词条，如：句序",
+        None,
+        self,
+        self,
+        objcSel("onLexiconTextChanged:")
+    );
+    let addBtn = objcAllocInitFrame("UIButton", cgRect(0.0, 0.0, 62.0, 34.0));
+    applyContinuousCorner(addBtn, 8.0);
+    setButtonPlainTitle(addBtn, "添加", sysFont(14.0, fontWeightSemibold()), colorWhite());
+    // UIControlStateDisabled = 2
+    msgSendVoid1Ptr1I64(addBtn, objcSel("setTitleColor:forState:"), colorTertiaryLabel(), intToI64(2));
+    msgSendVoid1Ptr1Sel1U64(addBtn, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onLexiconAddTap:"), intToI64(64));
+
+    let fbLbl = makeLabel("", sysFont(12.0, fontWeightRegular()), colorAccent(), 0);
+    msgSendVoid1Bool(fbLbl, objcSel("setHidden:"), true);
+
+    let rowsCont = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 260.0, 40.0));
+    msgSendVoid1Ptr(rowsCont, objcSel("setBackgroundColor:"), colorClear());
+
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), hdrLbl);
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), wordField);
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), addBtn);
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), fbLbl);
+    msgSendVoid1Ptr(card2, objcSel("addSubview:"), rowsCont);
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), card2);
+
+    let nc = msgSend0(objcClass("NSNotificationCenter"), objcSel("defaultCenter"));
+    if (!ptrIsNull(nc)) {
+        msgSendVoid1Ptr1Sel2Ptr(nc, objcSel("addObserver:selector:name:object:"), self, objcSel("onLexiconTextChanged:"), notifTextFieldDidChange(), wordField);
+        msgSendVoid1Ptr1Sel2Ptr(nc, objcSel("addObserver:selector:name:object:"), self, objcSel("onLexiconKeyboardWillChange:"), notifKeyboardWillChangeFrame(), ptrNull());
+        msgSendVoid1Ptr1Sel2Ptr(nc, objcSel("addObserver:selector:name:object:"), self, objcSel("onLexiconKeyboardWillHide:"), notifKeyboardWillHide(), ptrNull())
+    } else ();
+
+    let ui = LexiconTabUi {
+        lxuVc: self,
+        lxuScroll: sv,
+        lxuCard1: card1,
+        lxuSw1Title: sw1T, lxuSw1Sub: sw1S, lxuSw1: sw1,
+        lxuDiv1: div1,
+        lxuSw2Title: sw2T, lxuSw2Sub: sw2S, lxuSw2: sw2,
+        lxuDiv2: div2,
+        lxuSw3Title: sw3T, lxuSw3Sub: sw3S, lxuSw3: sw3,
+        lxuCard2: card2,
+        lxuHdrLbl: hdrLbl,
+        lxuWordField: wordField,
+        lxuAddBtn: addBtn,
+        lxuFeedbackLbl: fbLbl,
+        lxuRowsContainer: rowsCont,
+        lxuPhraseRows: vecNew(),
+        lxuWordFocused: cellNew(false),
+        lxuFeedbackText: cellNew(""),
+    };
+    cellSet(gLexiconUi, Some(ui));
+    syncLexiconFromSession(ui)
+}
+
+def lexiconVcViewWillAppear(self: Ptr, _cmd: Ptr, animated: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIViewController", objcSel("viewWillAppear:"), animated);
+    refreshLexiconTab()
+}
+
+def lexiconVcViewDidLayoutSubviews(self: Ptr, _cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIViewController", objcSel("viewDidLayoutSubviews"));
+    match cellGet(gLexiconUi) {
+        Some(ui) -> layoutLexiconTab(ui),
+        None -> (),
+    }
+}
+
+pub def registerLexiconTabClass(): Void = {
+    let cls = objcAllocateClass("UIViewController", "JuxuLexiconTabVC");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddProtocol(cls, "UITextFieldDelegate");
+        let _ = objcAddMethod(cls, "viewDidLoad", cFnPtr(lexiconVcViewDidLoad), "v@:");
+        let _ = objcAddMethod(cls, "viewWillAppear:", cFnPtr(lexiconVcViewWillAppear), "v@:B");
+        let _ = objcAddMethod(cls, "viewDidLayoutSubviews", cFnPtr(lexiconVcViewDidLayoutSubviews), "v@:");
+        let _ = objcAddMethod(cls, "onLexiconSwitchChanged:", cFnPtr(lexiconOnSwitchChanged), "v@:@");
+        let _ = objcAddMethod(cls, "onLexiconTextChanged:", cFnPtr(lexiconOnTextChanged), "v@:@");
+        let _ = objcAddMethod(cls, "onLexiconAddTap:", cFnPtr(lexiconOnAddTap), "v@:@");
+        let _ = objcAddMethod(cls, "onLexiconTapDelete:", cFnPtr(lexiconOnTapDelete), "v@:@");
+        let _ = objcAddMethod(cls, "onLexiconSwipeDelete:", cFnPtr(lexiconOnSwipeDelete), "v@:@");
+        let _ = objcAddMethod(cls, "onLexiconBgTap:", cFnPtr(lexiconOnBgTap), "v@:@");
+        let _ = objcAddMethod(cls, "onLexiconKeyboardWillChange:", cFnPtr(lexiconOnKeyboardWillChange), "v@:@");
+        let _ = objcAddMethod(cls, "onLexiconKeyboardWillHide:", cFnPtr(lexiconOnKeyboardWillHide), "v@:@");
+        let _ = objcAddMethod(cls, "textFieldDidBeginEditing:", cFnPtr(lexiconTextFieldDidBeginEditing), "v@:@");
+        let _ = objcAddMethod(cls, "textFieldDidEndEditing:", cFnPtr(lexiconTextFieldDidEndEditing), "v@:@");
+        let _ = objcAddMethod(cls, "textFieldShouldReturn:", cFnPtr(lexiconTextFieldShouldReturn), "B@:@");
+        objcRegisterClass(cls)
+    } else ()
+}

@@ -1,54 +1,151 @@
-/// Unit & integration tests for `juxu_shared` (punctuation pairing, auto-spacing, and `JuxuSession`).
+/// Comprehensive parity test suite for `juxu_shared` (ported directly from `Tests/SwiftBridgeTests.swift`).
 
+use std.option.{Some, None}
 use std.vec.{vecLen, vecGetOr}
-use std.str.{intToStr}
 use sys.proc.{exit}
-use juxu_core.{
-    Pinyin, Toml, SelectPage, emptyCandidate,
-    applyConfig, typeAscii, step, snapCommitText, predictNext, setContext,
-}
+use juxu_core.{Candidate, emptyCandidate}
 use juxu_shared.{
-    InsertPair, SkipClose, Plain,
-    punctuationTrackerNew, punctuationTrackerHandleSymbol, punctuationTrackerConsumeBackspacePair,
-    defaultAutoSpaceOptions, formatAutoSpace,
-    sessionNew, sessionLoadDictsFromDir,
-}
-
-def fail(msg: String): Void = {
-    printLn("ASSERT FAILED: " + msg);
-    exit(1)
+    bridgeNew, bridgeSwitchSchema, bridgeAddUserPhrase, bridgeHandleKey, bridgePushTouch,
+    bridgeCommitPending, bridgeResetQuoteState, bridgeSetContext, bridgePredictNextWords,
+    bridgeAcceptPrediction, bridgeApplyAndSaveConfig, activeInlinePreedit, macOSPreedit,
+    AutoSpaceOptions, formatAutoSpaceFull,
+    autoSpaceTrackerNew, autoSpaceTrackerPrepareCommit, autoSpaceTrackerRecordPassthrough,
+    autoSpaceTrackerWillDeleteBackward, autoSpaceTrackerReconcileExternal, autoSpaceTrackerEffectiveBefore,
+    PunctuationAction, Plain, InsertPair, SkipClose,
+    punctuationTrackerNew, punctuationTrackerHandleSymbol, punctuationTrackerConsumeBackspacePair, punctuationTrackerPrune,
+    strUtf16Len, utf16SliceContext,
 }
 
 def assertTrue(cond: Bool, msg: String): Void =
-    if (!cond) fail(msg) else ()
+    if (!cond) {
+        printLn("ASSERTION FAILED: " + msg);
+        exit(1)
+    } else ()
+
+def fmtText(before: String, ins: String, split: Bool, opts: AutoSpaceOptions): String = {
+    let (txt, _) = formatAutoSpaceFull(before, ins, split, false, opts);
+    txt
+}
 
 def main(): Void = {
-    // 1. Punctuation pairing tracker
+    // 1. UTF-16 length & surrogate-pair context slicing
+    assertTrue(strUtf16Len("你好") == intToI64(2), "UTF-16 CJK len");
+    assertTrue(strUtf16Len("你好😀世界abc") == intToI64(9), "UTF-16 surrogate pair len");
+    let (sBefore, sSel, sAfter) = utf16SliceContext("你好😀世界abc", 4, 2, 10, 10, 10);
+    assertTrue(sBefore == "你好😀" && sSel == "世界" && sAfter == "abc", "UTF-16 slice context");
+
+    // 2. AutoSpaceFormatter edge cases from SwiftBridgeTests
+    let allOn = AutoSpaceOptions { asoEnabled: true, asoSpaceDigits: true };
+    let noDigits = AutoSpaceOptions { asoEnabled: true, asoSpaceDigits: false };
+    let allOff = AutoSpaceOptions { asoEnabled: false, asoSpaceDigits: true };
+
+    assertTrue(fmtText("你好", "hello", false, allOn) == " hello", "cjk -> en");
+    assertTrue(fmtText("hello", "世界", false, allOn) == " 世界", "en -> cjk");
+    assertTrue(fmtText("第", "1", false, allOn) == " 1", "cjk -> digit");
+    assertTrue(fmtText("2026", "年", false, allOn) == " 年", "digit -> cjk");
+    assertTrue(fmtText("第", "1", false, noDigits) == "1", "noDigits 1");
+    assertTrue(fmtText("2026", "年", false, noDigits) == "年", "noDigits 2");
+    assertTrue(fmtText("iPhone17", "手机", false, noDigits) == " 手机", "iPhone17 -> cjk");
+    assertTrue(fmtText("看", "3D", false, noDigits) == " 3D", "cjk -> 3D");
+    assertTrue(fmtText("你好", "hello", false, allOff) == "hello", "allOff");
+    assertTrue(fmtText("https://zh.wikipedia.org/wiki/五笔", "86", false, allOn) == "86", "cjk url");
+    assertTrue(fmtText("看 https://github.com/nameoverflow/formordo", "仓库", false, allOn) == " 仓库", "prose after url");
+    assertTrue(fmtText("用 C++", "写", false, allOn) == " 写", "C++");
+    assertTrue(fmtText("用 C#", "开发", false, allOn) == " 开发", "C#");
+    assertTrue(fmtText("增长 50%", "左右", false, allOn) == " 左右", "50%");
+    assertTrue(fmtText("增长 50%", "左右", false, noDigits) == "左右", "50% noDigits");
+    assertTrue(fmtText("%50%", "测试", false, allOn) == "测试", "%50% reject");
+    assertTrue(fmtText("", "我用rust写了", true, allOn) == "我用 rust 写了", "splitInternal 1");
+    assertTrue(fmtText("", "使用iOS18系统", true, noDigits) == "使用 iOS18 系统", "splitInternal 2");
+    assertTrue(fmtText("𠮷", "a", false, allOn) == " a", "CJK Ext B");
+    assertTrue(fmtText("café", "店", false, allOn) == " 店", "Latin Ext");
+
+    // 3. PunctuationPairingTracker (nested pairs + cursorStaysInPairs prune)
     let pt = punctuationTrackerNew();
-    assertTrue(punctuationTrackerHandleSymbol(pt, "“", "") == InsertPair("”"), "open quote inserts pair");
-    assertTrue(punctuationTrackerHandleSymbol(pt, "”", "”") == SkipClose, "typing closer skips close");
-    assertTrue(punctuationTrackerHandleSymbol(pt, "（", "") == InsertPair("）"), "open paren inserts pair");
-    assertTrue(punctuationTrackerConsumeBackspacePair(pt, "（", "）"), "backspace deletes pair");
+    assertTrue(punctuationTrackerHandleSymbol(pt, "（", "，后文") == InsertPair("）"), "open outer");
+    assertTrue(punctuationTrackerHandleSymbol(pt, "“", "），后文") == InsertPair("”"), "open inner");
+    assertTrue(punctuationTrackerHandleSymbol(pt, "”", "”），后文") == SkipClose, "skip inner");
+    assertTrue(punctuationTrackerHandleSymbol(pt, "）", "），后文") == SkipClose, "skip outer");
+    assertTrue(vecLen(pt.openClosers) == 0, "empty stack");
 
-    // 2. Chinese/English auto-spacing
-    let opts = defaultAutoSpaceOptions();
-    assertTrue(formatAutoSpace("使用", "Geisha", opts) == " Geisha", "CJK -> ASCII inserts space");
-    assertTrue(formatAutoSpace("Geisha", "输入法", opts) == " 输入法", "ASCII -> CJK inserts space");
-    assertTrue(formatAutoSpace("使用 ", "Geisha", opts) == "Geisha", "existing space not doubled");
+    let _ = punctuationTrackerHandleSymbol(pt, "《", "。原文");
+    punctuationTrackerPrune(pt, "》别的段落");
+    assertTrue(vecLen(pt.openClosers) == 0, "cursorStaysInPairs prune");
 
-    // 3. End-to-end JuxuSession backed directly by `juxu_core`
-    let s = sessionNew();
-    let loaded = sessionLoadDictsFromDir(s, "/Users/nomofu/code/juxu/Resources/Dicts");
-    assertTrue(loaded >= 4, "loaded dicts >= 4 (got " + intToStr(loaded) + ")");
-    applyConfig(s.engine, Toml, "[general]\nschema = \"pinyin\"\n");
-    let snap = typeAscii(s.engine, "nihao", intToI64(1000), intToI64(50));
-    let top1 = vecGetOr(snap.pageCandidates, 0, emptyCandidate());
-    assertTrue(top1.text == "你好", "nihao top1 == 你好");
-    let out = step(s.engine, SelectPage { index: 0, atMs: intToI64(2000) });
-    assertTrue(snapCommitText(out) == "你好", "SelectPage commits 你好");
-    setContext(s.engine, "你好");
-    let preds = predictNext(s.engine, 5);
-    assertTrue(vecLen(preds) > 0, "predictNext non-empty");
+    let _ = punctuationTrackerHandleSymbol(pt, "「", "");
+    assertTrue(!punctuationTrackerConsumeBackspacePair(pt, "你好「字", "」"), "keep non-empty pair");
+    assertTrue(punctuationTrackerConsumeBackspacePair(pt, "你好「", "」"), "delete empty pair");
 
-    printLn("shared_test: ALL PASSED (loaded=" + intToStr(loaded) + " dicts, top1=" + top1.text + ")")
+    // 4. AutoSpaceContextTracker (authoritative macOS & optimistic stale-XPC iOS)
+    let macT = autoSpaceTrackerNew();
+    assertTrue(autoSpaceTrackerPrepareCommit(macT, "T", Some(""), true, None, true, allOn) == "T", "mac1");
+    assertTrue(autoSpaceTrackerPrepareCommit(macT, "恤", Some("T"), true, None, true, allOn) == " 恤", "mac2");
+    autoSpaceTrackerWillDeleteBackward(macT, Some("T 恤"), true);
+    autoSpaceTrackerWillDeleteBackward(macT, Some("T "), true);
+    assertTrue(autoSpaceTrackerPrepareCommit(macT, "恤", Some("T"), true, None, true, allOn) == "恤", "mac3 suppressed");
+
+    let iosT = autoSpaceTrackerNew();
+    assertTrue(autoSpaceTrackerPrepareCommit(iosT, "我们", Some("hello"), false, None, true, allOn) == " 我们", "ios1");
+    assertTrue(autoSpaceTrackerPrepareCommit(iosT, "a", Some("hello"), false, None, false, allOn) == " a", "ios2 stale XPC");
+    autoSpaceTrackerWillDeleteBackward(iosT, Some("hello"), false);
+    autoSpaceTrackerWillDeleteBackward(iosT, Some("hello"), false);
+    autoSpaceTrackerReconcileExternal(iosT, Some("hello 我们"));
+    assertTrue(autoSpaceTrackerPrepareCommit(iosT, "a", Some("hello 我们"), false, None, false, allOn) == "a", "ios3 suppressed after catchup");
+    let _ = autoSpaceTrackerRecordPassthrough;
+    let _ = autoSpaceTrackerEffectiveBefore;
+    let _ = Plain;
+
+    // 5. Full JuxuBridge / JuxuSession against real dicts
+    let b = bridgeNew(Some("../Resources/Dicts"), true);
+    assertTrue(cellGet(b.jsState).asSchemaId == 86, "default 86");
+    let code86 = bridgeAddUserPhrase(b, "棱五笔", false);
+    assertTrue(strLen(code86) > 0, "phrase code 86");
+
+    bridgeSwitchSchema(b, 98, false);
+    assertTrue(cellGet(b.jsState).asSchemaId == 98, "switch 98");
+    bridgeSwitchSchema(b, 86, false);
+
+    // 4-code auto-commit trwu -> 我们
+    let _ = bridgeHandleKey(b, 0, 116, false, intToI64(100));
+    let _ = bridgeHandleKey(b, 0, 114, false, intToI64(110));
+    let _ = bridgeHandleKey(b, 0, 119, false, intToI64(120));
+    let s4 = bridgeHandleKey(b, 0, 117, false, intToI64(130));
+    assertTrue(s4.asCommitText == "我们", "trwu auto-commit");
+
+    // Touch slip rescue yrwu -> 我们
+    let _ = bridgePushTouch(b, 121, 4.54, 0.03, true, intToI64(200));
+    let _ = bridgePushTouch(b, 114, 3.00, 0.00, true, intToI64(260));
+    let _ = bridgePushTouch(b, 119, 1.00, 0.00, true, intToI64(320));
+    let tOut = bridgePushTouch(b, 117, 6.00, 0.00, true, intToI64(380));
+    let topCand: Candidate = vecGetOr(tOut.asCandidates, 0, emptyCandidate());
+    assertTrue(topCand.text == "我们", "touch slip rescue");
+    let confirm = bridgeHandleKey(b, 0x31, 32, false, intToI64(420));
+    assertTrue(confirm.asCommitText == "我们" && confirm.asCalibratedKeyCount >= 1, "touch calibrated");
+
+    // Xiaohe Shuangpin raw preedit (`ce'ui'yi'xx`) + predictions + Cmd+Backspace
+    bridgeSwitchSchema(b, 21, false);
+    bridgeSetContext(b, "");
+    let sp = "ceuiyixx";
+    let k = cellNew(0);
+    while (cellGet(k) < strLen(sp)) {
+        let idx = cellGet(k);
+        let _ = bridgeHandleKey(b, 0, strByteAt(sp, idx), false, intToI64(700 + idx * 20));
+        cellSet(k, idx + 1)
+    };
+    assertTrue(macOSPreedit(cellGet(b.jsState)) == "ce'ui'yi'xx", "shuangpin raw preedit");
+    assertTrue(activeInlinePreedit(cellGet(b.jsState)) == "ce'ui'yi'xx", "activeInlinePreedit");
+    let cleared = bridgeHandleKey(b, 0x33, 0, true, intToI64(900));
+    assertTrue(cleared.asConsumed && strLen(cleared.asPreedit) == 0, "Cmd+Backspace clears");
+
+    // Predictions & quote reset
+    bridgeSwitchSchema(b, 20, false);
+    bridgeSetContext(b, "小红");
+    let preds = bridgePredictNextWords(b, 8);
+    assertTrue(vecGetOr(preds, 0, "") == "书", "predict 书 after 小红");
+    bridgeAcceptPrediction(b, "书", intToI64(1000));
+    bridgeResetQuoteState(b);
+    let _ = bridgeCommitPending(b, intToI64(1010));
+    let _ = bridgeApplyAndSaveConfig;
+
+    printLn("shared_test: ALL PARITY CHECKS PASSED!")
 }

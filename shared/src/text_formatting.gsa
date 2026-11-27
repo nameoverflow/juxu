@@ -1,78 +1,76 @@
-/// Chinese punctuation pairing and Chinese/English auto-spacing
-/// shared between macOS (`JuxuInputController`) and iOS (`KeyboardViewController`).
+/// Complete 1:1 port of `Shared/TextFormatting.swift` (645 lines):
+/// - `PunctuationPairing` & `PunctuationPairingTracker` (including `cursorStaysInPairs`)
+/// - `AutoSpaceFormatter` (including CJK URLs, `C++`/`C#`, `50%`, mixed alphanumeric `iPhone17`, `splitInternal`, `suppressLeading`)
+/// - `AutoSpaceContextTracker` (authoritative macOS & optimistic stale-XPC iOS delta tracking + backspace auto-space suppression).
 
 use std.option.{Option, Some, None}
-use std.vec.{Vec, vecNew, vecLen, vecPush, vecPop, vecGetOr, vecClear}
-use std.buf.{bufNew, bufPushStr, bufToString}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecPop, vecGetOr, vecClear}
+use std.buf.{bufNew, bufWithCap, bufPushStr, bufPushByte, bufToString}
+use std.str.{strStartsWith, strEndsWith}
 use std.generic
-
-// ============================================================================
-// UTF-8 First / Last Character Helpers
-// ============================================================================
-
-def utf8CharByteLen(b0: Int): Int =
-    if (b0 < 0x80) 1
-    else if ((b0 & 0xE0) == 0xC0) 2
-    else if ((b0 & 0xF0) == 0xE0) 3
-    else if ((b0 & 0xF8) == 0xF0) 4
-    else 1
-
-/// Decode the first Unicode scalar of `s` (returns `(codepoint, byteLen)`, or `(0, 0)` if empty).
-pub def utf8FirstScalar(s: String): (Int, Int) = {
-    let n = strLen(s);
-    if (n == 0) (0, 0)
-    else {
-        let b0 = strByteAt(s, 0);
-        if (b0 < 0x80) (b0, 1)
-        else if ((b0 & 0xE0) == 0xC0 && n >= 2) {
-            let b1 = strByteAt(s, 1);
-            (((b0 & 0x1F) << 6) | (b1 & 0x3F), 2)
-        } else if ((b0 & 0xF0) == 0xE0 && n >= 3) {
-            let b1 = strByteAt(s, 1);
-            let b2 = strByteAt(s, 2);
-            (((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F), 3)
-        } else if ((b0 & 0xF8) == 0xF0 && n >= 4) {
-            let b1 = strByteAt(s, 1);
-            let b2 = strByteAt(s, 2);
-            let b3 = strByteAt(s, 3);
-            (((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F), 4)
-        } else (b0, 1)
-    }
-}
-
-/// Return the first UTF-8 character of `s` as a `String` (or `""` if empty).
-pub def firstCharStr(s: String): String = {
-    let (_, len) = utf8FirstScalar(s);
-    if (len == 0) "" else strSlice(s, 0, len)
-}
-
-/// Decode the last Unicode scalar of `s` (returns `(codepoint, startByteIdx)`).
-pub def utf8LastScalar(s: String): (Int, Int) = {
-    let n = strLen(s);
-    if (n == 0) (0, 0)
-    else {
-        let idx = cellNew(n - 1);
-        while (cellGet(idx) > 0 && (strByteAt(s, cellGet(idx)) & 0xC0) == 0x80) {
-            cellSet(idx, cellGet(idx) - 1)
-        };
-        let start = cellGet(idx);
-        let (cp, _) = utf8FirstScalar(strSlice(s, start, n));
-        (cp, start)
-    }
-}
-
-/// Return the last UTF-8 character of `s` as a `String` (or `""` if empty).
-pub def lastCharStr(s: String): String = {
-    let n = strLen(s);
-    if (n == 0) ""
-    else {
-        let (_, start) = utf8LastScalar(s);
-        strSlice(s, start, n)
-    }
+use juxu_core.{JuxuConfig}
+use apple_geom.{
+    utf8FirstScalar, utf8LastScalar, firstCharStr, lastCharStr,
+    utf8ToScalars, utf8ScalarCount, scalarsToUtf8, scalarToString,
+    tailScalars, headScalars, dropLastScalars,
 }
 
 // ============================================================================
-// Chinese Punctuation Pairing
+// Unicode Whitespace & Character Classification
+// ============================================================================
+
+pub def isUnicodeWhitespaceScalar(v: Int): Bool =
+    (v >= 0x09 && v <= 0x0D)
+        || v == 0x20
+        || v == 0x85
+        || v == 0xA0
+        || v == 0x1680
+        || (v >= 0x2000 && v <= 0x200A)
+        || v == 0x2028
+        || v == 0x2029
+        || v == 0x202F
+        || v == 0x205F
+        || v == 0x3000
+
+data CharClass : Eq {
+    CCjk,
+    CAsciiLetter,
+    CAsciiDigit,
+    CWhitespace,
+    COther,
+}
+
+def classifyScalar(v: Int): CharClass =
+    if (isUnicodeWhitespaceScalar(v) || v == 0x200B || v == 0x200C || v == 0x200D || v == 0xFEFF) {
+        CWhitespace
+    } else if (v >= 0x30 && v <= 0x39) {
+        CAsciiDigit
+    } else if ((v >= 0x41 && v <= 0x5A)
+        || (v >= 0x61 && v <= 0x7A)
+        || (v >= 0x00C0 && v <= 0x00D6)
+        || (v >= 0x00D8 && v <= 0x00F6)
+        || (v >= 0x00F8 && v <= 0x024F)
+        || (v >= 0x1E00 && v <= 0x1EFF)) {
+        CAsciiLetter
+    } else if ((v >= 0x4E00 && v <= 0x9FFF)
+        || (v >= 0x3400 && v <= 0x4DBF)
+        || (v >= 0x20000 && v <= 0x2A6DF)
+        || (v >= 0x2A700 && v <= 0x2EBEF)
+        || (v >= 0x30000 && v <= 0x323AF)
+        || (v >= 0xF900 && v <= 0xFAFF)
+        || (v >= 0x2F800 && v <= 0x2FA1F)
+        || (v >= 0x2E80 && v <= 0x2EFF)
+        || (v >= 0x2F00 && v <= 0x2FDF)
+        || (v >= 0x3100 && v <= 0x312F)
+        || (v >= 0x31A0 && v <= 0x31BF)
+        || v == 0x3007) {
+        CCjk
+    } else {
+        COther
+    }
+
+// ============================================================================
+// Chinese Punctuation Pairing & Tracker
 // ============================================================================
 
 pub data PunctuationAction : Eq {
@@ -97,13 +95,70 @@ def isCloserSymbol(sym: String): Bool =
     sym == "”" || sym == "’" || sym == "）" || sym == "》" || sym == "〉"
         || sym == "】" || sym == "〕" || sym == "」" || sym == "』"
 
-def isSafeFollower(ch: String): Bool =
-    ch == " " || ch == "\t" || ch == "\n" || ch == "\r"
-        || ch == "，" || ch == "。" || ch == "！" || ch == "？" || ch == "；" || ch == "：" || ch == "、"
+def isSafeFollowerChar(ch: String): Bool = {
+    let (cp, len) = utf8FirstScalar(ch);
+    if (len == 0) true
+    else if (isUnicodeWhitespaceScalar(cp)) true
+    else ch == "，" || ch == "。" || ch == "！" || ch == "？" || ch == "；" || ch == "：" || ch == "、"
         || ch == "）" || ch == "》" || ch == "〉" || ch == "】" || ch == "〕" || ch == "」" || ch == "』"
         || ch == "”" || ch == "’"
         || ch == "," || ch == "." || ch == "!" || ch == "?" || ch == ";" || ch == ":"
         || ch == ")" || ch == "]" || ch == "}"
+}
+
+pub def punctuationAction(symbol: String, after: String, openClosers: Vec String): PunctuationAction =
+    match closerForOpen(symbol) {
+        Some(close) -> {
+            let nextCh = firstCharStr(after);
+            if (strLen(nextCh) == 0 || isSafeFollowerChar(nextCh)) InsertPair(close) else Plain
+        },
+        None -> {
+            let n = vecLen(openClosers);
+            if (isCloserSymbol(symbol) && n > 0 && vecGetOr(openClosers, n - 1, "") == symbol && firstCharStr(after) == symbol) {
+                SkipClose
+            } else Plain
+        },
+    }
+
+pub def punctuationShouldDeletePair(before: String, after: String, openClosers: Vec String): Bool = {
+    let n = vecLen(openClosers);
+    if (n == 0) false
+    else {
+        let close = vecGetOr(openClosers, n - 1, "");
+        let openSym = lastCharStr(before);
+        match closerForOpen(openSym) {
+            Some(expected) -> expected == close && firstCharStr(after) == close,
+            None -> false,
+        }
+    }
+}
+
+pub def punctuationPruned(openClosers: Vec String, after: String): Bool = {
+    let n = vecLen(openClosers);
+    if (n == 0) true
+    else firstCharStr(after) == vecGetOr(openClosers, n - 1, "")
+}
+
+/// True while the text right of the cursor is still the tracked closers (innermost first)
+/// followed by what was there when the first pair opened (`PunctuationPairing.cursorStaysInPairs`).
+pub def punctuationCursorStaysInPairs(openClosers: Vec String, tail: String, after: String): Bool = {
+    let n = vecLen(openClosers);
+    if (n == 0) true
+    else {
+        let b = bufNew();
+        let i = cellNew(n - 1);
+        while (cellGet(i) >= 0) {
+            bufPushStr(b, vecGetOr(openClosers, cellGet(i), ""));
+            cellSet(i, cellGet(i) - 1)
+        };
+        bufPushStr(b, tail);
+        let expected = bufToString(b);
+        let expLen = utf8ScalarCount(expected);
+        let visLen = utf8ScalarCount(after);
+        let cmpLen = if (expLen < visLen) expLen else visLen;
+        visLen >= n && headScalars(expected, cmpLen) == headScalars(after, cmpLen)
+    }
+}
 
 pub data PunctuationPairingTracker {
     openClosers: Vec String,
@@ -121,123 +176,595 @@ pub def punctuationTrackerReset(t: PunctuationPairingTracker): Void = {
     cellSet(t.openPairTail, "")
 }
 
-def trackerLastCloser(t: PunctuationPairingTracker): Option String = {
-    let n = vecLen(t.openClosers);
-    if (n == 0) None else Some(vecGetOr(t.openClosers, n - 1, ""))
-}
-
 pub def punctuationTrackerPrune(t: PunctuationPairingTracker, after: String): Void = {
-    let n = vecLen(t.openClosers);
-    if (n > 0) {
-        let first = firstCharStr(after);
-        let last = vecGetOr(t.openClosers, n - 1, "");
-        if (first != last) {
-            punctuationTrackerReset(t)
-        } else ()
+    if (!punctuationPruned(t.openClosers, after)) {
+        vecClear(t.openClosers)
+    } else ();
+    if (!punctuationCursorStaysInPairs(t.openClosers, cellGet(t.openPairTail), after)) {
+        vecClear(t.openClosers)
+    } else ();
+    if (vecLen(t.openClosers) == 0) {
+        cellSet(t.openPairTail, "")
     } else ()
 }
 
 pub def punctuationTrackerHandleSymbol(t: PunctuationPairingTracker, symbol: String, after: String): PunctuationAction = {
     punctuationTrackerPrune(t, after);
-    match closerForOpen(symbol) {
-        Some(close) -> {
-            let nextCh = firstCharStr(after);
-            if (strLen(nextCh) == 0 || isSafeFollower(nextCh)) {
-                if (vecLen(t.openClosers) == 0) cellSet(t.openPairTail, after) else ();
-                vecPush(t.openClosers, close);
-                InsertPair(close)
-            } else Plain
+    let act = punctuationAction(symbol, after, t.openClosers);
+    match act {
+        InsertPair(close) -> {
+            if (vecLen(t.openClosers) == 0) cellSet(t.openPairTail, after) else ();
+            vecPush(t.openClosers, close)
         },
-        None -> {
-            if (isCloserSymbol(symbol)) {
-                match trackerLastCloser(t) {
-                    Some(last) if (last == symbol && firstCharStr(after) == symbol) -> {
-                        let _ = vecPop(t.openClosers);
-                        if (vecLen(t.openClosers) == 0) cellSet(t.openPairTail, "") else ();
-                        SkipClose
-                    },
-                    _ -> Plain,
-                }
-            } else Plain
+        SkipClose -> {
+            let _ = vecPop(t.openClosers);
+            if (vecLen(t.openClosers) == 0) cellSet(t.openPairTail, "") else ()
         },
-    }
+        Plain -> (),
+    };
+    act
 }
 
-pub def punctuationTrackerConsumeBackspacePair(t: PunctuationPairingTracker, before: String, after: String): Bool = {
+pub def punctuationTrackerConsumeBackspacePair(t: PunctuationPairingTracker, before: String, after: String): Bool =
     if (vecLen(t.openClosers) == 0) false
     else {
         punctuationTrackerPrune(t, after);
-        match trackerLastCloser(t) {
-            Some(close) -> {
-                let openSym = lastCharStr(before);
-                let matches = match closerForOpen(openSym) {
-                    Some(expected) -> expected == close && firstCharStr(after) == close,
-                    None -> false,
-                };
-                if (matches) {
-                    let _ = vecPop(t.openClosers);
-                    if (vecLen(t.openClosers) == 0) cellSet(t.openPairTail, "") else ();
-                    true
-                } else false
-            },
+        if (punctuationShouldDeletePair(before, after, t.openClosers)) {
+            let _ = vecPop(t.openClosers);
+            if (vecLen(t.openClosers) == 0) cellSet(t.openPairTail, "") else ();
+            true
+        } else false
+    }
+
+// ============================================================================
+// Chinese / English Auto-Spacing Engine (`AutoSpaceFormatter`)
+// ============================================================================
+
+pub data AutoSpaceOptions : Eq {
+    asoEnabled: Bool,
+    asoSpaceDigits: Bool,
+}
+
+pub def defaultAutoSpaceOptions(): AutoSpaceOptions =
+    AutoSpaceOptions { asoEnabled: true, asoSpaceDigits: true }
+
+pub def autoSpaceOptionsFromConfig(cfg: JuxuConfig): AutoSpaceOptions =
+    AutoSpaceOptions {
+        asoEnabled: cfg.autoSpaceZhEn,
+        asoSpaceDigits: cfg.autoSpaceDigits,
+    }
+
+def trailingAlnumContainsLetter(s: String): Bool = {
+    let scs = utf8ToScalars(s);
+    let i = cellNew(vecLen(scs) - 1);
+    let hasLetter = cellNew(false);
+    let stop = cellNew(false);
+    while (cellGet(i) >= 0 && !cellGet(stop)) {
+        let c = classifyScalar(vecGetOr(scs, cellGet(i), 0));
+        if (c == CAsciiLetter) {
+            cellSet(hasLetter, true)
+        } else if (c != CAsciiDigit) {
+            cellSet(stop, true)
+        } else ();
+        cellSet(i, cellGet(i) - 1)
+    };
+    cellGet(hasLetter)
+}
+
+def leadingAlnumContainsLetter(s: String): Bool = {
+    let scs = utf8ToScalars(s);
+    let n = vecLen(scs);
+    let i = cellNew(0);
+    let found = cellNew(false);
+    let stop = cellNew(false);
+    while (cellGet(i) < n && !cellGet(found) && !cellGet(stop)) {
+        let c = classifyScalar(vecGetOr(scs, cellGet(i), 0));
+        if (c == CAsciiLetter) {
+            cellSet(found, true)
+        } else if (c != CAsciiDigit) {
+            cellSet(stop, true)
+        } else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+def findSchemeColonSlashSlash(token: String): Option Int = {
+    let n = strLen(token);
+    if (n < 4) None
+    else {
+        let i = cellNew(0);
+        let res: Cell (Option Int) = cellNew(None);
+        while (cellGet(i) <= n - 3 && match cellGet(res) { None -> true, Some(_) -> false }) {
+            let idx = cellGet(i);
+            if (strSlice(token, idx, idx + 3) == "://") {
+                cellSet(res, Some(idx))
+            } else ();
+            cellSet(i, idx + 1)
+        };
+        cellGet(res)
+    }
+}
+
+def isInsideCJKURL(before: String): Bool = {
+    let scs = utf8ToScalars(before);
+    let n = vecLen(scs);
+    let startIdx = cellNew(n);
+    let stop = cellNew(false);
+    while (cellGet(startIdx) > 0 && !cellGet(stop)) {
+        let prev = vecGetOr(scs, cellGet(startIdx) - 1, 0);
+        if (classifyScalar(prev) == CWhitespace) {
+            cellSet(stop, true)
+        } else {
+            cellSet(startIdx, cellGet(startIdx) - 1)
+        }
+    };
+    let sIdx = cellGet(startIdx);
+    if (sIdx >= n) false
+    else {
+        let token = scalarsToUtf8(scs, sIdx, n);
+        match findSchemeColonSlashSlash(token) {
             None -> false,
+            Some(colonByte) ->
+                if (colonByte == 0) false
+                else {
+                    let schemeOk = cellNew(true);
+                    let k = cellNew(0);
+                    while (cellGet(k) < colonByte && cellGet(schemeOk)) {
+                        let b = strByteAt(token, cellGet(k));
+                        let valid = (b >= 0x41 && b <= 0x5A)
+                            || (b >= 0x61 && b <= 0x7A)
+                            || (b >= 0x30 && b <= 0x39)
+                            || b == 0x2B || b == 0x2D || b == 0x2E;
+                        if (!valid) cellSet(schemeOk, false) else ();
+                        cellSet(k, cellGet(k) + 1)
+                    };
+                    if (!cellGet(schemeOk)) false
+                    else {
+                        let afterScheme = strSlice(token, colonByte + 3, strLen(token));
+                        let afterScs = utf8ToScalars(afterScheme);
+                        let m = vecLen(afterScs);
+                        let j = cellNew(0);
+                        let hasCjk = cellNew(false);
+                        while (cellGet(j) < m && !cellGet(hasCjk)) {
+                            if (classifyScalar(vecGetOr(afterScs, cellGet(j), 0)) == CCjk) {
+                                cellSet(hasCjk, true)
+                            } else ();
+                            cellSet(j, cellGet(j) + 1)
+                        };
+                        cellGet(hasCjk)
+                    }
+                },
         }
     }
 }
 
-// ============================================================================
-// Chinese / English Auto-Spacing
-// ============================================================================
-
-pub data AutoSpaceOptions : Eq {
-    enabled: Bool,
-    spaceDigits: Bool,
+def endsWithSpacedLanguageToken(before: String): Bool = {
+    let scs = utf8ToScalars(before);
+    let n = vecLen(scs);
+    // e.g. `C++`, `g++`
+    let plusPlus =
+        if (n >= 3 && vecGetOr(scs, n - 1, 0) == 43 && vecGetOr(scs, n - 2, 0) == 43) {
+            classifyScalar(vecGetOr(scs, n - 3, 0)) == CAsciiLetter
+        } else false;
+    if (plusPlus) true
+    else if (n >= 2 && vecGetOr(scs, n - 1, 0) == 35) {
+        // e.g. `C#`, `F#` (not `#tag` or `##`)
+        let prev = vecGetOr(scs, n - 2, 0);
+        if (prev == 67 || prev == 99 || prev == 70 || prev == 102) {
+            if (n == 2) true
+            else {
+                let bp = vecGetOr(scs, n - 3, 0);
+                let c = classifyScalar(bp);
+                c != CAsciiLetter && c != CAsciiDigit && bp != 35
+            }
+        } else false
+    } else false
 }
 
-pub def defaultAutoSpaceOptions(): AutoSpaceOptions =
-    AutoSpaceOptions { enabled: true, spaceDigits: true }
-
-data CharClass : Eq {
-    CCjk,
-    CAsciiLetter,
-    CAsciiDigit,
-    CWhitespace,
-    COther,
+def endsWithNumberPercent(before: String): Bool = {
+    let scs = utf8ToScalars(before);
+    let n = vecLen(scs);
+    if (n < 2 || vecGetOr(scs, n - 1, 0) != 37) false
+    else {
+        let i = cellNew(n - 2);
+        let sawDigit = cellNew(false);
+        let rejected = cellNew(false);
+        let done = cellNew(false);
+        while (cellGet(i) >= 0 && !cellGet(done) && !cellGet(rejected)) {
+            let s = vecGetOr(scs, cellGet(i), 0);
+            if (classifyScalar(s) == CAsciiDigit) {
+                cellSet(sawDigit, true)
+            } else if (s == 46 && cellGet(sawDigit)) {
+                // Allow decimals like 99.9%
+                ()
+            } else if (s == 37) {
+                // Reject %50% patterns
+                cellSet(rejected, true)
+            } else {
+                cellSet(done, true)
+            };
+            cellSet(i, cellGet(i) - 1)
+        };
+        !cellGet(rejected) && cellGet(sawDigit)
+    }
 }
 
-def classifyScalar(v: Int): CharClass =
-    if (v == 0x20 || v == 0x09 || v == 0x0A || v == 0x0D || v == 0xA0 || v == 0x3000
-        || v == 0x200B || v == 0x200C || v == 0x200D || v == 0xFEFF) {
-        CWhitespace
-    } else if (v >= 0x30 && v <= 0x39) {
-        CAsciiDigit
-    } else if ((v >= 0x41 && v <= 0x5A) || (v >= 0x61 && v <= 0x7A)
-        || (v >= 0xC0 && v <= 0xD6) || (v >= 0xD8 && v <= 0xF6) || (v >= 0xF8 && v <= 0x24F)) {
-        CAsciiLetter
-    } else if ((v >= 0x4E00 && v <= 0x9FFF) || (v >= 0x3400 && v <= 0x4DBF)
-        || (v >= 0x20000 && v <= 0x2A6DF) || (v >= 0xF900 && v <= 0xFAFF)
-        || (v >= 0x2E80 && v <= 0x2FDF) || v == 0x3007) {
-        CCjk
-    } else {
-        COther
+pub def isAutoSpaceRightTrigger(text: String, opts: AutoSpaceOptions): Bool =
+    if (!opts.asoEnabled || strLen(text) == 0) false
+    else {
+        let (firstCp, _) = utf8FirstScalar(text);
+        let c = classifyScalar(firstCp);
+        if (c == CCjk || c == CAsciiLetter) true
+        else if (c == CAsciiDigit) {
+            if (opts.asoSpaceDigits) true else leadingAlnumContainsLetter(text)
+        } else false
     }
 
 /// Decide whether a leading ASCII space should be inserted between `before` and `inserting`.
 pub def shouldInsertLeadingSpace(before: String, inserting: String, opts: AutoSpaceOptions): Bool =
-    if (!opts.enabled || strLen(before) == 0 || strLen(inserting) == 0) false
+    if (!opts.asoEnabled || strLen(before) == 0 || strLen(inserting) == 0) false
     else {
         let (leftCp, _) = utf8LastScalar(before);
         let (rightCp, _) = utf8FirstScalar(inserting);
         let lc = classifyScalar(leftCp);
         let rc = classifyScalar(rightCp);
         if (lc == CWhitespace || rc == CWhitespace) false
+        else if ((rc == CAsciiLetter || rc == CAsciiDigit) && isInsideCJKURL(before)) false
         else if (lc == CCjk && rc == CAsciiLetter) true
         else if (lc == CAsciiLetter && rc == CCjk) true
-        else if (opts.spaceDigits && ((lc == CCjk && rc == CAsciiDigit) || (lc == CAsciiDigit && rc == CCjk))) true
-        else false
+        else if (lc == CCjk && rc == CAsciiDigit) {
+            opts.asoSpaceDigits || leadingAlnumContainsLetter(inserting)
+        } else if (lc == CAsciiDigit && rc == CCjk) {
+            opts.asoSpaceDigits || trailingAlnumContainsLetter(before)
+        } else if (rc == CCjk && lc == COther) {
+            if (endsWithSpacedLanguageToken(before)) true
+            else if (opts.asoSpaceDigits && endsWithNumberPercent(before)) true
+            else false
+        } else false
     }
 
-/// Apply leading Chinese/English auto-spacing to `inserting` given preceding text `before`.
-pub def formatAutoSpace(before: String, inserting: String, opts: AutoSpaceOptions): String =
-    if (shouldInsertLeadingSpace(before, inserting, opts)) " " + inserting
-    else inserting
+/// Full `AutoSpaceFormatter.format`: returns `(formattedText, lastAutoSpaceAnchor)`.
+pub def formatAutoSpaceFull(
+    before: String,
+    inserting: String,
+    splitInternal: Bool,
+    suppressLeading: Bool,
+    opts: AutoSpaceOptions
+): (String, Option String) =
+    if (strLen(inserting) == 0 || !opts.asoEnabled) (inserting, None)
+    else if (!splitInternal) {
+        let addLead = !suppressLeading && shouldInsertLeadingSpace(before, inserting, opts);
+        if (addLead) (" " + inserting, Some(before))
+        else (inserting, None)
+    } else {
+        let acc = cellNew(tailScalars(before, 64));
+        let out = bufWithCap(strLen(inserting) + 4);
+        let lastAnchor: Cell (Option String) = cellNew(None);
+        let scs = utf8ToScalars(inserting);
+        let n = vecLen(scs);
+        let idx = cellNew(0);
+        while (cellGet(idx) < n) {
+            let i = cellGet(idx);
+            let s = scalarToString(vecGetOr(scs, i, 0));
+            let suppressHere = (i == 0) && suppressLeading;
+            let curAcc = cellGet(acc);
+            if (!suppressHere && shouldInsertLeadingSpace(curAcc, s, opts)) {
+                cellSet(lastAnchor, Some(curAcc));
+                bufPushByte(out, 32);
+                cellSet(acc, curAcc + " " + s)
+            } else {
+                cellSet(acc, curAcc + s)
+            };
+            bufPushStr(out, s);
+            cellSet(idx, i + 1)
+        };
+        (bufToString(out), cellGet(lastAnchor))
+    }
+
+/// Convenience leading-only formatter.
+pub def formatAutoSpace(before: String, inserting: String, opts: AutoSpaceOptions): String = {
+    let (formatted, _) = formatAutoSpaceFull(before, inserting, false, false, opts);
+    formatted
+}
+
+// ============================================================================
+// AutoSpaceContextTracker (`Shared/TextFormatting.swift` lines 382-645)
+// ============================================================================
+
+pub data AutoSpaceContextTracker {
+    shadowBefore: Cell String,
+    lastObservedHostBefore: Cell (Option String),
+    optimisticInserted: Cell String,
+    optimisticDeleteCount: Cell Int,
+    lastAutoSpaceAnchorTail: Cell (Option String),
+    pendingAutoSpaceActive: Cell Bool,
+    commitsSinceAutoSpace: Cell Int,
+    suppressedAnchorTail: Cell (Option String),
+}
+
+pub def autoSpaceTrackerNew(): AutoSpaceContextTracker =
+    AutoSpaceContextTracker {
+        shadowBefore: cellNew(""),
+        lastObservedHostBefore: cellNew(None),
+        optimisticInserted: cellNew(""),
+        optimisticDeleteCount: cellNew(0),
+        lastAutoSpaceAnchorTail: cellNew(None),
+        pendingAutoSpaceActive: cellNew(false),
+        commitsSinceAutoSpace: cellNew(0),
+        suppressedAnchorTail: cellNew(None),
+    }
+
+pub def autoSpaceTrackerInvalidate(t: AutoSpaceContextTracker): Void = {
+    cellSet(t.shadowBefore, "");
+    cellSet(t.lastObservedHostBefore, None);
+    cellSet(t.optimisticInserted, "");
+    cellSet(t.optimisticDeleteCount, 0);
+    cellSet(t.lastAutoSpaceAnchorTail, None);
+    cellSet(t.pendingAutoSpaceActive, false);
+    cellSet(t.commitsSinceAutoSpace, 0);
+    cellSet(t.suppressedAnchorTail, None)
+}
+
+pub def autoSpaceTrackerCurrentShadowBefore(t: AutoSpaceContextTracker): String =
+    cellGet(t.shadowBefore)
+
+def applyOptimisticDelta(t: AutoSpaceContextTracker, base: String): String = {
+    let delCnt = cellGet(t.optimisticDeleteCount);
+    let trimmed = if (delCnt > 0) dropLastScalars(base, delCnt) else base;
+    let ins = cellGet(t.optimisticInserted);
+    if (strLen(ins) > 0) trimmed + ins else trimmed
+}
+
+pub def autoSpaceTrackerEffectiveBefore(
+    t: AutoSpaceContextTracker,
+    hostBeforeOpt: Option String,
+    hostBeforeIsAuthoritative: Bool
+): String =
+    if (hostBeforeIsAuthoritative) {
+        match hostBeforeOpt {
+            Some(host) -> {
+                cellSet(t.shadowBefore, tailScalars(host, 64));
+                host
+            },
+            None -> cellGet(t.shadowBefore),
+        }
+    } else {
+        let currentHost = match hostBeforeOpt { Some(h) -> h, None -> "" };
+        match cellGet(t.lastObservedHostBefore) {
+            Some(prevHost) -> {
+                if (currentHost == prevHost) {
+                    applyOptimisticDelta(t, currentHost)
+                } else {
+                    let expected = applyOptimisticDelta(t, prevHost);
+                    if (currentHost == expected) {
+                        cellSet(t.lastObservedHostBefore, Some(currentHost));
+                        cellSet(t.optimisticInserted, "");
+                        cellSet(t.optimisticDeleteCount, 0);
+                        cellSet(t.shadowBefore, tailScalars(currentHost, 64));
+                        currentHost
+                    } else if (cellGet(t.optimisticDeleteCount) == 0 && strStartsWith(currentHost, prevHost)) {
+                        let caughtUp = strSlice(currentHost, strLen(prevHost), strLen(currentHost));
+                        let optIns = cellGet(t.optimisticInserted);
+                        if (strLen(caughtUp) > 0 && strStartsWith(optIns, caughtUp)) {
+                            cellSet(t.optimisticInserted, strSlice(optIns, strLen(caughtUp), strLen(optIns)));
+                            cellSet(t.lastObservedHostBefore, Some(currentHost));
+                            let merged = applyOptimisticDelta(t, currentHost);
+                            cellSet(t.shadowBefore, tailScalars(merged, 64));
+                            merged
+                        } else {
+                            cellSet(t.lastObservedHostBefore, Some(currentHost));
+                            cellSet(t.optimisticInserted, "");
+                            cellSet(t.optimisticDeleteCount, 0);
+                            cellSet(t.shadowBefore, tailScalars(currentHost, 64));
+                            currentHost
+                        }
+                    } else {
+                        cellSet(t.lastObservedHostBefore, Some(currentHost));
+                        cellSet(t.optimisticInserted, "");
+                        cellSet(t.optimisticDeleteCount, 0);
+                        cellSet(t.shadowBefore, tailScalars(currentHost, 64));
+                        currentHost
+                    }
+                }
+            },
+            None -> {
+                cellSet(t.lastObservedHostBefore, Some(currentHost));
+                cellSet(t.optimisticInserted, "");
+                cellSet(t.optimisticDeleteCount, 0);
+                cellSet(t.shadowBefore, tailScalars(currentHost, 64));
+                currentHost
+            },
+        }
+    }
+
+pub def autoSpaceTrackerPrepareCommit(
+    t: AutoSpaceContextTracker,
+    text: String,
+    hostBeforeOpt: Option String,
+    hostBeforeIsAuthoritative: Bool,
+    overrideBeforeOpt: Option String,
+    splitInternal: Bool,
+    opts: AutoSpaceOptions
+): String =
+    if (strLen(text) == 0) text
+    else {
+        let before = match overrideBeforeOpt {
+            Some(ov) -> ov,
+            None -> autoSpaceTrackerEffectiveBefore(t, hostBeforeOpt, hostBeforeIsAuthoritative),
+        };
+        let suppressLeading = match cellGet(t.suppressedAnchorTail) {
+            Some(sup) -> strLen(sup) > 0 && strEndsWith(before, sup),
+            None -> false,
+        };
+        let (formatted, anchorOpt) = formatAutoSpaceFull(before, text, splitInternal, suppressLeading, opts);
+        cellSet(t.suppressedAnchorTail, None);
+
+        match anchorOpt {
+            Some(anchor) -> {
+                cellSet(t.lastAutoSpaceAnchorTail, Some(tailScalars(anchor, 16)));
+                cellSet(t.pendingAutoSpaceActive, true);
+                cellSet(t.commitsSinceAutoSpace, 1)
+            },
+            None ->
+                if (cellGet(t.pendingAutoSpaceActive)) {
+                    let (firstCp, _) = utf8FirstScalar(text);
+                    if (isUnicodeWhitespaceScalar(firstCp)) {
+                        cellSet(t.pendingAutoSpaceActive, false);
+                        cellSet(t.lastAutoSpaceAnchorTail, None);
+                        cellSet(t.commitsSinceAutoSpace, 0)
+                    } else {
+                        let nextCnt = cellGet(t.commitsSinceAutoSpace) + 1;
+                        cellSet(t.commitsSinceAutoSpace, nextCnt);
+                        if (nextCnt > 2) {
+                            cellSet(t.pendingAutoSpaceActive, false);
+                            cellSet(t.lastAutoSpaceAnchorTail, None)
+                        } else ()
+                    }
+                } else (),
+        };
+
+        cellSet(t.shadowBefore, tailScalars(before + formatted, 64));
+        if (!hostBeforeIsAuthoritative) {
+            match cellGet(t.lastObservedHostBefore) {
+                Some(_) -> (),
+                None -> cellSet(t.lastObservedHostBefore, Some(match hostBeforeOpt { Some(h) -> h, None -> "" })),
+            };
+            cellSet(t.optimisticInserted, cellGet(t.optimisticInserted) + formatted)
+        } else ();
+        formatted
+    }
+
+pub def autoSpaceTrackerRecordPassthrough(
+    t: AutoSpaceContextTracker,
+    text: String,
+    hostBeforeOpt: Option String,
+    hostBeforeIsAuthoritative: Bool,
+    overrideBeforeOpt: Option String
+): Void =
+    if (strLen(text) == 0) ()
+    else {
+        let before = match overrideBeforeOpt {
+            Some(ov) -> ov,
+            None -> autoSpaceTrackerEffectiveBefore(t, hostBeforeOpt, hostBeforeIsAuthoritative),
+        };
+        cellSet(t.suppressedAnchorTail, None);
+        if (cellGet(t.pendingAutoSpaceActive)) {
+            let (firstCp, _) = utf8FirstScalar(text);
+            if (isUnicodeWhitespaceScalar(firstCp)) {
+                cellSet(t.pendingAutoSpaceActive, false);
+                cellSet(t.lastAutoSpaceAnchorTail, None);
+                cellSet(t.commitsSinceAutoSpace, 0)
+            } else {
+                let nextCnt = cellGet(t.commitsSinceAutoSpace) + 1;
+                cellSet(t.commitsSinceAutoSpace, nextCnt);
+                if (nextCnt > 2) {
+                    cellSet(t.pendingAutoSpaceActive, false);
+                    cellSet(t.lastAutoSpaceAnchorTail, None)
+                } else ()
+            }
+        } else ();
+        cellSet(t.shadowBefore, tailScalars(before + text, 64));
+        if (!hostBeforeIsAuthoritative) {
+            match cellGet(t.lastObservedHostBefore) {
+                Some(_) -> (),
+                None -> cellSet(t.lastObservedHostBefore, Some(match hostBeforeOpt { Some(h) -> h, None -> "" })),
+            };
+            cellSet(t.optimisticInserted, cellGet(t.optimisticInserted) + text)
+        } else ()
+    }
+
+pub def autoSpaceTrackerWillDeleteBackward(
+    t: AutoSpaceContextTracker,
+    hostBeforeOpt: Option String,
+    hostBeforeIsAuthoritative: Bool
+): Void = {
+    let before = autoSpaceTrackerEffectiveBefore(t, hostBeforeOpt, hostBeforeIsAuthoritative);
+    if (strLen(before) == 0) {
+        cellSet(t.suppressedAnchorTail, None);
+        cellSet(t.pendingAutoSpaceActive, false)
+    } else {
+        let (lastCp, _) = utf8LastScalar(before);
+        let remaining = dropLastScalars(before, 1);
+        let shouldSuppress =
+            if (lastCp == 32 && cellGet(t.pendingAutoSpaceActive) && cellGet(t.commitsSinceAutoSpace) <= 2) {
+                match cellGet(t.lastAutoSpaceAnchorTail) {
+                    Some(anchor) -> strLen(anchor) > 0 && strEndsWith(remaining, anchor),
+                    None -> false,
+                }
+            } else false;
+        if (shouldSuppress) {
+            cellSet(t.suppressedAnchorTail, cellGet(t.lastAutoSpaceAnchorTail));
+            cellSet(t.pendingAutoSpaceActive, false);
+            cellSet(t.lastAutoSpaceAnchorTail, None);
+            cellSet(t.commitsSinceAutoSpace, 0)
+        } else {
+            cellSet(t.suppressedAnchorTail, None)
+        };
+        cellSet(t.shadowBefore, tailScalars(remaining, 64));
+        if (!hostBeforeIsAuthoritative) {
+            match cellGet(t.lastObservedHostBefore) {
+                Some(_) -> (),
+                None -> cellSet(t.lastObservedHostBefore, Some(match hostBeforeOpt { Some(h) -> h, None -> "" })),
+            };
+            let optIns = cellGet(t.optimisticInserted);
+            if (strLen(optIns) > 0) {
+                cellSet(t.optimisticInserted, dropLastScalars(optIns, 1))
+            } else {
+                cellSet(t.optimisticDeleteCount, cellGet(t.optimisticDeleteCount) + 1)
+            }
+        } else ()
+    }
+}
+
+pub def autoSpaceTrackerReconcileExternal(
+    t: AutoSpaceContextTracker,
+    hostBeforeOpt: Option String
+): Void = {
+    let current = match hostBeforeOpt { Some(h) -> h, None -> "" };
+    match cellGet(t.lastObservedHostBefore) {
+        None -> {
+            cellSet(t.lastObservedHostBefore, Some(current));
+            cellSet(t.shadowBefore, tailScalars(current, 64))
+        },
+        Some(prevHost) -> {
+            let optIns = cellGet(t.optimisticInserted);
+            let optDel = cellGet(t.optimisticDeleteCount);
+            if ((strLen(optIns) > 0 || optDel > 0) && current == prevHost) {
+                ()
+            } else {
+                let expected = applyOptimisticDelta(t, prevHost);
+                if (current == expected) {
+                    cellSet(t.lastObservedHostBefore, Some(current));
+                    cellSet(t.optimisticInserted, "");
+                    cellSet(t.optimisticDeleteCount, 0);
+                    cellSet(t.shadowBefore, tailScalars(current, 64))
+                } else if (optDel == 0 && strStartsWith(current, prevHost)) {
+                    let caughtUp = strSlice(current, strLen(prevHost), strLen(current));
+                    if (strLen(caughtUp) > 0 && strStartsWith(optIns, caughtUp)) {
+                        cellSet(t.optimisticInserted, strSlice(optIns, strLen(caughtUp), strLen(optIns)));
+                        cellSet(t.lastObservedHostBefore, Some(current));
+                        let merged = applyOptimisticDelta(t, current);
+                        cellSet(t.shadowBefore, tailScalars(merged, 64))
+                    } else {
+                        cellSet(t.lastObservedHostBefore, Some(current));
+                        cellSet(t.optimisticInserted, "");
+                        cellSet(t.optimisticDeleteCount, 0);
+                        cellSet(t.shadowBefore, tailScalars(current, 64))
+                    }
+                } else {
+                    if (strLen(optIns) == 0 && optDel == 0 && current != prevHost) {
+                        cellSet(t.lastAutoSpaceAnchorTail, None);
+                        cellSet(t.pendingAutoSpaceActive, false);
+                        cellSet(t.commitsSinceAutoSpace, 0);
+                        cellSet(t.suppressedAnchorTail, None)
+                    } else ();
+                    cellSet(t.lastObservedHostBefore, Some(current));
+                    cellSet(t.optimisticInserted, "");
+                    cellSet(t.optimisticDeleteCount, 0);
+                    cellSet(t.shadowBefore, tailScalars(current, 64))
+                }
+            }
+        },
+    }
+}

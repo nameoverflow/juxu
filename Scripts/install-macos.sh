@@ -206,7 +206,7 @@ ROOT_INSTALL_CMD='rm -rf "$2" && mkdir -p "$(dirname "$2")" && cp -R "$1" "$2" &
 if [ "$NEEDS_ROOT_CACHE" = "0" ] && [ -d "$SYS_APP" ] && [ -w "$SYS_APP" ]; then
     rm -rf "$SYS_APP/Contents"
     cp -R "$SRC_APP/Contents" "$SYS_APP/Contents"
-    xattr -cr "$SYS_APP/Contents" 2>/dev/null || true
+    xattr -dr com.apple.quarantine "$SYS_APP/Contents" 2>/dev/null || true
     chmod -R ug+rwX,o+rX "$SYS_APP/Contents"
     "$LSREGISTER" -f -R -trusted "$SYS_APP" 2>/dev/null || true
 elif [ "$(id -u)" -eq 0 ]; then

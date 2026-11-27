@@ -1,0 +1,693 @@
+/// Comprehensive 1:1 parity test suite for `juxu_macos_voice_ui`:
+/// 1. `VoiceHUDMetrics` (all 22 geometry & timing constants)
+/// 2. `VoiceHUDTextFit` (`attributes`, `lineCount`, binary-search `tailFitting` with `"…"`)
+/// 3. `VoiceLevelMeter` (laptop mic & hot close-up mic dB curves from `SwiftBridgeTests.swift`)
+/// 4. `VoiceSpectrumAnalyzer` (Accelerate vDSP 11-band room rumble, 520 Hz vowel bar 5, 3450 Hz fricative bar 0, 25ms multi-frame slicing)
+/// 5. `JuxuGeishaVoiceHUDContentView` (weak `CADisplayLink` zero self-retain test, smoothstep pill resize clock sync, offscreen Retina `drawRect:`)
+/// 6. `VoiceHUDPanelController` & `voiceHUDInitHooks` (strict lazy on-demand load, clamping, show/spectrum/hide/unload)
+/// 7. `voiceBuildSettingsPageView` & `voiceOnSettingsWindowClosed` (Disabled, Enabled+Cloud BYOK Preset & Custom SplitLLM, Enabled+Local Engine/AppleSpeech/HTTP/InstallerProgress + Context Inspector + Disabled Context switches, plus offscreen rendering).
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGetOr}
+use std.math.{pi, sin, pow, abs}
+use std.str.{strStartsWith, strContains, intToStr, floatToStr}
+use sys.proc.{exit}
+use objc.{
+    objcClass, objcSel, objcReleaseRaw, withAutoreleasePool,
+    msgSend0, msgSendBool0, msgSendI64_0, msgSendVoid1Ptr, msgSendVoid1Bool,
+}
+use juxu_shared.{
+    CGRect, cgRect, rectMidX, nsStr, nsStrPtrToString, bridgeNew,
+    msgSendRect0, msgSend2Float, msgSend1I64_1Ptr,
+}
+use voice_common.{
+    VoiceProviderMode, VpmCloudBYOK, VpmLocal,
+    VoiceCloudPreset, VcpGroq, VcpCustom,
+    VoiceLocalASRModelPreset, VlaWhisperTurbo, VlaAppleSpeech, VlaCustomHTTP,
+    VoiceLocalLLMPreset, VllQwen15B, VllOllamaHTTP,
+    VoiceTriggerKey, VtkRightOption, VtkOptionSpace,
+    VoiceOutputMode, VomSmartPolish,
+    VoiceToneMode, VtmAutoByApp,
+    VoicePreferences, defaultVoicePreferences,
+    voicePrefsSetInMemoryForTesting, voicePrefsUpdate,
+    VoiceHUDState, VhsHidden, VhsRecording, VhsTranscribing, VhsPolishing, VhsNotice,
+    voiceHUDShow, voiceHUDHide, voiceHUDUnload, voiceHUDEnqueueSpectrum,
+    VoiceInstallPhase, VipIdle, VipDownloadingModel, gVoiceInstallPhaseCell,
+    VoiceContextSummary, gVoiceInspectorPresented, gVoiceInspectorLastSummary,
+}
+use voice_ui_root.{
+    voiceHUDMetrics,
+    vhmCanvasWidth, vhmCanvasHeight, vhmListeningWidth, vhmProcessingWidth,
+    vhmBarCount, vhmBarWidth, vhmBarMinHeight, vhmBarPitch, vhmBarMaxHeight,
+    vhmCardLineHeight, vhmPillResizeDuration,
+    voiceHUDTextFitAttributes, voiceHUDTextFitLineCount, voiceHUDTextFitTailFitting,
+    voiceLevelMeterNew, voiceLevelMeterProcess,
+    voiceSpectrumNew, voiceSpectrumProcessVec, voiceSpectrumProcessFrame,
+    voiceHUDViewCreate, voiceHUDViewSetOnBackdropLayout, voiceHUDViewReportBackdropLayout,
+    voiceHUDViewApply, voiceHUDViewAdvance,
+    voiceHUDViewStartAnimating, voiceHUDViewIsAnimating,
+    voiceHUDWeakBoxNew, voiceHUDWeakBoxIsAlive, voiceHUDWeakBoxFree,
+    voiceHUDControllerIsLoaded, voiceHUDControllerShared, voiceHUDResolvedPanelOrigin,
+    voiceHUDControllerUnload, voiceHUDInitHooks,
+    voiceBuildSettingsPageView,
+    voiceOnSettingsWindowClosed,
+}
+
+extern "objc_msgSend" def msgSendBitmapInitTest(
+    obj: Ptr, sel: Ptr, planes: Ptr, w: Int64, h: Int64,
+    bps: Int64, spp: Int64, alpha: Bool, planar: Bool, csName: Ptr, bpr: Int64, bpp: Int64
+): Ptr
+extern "objc_msgSend" def msgSendCacheDisplayTest(view: Ptr, sel: Ptr, r: CGRect, rep: Ptr): Void
+extern "objc_msgSend" def msgSendRespSelTest(obj: Ptr, sel: Ptr, querySel: Ptr): Bool
+
+def assertTrue(cond: Bool, msg: String): Void =
+    if (!cond) {
+        printLn("ASSERTION FAILED: " + msg);
+        exit(1)
+    } else ()
+
+def approxEq(a: Float, b: Float, eps: Float): Bool =
+    abs(a - b) <= eps
+
+def renderViewOffscreen(view: Ptr): Void = {
+    let b = msgSendRect0(view, objcSel("bounds"));
+    let wPx = if (b.size.width > 4.0) floatToInt(b.size.width) else 64;
+    let hPx = if (b.size.height > 4.0) floatToInt(b.size.height) else 64;
+    let repAlloc = msgSend0(objcClass("NSBitmapImageRep"), objcSel("alloc"));
+    let rep = msgSendBitmapInitTest(
+        repAlloc,
+        objcSel("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:"),
+        ptrNull(),
+        intToI64(wPx),
+        intToI64(hPx),
+        intToI64(8),
+        intToI64(4),
+        true,
+        false,
+        nsStr("NSCalibratedRGBColorSpace"),
+        intToI64(wPx * 4),
+        intToI64(32)
+    );
+    if (!ptrIsNull(rep)) {
+        msgSendCacheDisplayTest(
+            view,
+            objcSel("cacheDisplayInRect:toBitmapImageRep:"),
+            cgRect(0.0, 0.0, intToFloat(wPx), intToFloat(hPx)),
+            rep
+        );
+        objcReleaseRaw(rep)
+    } else ()
+}
+
+def collectStringsRecursive(view: Ptr, out: Vec String): Void =
+    if (!ptrIsNull(view)) {
+        if (msgSendRespSelTest(view, objcSel("respondsToSelector:"), objcSel("stringValue"))) {
+            let sv = nsStrPtrToString(msgSend0(view, objcSel("stringValue")));
+            if (strLen(sv) > 0) vecPush(out, sv) else ()
+        } else ();
+        if (msgSendRespSelTest(view, objcSel("respondsToSelector:"), objcSel("title"))) {
+            let tv = nsStrPtrToString(msgSend0(view, objcSel("title")));
+            if (strLen(tv) > 0) vecPush(out, tv) else ()
+        } else ();
+        if (msgSendRespSelTest(view, objcSel("respondsToSelector:"), objcSel("placeholderAttributedString"))) {
+            let pa = msgSend0(view, objcSel("placeholderAttributedString"));
+            if (!ptrIsNull(pa)) {
+                let ps = nsStrPtrToString(msgSend0(pa, objcSel("string")));
+                if (strLen(ps) > 0) vecPush(out, ps) else ()
+            } else ()
+        } else ();
+
+        let subs = msgSend0(view, objcSel("subviews"));
+        if (!ptrIsNull(subs)) {
+            let n = i64ToInt(msgSendI64_0(subs, objcSel("count")));
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let child = msgSend1I64_1Ptr(subs, objcSel("objectAtIndex:"), intToI64(cellGet(i)), ptrNull());
+                collectStringsRecursive(child, out);
+                cellSet(i, cellGet(i) + 1)
+            }
+        } else ()
+    } else ()
+
+def vecHasSubstring(items: Vec String, needle: String): Bool = {
+    let found = cellNew(false);
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(items) && !cellGet(found)) {
+        if (strContains(vecGetOr(items, cellGet(i), ""), needle)) {
+            cellSet(found, true)
+        } else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+// ============================================================================
+// 1. VoiceHUDMetrics & VoiceHUDTextFit Tests
+// ============================================================================
+
+def testVoiceHUDMetricsAndTextFit(): Void = {
+    let m = voiceHUDMetrics();
+    assertTrue(approxEq(m.vhmCanvasWidth, 576.0, 1.0e-6), "canvasWidth == 576");
+    assertTrue(approxEq(m.vhmCanvasHeight, 112.0, 1.0e-6), "canvasHeight == 112");
+    assertTrue(approxEq(m.vhmPillBottom, 9.0, 1.0e-6), "pillBottom == 9");
+    assertTrue(approxEq(m.vhmPillHeight, 28.0, 1.0e-6), "pillHeight == 28");
+    assertTrue(approxEq(m.vhmListeningWidth, 64.0, 1.0e-6), "listeningWidth == 64");
+    assertTrue(approxEq(m.vhmProcessingWidth, 87.0, 1.0e-6), "processingWidth == 87");
+    assertTrue(m.vhmBarCount == 11, "barCount == 11");
+    assertTrue(approxEq(m.vhmBarWidth, 2.0, 1.0e-6), "barWidth == 2");
+    assertTrue(approxEq(m.vhmBarMinHeight, 2.0, 1.0e-6), "barMinHeight == 2");
+    assertTrue(approxEq(m.vhmBarPitch, 3.6, 1.0e-6), "barPitch == 3.6");
+    assertTrue(approxEq(m.vhmBarMaxHeight, 19.6, 1.0e-6), "barMaxHeight == 19.6");
+    assertTrue(approxEq(m.vhmBarsInset, 13.0, 1.0e-6), "barsInset == 13");
+    assertTrue(approxEq(m.vhmCardGap, 8.0, 1.0e-6), "cardGap == 8");
+    assertTrue(approxEq(m.vhmCardMaxWidth, 520.0, 1.0e-6), "cardMaxWidth == 520");
+    assertTrue(approxEq(m.vhmCardLineHeight, 20.0, 1.0e-6), "cardLineHeight == 20");
+    assertTrue(approxEq(m.vhmCardPadX, 14.0, 1.0e-6), "cardPadX == 14");
+    assertTrue(approxEq(m.vhmCardPadY, 9.0, 1.0e-6), "cardPadY == 9");
+    assertTrue(approxEq(m.vhmNoticeMaxTextWidth, 360.0, 1.0e-6), "noticeMaxTextWidth == 360");
+    assertTrue(approxEq(m.vhmFadeDuration, 0.14, 1.0e-6), "fadeDuration == 0.14");
+    assertTrue(approxEq(m.vhmPillResizeDuration, 0.18, 1.0e-6), "pillResizeDuration == 0.18");
+    assertTrue(approxEq(m.vhmCaptionFadeDuration, 0.11, 1.0e-6), "captionFadeDuration == 0.11");
+    assertTrue(approxEq(m.vhmCaptionMaxStagger, 0.05, 1.0e-6), "captionMaxStagger == 0.05");
+
+    let font = msgSend2Float(objcClass("NSFont"), objcSel("systemFontOfSize:weight:"), 14.0, 0.0);
+    let attrs = voiceHUDTextFitAttributes(font, vhmCardLineHeight(), ptrNull());
+    let shortText = "句序语音输入";
+    assertTrue(voiceHUDTextFitLineCount(shortText, attrs, 240.0, 20.0) == 1, "short text fits in 1 line");
+    assertTrue(voiceHUDTextFitTailFitting(shortText, attrs, 240.0, 20.0, 2) == shortText, "short text not truncated");
+
+    let longText = "这是一段非常非常长的实时流式语音识别字幕测试文本，用于验证超过两行宽度限制时二分搜索会自动保留末尾最新内容并在最前面加上省略号后缀结尾标识";
+    assertTrue(voiceHUDTextFitLineCount(longText, attrs, 180.0, 20.0) > 2, "long text exceeds 2 lines at 180pt");
+    let fitted = voiceHUDTextFitTailFitting(longText, attrs, 180.0, 20.0, 2);
+    assertTrue(strStartsWith(fitted, "…"), "truncated tail starts with ellipsis");
+    assertTrue(strContains(fitted, "结尾标识"), "truncated tail keeps suffix");
+    assertTrue(voiceHUDTextFitLineCount(fitted, attrs, 180.0, 20.0) <= 2, "fitted tail fits <= 2 lines")
+}
+
+// ============================================================================
+// 2. VoiceLevelMeter Parity Tests (`SwiftBridgeTests.swift` lines 648-668)
+// ============================================================================
+
+def rmsFromDB(db: Float): Float = pow(10.0, db / 20.0)
+
+def testVoiceLevelMeter(): Void = {
+    let laptopMeter = voiceLevelMeterNew();
+    let k = cellNew(0);
+    while (cellGet(k) < 10) {
+        let _ = voiceLevelMeterProcess(laptopMeter, rmsFromDB(-41.5), 0.1);
+        cellSet(k, cellGet(k) + 1)
+    };
+
+    let dbs = vecWithCap(5);
+    vecPush(dbs, -41.5);
+    vecPush(dbs, -36.0);
+    vecPush(dbs, -32.0);
+    vecPush(dbs, -29.0);
+    vecPush(dbs, -25.0);
+
+    let steps = vecWithCap(5);
+    let i = cellNew(0);
+    while (cellGet(i) < 5) {
+        let db = vecGetOr(dbs, cellGet(i), -41.5);
+        let out = cellNew(0.0);
+        let r = cellNew(0);
+        while (cellGet(r) < 4) {
+            cellSet(out, voiceLevelMeterProcess(laptopMeter, rmsFromDB(db), 0.1));
+            cellSet(r, cellGet(r) + 1)
+        };
+        vecPush(steps, cellGet(out));
+        cellSet(i, cellGet(i) + 1)
+    };
+
+    assertTrue(vecGetOr(steps, 0, 1.0) == 0.0, "laptop room noise stays at rest");
+    assertTrue(vecGetOr(steps, 0, 0.0) < vecGetOr(steps, 1, 0.0), "step 0 < step 1");
+    assertTrue(vecGetOr(steps, 1, 0.0) < vecGetOr(steps, 2, 0.0), "step 1 < step 2");
+    assertTrue(vecGetOr(steps, 2, 0.0) < vecGetOr(steps, 3, 0.0), "step 2 < step 3");
+    assertTrue(vecGetOr(steps, 3, 0.0) < vecGetOr(steps, 4, 0.0), "step 3 < step 4");
+    assertTrue(vecGetOr(steps, 2, 0.0) >= 0.35 && vecGetOr(steps, 4, 0.0) >= 0.85, "laptop speech spans clear visual range");
+
+    let closeMic = voiceLevelMeterNew();
+    let c = cellNew(0);
+    while (cellGet(c) < 10) {
+        let _ = voiceLevelMeterProcess(closeMic, rmsFromDB(-56.0), 0.1);
+        cellSet(c, cellGet(c) + 1)
+    };
+    assertTrue(voiceLevelMeterProcess(closeMic, rmsFromDB(-56.0), 0.1) == 0.0, "quiet room stays at rest");
+
+    let h = cellNew(0);
+    while (cellGet(h) < 6) {
+        let _ = voiceLevelMeterProcess(closeMic, rmsFromDB(-12.0), 0.1);
+        cellSet(h, cellGet(h) + 1)
+    };
+    let closeLoud = voiceLevelMeterProcess(closeMic, rmsFromDB(-12.0), 0.1);
+    let closeNormal = voiceLevelMeterProcess(closeMic, rmsFromDB(-26.0), 0.1);
+    let closeWhisper = voiceLevelMeterProcess(closeMic, rmsFromDB(-42.0), 0.1);
+    assertTrue(
+        closeWhisper > 0.05 && closeWhisper < closeNormal && closeNormal < closeLoud,
+        "adaptive ceiling separates whisper, normal and loud speech on hot mics"
+    )
+}
+
+// ============================================================================
+// 3. VoiceSpectrumAnalyzer Parity Tests (`SwiftBridgeTests.swift` lines 671-693)
+// ============================================================================
+
+def makeSineTone(frameLen: Int, sampleRate: Float, hz: Float, amp: Float): Vec Float = {
+    let out = vecWithCap(frameLen);
+    let i = cellNew(0);
+    while (cellGet(i) < frameLen) {
+        let idx = cellGet(i);
+        vecPush(out, amp * sin(2.0 * pi() * hz * intToFloat(idx) / sampleRate));
+        cellSet(i, idx + 1)
+    };
+    out
+}
+
+def testVoiceSpectrumAnalyzer(): Void = {
+    let sampleRate = 16000.0;
+    let frameLen = 512;
+    let quietFloor = vecWithCap(frameLen);
+    let i = cellNew(0);
+    while (cellGet(i) < frameLen) {
+        let idx = cellGet(i);
+        vecPush(quietFloor, 0.008 * sin(intToFloat(idx) * 0.13));
+        cellSet(i, idx + 1)
+    };
+
+    let spectrum = voiceSpectrumNew();
+    let w = cellNew(0);
+    while (cellGet(w) < 12) {
+        let _ = voiceSpectrumProcessFrame(spectrum, quietFloor, sampleRate, None);
+        cellSet(w, cellGet(w) + 1)
+    };
+    let quietBars = voiceSpectrumProcessFrame(spectrum, quietFloor, sampleRate, None);
+    assertTrue(vecLen(quietBars) == 11, "quietBars has 11 bands");
+    let b = cellNew(0);
+    while (cellGet(b) < 11) {
+        let v = vecGetOr(quietBars, cellGet(b), 1.0);
+        assertTrue(v < 0.05, "steady room noise stays at rest on bar " + intToStr(cellGet(b)) + ", got " + floatToStr(v));
+        cellSet(b, cellGet(b) + 1)
+    };
+
+    let lowVowel = makeSineTone(frameLen, sampleRate, 520.0, 0.05);
+    let lowBars = voiceSpectrumProcessFrame(spectrum, lowVowel, sampleRate, None);
+    let lb5 = vecGetOr(lowBars, 5, 0.0);
+    let lb0 = vecGetOr(lowBars, 0, 1.0);
+    let lb10 = vecGetOr(lowBars, 10, 1.0);
+    assertTrue(lb5 > 0.5 && lb5 > lb0 * 3.0 && lb5 > lb10 * 3.0, "520 Hz vowel peaks on center bar 5");
+
+    let highSibilant = makeSineTone(frameLen, sampleRate, 3450.0, 0.04);
+    let highBars = voiceSpectrumProcessFrame(spectrum, highSibilant, sampleRate, None);
+    let hb0 = vecGetOr(highBars, 0, 0.0);
+    let hb5 = vecGetOr(highBars, 5, 1.0);
+    assertTrue(hb0 > 0.4 && hb0 > hb5 * 2.0, "3450 Hz fricative peaks on high-frequency bar 0");
+
+    let multiSamples = makeSineTone(1600, sampleRate, 520.0, 0.05);
+    let slicedFrames = voiceSpectrumProcessVec(spectrum, multiSamples, sampleRate);
+    assertTrue(vecLen(slicedFrames) == 4, "1600 samples @ 16kHz -> 4 x 25ms frames")
+}
+
+// ============================================================================
+// 4. VoiceHUDContentView & VoiceHUDPanelController Parity Tests
+// ============================================================================
+
+def testVoiceHUDViewAndPanelController(): Void = {
+    // 4a. Verify `JuxuGeishaVoiceHUDContentView` does NOT self-retain via `CADisplayLink` (`SwiftBridgeTests` section 11)
+    let weakSlot = cellNew(ptrNull());
+    withAutoreleasePool(() -> {
+        let (hudView, hudSt) = voiceHUDViewCreate(cgRect(0.0, 0.0, 200.0, 80.0));
+        cellSet(weakSlot, voiceHUDWeakBoxNew(hudView));
+        assertTrue(voiceHUDWeakBoxIsAlive(cellGet(weakSlot)), "hudView alive inside pool");
+        voiceHUDViewStartAnimating(hudView, hudSt);
+        assertTrue(voiceHUDViewIsAnimating(hudSt), "hudView isAnimating == true");
+        objcReleaseRaw(hudView)
+    });
+    assertTrue(!voiceHUDWeakBoxIsAlive(cellGet(weakSlot)), "JuxuGeishaVoiceHUDContentView deallocated cleanly while CADisplayLink was active");
+    voiceHUDWeakBoxFree(cellGet(weakSlot));
+
+    // 4b. Smoothstep pill resize stepped on one clock (`SwiftBridgeTests` section 11b)
+    withAutoreleasePool(() -> {
+        let (hudView, hudSt) = voiceHUDViewCreate(cgRect(0.0, 0.0, vhmCanvasWidth(), vhmCanvasHeight()));
+        let reported: Vec CGRect = vecNew();
+        voiceHUDViewSetOnBackdropLayout(hudSt, (pill, _cardOpt) -> {
+            vecPush(reported, pill)
+        });
+        voiceHUDViewReportBackdropLayout(hudSt);
+        let startWidth = (vecGetOr(reported, vecLen(reported) - 1, cgRect(0.0, 0.0, 0.0, 0.0))).size.width;
+        voiceHUDViewApply(hudView, hudSt, VhsNotice("已复制到剪贴板，可以直接粘贴", false), true);
+        voiceHUDViewAdvance(hudView, hudSt, vhmPillResizeDuration() * 0.5);
+        let midWidth = (vecGetOr(reported, vecLen(reported) - 1, cgRect(0.0, 0.0, 0.0, 0.0))).size.width;
+        voiceHUDViewAdvance(hudView, hudSt, vhmPillResizeDuration());
+        let lastRect = vecGetOr(reported, vecLen(reported) - 1, cgRect(0.0, 0.0, 0.0, 0.0));
+        let endWidth = lastRect.size.width;
+
+        assertTrue(approxEq(startWidth, vhmListeningWidth(), 0.01), "pill starts at listeningWidth (64)");
+        assertTrue(midWidth > startWidth && midWidth < endWidth, "mid-resize width interpolated between start and end");
+        assertTrue(abs(rectMidX(lastRect) - vhmCanvasWidth() * 0.5) <= 0.5, "resized pill stays centred");
+
+        let settledCount = vecLen(reported);
+        voiceHUDViewAdvance(hudView, hudSt, 0.1);
+        assertTrue(vecLen(reported) == settledCount, "no redundant backdrop layout updates after settle");
+
+        // Exercise offscreen rendering across Recording (with partial + tentative tail), Processing, and Error Notice
+        voiceHUDViewApply(hudView, hudSt, VhsRecording(0.75, 1.2, "实时语音字幕预览测试", "智能整理", 4), false);
+        voiceHUDViewAdvance(hudView, hudSt, 0.03);
+        renderViewOffscreen(hudView);
+
+        voiceHUDViewApply(hudView, hudSt, VhsTranscribing("Whisper"), false);
+        voiceHUDViewAdvance(hudView, hudSt, 0.05);
+        renderViewOffscreen(hudView);
+
+        voiceHUDViewApply(hudView, hudSt, VhsNotice("麦克风权限未开启", true), false);
+        renderViewOffscreen(hudView);
+
+        objcReleaseRaw(hudView)
+    });
+
+    // 4c. Clamping & Lazy On-Demand `VoiceHUDPanelController` + `voiceHUDInitHooks()`
+    let wideOrigin = voiceHUDResolvedPanelOrigin(cgRect(200.0, 200.0, 2.0, 18.0), Some(cgRect(0.0, 40.0, 1440.0, 860.0)));
+    assertTrue(approxEq(wideOrigin.x, (1440.0 - 576.0) * 0.5, 0.5) && approxEq(wideOrigin.y, 40.0, 0.5), "bottom-center origin on 1440w screen");
+    let narrowOrigin = voiceHUDResolvedPanelOrigin(cgRect(10.0, 10.0, 2.0, 18.0), Some(cgRect(50.0, 30.0, 400.0, 600.0)));
+    assertTrue(approxEq(narrowOrigin.x, 50.0, 0.5) && approxEq(narrowOrigin.y, 30.0, 0.5), "clamped to visible.minX on narrow screen");
+
+    voiceHUDControllerUnload();
+    assertTrue(!voiceHUDControllerIsLoaded(), "controller unloaded initially");
+    voiceHUDInitHooks();
+    assertTrue(!voiceHUDControllerIsLoaded(), "voiceHUDInitHooks must NOT eagerly allocate panel");
+    voiceHUDShow(VhsHidden, cgRect(0.0, 0.0, 0.0, 0.0), None, 0.0);
+    assertTrue(!voiceHUDControllerIsLoaded(), "showing VhsHidden must NOT allocate panel");
+
+    voiceHUDShow(VhsRecording(0.5, 0.4, "你好句序", "智能整理", 2), cgRect(300.0, 300.0, 2.0, 18.0), None, 0.0);
+    assertTrue(voiceHUDControllerIsLoaded(), "controller loaded on active show");
+    let ctrl = voiceHUDControllerShared();
+    assertTrue(msgSendBool0(ctrl.vhpcPanel, objcSel("isVisible")), "HUD NSPanel visible after show");
+
+    let specFrame = vecWithCap(11);
+    let si = cellNew(0);
+    while (cellGet(si) < 11) {
+        vecPush(specFrame, 0.6);
+        cellSet(si, cellGet(si) + 1)
+    };
+    let specBatch: Vec (Vec Float) = vecNew();
+    vecPush(specBatch, specFrame);
+    voiceHUDEnqueueSpectrum(specBatch);
+
+    voiceHUDShow(VhsPolishing("你好，句序。"), cgRect(300.0, 300.0, 2.0, 18.0), Some(intToI64(25)), 0.0);
+    voiceHUDHide();
+    voiceHUDUnload();
+    assertTrue(!voiceHUDControllerIsLoaded(), "voiceHUDUnload releases panel and resets isLoaded == false")
+}
+
+// ============================================================================
+// 5. VoiceSettingsView Parity Tests (Disabled, Enabled+Cloud, Enabled+Local, Inspector)
+// ============================================================================
+
+def testVoiceSettingsPageAllModes(): Void = withAutoreleasePool(() -> {
+    voicePrefsSetInMemoryForTesting(true);
+    let session = bridgeNew(None, true);
+
+    // ---- 5a. Disabled State (`vpEnabled == false`) ----
+    let d0 = defaultVoicePreferences();
+    voicePrefsUpdate(d0, false);
+    let pageDisabled = voiceBuildSettingsPageView(session, 500.0);
+    assertTrue(!ptrIsNull(pageDisabled), "pageDisabled non-null");
+    let strsDisabled: Vec String = vecNew();
+    collectStringsRecursive(pageDisabled, strsDisabled);
+    assertTrue(vecHasSubstring(strsDisabled, "语音识别与智能整理"), "disabled header title");
+    assertTrue(vecHasSubstring(strsDisabled, "开启句序语音输入入口"), "disabled master switch title");
+    assertTrue(vecHasSubstring(strsDisabled, "默认关闭。未开启时不加载音频引擎"), "disabled off subtitle");
+    assertTrue(vecHasSubstring(strsDisabled, "按需加载：开启后才加载语音模块与配置"), "disabled bolt.shield note");
+    assertTrue(!vecHasSubstring(strsDisabled, "运行方案"), "disabled hides provider section");
+    renderViewOffscreen(pageDisabled);
+
+    // ---- 5b. Enabled + Cloud BYOK (Groq preset + Inspector summary) ----
+    let sampleSummary = VoiceContextSummary {
+        vcsAppName: "Cursor",
+        vcsAppIdentifier: "com.todesktop.230313mzl4w4u92",
+        vcsAppType: "ide",
+        vcsWindowTitle: "VoiceSettingsView.swift — juxu",
+        vcsWebURL: None,
+        vcsEnhancedUI: true,
+        vcsRole: "AXTextArea",
+        vcsIsEditable: true,
+        vcsIsBlacklisted: false,
+        vcsBlacklistReason: None,
+        vcsIsSecureInput: false,
+        vcsSelectedText: "let x = 1",
+        vcsTextBeforeCursor: "func demo() {\n",
+        vcsTextAfterCursor: "\n}",
+        vcsTextBeforeArea: "Explorer",
+        vcsTextAfterArea: "Terminal",
+        vcsVisibleScreenContent: Some("VoiceHUDPanel VoiceSettingsView"),
+        vcsElapsedMs: 14,
+        vcsPrettyJSON: "{\n  \"app\": \"Cursor\"\n}",
+        vcsAsrTargetLabel: "whisper-large-v3-turbo · 上限 320 字",
+        vcsAsrContext: "句序, Juxu, VoiceHUDPanel",
+        vcsPolishBudgetLabel: "AI 润色（full）",
+        vcsPolishContext: "[App: Cursor]\nbefore: func demo() {",
+    };
+    cellSet(gVoiceInspectorLastSummary, Some(sampleSummary));
+
+    let cloudGroq = VoicePreferences {
+        vpEnabled: true,
+        vpProviderMode: VpmCloudBYOK,
+        vpTriggerKey: VtkOptionSpace,
+        vpOutputMode: VomSmartPolish,
+        vpToneMode: VtmAutoByApp,
+        vpLanguage: "zh",
+        vpSpeakToEditSelection: true,
+        vpSyncJuxuLexicon: true,
+        vpCustomVocabulary: "句序, Juxu",
+        vpCloudPreset: VcpGroq,
+        vpCloudPolishEnabled: true,
+        vpCustomBaseURL: "https://api.openai.com/v1",
+        vpCustomASRModel: "whisper-1",
+        vpCustomLLMModel: "gpt-4o-mini",
+        vpCustomSplitLLM: false,
+        vpCustomLLMBaseURL: "https://api.deepseek.com/v1",
+        vpLocalASRPreset: VlaWhisperTurbo,
+        vpLocalAppleLocale: "zh-CN",
+        vpLocalAppleRequireOnDevice: true,
+        vpLocalHTTPASRBaseURL: "http://127.0.0.1:8080/v1",
+        vpLocalHTTPASRModel: "whisper-1",
+        vpLocalLLMPreset: VllQwen15B,
+        vpLocalHTTPLLMBaseURL: "http://127.0.0.1:11434/v1",
+        vpLocalHTTPLLMModel: "qwen2.5:3b",
+        vpGlobalVoiceHotkey: Some(true),
+        vpVoiceCues: None,
+        vpContextCapture: Some(true),
+        vpContextBlacklist: Some(true),
+        vpScreenContextToCloud: Some(false),
+    };
+    voicePrefsUpdate(cloudGroq, false);
+    let pageCloud = voiceBuildSettingsPageView(session, 500.0);
+    assertTrue(msgSendRect0(pageCloud, objcSel("frame")).size.height > 700.0, "enabled Cloud page height > 700");
+    assertTrue(cellGet(gVoiceInspectorPresented), "inspector marked presented when enabled + captureOn");
+
+    let strsCloud: Vec String = vecNew();
+    collectStringsRecursive(pageCloud, strsCloud);
+    assertTrue(vecHasSubstring(strsCloud, "运行方案"), "cloud has 运行方案");
+    assertTrue(vecHasSubstring(strsCloud, "云端服务商"), "cloud has 云端服务商");
+    assertTrue(vecHasSubstring(strsCloud, "API Key"), "cloud has API Key");
+    assertTrue(vecHasSubstring(strsCloud, "gsk_..."), "cloud Groq key placeholder");
+    assertTrue(vecHasSubstring(strsCloud, "启用云端 AI 口语整理"), "cloud has AI polish switch");
+    assertTrue(vecHasSubstring(strsCloud, "全局模式需要长按类触发键"), "optionSpace global hotkey warning shown");
+    assertTrue(vecHasSubstring(strsCloud, "输入监控（监听语音键）"), "input monitoring perm row");
+    assertTrue(vecHasSubstring(strsCloud, "辅助功能（写入其他应用）"), "accessibility perm row");
+    assertTrue(vecHasSubstring(strsCloud, "语气风格"), "smartPolish shows 语气风格");
+    assertTrue(vecHasSubstring(strsCloud, "选中文本语音改写（Speak to Edit）"), "Speak to Edit row");
+    assertTrue(vecHasSubstring(strsCloud, "读取当前应用的上下文"), "context capture row");
+    assertTrue(vecHasSubstring(strsCloud, "敏感应用/网址黑名单"), "context blacklist row");
+    assertTrue(vecHasSubstring(strsCloud, "把屏幕和输入框周围的文字发给云端"), "screen context cloud row");
+    assertTrue(vecHasSubstring(strsCloud, "上下文抓取实测（AXUIElement）"), "inspector card header");
+    assertTrue(vecHasSubstring(strsCloud, "实际送给 ASR 模型的上下文"), "inspector ASR box header");
+    assertTrue(vecHasSubstring(strsCloud, "实际送给润色模型的上下文"), "inspector Polish box header");
+    assertTrue(vecHasSubstring(strsCloud, "联动句序个人词库"), "lexicon sync row");
+    assertTrue(vecHasSubstring(strsCloud, "检测当前配置"), "connectivity test button");
+    assertTrue(vecHasSubstring(strsCloud, "配置：voice.json"), "voice.json path badge");
+    renderViewOffscreen(pageCloud);
+
+    // ---- 5c. Enabled + Cloud Custom Split LLM ----
+    let cloudCustom = VoicePreferences {
+        vpEnabled: true,
+        vpProviderMode: VpmCloudBYOK,
+        vpTriggerKey: VtkRightOption,
+        vpOutputMode: VomSmartPolish,
+        vpToneMode: VtmAutoByApp,
+        vpLanguage: "zh",
+        vpSpeakToEditSelection: true,
+        vpSyncJuxuLexicon: true,
+        vpCustomVocabulary: "",
+        vpCloudPreset: VcpCustom,
+        vpCloudPolishEnabled: true,
+        vpCustomBaseURL: "https://api.openai.com/v1",
+        vpCustomASRModel: "whisper-1",
+        vpCustomLLMModel: "gpt-4o-mini",
+        vpCustomSplitLLM: true,
+        vpCustomLLMBaseURL: "https://api.deepseek.com/v1",
+        vpLocalASRPreset: VlaWhisperTurbo,
+        vpLocalAppleLocale: "zh-CN",
+        vpLocalAppleRequireOnDevice: true,
+        vpLocalHTTPASRBaseURL: "http://127.0.0.1:8080/v1",
+        vpLocalHTTPASRModel: "whisper-1",
+        vpLocalLLMPreset: VllQwen15B,
+        vpLocalHTTPLLMBaseURL: "http://127.0.0.1:11434/v1",
+        vpLocalHTTPLLMModel: "qwen2.5:3b",
+        vpGlobalVoiceHotkey: None,
+        vpVoiceCues: None,
+        vpContextCapture: Some(false),
+        vpContextBlacklist: Some(true),
+        vpScreenContextToCloud: Some(false),
+    };
+    voicePrefsUpdate(cloudCustom, false);
+    let pageCustom = voiceBuildSettingsPageView(session, 500.0);
+    let strsCustom: Vec String = vecNew();
+    collectStringsRecursive(pageCustom, strsCustom);
+    assertTrue(vecHasSubstring(strsCustom, "Base URL"), "custom has Base URL");
+    assertTrue(vecHasSubstring(strsCustom, "语音识别模型"), "custom has 语音识别模型");
+    assertTrue(vecHasSubstring(strsCustom, "口语整理模型"), "custom has 口语整理模型");
+    assertTrue(vecHasSubstring(strsCustom, "整理模型使用独立接口与 Key"), "custom has split switch");
+    assertTrue(vecHasSubstring(strsCustom, "整理 Base URL"), "custom split has 整理 Base URL");
+    assertTrue(vecHasSubstring(strsCustom, "整理 API Key"), "custom split has 整理 API Key");
+    assertTrue(!vecHasSubstring(strsCustom, "上下文抓取实测（AXUIElement）"), "inspector hidden when capture == false");
+    assertTrue(!cellGet(gVoiceInspectorPresented), "gVoiceInspectorPresented == false when capture off");
+    renderViewOffscreen(pageCustom);
+
+    // ---- 5d. Enabled + Local Mode (Engine + Downloading Banner, plus Apple Speech & Custom HTTP) ----
+    cellSet(gVoiceInstallPhaseCell, VipDownloadingModel("ggml-large-v3-turbo-q5_0.bin", 0.42, "241 / 574 MB"));
+    let localEngine = VoicePreferences {
+        vpEnabled: true,
+        vpProviderMode: VpmLocal,
+        vpTriggerKey: VtkRightOption,
+        vpOutputMode: VomSmartPolish,
+        vpToneMode: VtmAutoByApp,
+        vpLanguage: "zh",
+        vpSpeakToEditSelection: true,
+        vpSyncJuxuLexicon: true,
+        vpCustomVocabulary: "",
+        vpCloudPreset: VcpGroq,
+        vpCloudPolishEnabled: true,
+        vpCustomBaseURL: "https://api.openai.com/v1",
+        vpCustomASRModel: "whisper-1",
+        vpCustomLLMModel: "gpt-4o-mini",
+        vpCustomSplitLLM: false,
+        vpCustomLLMBaseURL: "https://api.deepseek.com/v1",
+        vpLocalASRPreset: VlaWhisperTurbo,
+        vpLocalAppleLocale: "zh-CN",
+        vpLocalAppleRequireOnDevice: true,
+        vpLocalHTTPASRBaseURL: "http://127.0.0.1:8080/v1",
+        vpLocalHTTPASRModel: "whisper-1",
+        vpLocalLLMPreset: VllQwen15B,
+        vpLocalHTTPLLMBaseURL: "http://127.0.0.1:11434/v1",
+        vpLocalHTTPLLMModel: "qwen2.5:3b",
+        vpGlobalVoiceHotkey: None,
+        vpVoiceCues: None,
+        vpContextCapture: Some(true),
+        vpContextBlacklist: Some(true),
+        vpScreenContextToCloud: Some(false),
+    };
+    voicePrefsUpdate(localEngine, false);
+    let pageLocal = voiceBuildSettingsPageView(session, 500.0);
+    let strsLocal: Vec String = vecNew();
+    collectStringsRecursive(pageLocal, strsLocal);
+    assertTrue(vecHasSubstring(strsLocal, "本地语音识别模型"), "local has 本地语音识别模型");
+    assertTrue(vecHasSubstring(strsLocal, "一键下载并安装"), "local has 一键下载并安装");
+    assertTrue(vecHasSubstring(strsLocal, "本地 LLM 整理引擎"), "local has 本地 LLM 整理引擎");
+    assertTrue(vecHasSubstring(strsLocal, "正在下载 ggml-large-v3-turbo-q5_0.bin"), "local shows live download progress");
+    assertTrue(vecHasSubstring(strsLocal, "241 / 574 MB"), "local shows monospaced progress detail");
+    renderViewOffscreen(pageLocal);
+
+    // Apple Speech + Ollama HTTP sub-branches
+    cellSet(gVoiceInstallPhaseCell, VipIdle);
+    let localApple = VoicePreferences {
+        vpEnabled: true,
+        vpProviderMode: VpmLocal,
+        vpTriggerKey: VtkRightOption,
+        vpOutputMode: VomSmartPolish,
+        vpToneMode: VtmAutoByApp,
+        vpLanguage: "zh",
+        vpSpeakToEditSelection: true,
+        vpSyncJuxuLexicon: true,
+        vpCustomVocabulary: "",
+        vpCloudPreset: VcpGroq,
+        vpCloudPolishEnabled: true,
+        vpCustomBaseURL: "https://api.openai.com/v1",
+        vpCustomASRModel: "whisper-1",
+        vpCustomLLMModel: "gpt-4o-mini",
+        vpCustomSplitLLM: false,
+        vpCustomLLMBaseURL: "https://api.deepseek.com/v1",
+        vpLocalASRPreset: VlaAppleSpeech,
+        vpLocalAppleLocale: "zh-CN",
+        vpLocalAppleRequireOnDevice: true,
+        vpLocalHTTPASRBaseURL: "http://127.0.0.1:8080/v1",
+        vpLocalHTTPASRModel: "whisper-1",
+        vpLocalLLMPreset: VllOllamaHTTP,
+        vpLocalHTTPLLMBaseURL: "http://127.0.0.1:11434/v1",
+        vpLocalHTTPLLMModel: "qwen2.5:3b",
+        vpGlobalVoiceHotkey: None,
+        vpVoiceCues: None,
+        vpContextCapture: Some(true),
+        vpContextBlacklist: Some(true),
+        vpScreenContextToCloud: Some(false),
+    };
+    voicePrefsUpdate(localApple, false);
+    let pageApple = voiceBuildSettingsPageView(session, 500.0);
+    let strsApple: Vec String = vecNew();
+    collectStringsRecursive(pageApple, strsApple);
+    assertTrue(vecHasSubstring(strsApple, "识别语言"), "Apple Speech shows 识别语言");
+    assertTrue(vecHasSubstring(strsApple, "仅离线"), "Apple Speech shows 仅离线");
+    assertTrue(vecHasSubstring(strsApple, "http://127.0.0.1:11434/v1"), "Ollama HTTP shows base URL");
+    renderViewOffscreen(pageApple);
+
+    // Custom HTTP ASR sub-branch
+    let localHttp = VoicePreferences {
+        vpEnabled: true,
+        vpProviderMode: VpmLocal,
+        vpTriggerKey: VtkRightOption,
+        vpOutputMode: VomSmartPolish,
+        vpToneMode: VtmAutoByApp,
+        vpLanguage: "zh",
+        vpSpeakToEditSelection: true,
+        vpSyncJuxuLexicon: true,
+        vpCustomVocabulary: "",
+        vpCloudPreset: VcpGroq,
+        vpCloudPolishEnabled: true,
+        vpCustomBaseURL: "https://api.openai.com/v1",
+        vpCustomASRModel: "whisper-1",
+        vpCustomLLMModel: "gpt-4o-mini",
+        vpCustomSplitLLM: false,
+        vpCustomLLMBaseURL: "https://api.deepseek.com/v1",
+        vpLocalASRPreset: VlaCustomHTTP,
+        vpLocalAppleLocale: "zh-CN",
+        vpLocalAppleRequireOnDevice: true,
+        vpLocalHTTPASRBaseURL: "http://127.0.0.1:8080/v1",
+        vpLocalHTTPASRModel: "whisper-1",
+        vpLocalLLMPreset: VllQwen15B,
+        vpLocalHTTPLLMBaseURL: "http://127.0.0.1:11434/v1",
+        vpLocalHTTPLLMModel: "qwen2.5:3b",
+        vpGlobalVoiceHotkey: None,
+        vpVoiceCues: None,
+        vpContextCapture: Some(true),
+        vpContextBlacklist: Some(true),
+        vpScreenContextToCloud: Some(false),
+    };
+    voicePrefsUpdate(localHttp, false);
+    let pageHttp = voiceBuildSettingsPageView(session, 500.0);
+    let strsHttp: Vec String = vecNew();
+    collectStringsRecursive(pageHttp, strsHttp);
+    assertTrue(vecHasSubstring(strsHttp, "http://127.0.0.1:8080/v1"), "Custom HTTP ASR shows base URL");
+
+    voiceOnSettingsWindowClosed();
+    assertTrue(!cellGet(gVoiceInspectorPresented), "voiceOnSettingsWindowClosed resets gVoiceInspectorPresented");
+    cellSet(gVoiceInspectorLastSummary, None)
+})
+
+def main(): Void = withAutoreleasePool(() -> {
+    let _ = msgSend0(objcClass("NSApplication"), objcSel("sharedApplication"));
+    testVoiceHUDMetricsAndTextFit();
+    testVoiceLevelMeter();
+    testVoiceSpectrumAnalyzer();
+    testVoiceHUDViewAndPanelController();
+    testVoiceSettingsPageAllModes();
+    printLn("voice_ui_test: ALL HUD METRICS, TEXTFIT, LEVEL METER, VDSP FFT, HUD PANEL & SETTINGS VIEW TESTS PASSED!")
+})

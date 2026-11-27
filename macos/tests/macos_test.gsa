@@ -1,0 +1,380 @@
+/// Comprehensive parity test suite for `juxu_macos` (ported 1:1 from `Tests/SwiftBridgeTests.swift` sections 5, 8, 10):
+/// - `ShiftTapDetector`: all 10 cases `8(a)..8(j)` (bare Left/Right Shift taps, slow hold >= 0.35s, Cmd+Shift+S,
+///   Shift+Cmd, Ctrl/Opt/Fn+Shift, focus-switch reset while holding Cmd+Shift, Shift+KeyDown, intervening HID callback,
+///   LShift+RShift chord, subsequent bare Shift tap recovery)
+/// - `NativeCandidateContentView`: single-line `barHeight = 32.0`, zero line-wrapping across narrow->wide multi-phrase
+///   transitions, empty `subviews` (`NSHostingView`-free), `macOSPreedit` (`q·dgip`), vertical multi-row layout,
+///   and `cleanCandidateAnnotation` (`⌖trwu 96%` -> `trwu`, `⚡k` -> `k`)
+/// - `FloatingHUDPanel`: `resolvedOrigin` clamping to `visibleFrame` and flipping above caret near bottom edge
+/// - `SettingsWindow.isCloseWindowShortcut` & `performKeyEquivalent:`: all 9 `NSEvent` cases (`cmdW`, `cmdCapsW`,
+///   `cmdNonLatinW`, `cmdShiftW`, `cmdOptW`, `cmdCtrlW`, `plainW`, `cmdA`, `cmdWKeyUp`) + live `CloseSpy` window close test!
+
+use std.option.{Some, None}
+use std.vec.{Vec, vecNew, vecWithCap, vecPush}
+use sys.proc.{exit}
+use objc.{
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    objcReleaseRaw, withAutoreleasePool,
+    msgSend0, msgSendI64_0, msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1Bool,
+}
+use juxu_core.{Candidate, MkCandidate, Wubi98}
+use juxu_shared.{
+    MkJuxuConfig,
+    JuxuActionState, emptyActionState, macOSPreedit,
+    bridgeNew, bridgeApplyAndSaveConfig, bridgeHandleKey, bridgeSetContext,
+    CGPoint, CGRect, cgPoint, cgSize, cgRect, nsStr, objcAllocInit,
+    msgSendVoid1Rect, msgSendBool1Ptr,
+}
+use macos_ffi.{msgSendKeyEvent}
+use shift_tap.{
+    leftShiftKeyCode, rightShiftKeyCode,
+    modNone, modShift, modControl, modOption, modCommand, modFunction,
+    shiftTapDetectorNew, shiftTapReset, shiftTapHandleKeyDown,
+    shiftTapHandleFlagsChanged, shiftTapHandleFlagsChangedWithHid,
+}
+use floating_hud.{floatingPanelResolvedOrigin}
+use candidate_panel.{
+    candidateBarHeight, cleanCandidateAnnotation,
+    candidateViewCreate, candidateViewSetMaxAllowedWidth,
+    candidateViewSetState, candidateViewComputeFittingSize,
+}
+use settings_window.{
+    SecSchema, isCloseWindowShortcut, settingsWindowCreate, buildSettingsRootView,
+}
+
+def assertTrue(cond: Bool, msg: String): Void =
+    if (!cond) {
+        printLn("ASSERTION FAILED: " + msg);
+        exit(1)
+    } else ()
+
+def gCloseSpyCount: Cell Int = cellNew(0)
+
+def closeSpyWillClose(_self: Ptr, _cmd: Ptr, _notif: Ptr): Void =
+    cellSet(gCloseSpyCount, cellGet(gCloseSpyCount) + 1)
+
+extern init(110) def registerCloseSpyClass(): Void = {
+    let cls = objcAllocateClass("NSObject", "JuxuCloseSpyDelegate");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "windowWillClose:", cFnPtr(closeSpyWillClose), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}
+
+def makeKeyEvent(
+    evType: Int64,
+    chars: String,
+    ignoringMods: String,
+    modifiers: Int64,
+    keyCode: Int
+): Ptr =
+    msgSendKeyEvent(
+        objcClass("NSEvent"),
+        objcSel("keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:"),
+        evType,
+        cgPoint(0.0, 0.0),
+        modifiers,
+        0.0,
+        intToI64(0),
+        ptrNull(),
+        nsStr(chars),
+        nsStr(ignoringMods),
+        false,
+        keyCode
+    )
+
+def makeTestActionState(
+    preedit: String,
+    totalPages: Int,
+    vertical: Bool,
+    cands: Vec Candidate
+): JuxuActionState = {
+    let base = emptyActionState();
+    JuxuActionState {
+        asConsumed: true,
+        asBell: false,
+        asAsciiMode: false,
+        asSchemaId: 86,
+        asPage: 0,
+        asTotalPages: totalPages,
+        asVertical: vertical,
+        asSchemaName: "86版五笔",
+        asCommitText: "",
+        asPreedit: preedit,
+        asSegmentedCode: "",
+        asNotice: "",
+        asUserPhraseCount: 0,
+        asCalibratedKeyCount: 0,
+        asValidNextMask: base.asValidNextMask,
+        asNextKeyPriors: base.asNextKeyPriors,
+        asTouchOffsets: base.asTouchOffsets,
+        asT9Mode: false,
+        asT9ValidNextMask: base.asT9ValidNextMask,
+        asT9NextKeyPriors: base.asT9NextKeyPriors,
+        asT9TouchOffsets: base.asT9TouchOffsets,
+        asT9LockedPrefix: "",
+        asT9Syllables: vecNew(),
+        asCandidates: cands,
+        asHasDecodedTouchOffsets: true,
+        asHasDecodedT9TouchOffsets: true,
+    }
+}
+
+def testShiftTapDetectorAll10Cases(): Void = {
+    let lShift = leftShiftKeyCode();
+    let rShift = rightShiftKeyCode();
+    let lCmd = 0x37;
+    let lCtrl = 0x3B;
+    let lOpt = 0x3A;
+    let fnKey = 0x3F;
+
+    let d = shiftTapDetectorNew();
+
+    // 8(a): Bare Left/Right Shift taps within threshold toggle
+    assertTrue(!shiftTapHandleFlagsChanged(d, lShift, modShift(), 10.0), "8a tap1Down");
+    assertTrue(shiftTapHandleFlagsChanged(d, lShift, modNone(), 10.12), "8a tap1Up");
+    assertTrue(!shiftTapHandleFlagsChanged(d, rShift, modShift(), 11.0), "8a tap2Down");
+    assertTrue(shiftTapHandleFlagsChanged(d, rShift, modNone(), 11.20), "8a tap2Up");
+
+    // 8(b): Slow Shift hold (>= 0.35s) does not toggle
+    assertTrue(!shiftTapHandleFlagsChanged(d, lShift, modShift(), 12.0), "8b holdDown");
+    assertTrue(!shiftTapHandleFlagsChanged(d, lShift, modNone(), 12.40), "8b holdUp");
+
+    // 8(c): Cmd+Shift+S releasing Cmd before Shift must NOT toggle
+    let c1 = shiftTapHandleFlagsChanged(d, lCmd, modCommand(), 13.0);
+    let c2 = shiftTapHandleFlagsChanged(d, lShift, modCommand() | modShift(), 13.05);
+    shiftTapHandleKeyDown(d);
+    let c3 = shiftTapHandleFlagsChanged(d, lCmd, modShift(), 13.15);
+    let c4 = shiftTapHandleFlagsChanged(d, lShift, modNone(), 13.20);
+    assertTrue(!c1 && !c2 && !c3 && !c4, "8c Cmd+Shift+S");
+
+    // 8(d): Shift+Cmd releasing Cmd before Shift (even without IMK keyDown) must NOT toggle
+    let d1 = shiftTapHandleFlagsChanged(d, lShift, modShift(), 14.0);
+    let d2 = shiftTapHandleFlagsChanged(d, lCmd, modShift() | modCommand(), 14.03);
+    let d3 = shiftTapHandleFlagsChanged(d, lCmd, modShift(), 14.10);
+    let d4 = shiftTapHandleFlagsChanged(d, lShift, modNone(), 14.15);
+    assertTrue(!d1 && !d2 && !d3 && !d4, "8d Shift+Cmd");
+
+    // 8(e): Ctrl+Shift, Opt+Shift, Fn+Shift releasing other modifier first must NOT toggle
+    let checkChord = (code: Int, m: Int) -> {
+        let e1 = shiftTapHandleFlagsChanged(d, code, m, 15.0);
+        let e2 = shiftTapHandleFlagsChanged(d, lShift, m | modShift(), 15.02);
+        let e3 = shiftTapHandleFlagsChanged(d, code, modShift(), 15.08);
+        let e4 = shiftTapHandleFlagsChanged(d, lShift, modNone(), 15.12);
+        assertTrue(!e1 && !e2 && !e3 && !e4, "8e modifier chord")
+    };
+    checkChord(lCtrl, modControl());
+    checkChord(lOpt, modOption());
+    checkChord(fnKey, modFunction());
+
+    // 8(f): Focus switch while holding Cmd+Shift (reset detector, then Cmd up -> Shift up) must NOT toggle
+    shiftTapReset(d);
+    let f1 = shiftTapHandleFlagsChanged(d, lCmd, modShift(), 16.0);
+    let f2 = shiftTapHandleFlagsChanged(d, lShift, modNone(), 16.05);
+    assertTrue(!f1 && !f2, "8f focus switch while holding Cmd+Shift");
+
+    // 8(g): Shift + regular keyDown (e.g. Shift+A) must NOT toggle
+    let g1 = shiftTapHandleFlagsChanged(d, lShift, modShift(), 17.0);
+    shiftTapHandleKeyDown(d);
+    let g2 = shiftTapHandleFlagsChanged(d, lShift, modNone(), 17.10);
+    assertTrue(!g1 && !g2, "8g Shift + keyDown");
+
+    // 8(h): Shift + intercepted key/mouse (e.g. Shift+Tab, Shift+Click) caught via HID callback must NOT toggle
+    let h1 = shiftTapHandleFlagsChanged(d, lShift, modShift(), 18.0);
+    let sawExpectedDownTs = cellNew(false);
+    let h2 = shiftTapHandleFlagsChangedWithHid(d, lShift, modNone(), 18.10, (downTs: Float) -> {
+        if (downTs == 18.0) cellSet(sawExpectedDownTs, true) else ();
+        true
+    });
+    assertTrue(cellGet(sawExpectedDownTs), "8h downTs == 18.0 passed to HID callback");
+    assertTrue(!h1 && !h2, "8h HID callback suppresses Shift tap");
+
+    // 8(i): Left Shift + Right Shift chord must NOT toggle
+    let i1 = shiftTapHandleFlagsChanged(d, lShift, modShift(), 19.0);
+    let i2 = shiftTapHandleFlagsChanged(d, rShift, modShift(), 19.05);
+    let i3 = shiftTapHandleFlagsChanged(d, lShift, modShift(), 19.10);
+    let i4 = shiftTapHandleFlagsChanged(d, rShift, modNone(), 19.15);
+    assertTrue(!i1 && !i2 && !i3 && !i4, "8i LShift + RShift chord");
+
+    // 8(j): Subsequent bare Shift tap after combinations still works normally
+    let j1 = shiftTapHandleFlagsChanged(d, lShift, modShift(), 20.0);
+    let j2 = shiftTapHandleFlagsChanged(d, lShift, modNone(), 20.08);
+    assertTrue(!j1 && j2, "8j bare Shift tap recovery")
+}
+
+def testCandidateViewAndPanelPositioning(): Void = {
+    // Verify cleanCandidateAnnotation formatting (`CandidatePanel.swift` lines 122-136)
+    let typoCand = MkCandidate { text: "我们", comment: "⌖trwu 96%", badge: 2, confidence: 0.96, isExact: false };
+    let shortCand = MkCandidate { text: "中", comment: "⚡k", badge: 1, confidence: 1.0, isExact: true };
+    let lookupCand = MkCandidate { text: "过", comment: "fp · fpi (guō)", badge: 4, confidence: 1.0, isExact: true };
+    let userCand = MkCandidate { text: "棱五笔", comment: "sggtt", badge: 5, confidence: 1.0, isExact: true };
+    assertTrue(cleanCandidateAnnotation(typoCand) == "trwu", "cleanAnnotation typoCorrected");
+    assertTrue(cleanCandidateAnnotation(shortCand) == "k", "cleanAnnotation shortcode");
+    assertTrue(cleanCandidateAnnotation(lookupCand) == "fp · fpi (guō)", "cleanAnnotation lookup");
+    assertTrue(cleanCandidateAnnotation(userCand) == "", "cleanAnnotation userPhrase hidden");
+
+    // Verify FloatingHUDPanel clamping & bottom-edge flip
+    let vis = cgRect(0.0, 40.0, 1440.0, 860.0);
+    let flippedOrigin: CGPoint = floatingPanelResolvedOrigin(
+        cgSize(240.0, 32.0),
+        cgRect(1300.0, 52.0, 2.0, 18.0),
+        Some(vis),
+        5.0,
+        6.0,
+        8.0
+    );
+    assertTrue(flippedOrigin.y == 75.0, "panel flips above caret when near bottom of visibleFrame");
+    assertTrue(flippedOrigin.x == 1192.0, "panel clamps right edge to visibleFrame.maxX - 8");
+
+    // Section 5 from SwiftBridgeTests: pure AppKit NativeCandidateContentView NEVER wraps lines
+    let _ = msgSend0(objcClass("NSApplication"), objcSel("sharedApplication"));
+    let candView = candidateViewCreate(cgRect(0.0, 0.0, 90.0, 30.0));
+    candidateViewSetMaxAllowedWidth(candView, 800.0);
+
+    let narrowCands: Vec Candidate = vecWithCap(1);
+    vecPush(narrowCands, MkCandidate { text: "一", comment: "", badge: 0, confidence: 1.0, isExact: true });
+    let narrowState = makeTestActionState("g", 1, false, narrowCands);
+    candidateViewSetState(candView, narrowState);
+    let sz1 = candidateViewComputeFittingSize(candView);
+    assertTrue(sz1.height == candidateBarHeight(), "sz1.height == barHeight (32.0)");
+
+    let wideCands: Vec Candidate = vecWithCap(5);
+    vecPush(wideCands, MkCandidate { text: "中华人民共和国", comment: "⚡k", badge: 1, confidence: 1.0, isExact: true });
+    vecPush(wideCands, MkCandidate { text: "一心一意", comment: "", badge: 0, confidence: 1.0, isExact: true });
+    vecPush(wideCands, MkCandidate { text: "实事求是", comment: "", badge: 0, confidence: 1.0, isExact: true });
+    vecPush(wideCands, MkCandidate { text: "千方百计", comment: "", badge: 0, confidence: 1.0, isExact: true });
+    vecPush(wideCands, MkCandidate { text: "自力更生", comment: "", badge: 0, confidence: 1.0, isExact: true });
+    let wideState = makeTestActionState("khk", 3, false, wideCands);
+    candidateViewSetState(candView, wideState);
+    let sz2 = candidateViewComputeFittingSize(candView);
+    assertTrue(sz2.height == candidateBarHeight(), "sz2 strictly single-line barHeight without wrapping");
+    assertTrue(sz2.width > sz1.width + 200.0, "sz2 horizontal candidate bar expands cleanly on single line");
+
+    // Verify vertical candidate sizing expands height > barHeight and keeps subviews empty
+    let vertState = makeTestActionState("khk", 3, true, wideCands);
+    candidateViewSetState(candView, vertState);
+    let szVert = candidateViewComputeFittingSize(candView);
+    assertTrue(szVert.height > candidateBarHeight() * 3.0, "vertical layout multi-row height");
+
+    // Live engine `qdgip` test from SwiftBridgeTests lines 412-422 (spaceless 98 Wubi)
+    let bridge = bridgeNew(Some("../Resources/Dicts"), true);
+    let curCfg = cellGet(bridge.jsConfig);
+    bridgeApplyAndSaveConfig(bridge, MkJuxuConfig {
+        schema: Wubi98,
+        fourthCodeAutoCommit: curCfg.fourthCodeAutoCommit,
+        fifthCodePushCommit: curCfg.fifthCodePushCommit,
+        fourthEmptyBehavior: curCfg.fourthEmptyBehavior,
+        shortestCodeFirst: curCfg.shortestCodeFirst,
+        strictShortcode: curCfg.strictShortcode,
+        spaceless: true,
+        showShortcodeHint: curCfg.showShortcodeHint,
+        dynamicWordFreq: curCfg.dynamicWordFreq,
+        dynamicCharFreq: curCfg.dynamicCharFreq,
+        autoPhrase: curCfg.autoPhrase,
+        autoPhraseThreshold: curCfg.autoPhraseThreshold,
+        zOmnipotent: curCfg.zOmnipotent,
+        semicolonQuoteSelect: curCfg.semicolonQuoteSelect,
+        smartPunctuation: curCfg.smartPunctuation,
+        autoSpaceZhEn: curCfg.autoSpaceZhEn,
+        autoSpaceDigits: curCfg.autoSpaceDigits,
+        clipboardSuggestion: curCfg.clipboardSuggestion,
+        cangjieKeycapRadicals: curCfg.cangjieKeycapRadicals,
+        wubiKeycapRadicals: curCfg.wubiKeycapRadicals,
+        keySwipeUpInput: curCfg.keySwipeUpInput,
+        spaceCommaKey: curCfg.spaceCommaKey,
+        keyLongPressAlternates: curCfg.keyLongPressAlternates,
+        backspaceSwipeClear: curCfg.backspaceSwipeClear,
+        keyboardHoldCursor: curCfg.keyboardHoldCursor,
+        enableRareCharset: curCfg.enableRareCharset,
+        pinyinInitialAbbr: curCfg.pinyinInitialAbbr,
+        pinyinT9Layout: curCfg.pinyinT9Layout,
+        shiftToggleMode: curCfg.shiftToggleMode,
+        pageSize: curCfg.pageSize,
+        orientation: curCfg.orientation,
+        evalLogging: curCfg.evalLogging,
+        emojiCandidates: curCfg.emojiCandidates,
+        typo: curCfg.typo,
+    }, false);
+    bridgeSetContext(bridge, "");
+    let qdgip = "qdgip";
+    let k = cellNew(0);
+    while (cellGet(k) < strLen(qdgip)) {
+        let idx = cellGet(k);
+        let _ = bridgeHandleKey(bridge, 0, strByteAt(qdgip, idx), false, intToI64(600 + idx * 10));
+        cellSet(k, idx + 1)
+    };
+    let liveSt = cellGet(bridge.jsState);
+    candidateViewSetState(candView, liveSt);
+    let liveSz = candidateViewComputeFittingSize(candView);
+    msgSendVoid1Rect(candView, objcSel("setFrame:"), cgRect(0.0, 0.0, liveSz.width, liveSz.height));
+    msgSendVoid0(candView, objcSel("layout"));
+    assertTrue(liveSt.asPreedit == "我感觉" && macOSPreedit(liveSt) == "q·dgip", "qdgip preedit & macOSPreedit");
+    let subviews = msgSend0(candView, objcSel("subviews"));
+    assertTrue(liveSz.height == candidateBarHeight() && msgSendI64_0(subviews, objcSel("count")) == intToI64(0), "NativeCandidateContentView subviews empty");
+    objcReleaseRaw(candView)
+}
+
+def testSettingsWindowCloseShortcutAll9Cases(): Void = {
+    let evKeyDown = intToI64(10);
+    let evKeyUp = intToI64(11);
+    let flagCmd = intToI64(0x100000);
+    let flagCaps = intToI64(0x10000);
+    let flagShift = intToI64(0x20000);
+    let flagOpt = intToI64(0x80000);
+    let flagCtrl = intToI64(0x40000);
+
+    let cmdW = makeKeyEvent(evKeyDown, "w", "w", flagCmd, 13);
+    let cmdCapsW = makeKeyEvent(evKeyDown, "W", "W", flagCmd | flagCaps, 13);
+    let cmdNonLatinW = makeKeyEvent(evKeyDown, "w", "ц", flagCmd, 13);
+    let cmdShiftW = makeKeyEvent(evKeyDown, "W", "w", flagCmd | flagShift, 13);
+    let cmdOptW = makeKeyEvent(evKeyDown, "∑", "w", flagCmd | flagOpt, 13);
+    let cmdCtrlW = makeKeyEvent(evKeyDown, "w", "w", flagCmd | flagCtrl, 13);
+    let plainW = makeKeyEvent(evKeyDown, "w", "w", intToI64(0), 13);
+    let cmdA = makeKeyEvent(evKeyDown, "a", "a", flagCmd, 0);
+    let cmdWKeyUp = makeKeyEvent(evKeyUp, "w", "w", flagCmd, 13);
+
+    assertTrue(isCloseWindowShortcut(cmdW), "10.1 cmdW");
+    assertTrue(isCloseWindowShortcut(cmdCapsW), "10.2 cmdCapsW");
+    assertTrue(isCloseWindowShortcut(cmdNonLatinW), "10.3 cmdNonLatinW");
+    assertTrue(!isCloseWindowShortcut(cmdShiftW), "10.4 !cmdShiftW");
+    assertTrue(!isCloseWindowShortcut(cmdOptW), "10.5 !cmdOptW");
+    assertTrue(!isCloseWindowShortcut(cmdCtrlW), "10.6 !cmdCtrlW");
+    assertTrue(!isCloseWindowShortcut(plainW), "10.7 !plainW");
+    assertTrue(!isCloseWindowShortcut(cmdA), "10.8 !cmdA");
+    assertTrue(!isCloseWindowShortcut(cmdWKeyUp), "10.9 !cmdWKeyUp");
+
+    // Live SettingsWindow `performKeyEquivalent:` + `CloseSpy` delegate verification
+    let _ = msgSend0(objcClass("NSApplication"), objcSel("sharedApplication"));
+    cellSet(gCloseSpyCount, 0);
+    let spy = objcAllocInit("JuxuCloseSpyDelegate");
+    let bridge = bridgeNew(Some("../Resources/Dicts"), true);
+    // [.titled (1), .closable (2), .miniaturizable (4), .resizable (8)] = 15
+    let settingsWin = settingsWindowCreate(cgRect(0.0, 0.0, 720.0, 580.0), intToI64(15), true);
+    msgSendVoid1Bool(settingsWin, objcSel("setReleasedWhenClosed:"), false);
+    let (rootView, _) = buildSettingsRootView(bridge, cgRect(0.0, 0.0, 720.0, 580.0), SecSchema, false);
+    msgSendVoid1Ptr(settingsWin, objcSel("setContentView:"), rootView);
+    objcReleaseRaw(rootView);
+    msgSendVoid1Ptr(settingsWin, objcSel("setDelegate:"), spy);
+
+    let pkeSel = objcSel("performKeyEquivalent:");
+    let handledShiftW = msgSendBool1Ptr(settingsWin, pkeSel, cmdShiftW);
+    let handledPlainW = msgSendBool1Ptr(settingsWin, pkeSel, plainW);
+    let handledCmdA = msgSendBool1Ptr(settingsWin, pkeSel, cmdA);
+    assertTrue(!handledShiftW && !handledPlainW && !handledCmdA, "non-close equivalents rejected");
+    assertTrue(cellGet(gCloseSpyCount) == 0, "closeCount == 0 before Cmd+W");
+
+    let handledCmdW = msgSendBool1Ptr(settingsWin, pkeSel, cmdW);
+    assertTrue(handledCmdW, "Cmd+W handled by SettingsWindow.performKeyEquivalent:");
+    assertTrue(cellGet(gCloseSpyCount) == 1, "Expected Cmd+W to close SettingsWindow (closeCount == 1)");
+
+    msgSendVoid1Ptr(settingsWin, objcSel("setDelegate:"), ptrNull());
+    objcReleaseRaw(settingsWin);
+    objcReleaseRaw(spy)
+}
+
+def main(): Void = withAutoreleasePool(() -> {
+    testShiftTapDetectorAll10Cases();
+    testCandidateViewAndPanelPositioning();
+    testSettingsWindowCloseShortcutAll9Cases();
+    printLn("macos_test: ALL SHIFT-TAP, CANDIDATE-VIEW & SETTINGS-WINDOW PARITY TESTS PASSED!")
+})

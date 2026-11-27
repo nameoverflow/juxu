@@ -1,255 +1,1316 @@
-/// Dynamic `IMKInputController` subclass (`JuxuInputController`) registered in `extern init`.
-/// Bridges macOS `IMKTextInput` client events directly into `juxu_core` via `JuxuSession`,
-/// with exact cursor-rect positioning, surrounding-context sync, punctuation pairing,
-/// ZH/EN auto-spacing, post-commit backspace feedback, and candidate click-to-select.
+/// Complete 1:1 port of `Sources/InputController.swift` (876 lines):
+/// - `JuxuInputController : IMKInputController` (`initWithServer:delegate:client:`, `recognizedEvents:`,
+///   `activateServer:`, `deactivateServer:`, `commitComposition:`, `handleEvent:client:`, `menu`, `showPreferences:`)
+/// - `IsSecureEventInputEnabled()` (`suppressEvalLogging`) & `CGEventSourceSecondsSinceLastEventType` intervening HID check
+/// - Voice facade integration (`voiceSetInputMethodSink`, `voiceClearInputMethodSink`, `voiceHandleDeactivate`,
+///   `voiceHandleImkEvent`, `commitVoiceText` with selection replacement vs auto-spaced insertion)
+/// - Bare Shift toggle (`commit_code`, `commit_first`, `clear`) + `ModeIndicatorPanelController` (`"中"` / `"英"`)
+/// - Full client context & stubbed-range handling (`sawClientSupportForRanges`, `lastExpectedAnchor`, surrogate-safe slicing)
+/// - `Cmd+Backspace` clearing active composition while passing through when idle
+/// - Inline `setMarkedText:selectionRange:replacementRange:` using `macOSPreedit` with single-underline attributes
+/// - `PunctuationPairingTracker` (`setSelectedRange:` + `CGEvent` virtual key cursor placement & empty-pair delete)
+///   + `AutoSpaceContextTracker` + `notifyPostCommitBackspace`
+/// - Multi-fallback `queryCaretRect` (`attributesForCharacterIndex:lineHeightRectangle:`, `markedRange`, `selectedRange`, mouse)
+/// - Full status bar `NSMenu` (all 9 schemas in 3 category submenus, typo, spaceless, orientation, auto-space, voice, reload, preferences).
 
 use std.option.{Option, Some, None}
-use sys.time.{monotonicMs}
+use std.str.{strTrim}
+use std.math.{abs}
 use objc.{
     objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    objcSetAssocHandle, objcGetAssocHandle, objcReleaseRaw,
     msgSend0, msgSend1Ptr, msgSendInt0, msgSendI64_0, msgSendFloat0,
-    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64,
+    msgSendVoid1Ptr, msgSendVoid1I64,
 }
-use juxu_core.{
-    InputEvent, ToggleAscii, CommitPending, SelectPage, keyRaw,
-    setContext, notifyPostCommitBackspace, abandon,
-    snapConsumed, snapCommitText,
-}
+use juxu_core.{schemaId}
 use juxu_shared.{
-    JuxuSession, sessionStep, sessionResetForFocusChange, sessionFlushUserData,
-    CGRect, cgRect, nsRange, nsNotFound, nsStr, nsStrPtrToString, readCGRectFromBuf,
-    utf8FirstScalar,
-    PunctuationAction, InsertPair, SkipClose, Plain,
+    CandidateOrientation, Horizontal, Vertical,
+    MkJuxuConfig, MkTypoConfig,
+    JuxuSession, JuxuActionState, macOSPreedit,
+    bridgeShared, bridgeLoadConfigAndUser, bridgeApplyAndSaveConfig, bridgeSwitchSchema,
+    bridgeFlushPendingPersistence, bridgeFlushUserDataAsync,
+    bridgeHandleKey, bridgeSelectCandidate, bridgeTurnPage, bridgeToggleAsciiMode,
+    bridgeCommitPending, bridgeResetQuoteState, bridgeNotifyPostCommitBackspace, bridgeSetContext,
+    InputSchemaCategory, allSchemaCategories, categoryRawValue, categoryForSchemaId,
+    InputSchemaOption, schemaOptionsForCategory,
+    configIsPinyinFamily,
+    PunctuationAction, Plain, InsertPair, SkipClose, closerForOpen,
+    PunctuationPairingTracker, punctuationTrackerNew, punctuationTrackerReset,
     punctuationTrackerHandleSymbol, punctuationTrackerConsumeBackspacePair,
-    formatAutoSpace,
-    msgSendRange0, msgSend1Range, msgSend1I64_1Ptr,
-    msgSendVoid1Ptr1Range, msgSendVoid1Ptr2Range,
+    AutoSpaceOptions, autoSpaceOptionsFromConfig, isAutoSpaceRightTrigger,
+    AutoSpaceContextTracker, autoSpaceTrackerNew, autoSpaceTrackerInvalidate,
+    autoSpaceTrackerCurrentShadowBefore, autoSpaceTrackerEffectiveBefore,
+    autoSpaceTrackerPrepareCommit, autoSpaceTrackerRecordPassthrough, autoSpaceTrackerWillDeleteBackward,
+    CGRect, NSRange, cgRect, nsRange, nsNotFound, readCGRectFromBuf, writeCGRectToBuf,
+    ptrToI64, nsStr, nsStrPtrToString, nsStrPtrToOpt, strUtf16Len, systemUptimeSeconds,
+    utf8FirstScalar, utf8ScalarCount, lastCharStr, tailScalars,
+    msgSendRange0, msgSend1Range, msgSend1I64_1PtrOut,
+    msgSendVoid1Range, msgSendVoid1Ptr1Range, msgSendVoid1Ptr2Range, msgSendBool1Ptr,
+    objcSendSuperVoid1Ptr, dispatchMainAfterMs,
+}
+use macos_ffi.{
+    wallNowMs, isSecureEventInputEnabled, cgPreflightPostEventAccess,
+    postVirtualKey, hasInterveningHidInput, nsBeep, objcSendSuperInit3Ptr,
+    msgSendRect1Range1Ptr, makeUnderlinedAttrString, mouseScreenLocation,
 }
 use shift_tap.{
     ShiftTapDetector, shiftTapDetectorNew, shiftTapReset,
-    shiftTapHandleKeyDown, shiftTapHandleFlagsChanged,
-    modShift, modControl, modOption, modCommand, modFunction, modCapsLock,
+    shiftTapCancelPendingTap, shiftTapHandleKeyDown, shiftTapHandleFlagsChangedWithHid,
+    nsEventModifiersToShiftMask,
 }
-use candidate_panel.{candidatePanelUpdate, candidatePanelHide, candidatePanelSetOnSelect}
-use floating_hud.{hudShow}
+use floating_hud.{modeIndicatorShow, modeIndicatorHide}
+use candidate_panel.{
+    candidatePanelSetOnSelect, candidatePanelSetOnPage,
+    candidatePanelUpdateState, candidatePanelHide,
+}
+use voice_facade.{
+    voiceSetInputMethodSink, voiceClearInputMethodSink, voiceHandleDeactivate,
+    voiceHandleImkEvent, voiceIsEnabled, voiceProviderDisplayName,
+    voiceIsSmartPolishEnabled, voiceToggleProviderMode, voiceToggleSmartPolish,
+}
 use settings_window.{settingsWindowShow}
 
-def gSharedSession: Cell (Option JuxuSession) = cellNew(None)
-def gActiveClient: Cell Ptr = cellNew(ptrNull())
-def gShiftDetector: Cell ShiftTapDetector = cellNew(shiftTapDetectorNew())
-def gCursorRectBuf: Cell Ptr = cellNew(ptrNull())
+extern "objc_msgSend" def msgSendMenuInitTitle(obj: Ptr, sel: Ptr, title: Ptr): Ptr
+extern "objc_msgSend" def msgSendMenuItemInit(obj: Ptr, sel: Ptr, title: Ptr, action: Ptr, keyEq: Ptr): Ptr
 
-pub def inputControllerSetSession(s: JuxuSession): Void = {
-    cellSet(gSharedSession, Some(s));
-    candidatePanelSetOnSelect((idx: Int) -> {
-        let client = cellGet(gActiveClient);
-        let snap = sessionStep(s, SelectPage { index: idx, atMs: monotonicMs() });
-        commitWithFormatting(s, client, snapCommitText(snap));
-        setMarkedTextToClient(client, snap.displayPreedit);
-        candidatePanelUpdate(snap, queryClientCursorRect(client))
+// ============================================================================
+// Per-Instance Controller State & Session Binding
+// ============================================================================
+
+data ControllerState {
+    csActiveClient: Cell Ptr,
+    csShiftTap: ShiftTapDetector,
+    csAutoSpaceTracker: AutoSpaceContextTracker,
+    csPairingTracker: PunctuationPairingTracker,
+    csLastExpectedAnchor: Cell (Option Int64),
+    csSawClientSupportForRanges: Cell Bool,
+    csNeedsEngineContextSync: Cell Bool,
+    csSaveTimerGen: Cell Int64,
+}
+
+def gOverrideSession: Cell (Option JuxuSession) = cellNew(None)
+def gControllerKey: Cell Ptr = cellNew(ptrNull())
+def gCaretRectBuf: Cell Ptr = cellNew(ptrNull())
+
+pub def inputControllerSetSession(s: JuxuSession): Void =
+    cellSet(gOverrideSession, Some(s))
+
+def activeSession(): JuxuSession =
+    match cellGet(gOverrideSession) {
+        Some(s) -> s,
+        None -> bridgeShared(),
+    }
+
+def controllerAssocKey(): Ptr = {
+    let k = cellGet(gControllerKey);
+    if (!ptrIsNull(k)) k
+    else {
+        let nk = ptrAllocBytes(8);
+        cellSet(gControllerKey, nk);
+        nk
+    }
+}
+
+def getOrCreateControllerState(self: Ptr): ControllerState = {
+    let h = objcGetAssocHandle(self, controllerAssocKey());
+    if (h != intToI64(0)) {
+        gcHandleGet(h)
+    } else {
+        let st = ControllerState {
+            csActiveClient: cellNew(ptrNull()),
+            csShiftTap: shiftTapDetectorNew(),
+            csAutoSpaceTracker: autoSpaceTrackerNew(),
+            csPairingTracker: punctuationTrackerNew(),
+            csLastExpectedAnchor: cellNew(None),
+            csSawClientSupportForRanges: cellNew(false),
+            csNeedsEngineContextSync: cellNew(true),
+            csSaveTimerGen: cellNew(intToI64(0)),
+        };
+        objcSetAssocHandle(self, controllerAssocKey(), gcHandleNew(st));
+        st
+    }
+}
+
+def cancelSaveTimer(cs: ControllerState): Void =
+    cellSet(cs.csSaveTimerGen, cellGet(cs.csSaveTimerGen) + intToI64(1))
+
+def scheduleUserDataFlush(cs: ControllerState, s: JuxuSession): Void = {
+    let gen = cellGet(cs.csSaveTimerGen) + intToI64(1);
+    cellSet(cs.csSaveTimerGen, gen);
+    dispatchMainAfterMs(1500, () -> {
+        if (cellGet(cs.csSaveTimerGen) == gen) {
+            bridgeFlushUserDataAsync(s)
+        } else ()
     })
 }
 
-def nsModifiersToShiftMask(flags: Int64): Int = {
-    let m = cellNew(0);
-    if ((flags & intToI64(1 << 17)) != intToI64(0)) cellSet(m, cellGet(m) | modShift()) else ();
-    if ((flags & intToI64(1 << 18)) != intToI64(0)) cellSet(m, cellGet(m) | modControl()) else ();
-    if ((flags & intToI64(1 << 19)) != intToI64(0)) cellSet(m, cellGet(m) | modOption()) else ();
-    if ((flags & intToI64(1 << 20)) != intToI64(0)) cellSet(m, cellGet(m) | modCommand()) else ();
-    if ((flags & intToI64(1 << 23)) != intToI64(0)) cellSet(m, cellGet(m) | modFunction()) else ();
-    if ((flags & intToI64(1 << 16)) != intToI64(0)) cellSet(m, cellGet(m) | modCapsLock()) else ();
-    cellGet(m)
+def advanceExpectedAnchor(cs: ControllerState, utf16Count: Int64): Void =
+    match cellGet(cs.csLastExpectedAnchor) {
+        Some(anchor) -> cellSet(cs.csLastExpectedAnchor, Some(anchor + utf16Count)),
+        None -> (),
+    }
+
+def invalidateContextAndQuoteState(cs: ControllerState, s: JuxuSession): Void = {
+    autoSpaceTrackerInvalidate(cs.csAutoSpaceTracker);
+    punctuationTrackerReset(cs.csPairingTracker);
+    cellSet(cs.csLastExpectedAnchor, None);
+    cellSet(cs.csNeedsEngineContextSync, true);
+    bridgeResetQuoteState(s)
 }
 
-def queryClientCursorRect(client: Ptr): CGRect =
-    if (ptrIsNull(client)) cgRect(420.0, 420.0, 2.0, 18.0)
+// ============================================================================
+// Client Inspection, Window Level & Caret Geometry (`queryCaretRect`)
+// ============================================================================
+
+def clientRespondsTo(client: Ptr, sel: Ptr): Bool =
+    if (ptrIsNull(client)) false
+    else msgSendBool1Ptr(client, objcSel("respondsToSelector:"), sel)
+
+def queryClientWindowLevel(client: Ptr): Option Int64 =
+    if (ptrIsNull(client)) None
     else {
-        let buf = if (!ptrIsNull(cellGet(gCursorRectBuf))) cellGet(gCursorRectBuf)
-                  else {
-                      let b = ptrAllocBytes(32);
-                      cellSet(gCursorRectBuf, b);
-                      b
-                  };
-        ptrWriteF64Le(buf, 0, 0.0);
-        ptrWriteF64Le(buf, 8, 0.0);
-        ptrWriteF64Le(buf, 16, 0.0);
-        ptrWriteF64Le(buf, 24, 0.0);
-        let _ = msgSend1I64_1Ptr(client, objcSel("attributesForCharacterIndex:lineHeightRectangle:"), intToI64(0), buf);
-        let r = readCGRectFromBuf(buf);
-        if (r.origin.x == 0.0 && r.origin.y == 0.0 && r.size.height == 0.0) {
-            cgRect(420.0, 420.0, 2.0, 18.0)
-        } else r
+        let sel = objcSel("windowLevel");
+        if (!clientRespondsTo(client, sel)) None
+        else Some(intToI64(msgSendInt0(client, sel)))
     }
 
-def readClientContextBefore(client: Ptr): String =
+def isZeroOrigin(r: CGRect): Bool =
+    r.origin.x == 0.0 && r.origin.y == 0.0
+
+def tryLineHeightRectAtIndex(client: Ptr, buf: Ptr, charIdx: Int64): CGRect = {
+    writeCGRectToBuf(buf, cgRect(0.0, 0.0, 0.0, 0.0));
+    let _ = msgSend1I64_1PtrOut(
+        client,
+        objcSel("attributesForCharacterIndex:lineHeightRectangle:"),
+        charIdx,
+        buf
+    );
+    readCGRectFromBuf(buf)
+}
+
+/// Multi-fallback caret rect query (`InputController.queryCaretRect`, lines 275-303):
+/// 1. `attributesForCharacterIndex:lineHeightRectangle:` (`0`, `sel.location`, `sel.location - 1`)
+/// 2. `markedRange` -> `firstRectForCharacterRange:actualRange:`
+/// 3. `selectedRange` (`sel.location`, `sel.location - 1`) -> `firstRectForCharacterRange:actualRange:`
+/// 4. `NSEvent.mouseLocation` fallback `(mouse.x, mouse.y, 1, 20)`.
+def queryCaretRect(client: Ptr): CGRect = {
+    let lineRect = cellNew(cgRect(0.0, 0.0, 0.0, 0.0));
+    if (!ptrIsNull(client)) {
+        let buf =
+            if (!ptrIsNull(cellGet(gCaretRectBuf))) cellGet(gCaretRectBuf)
+            else {
+                let b = ptrAllocBytes(32);
+                cellSet(gCaretRectBuf, b);
+                b
+            };
+        let r0 = tryLineHeightRectAtIndex(client, buf, intToI64(0));
+        cellSet(lineRect, r0);
+
+        let sel = msgSendRange0(client, objcSel("selectedRange"));
+        if (isZeroOrigin(cellGet(lineRect)) && sel.location != nsNotFound() && sel.location >= intToI64(0)) {
+            if (sel.location > intToI64(0)) {
+                let rSel = tryLineHeightRectAtIndex(client, buf, sel.location);
+                if (!isZeroOrigin(rSel)) {
+                    cellSet(lineRect, rSel)
+                } else {
+                    let rPrev = tryLineHeightRectAtIndex(client, buf, sel.location - intToI64(1));
+                    if (!isZeroOrigin(rPrev)) cellSet(lineRect, rPrev) else ()
+                }
+            } else ()
+        } else ();
+
+        let firstRectSel = objcSel("firstRectForCharacterRange:actualRange:");
+        if (isZeroOrigin(cellGet(lineRect)) && clientRespondsTo(client, firstRectSel)) {
+            let marked = msgSendRange0(client, objcSel("markedRange"));
+            if (marked.location != nsNotFound()) {
+                let rm = msgSendRect1Range1Ptr(client, firstRectSel, marked, ptrNull());
+                if (!isZeroOrigin(rm)) cellSet(lineRect, rm) else ()
+            } else ();
+
+            if (isZeroOrigin(cellGet(lineRect)) && sel.location != nsNotFound() && sel.location >= intToI64(0)) {
+                let rs = msgSendRect1Range1Ptr(client, firstRectSel, nsRange(sel.location, intToI64(0)), ptrNull());
+                if (!isZeroOrigin(rs)) {
+                    cellSet(lineRect, rs)
+                } else if (sel.location > intToI64(0)) {
+                    let rsp = msgSendRect1Range1Ptr(client, firstRectSel, nsRange(sel.location - intToI64(1), intToI64(0)), ptrNull());
+                    if (!isZeroOrigin(rsp)) cellSet(lineRect, rsp) else ()
+                } else ()
+            } else ()
+        } else ()
+    } else ();
+
+    let resolved = cellGet(lineRect);
+    if (isZeroOrigin(resolved)) {
+        let mouse = mouseScreenLocation();
+        cgRect(mouse.x, mouse.y, 1.0, 20.0)
+    } else resolved
+}
+
+// ============================================================================
+// Surrounding Host Context Sync & Stubbed-Range Guards (`InputController.swift` lines 478-588, 715-775)
+// ============================================================================
+
+def clientAttrSubstringOpt(client: Ptr, r: NSRange): Option String = {
+    let attrStr = msgSend1Range(client, objcSel("attributedSubstringFromRange:"), r);
+    if (ptrIsNull(attrStr)) None
+    else nsStrPtrToOpt(msgSend0(attrStr, objcSel("string")))
+}
+
+def minI64(a: Int64, b: Int64): Int64 =
+    if (a <= b) a else b
+
+def maxI64(a: Int64, b: Int64): Int64 =
+    if (a >= b) a else b
+
+def readHostContextBefore(cs: ControllerState, s: JuxuSession, client: Ptr): Option String =
+    if (ptrIsNull(client)) None
+    else {
+        let marked = msgSendRange0(client, objcSel("markedRange"));
+        let sel = msgSendRange0(client, objcSel("selectedRange"));
+        let anchor = if (marked.location != nsNotFound()) marked.location else sel.location;
+        if (anchor == nsNotFound() || anchor < intToI64(0)) {
+            cellSet(cs.csLastExpectedAnchor, None);
+            None
+        } else {
+            let docLen = msgSendI64_0(client, objcSel("length"));
+            let safeAnchor =
+                if (docLen != nsNotFound() && docLen >= intToI64(0)) minI64(anchor, docLen)
+                else anchor;
+
+            // Guard against Electron/Terminal/stubbed-range clients returning 0 for selectedRange & length.
+            if (safeAnchor == intToI64(0)
+                && (docLen == nsNotFound() || docLen == intToI64(0))
+                && !cellGet(cs.csSawClientSupportForRanges)) {
+                match cellGet(cs.csLastExpectedAnchor) {
+                    Some(expected) if (expected > intToI64(0)) -> cellSet(cs.csLastExpectedAnchor, None),
+                    _ -> cellSet(cs.csLastExpectedAnchor, Some(intToI64(0))),
+                };
+                None
+            } else {
+                match cellGet(cs.csLastExpectedAnchor) {
+                    Some(expected) if (safeAnchor != expected) -> {
+                        autoSpaceTrackerInvalidate(cs.csAutoSpaceTracker);
+                        punctuationTrackerReset(cs.csPairingTracker);
+                        bridgeResetQuoteState(s)
+                    },
+                    _ -> (),
+                };
+                cellSet(cs.csLastExpectedAnchor, Some(safeAnchor));
+
+                if (safeAnchor == intToI64(0)) {
+                    if (docLen != nsNotFound() && docLen > intToI64(0)) {
+                        cellSet(cs.csSawClientSupportForRanges, true)
+                    } else ();
+                    Some("")
+                } else {
+                    let fetchLen = minI64(safeAnchor, intToI64(48));
+                    let start = safeAnchor - fetchLen;
+                    let subOpt = match clientAttrSubstringOpt(client, nsRange(start, fetchLen)) {
+                        Some(sub) if (strLen(sub) > 0) -> Some(sub),
+                        _ ->
+                            if (fetchLen > intToI64(1)) {
+                                clientAttrSubstringOpt(client, nsRange(start + intToI64(1), fetchLen - intToI64(1)))
+                            } else None,
+                    };
+                    match subOpt {
+                        Some(sub) if (strLen(sub) > 0) -> {
+                            cellSet(cs.csSawClientSupportForRanges, true);
+                            Some(sub)
+                        },
+                        _ -> None,
+                    }
+                }
+            }
+        }
+    }
+
+def readHostContextAfter(client: Ptr): String =
     if (ptrIsNull(client)) ""
     else {
+        let marked = msgSendRange0(client, objcSel("markedRange"));
         let sel = msgSendRange0(client, objcSel("selectedRange"));
-        if (sel.location == nsNotFound() || sel.location <= intToI64(0)) ""
+        let anchor =
+            if (marked.location != nsNotFound()) marked.location + marked.length
+            else if (sel.location != nsNotFound()) sel.location + sel.length
+            else nsNotFound();
+        if (anchor == nsNotFound() || anchor < intToI64(0)) ""
         else {
-            let take = if (sel.location > intToI64(32)) intToI64(32) else sel.location;
-            let r = nsRange(sel.location - take, take);
-            let attrStr = msgSend1Range(client, objcSel("attributedSubstringFromRange:"), r);
-            if (ptrIsNull(attrStr)) ""
-            else nsStrPtrToString(msgSend0(attrStr, objcSel("string")))
+            let docLen = msgSendI64_0(client, objcSel("length"));
+            if (docLen == nsNotFound() || docLen < anchor) ""
+            else {
+                let remaining = docLen - anchor;
+                if (remaining == intToI64(0)) ""
+                else {
+                    let fetchLen = minI64(remaining, intToI64(16));
+                    match clientAttrSubstringOpt(client, nsRange(anchor, fetchLen)) {
+                        Some(sub) -> sub,
+                        None ->
+                            if (fetchLen > intToI64(1)) {
+                                match clientAttrSubstringOpt(client, nsRange(anchor, fetchLen - intToI64(1))) {
+                                    Some(sub2) -> sub2,
+                                    None -> "",
+                                }
+                            } else "",
+                    }
+                }
+            }
         }
     }
 
-def commitTextToClient(client: Ptr, text: String): Void =
-    if (!ptrIsNull(client) && strLen(text) > 0) {
-        let repl = nsRange(nsNotFound(), nsNotFound());
-        msgSendVoid1Ptr1Range(client, objcSel("insertText:replacementRange:"), nsStr(text), repl)
-    } else ()
+def syncEngineContextFromClient(cs: ControllerState, s: JuxuSession, client: Ptr): Void = {
+    cellSet(cs.csNeedsEngineContextSync, false);
+    if (strLen(cellGet(s.jsState).asPreedit) == 0) {
+        if (isSecureEventInputEnabled() || ptrIsNull(client)) {
+            bridgeSetContext(s, "")
+        } else {
+            let marked = msgSendRange0(client, objcSel("markedRange"));
+            if (marked.location != nsNotFound() && marked.length > intToI64(0)) {
+                ()
+            } else {
+                let sel = msgSendRange0(client, objcSel("selectedRange"));
+                if (sel.location == nsNotFound() || sel.location < intToI64(0)) {
+                    cellSet(cs.csLastExpectedAnchor, None);
+                    bridgeSetContext(s, "")
+                } else {
+                    let docLen = msgSendI64_0(client, objcSel("length"));
+                    let safeAnchor =
+                        if (docLen != nsNotFound() && docLen >= intToI64(0)) minI64(sel.location, docLen)
+                        else sel.location;
 
-def commitWithFormatting(s: JuxuSession, client: Ptr, committed: String): Void =
-    if (strLen(committed) > 0) {
-        let before = readClientContextBefore(client);
-        let formatted = formatAutoSpace(before, committed, cellGet(s.autoSpace));
-        match punctuationTrackerHandleSymbol(s.punctuation, formatted, "") {
-            InsertPair(close) -> commitTextToClient(client, formatted + close),
-            SkipClose -> (),
-            Plain -> commitTextToClient(client, formatted),
+                    if (safeAnchor == intToI64(0)
+                        && (docLen == nsNotFound() || docLen == intToI64(0))
+                        && !cellGet(cs.csSawClientSupportForRanges)) {
+                        cellSet(cs.csLastExpectedAnchor, Some(intToI64(0)));
+                        bridgeSetContext(s, tailScalars(autoSpaceTrackerCurrentShadowBefore(cs.csAutoSpaceTracker), 32))
+                    } else {
+                        cellSet(cs.csLastExpectedAnchor, Some(safeAnchor));
+                        if (safeAnchor == intToI64(0)) {
+                            if (docLen != nsNotFound() && docLen > intToI64(0)) {
+                                cellSet(cs.csSawClientSupportForRanges, true)
+                            } else ();
+                            bridgeSetContext(s, "")
+                        } else {
+                            let fetchLen = minI64(safeAnchor, intToI64(64));
+                            let start = safeAnchor - fetchLen;
+                            let subOpt = match clientAttrSubstringOpt(client, nsRange(start, fetchLen)) {
+                                Some(sub) if (strLen(sub) > 0) -> Some(sub),
+                                _ ->
+                                    if (fetchLen > intToI64(1)) {
+                                        clientAttrSubstringOpt(client, nsRange(start + intToI64(1), fetchLen - intToI64(1)))
+                                    } else None,
+                            };
+                            match subOpt {
+                                Some(sub) if (strLen(sub) > 0) -> {
+                                    cellSet(cs.csSawClientSupportForRanges, true);
+                                    bridgeSetContext(s, tailScalars(sub, 32))
+                                },
+                                _ ->
+                                    bridgeSetContext(s, tailScalars(autoSpaceTrackerCurrentShadowBefore(cs.csAutoSpaceTracker), 32)),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else ()
+}
+
+def syncEngineContextBeforeFreshCompositionIfNeeded(cs: ControllerState, s: JuxuSession, client: Ptr): Void =
+    if (strLen(cellGet(s.jsState).asPreedit) == 0) {
+        if (isSecureEventInputEnabled() || ptrIsNull(client)) {
+            if (cellGet(cs.csNeedsEngineContextSync)) {
+                bridgeSetContext(s, "");
+                cellSet(cs.csNeedsEngineContextSync, false)
+            } else ()
+        } else {
+            let marked = msgSendRange0(client, objcSel("markedRange"));
+            if (marked.location != nsNotFound() && marked.length > intToI64(0)) {
+                ()
+            } else {
+                let sel = msgSendRange0(client, objcSel("selectedRange"));
+                if (sel.location == nsNotFound() || sel.location < intToI64(0)) {
+                    if (cellGet(cs.csNeedsEngineContextSync)) {
+                        bridgeSetContext(s, "");
+                        cellSet(cs.csNeedsEngineContextSync, false)
+                    } else ()
+                } else {
+                    let docLen = msgSendI64_0(client, objcSel("length"));
+                    let safeAnchor =
+                        if (docLen != nsNotFound() && docLen >= intToI64(0)) minI64(sel.location, docLen)
+                        else sel.location;
+
+                    if (safeAnchor == intToI64(0)
+                        && (docLen == nsNotFound() || docLen == intToI64(0))
+                        && !cellGet(cs.csSawClientSupportForRanges)) {
+                        match cellGet(cs.csLastExpectedAnchor) {
+                            Some(expected) if (expected > intToI64(0)) -> cellSet(cs.csLastExpectedAnchor, None),
+                            _ -> cellSet(cs.csLastExpectedAnchor, Some(intToI64(0))),
+                        };
+                        if (cellGet(cs.csNeedsEngineContextSync)) {
+                            syncEngineContextFromClient(cs, s, client)
+                        } else ()
+                    } else {
+                        let cursorMovedExternally = match cellGet(cs.csLastExpectedAnchor) {
+                            Some(expected) -> safeAnchor != expected,
+                            None -> false,
+                        };
+                        if (cellGet(cs.csNeedsEngineContextSync) || cursorMovedExternally) {
+                            if (cursorMovedExternally) {
+                                autoSpaceTrackerInvalidate(cs.csAutoSpaceTracker);
+                                punctuationTrackerReset(cs.csPairingTracker);
+                                bridgeResetQuoteState(s)
+                            } else ();
+                            syncEngineContextFromClient(cs, s, client)
+                        } else ()
+                    }
+                }
+            }
         }
     } else ()
 
-def setMarkedTextToClient(client: Ptr, preedit: String): Void =
-    if (!ptrIsNull(client)) {
-        let selRange = nsRange(intToI64(strLen(preedit)), intToI64(0));
-        let repl = nsRange(nsNotFound(), nsNotFound());
-        msgSendVoid1Ptr2Range(client, objcSel("setMarkedText:selectionRange:replacementRange:"), nsStr(preedit), selRange, repl)
+// ============================================================================
+// Auto-Spacing, Punctuation Pairing & Client Text Commit Helpers
+// ============================================================================
+
+def insertTextToClient(client: Ptr, text: String, replRange: NSRange): Void =
+    if (!ptrIsNull(client) && strLen(text) > 0) {
+        msgSendVoid1Ptr1Range(client, objcSel("insertText:replacementRange:"), nsStr(text), replRange)
     } else ()
 
-def imkHandleEvent(_self: Ptr, _cmd: Ptr, event: Ptr, client: Ptr): Bool = {
-    cellSet(gActiveClient, client);
+def setMarkedTextPlainEmpty(client: Ptr): Void =
+    if (!ptrIsNull(client)) {
+        msgSendVoid1Ptr2Range(
+            client,
+            objcSel("setMarkedText:selectionRange:replacementRange:"),
+            nsStr(""),
+            nsRange(intToI64(0), intToI64(0)),
+            nsRange(nsNotFound(), nsNotFound())
+        )
+    } else ()
+
+def formatTextForCommit(
+    cs: ControllerState,
+    s: JuxuSession,
+    text: String,
+    splitInternal: Bool,
+    client: Ptr
+): String =
+    if (isSecureEventInputEnabled()) text
+    else {
+        let hostBeforeOpt = readHostContextBefore(cs, s, client);
+        let opts = autoSpaceOptionsFromConfig(cellGet(s.jsConfig));
+        autoSpaceTrackerPrepareCommit(
+            cs.csAutoSpaceTracker,
+            text,
+            hostBeforeOpt,
+            true,
+            None,
+            splitInternal,
+            opts
+        )
+    }
+
+def canAdjustClientCursor(client: Ptr): Bool = {
+    let setSel = objcSel("setSelectedRange:");
+    clientRespondsTo(client, setSel) || cgPreflightPostEventAccess()
+}
+
+def moveClientCursorRelative(client: Ptr, deltaUtf16: Int64): Void = {
+    let setSel = objcSel("setSelectedRange:");
+    let movedViaRange =
+        if (clientRespondsTo(client, setSel)) {
+            let sel = msgSendRange0(client, objcSel("selectedRange"));
+            if (sel.location != nsNotFound() && sel.location + deltaUtf16 >= intToI64(0)) {
+                msgSendVoid1Range(client, setSel, nsRange(sel.location + deltaUtf16, intToI64(0)));
+                true
+            } else false
+        } else false;
+    if (!movedViaRange && cgPreflightPostEventAccess()) {
+        // 0x7B = Left Arrow, 0x7C = Right Arrow
+        if (deltaUtf16 < intToI64(0)) postVirtualKey(0x7B)
+        else if (deltaUtf16 > intToI64(0)) postVirtualKey(0x7C)
+        else ()
+    } else ()
+}
+
+def commitWithOptionalPairing(
+    cs: ControllerState,
+    s: JuxuSession,
+    out: JuxuActionState,
+    client: Ptr
+): Bool = {
+    let cfg = cellGet(s.jsConfig);
+    if (!cfg.smartPunctuation
+        || out.asAsciiMode
+        || strLen(macOSPreedit(out)) > 0
+        || !canAdjustClientCursor(client)
+        || strLen(out.asCommitText) == 0) {
+        false
+    } else {
+        let sym = lastCharStr(out.asCommitText);
+        let hasPrefix = utf8ScalarCount(out.asCommitText) > 1;
+        let hasCloser = match closerForOpen(sym) { Some(_) -> true, None -> false };
+        if (hasPrefix && !hasCloser) {
+            false
+        } else {
+            let hostAfter = readHostContextAfter(client);
+            match punctuationTrackerHandleSymbol(cs.csPairingTracker, sym, hostAfter) {
+                SkipClose -> {
+                    let symU16 = strUtf16Len(sym);
+                    moveClientCursorRelative(client, symU16);
+                    autoSpaceTrackerInvalidate(cs.csAutoSpaceTracker);
+                    advanceExpectedAnchor(cs, symU16);
+                    cellSet(cs.csNeedsEngineContextSync, true);
+                    true
+                },
+                InsertPair(close) -> {
+                    let formatted = formatTextForCommit(cs, s, out.asCommitText, true, client);
+                    insertTextToClient(client, formatted + close, nsRange(nsNotFound(), nsNotFound()));
+                    moveClientCursorRelative(client, intToI64(0) - strUtf16Len(close));
+                    advanceExpectedAnchor(cs, strUtf16Len(formatted));
+                    autoSpaceTrackerInvalidate(cs.csAutoSpaceTracker);
+                    true
+                },
+                Plain -> false,
+            }
+        }
+    }
+}
+
+def applyEngineOutput(
+    cs: ControllerState,
+    s: JuxuSession,
+    out: JuxuActionState,
+    client: Ptr
+): Void = {
+    if (out.asBell) nsBeep() else ();
+
+    if (strLen(out.asCommitText) > 0) {
+        if (!commitWithOptionalPairing(cs, s, out, client)) {
+            let formatted = formatTextForCommit(cs, s, out.asCommitText, true, client);
+            insertTextToClient(client, formatted, nsRange(nsNotFound(), nsNotFound()));
+            advanceExpectedAnchor(cs, strUtf16Len(formatted))
+        } else ();
+        scheduleUserDataFlush(cs, s)
+    } else ();
+
+    let markedText = macOSPreedit(out);
+    if (strLen(markedText) == 0) {
+        if (strLen(out.asCommitText) == 0) {
+            setMarkedTextPlainEmpty(client)
+        } else ();
+        candidatePanelHide()
+    } else {
+        if (!ptrIsNull(client)) {
+            let attr = makeUnderlinedAttrString(markedText);
+            msgSendVoid1Ptr2Range(
+                client,
+                objcSel("setMarkedText:selectionRange:replacementRange:"),
+                attr,
+                nsRange(strUtf16Len(markedText), intToI64(0)),
+                nsRange(nsNotFound(), nsNotFound())
+            );
+            objcReleaseRaw(attr)
+        } else ();
+        let caret = queryCaretRect(client);
+        modeIndicatorHide();
+        candidatePanelUpdateState(out, caret, queryClientWindowLevel(client))
+    }
+}
+
+def commitPendingAndHide(cs: ControllerState, s: JuxuSession, sender: Ptr): Void = {
+    let clientObj = if (!ptrIsNull(sender)) sender else cellGet(cs.csActiveClient);
+    if (strLen(cellGet(s.jsState).asPreedit) > 0) {
+        let out = bridgeCommitPending(s, wallNowMs());
+        if (strLen(out.asCommitText) > 0) {
+            let formatted = formatTextForCommit(cs, s, out.asCommitText, true, clientObj);
+            insertTextToClient(clientObj, formatted, nsRange(nsNotFound(), nsNotFound()));
+            advanceExpectedAnchor(cs, strUtf16Len(formatted))
+        } else {
+            setMarkedTextPlainEmpty(clientObj)
+        };
+        bridgeFlushUserDataAsync(s)
+    } else ();
+    candidatePanelHide();
+    modeIndicatorHide()
+}
+
+def commitVoiceText(
+    cs: ControllerState,
+    s: JuxuSession,
+    text: String,
+    replaceSelection: Bool,
+    client: Ptr
+): Void = {
+    let trimmed = strTrim(text);
+    if (strLen(trimmed) > 0) {
+        let targetClient = if (!ptrIsNull(client)) client else cellGet(cs.csActiveClient);
+        let replaced =
+            if (replaceSelection && !ptrIsNull(targetClient)) {
+                let sel = msgSendRange0(targetClient, objcSel("selectedRange"));
+                if (sel.location != nsNotFound() && sel.length > intToI64(0)) {
+                    insertTextToClient(targetClient, trimmed, sel);
+                    invalidateContextAndQuoteState(cs, s);
+                    bridgeSetContext(s, tailScalars(trimmed, 32));
+                    true
+                } else false
+            } else false;
+        if (!replaced) {
+            let formatted = formatTextForCommit(cs, s, trimmed, false, targetClient);
+            insertTextToClient(targetClient, formatted, nsRange(nsNotFound(), nsNotFound()));
+            advanceExpectedAnchor(cs, strUtf16Len(formatted));
+            bridgeSetContext(s, tailScalars(autoSpaceTrackerCurrentShadowBefore(cs.csAutoSpaceTracker), 32))
+        } else ()
+    } else ()
+}
+
+def handlePassthroughAutoSpace(
+    cs: ControllerState,
+    s: JuxuSession,
+    keyCode: Int,
+    chars: String,
+    firstScalar: Int,
+    hasCtrl: Bool,
+    client: Ptr
+): Bool =
+    if (hasCtrl) {
+        invalidateContextAndQuoteState(cs, s);
+        false
+    } else if (keyCode == 0x33) {
+        // Backspace
+        let hostBeforeOpt = readHostContextBefore(cs, s, client);
+        let cfg = cellGet(s.jsConfig);
+        if (cfg.smartPunctuation && !cellGet(s.jsState).asAsciiMode && canAdjustClientCursor(client)) {
+            let beforeStr = match hostBeforeOpt {
+                Some(hb) -> hb,
+                None -> autoSpaceTrackerCurrentShadowBefore(cs.csAutoSpaceTracker),
+            };
+            let afterStr = readHostContextAfter(client);
+            if (punctuationTrackerConsumeBackspacePair(cs.csPairingTracker, beforeStr, afterStr)) {
+                if (cgPreflightPostEventAccess()) {
+                    postVirtualKey(0x75) // ForwardDelete removes closer on the right
+                } else if (!ptrIsNull(client)) {
+                    let sel = msgSendRange0(client, objcSel("selectedRange"));
+                    if (sel.location != nsNotFound()) {
+                        msgSendVoid1Ptr1Range(
+                            client,
+                            objcSel("insertText:replacementRange:"),
+                            nsStr(""),
+                            nsRange(sel.location, intToI64(1))
+                        )
+                    } else ()
+                } else ();
+                autoSpaceTrackerInvalidate(cs.csAutoSpaceTracker)
+            } else ()
+        } else ();
+
+        let eff = autoSpaceTrackerEffectiveBefore(cs.csAutoSpaceTracker, hostBeforeOpt, true);
+        if (strLen(eff) > 0) {
+            bridgeNotifyPostCommitBackspace(s, wallNowMs())
+        } else ();
+        let delUtf16 =
+            if (strLen(eff) == 0) intToI64(1)
+            else strUtf16Len(lastCharStr(eff));
+        autoSpaceTrackerWillDeleteBackward(cs.csAutoSpaceTracker, hostBeforeOpt, true);
+        match cellGet(cs.csLastExpectedAnchor) {
+            Some(anchor) -> cellSet(cs.csLastExpectedAnchor, Some(maxI64(intToI64(0), anchor - delUtf16))),
+            None -> (),
+        };
+        cellSet(cs.csNeedsEngineContextSync, true);
+        false
+    } else if (keyCode == 0x24 || keyCode == 0x4C) {
+        // Return / Keypad Enter
+        let hostBeforeOpt = readHostContextBefore(cs, s, client);
+        autoSpaceTrackerRecordPassthrough(cs.csAutoSpaceTracker, "\n", hostBeforeOpt, true, None);
+        advanceExpectedAnchor(cs, intToI64(1));
+        cellSet(cs.csNeedsEngineContextSync, true);
+        false
+    } else if (keyCode == 0x30) {
+        // Tab
+        let hostBeforeOpt = readHostContextBefore(cs, s, client);
+        autoSpaceTrackerRecordPassthrough(cs.csAutoSpaceTracker, "\t", hostBeforeOpt, true, None);
+        advanceExpectedAnchor(cs, intToI64(1));
+        cellSet(cs.csNeedsEngineContextSync, true);
+        false
+    } else if (keyCode == 0x31) {
+        // Space
+        let hostBeforeOpt = readHostContextBefore(cs, s, client);
+        autoSpaceTrackerRecordPassthrough(cs.csAutoSpaceTracker, " ", hostBeforeOpt, true, None);
+        advanceExpectedAnchor(cs, intToI64(1));
+        cellSet(cs.csNeedsEngineContextSync, true);
+        false
+    } else if (keyCode == 0x35 || keyCode == 0x73 || keyCode == 0x74 || keyCode == 0x75
+        || keyCode == 0x77 || keyCode == 0x79 || keyCode == 0x7B || keyCode == 0x7C
+        || keyCode == 0x7D || keyCode == 0x7E) {
+        // Esc, Home, PgUp, ForwardDel, End, PgDn, Left, Right, Down, Up
+        invalidateContextAndQuoteState(cs, s);
+        false
+    } else if (strLen(chars) == 0 || firstScalar < 0x20
+        || (firstScalar >= 0xF700 && firstScalar <= 0xF8FF)
+        || firstScalar == 0x7F) {
+        if (strLen(chars) > 0) invalidateContextAndQuoteState(cs, s) else ();
+        false
+    } else {
+        let hostBeforeOpt = readHostContextBefore(cs, s, client);
+        let opts = autoSpaceOptionsFromConfig(cellGet(s.jsConfig));
+        cellSet(cs.csNeedsEngineContextSync, true);
+        if (!isSecureEventInputEnabled() && isAutoSpaceRightTrigger(chars, opts)) {
+            let formatted = autoSpaceTrackerPrepareCommit(
+                cs.csAutoSpaceTracker,
+                chars,
+                hostBeforeOpt,
+                true,
+                None,
+                false,
+                opts
+            );
+            if (formatted != chars) {
+                insertTextToClient(client, formatted, nsRange(nsNotFound(), nsNotFound()));
+                advanceExpectedAnchor(cs, strUtf16Len(formatted));
+                true
+            } else {
+                advanceExpectedAnchor(cs, strUtf16Len(chars));
+                false
+            }
+        } else {
+            autoSpaceTrackerRecordPassthrough(cs.csAutoSpaceTracker, chars, hostBeforeOpt, true, None);
+            advanceExpectedAnchor(cs, strUtf16Len(chars));
+            false
+        }
+    }
+
+def configurePanelCallbacks(cs: ControllerState, s: JuxuSession): Void = {
+    candidatePanelSetOnSelect((relIdx: Int) -> {
+        let out = bridgeSelectCandidate(s, relIdx, wallNowMs());
+        applyEngineOutput(cs, s, out, cellGet(cs.csActiveClient))
+    });
+    candidatePanelSetOnPage((delta: Int) -> {
+        let out = bridgeTurnPage(s, delta);
+        applyEngineOutput(cs, s, out, cellGet(cs.csActiveClient))
+    })
+}
+
+// ============================================================================
+// IMKInputController Objective-C Method Implementations
+// ============================================================================
+
+def imkInitWithServerDelegateClient(
+    self: Ptr,
+    cmd: Ptr,
+    server: Ptr,
+    delegate: Ptr,
+    inputClient: Ptr
+): Ptr = {
+    let obj = objcSendSuperInit3Ptr(self, "IMKInputController", cmd, server, delegate, inputClient);
+    if (!ptrIsNull(obj)) {
+        let cs = getOrCreateControllerState(obj);
+        cellSet(cs.csActiveClient, inputClient)
+    } else ();
+    obj
+}
+
+def imkRecognizedEvents(_self: Ptr, _cmd: Ptr, _sender: Ptr): Int64 =
+    // NSEventMaskKeyDown (1 << 10) | NSEventMaskFlagsChanged (1 << 12) = 5120
+    intToI64(5120)
+
+def imkActivateServer(self: Ptr, cmd: Ptr, sender: Ptr): Void = {
+    objcSendSuperVoid1Ptr(self, "IMKInputController", cmd, sender);
+    let cs = getOrCreateControllerState(self);
+    let s = activeSession();
+    cellSet(cs.csActiveClient, sender);
+    shiftTapReset(cs.csShiftTap);
+    invalidateContextAndQuoteState(cs, s);
+    cellSet(cs.csSawClientSupportForRanges, false);
+    configurePanelCallbacks(cs, s);
+    syncEngineContextFromClient(cs, s, sender);
+    voiceSetInputMethodSink(self, (text: String, replaceSel: Bool) -> {
+        let cl = cellGet(cs.csActiveClient);
+        if (ptrIsNull(cl)) false
+        else {
+            commitVoiceText(cs, s, text, replaceSel, cl);
+            true
+        }
+    })
+}
+
+def imkDeactivateServer(self: Ptr, cmd: Ptr, sender: Ptr): Void = {
+    let cs = getOrCreateControllerState(self);
+    let s = activeSession();
+    voiceClearInputMethodSink(self);
+    voiceHandleDeactivate();
+    cancelSaveTimer(cs);
+    commitPendingAndHide(cs, s, sender);
+    bridgeFlushUserDataAsync(s);
+    bridgeFlushPendingPersistence(s);
+    shiftTapReset(cs.csShiftTap);
+    invalidateContextAndQuoteState(cs, s);
+    cellSet(cs.csSawClientSupportForRanges, false);
+    objcSendSuperVoid1Ptr(self, "IMKInputController", cmd, sender)
+}
+
+def imkCommitComposition(self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
+    let cs = getOrCreateControllerState(self);
+    let s = activeSession();
+    cancelSaveTimer(cs);
+    commitPendingAndHide(cs, s, sender)
+}
+
+def imkHandleEvent(self: Ptr, _cmd: Ptr, event: Ptr, sender: Ptr): Bool =
     if (ptrIsNull(event)) false
-    else match cellGet(gSharedSession) {
-        None -> false,
-        Some(s) -> {
+    else {
+        let cs = getOrCreateControllerState(self);
+        let s = activeSession();
+        let prevClient = cellGet(cs.csActiveClient);
+        let clientObj = if (!ptrIsNull(sender)) sender else prevClient;
+        if (!ptrIsNull(clientObj) && !ptrIsNull(prevClient) && ptrToI64(clientObj) != ptrToI64(prevClient)) {
+            cellSet(cs.csSawClientSupportForRanges, false);
+            invalidateContextAndQuoteState(cs, s)
+        } else ();
+        cellSet(cs.csActiveClient, clientObj);
+        cellSet(s.suppressEvalLogging, isSecureEventInputEnabled());
+
+        let winLvlOpt = queryClientWindowLevel(clientObj);
+        let winLvlRaw = match winLvlOpt {
+            Some(lvl) -> lvl,
+            None -> intToI64(-1),
+        };
+        let consumedByVoice = voiceHandleImkEvent(
+            event,
+            clientObj,
+            () -> queryCaretRect(clientObj),
+            winLvlRaw,
+            () -> match readHostContextBefore(cs, s, clientObj) {
+                Some(b) -> b,
+                None -> "",
+            },
+            (txt: String, repSel: Bool) -> commitVoiceText(cs, s, txt, repSel, clientObj)
+        );
+        if (consumedByVoice) {
+            shiftTapCancelPendingTap(cs.csShiftTap);
+            true
+        } else {
             let evType = msgSendI64_0(event, objcSel("type"));
             // NSEventTypeFlagsChanged == 12
             if (evType == intToI64(12)) {
+                let now = systemUptimeSeconds();
+                let rawTs = msgSendFloat0(event, objcSel("timestamp"));
+                let eventTs = if (rawTs > 0.0 && abs(now - rawTs) < 5.0) rawTs else now;
                 let kc = msgSendInt0(event, objcSel("keyCode"));
-                let flags = msgSendI64_0(event, objcSel("modifierFlags"));
-                let ts = msgSendFloat0(event, objcSel("timestamp"));
-                let mask = nsModifiersToShiftMask(flags);
-                if (shiftTapHandleFlagsChanged(cellGet(gShiftDetector), kc, mask, ts)) {
-                    let snap = sessionStep(s, ToggleAscii);
-                    commitWithFormatting(s, client, snapCommitText(snap));
-                    setMarkedTextToClient(client, snap.displayPreedit);
-                    candidatePanelHide();
-                    hudShow(if (snap.asciiMode) "英" else "中");
+                let mods = nsEventModifiersToShiftMask(msgSendI64_0(event, objcSel("modifierFlags")));
+                let triggered = shiftTapHandleFlagsChangedWithHid(
+                    cs.csShiftTap,
+                    kc,
+                    mods,
+                    eventTs,
+                    (downTs: Float) -> hasInterveningHidInput(downTs, systemUptimeSeconds())
+                );
+                if (triggered) {
+                    let out = bridgeToggleAsciiMode(s);
+                    applyEngineOutput(cs, s, out, clientObj);
+                    if (strLen(out.asPreedit) == 0) {
+                        modeIndicatorShow(out.asAsciiMode, queryCaretRect(clientObj), winLvlOpt)
+                    } else ();
                     true
                 } else false
             // NSEventTypeKeyDown == 10
             } else if (evType == intToI64(10)) {
-                shiftTapHandleKeyDown(cellGet(gShiftDetector));
+                shiftTapHandleKeyDown(cs.csShiftTap);
+                let flags = msgSendI64_0(event, objcSel("modifierFlags")) & intToI64(0xFFFF0000);
+                let hasCmd = (flags & intToI64(0x100000)) != intToI64(0);
+                let hasOption = (flags & intToI64(0x80000)) != intToI64(0);
+                let hasCtrl = (flags & intToI64(0x40000)) != intToI64(0);
+                let hasShift = (flags & intToI64(0x20000)) != intToI64(0);
                 let kc = msgSendInt0(event, objcSel("keyCode"));
-                let flags = msgSendI64_0(event, objcSel("modifierFlags"));
-                let hasCmdOrCtrl = (flags & intToI64((1 << 20) | (1 << 18))) != intToI64(0);
-                let chars = nsStrPtrToString(msgSend0(event, objcSel("characters")));
-                let (scalar, _) = utf8FirstScalar(chars);
-                let nowMs = monotonicMs();
-
-                let before = readClientContextBefore(client);
-                if (strLen(before) > 0) setContext(s.engine, before) else ();
-
-                let snap = sessionStep(s, keyRaw(kc, scalar, hasCmdOrCtrl, nowMs));
-                if (snapConsumed(snap)) {
-                    commitWithFormatting(s, client, snapCommitText(snap));
-                    setMarkedTextToClient(client, snap.displayPreedit);
-                    candidatePanelUpdate(snap, queryClientCursorRect(client));
-                    true
-                } else {
-                    // Backspace on empty composition -> notify engine for post-commit undo/eval
-                    if (kc == 51) notifyPostCommitBackspace(s.engine, nowMs) else ();
+                let isCmdBackspaceWhileComposing =
+                    kc == 0x33
+                        && hasCmd
+                        && !hasOption
+                        && !hasCtrl
+                        && !hasShift
+                        && strLen(cellGet(s.jsState).asPreedit) > 0;
+                if ((hasCmd || hasOption) && !isCmdBackspaceWhileComposing) {
+                    invalidateContextAndQuoteState(cs, s);
                     false
+                } else {
+                    let chars = nsStrPtrToString(msgSend0(event, objcSel("characters")));
+                    let (scalar, _) = utf8FirstScalar(chars);
+                    if (!hasCtrl && !isCmdBackspaceWhileComposing && strLen(cellGet(s.jsState).asPreedit) == 0) {
+                        syncEngineContextBeforeFreshCompositionIfNeeded(cs, s, clientObj)
+                    } else ();
+
+                    let out = bridgeHandleKey(
+                        s,
+                        kc,
+                        scalar,
+                        hasCtrl || isCmdBackspaceWhileComposing,
+                        wallNowMs()
+                    );
+                    if (!out.asConsumed) {
+                        handlePassthroughAutoSpace(cs, s, kc, chars, scalar, hasCtrl, clientObj)
+                    } else {
+                        applyEngineOutput(cs, s, out, clientObj);
+                        true
+                    }
                 }
             } else false
-        },
+        }
     }
+
+// ============================================================================
+// Status Bar NSMenu & Actions (`InputController.swift` lines 307-423, 472-474)
+// ============================================================================
+
+def makeMenuItem(title: String, target: Ptr, actionOpt: Option Ptr, checked: Bool, tag: Int): Ptr = {
+    let act = match actionOpt {
+        Some(sel) -> sel,
+        None -> ptrNull(),
+    };
+    let item = msgSendMenuItemInit(
+        msgSend0(objcClass("NSMenuItem"), objcSel("alloc")),
+        objcSel("initWithTitle:action:keyEquivalent:"),
+        nsStr(title),
+        act,
+        nsStr("")
+    );
+    if (!ptrIsNull(target)) {
+        msgSendVoid1Ptr(item, objcSel("setTarget:"), target)
+    } else ();
+    msgSendVoid1I64(item, objcSel("setState:"), if (checked) intToI64(1) else intToI64(0));
+    if (tag != 0) {
+        msgSendVoid1I64(item, objcSel("setTag:"), intToI64(tag))
+    } else ();
+    item
 }
 
-def imkActivateServer(_self: Ptr, _cmd: Ptr, client: Ptr): Void = {
-    cellSet(gActiveClient, client);
-    shiftTapReset(cellGet(gShiftDetector));
-    match cellGet(gSharedSession) {
-        Some(s) -> {
-            sessionResetForFocusChange(s);
-            let before = readClientContextBefore(client);
-            if (strLen(before) > 0) setContext(s.engine, before) else ()
-        },
-        None -> (),
-    }
+def extractMenuSenderTag(sender: Ptr): Int =
+    if (ptrIsNull(sender)) 0
+    else if (clientRespondsTo(sender, objcSel("tag"))) {
+        i64ToInt(msgSendI64_0(sender, objcSel("tag")))
+    } else if (clientRespondsTo(sender, objcSel("objectForKey:"))) {
+        // IMK `doCommandBySelector:commandDictionary:` passes `infoDictionary` with `"IMKCommandMenuItem"`
+        let mi = msgSend1Ptr(sender, objcSel("objectForKey:"), nsStr("IMKCommandMenuItem"));
+        if (!ptrIsNull(mi) && clientRespondsTo(mi, objcSel("tag"))) {
+            i64ToInt(msgSendI64_0(mi, objcSel("tag")))
+        } else 0
+    } else 0
+
+def imkSelectSchemaFromMenu(_self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
+    let sid = extractMenuSenderTag(sender);
+    if (sid > 0) {
+        bridgeSwitchSchema(activeSession(), sid, true)
+    } else ()
 }
 
-def imkDeactivateServer(_self: Ptr, _cmd: Ptr, client: Ptr): Void = {
-    candidatePanelHide();
-    match cellGet(gSharedSession) {
-        Some(s) -> {
-            let nowMs = monotonicMs();
-            let snap = sessionStep(s, CommitPending(nowMs));
-            commitWithFormatting(s, client, snapCommitText(snap));
-            abandon(s.engine, nowMs);
-            sessionResetForFocusChange(s);
-            let _ = sessionFlushUserData(s);
-            ()
-        },
-        None -> (),
-    }
+def imkToggleTypoCorrection(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void = {
+    let s = activeSession();
+    let cur = cellGet(s.jsConfig);
+    let t = cur.typo;
+    let newTypo = MkTypoConfig {
+        enabled: !t.enabled,
+        touchHitboxAdapt: t.touchHitboxAdapt,
+        promoteThreshold: t.promoteThreshold,
+        suggestThreshold: t.suggestThreshold,
+        suppressAutoCommitOnCorrection: t.suppressAutoCommitOnCorrection,
+        missedSpaceCorrection: t.missedSpaceCorrection,
+    };
+    let updated = MkJuxuConfig {
+        schema: cur.schema,
+        fourthCodeAutoCommit: cur.fourthCodeAutoCommit,
+        fifthCodePushCommit: cur.fifthCodePushCommit,
+        fourthEmptyBehavior: cur.fourthEmptyBehavior,
+        shortestCodeFirst: cur.shortestCodeFirst,
+        strictShortcode: cur.strictShortcode,
+        spaceless: cur.spaceless,
+        showShortcodeHint: cur.showShortcodeHint,
+        dynamicWordFreq: cur.dynamicWordFreq,
+        dynamicCharFreq: cur.dynamicCharFreq,
+        autoPhrase: cur.autoPhrase,
+        autoPhraseThreshold: cur.autoPhraseThreshold,
+        zOmnipotent: cur.zOmnipotent,
+        semicolonQuoteSelect: cur.semicolonQuoteSelect,
+        smartPunctuation: cur.smartPunctuation,
+        autoSpaceZhEn: cur.autoSpaceZhEn,
+        autoSpaceDigits: cur.autoSpaceDigits,
+        clipboardSuggestion: cur.clipboardSuggestion,
+        cangjieKeycapRadicals: cur.cangjieKeycapRadicals,
+        wubiKeycapRadicals: cur.wubiKeycapRadicals,
+        keySwipeUpInput: cur.keySwipeUpInput,
+        spaceCommaKey: cur.spaceCommaKey,
+        keyLongPressAlternates: cur.keyLongPressAlternates,
+        backspaceSwipeClear: cur.backspaceSwipeClear,
+        keyboardHoldCursor: cur.keyboardHoldCursor,
+        enableRareCharset: cur.enableRareCharset,
+        pinyinInitialAbbr: cur.pinyinInitialAbbr,
+        pinyinT9Layout: cur.pinyinT9Layout,
+        shiftToggleMode: cur.shiftToggleMode,
+        pageSize: cur.pageSize,
+        orientation: cur.orientation,
+        evalLogging: cur.evalLogging,
+        emojiCandidates: cur.emojiCandidates,
+        typo: newTypo,
+    };
+    bridgeApplyAndSaveConfig(s, updated, true)
 }
 
-def imkCommitComposition(_self: Ptr, _cmd: Ptr, client: Ptr): Void = {
-    candidatePanelHide();
-    match cellGet(gSharedSession) {
-        Some(s) -> {
-            let snap = sessionStep(s, CommitPending(monotonicMs()));
-            commitWithFormatting(s, client, snapCommitText(snap))
-        },
-        None -> (),
-    }
+def imkToggleSpaceless(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void = {
+    let s = activeSession();
+    let cur = cellGet(s.jsConfig);
+    let updated = MkJuxuConfig {
+        schema: cur.schema,
+        fourthCodeAutoCommit: cur.fourthCodeAutoCommit,
+        fifthCodePushCommit: cur.fifthCodePushCommit,
+        fourthEmptyBehavior: cur.fourthEmptyBehavior,
+        shortestCodeFirst: cur.shortestCodeFirst,
+        strictShortcode: cur.strictShortcode,
+        spaceless: !cur.spaceless,
+        showShortcodeHint: cur.showShortcodeHint,
+        dynamicWordFreq: cur.dynamicWordFreq,
+        dynamicCharFreq: cur.dynamicCharFreq,
+        autoPhrase: cur.autoPhrase,
+        autoPhraseThreshold: cur.autoPhraseThreshold,
+        zOmnipotent: cur.zOmnipotent,
+        semicolonQuoteSelect: cur.semicolonQuoteSelect,
+        smartPunctuation: cur.smartPunctuation,
+        autoSpaceZhEn: cur.autoSpaceZhEn,
+        autoSpaceDigits: cur.autoSpaceDigits,
+        clipboardSuggestion: cur.clipboardSuggestion,
+        cangjieKeycapRadicals: cur.cangjieKeycapRadicals,
+        wubiKeycapRadicals: cur.wubiKeycapRadicals,
+        keySwipeUpInput: cur.keySwipeUpInput,
+        spaceCommaKey: cur.spaceCommaKey,
+        keyLongPressAlternates: cur.keyLongPressAlternates,
+        backspaceSwipeClear: cur.backspaceSwipeClear,
+        keyboardHoldCursor: cur.keyboardHoldCursor,
+        enableRareCharset: cur.enableRareCharset,
+        pinyinInitialAbbr: cur.pinyinInitialAbbr,
+        pinyinT9Layout: cur.pinyinT9Layout,
+        shiftToggleMode: cur.shiftToggleMode,
+        pageSize: cur.pageSize,
+        orientation: cur.orientation,
+        evalLogging: cur.evalLogging,
+        emojiCandidates: cur.emojiCandidates,
+        typo: cur.typo,
+    };
+    bridgeApplyAndSaveConfig(s, updated, true)
 }
 
-def imkShowSettings(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
-    match cellGet(gSharedSession) {
-        Some(s) -> settingsWindowShow(s),
-        None -> (),
-    }
+def imkToggleOrientation(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void = {
+    let s = activeSession();
+    let cur = cellGet(s.jsConfig);
+    let nextOrient = if (cur.orientation == Vertical) Horizontal else Vertical;
+    let updated = MkJuxuConfig {
+        schema: cur.schema,
+        fourthCodeAutoCommit: cur.fourthCodeAutoCommit,
+        fifthCodePushCommit: cur.fifthCodePushCommit,
+        fourthEmptyBehavior: cur.fourthEmptyBehavior,
+        shortestCodeFirst: cur.shortestCodeFirst,
+        strictShortcode: cur.strictShortcode,
+        spaceless: cur.spaceless,
+        showShortcodeHint: cur.showShortcodeHint,
+        dynamicWordFreq: cur.dynamicWordFreq,
+        dynamicCharFreq: cur.dynamicCharFreq,
+        autoPhrase: cur.autoPhrase,
+        autoPhraseThreshold: cur.autoPhraseThreshold,
+        zOmnipotent: cur.zOmnipotent,
+        semicolonQuoteSelect: cur.semicolonQuoteSelect,
+        smartPunctuation: cur.smartPunctuation,
+        autoSpaceZhEn: cur.autoSpaceZhEn,
+        autoSpaceDigits: cur.autoSpaceDigits,
+        clipboardSuggestion: cur.clipboardSuggestion,
+        cangjieKeycapRadicals: cur.cangjieKeycapRadicals,
+        wubiKeycapRadicals: cur.wubiKeycapRadicals,
+        keySwipeUpInput: cur.keySwipeUpInput,
+        spaceCommaKey: cur.spaceCommaKey,
+        keyLongPressAlternates: cur.keyLongPressAlternates,
+        backspaceSwipeClear: cur.backspaceSwipeClear,
+        keyboardHoldCursor: cur.keyboardHoldCursor,
+        enableRareCharset: cur.enableRareCharset,
+        pinyinInitialAbbr: cur.pinyinInitialAbbr,
+        pinyinT9Layout: cur.pinyinT9Layout,
+        shiftToggleMode: cur.shiftToggleMode,
+        pageSize: cur.pageSize,
+        orientation: nextOrient,
+        evalLogging: cur.evalLogging,
+        emojiCandidates: cur.emojiCandidates,
+        typo: cur.typo,
+    };
+    bridgeApplyAndSaveConfig(s, updated, true)
+}
 
-def imkToggleAsciiMenu(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
-    match cellGet(gSharedSession) {
-        Some(s) -> {
-            let snap = sessionStep(s, ToggleAscii);
-            hudShow(if (snap.asciiMode) "英" else "中")
-        },
-        None -> (),
-    }
+def imkToggleAutoSpace(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void = {
+    let s = activeSession();
+    let cur = cellGet(s.jsConfig);
+    let updated = MkJuxuConfig {
+        schema: cur.schema,
+        fourthCodeAutoCommit: cur.fourthCodeAutoCommit,
+        fifthCodePushCommit: cur.fifthCodePushCommit,
+        fourthEmptyBehavior: cur.fourthEmptyBehavior,
+        shortestCodeFirst: cur.shortestCodeFirst,
+        strictShortcode: cur.strictShortcode,
+        spaceless: cur.spaceless,
+        showShortcodeHint: cur.showShortcodeHint,
+        dynamicWordFreq: cur.dynamicWordFreq,
+        dynamicCharFreq: cur.dynamicCharFreq,
+        autoPhrase: cur.autoPhrase,
+        autoPhraseThreshold: cur.autoPhraseThreshold,
+        zOmnipotent: cur.zOmnipotent,
+        semicolonQuoteSelect: cur.semicolonQuoteSelect,
+        smartPunctuation: cur.smartPunctuation,
+        autoSpaceZhEn: !cur.autoSpaceZhEn,
+        autoSpaceDigits: cur.autoSpaceDigits,
+        clipboardSuggestion: cur.clipboardSuggestion,
+        cangjieKeycapRadicals: cur.cangjieKeycapRadicals,
+        wubiKeycapRadicals: cur.wubiKeycapRadicals,
+        keySwipeUpInput: cur.keySwipeUpInput,
+        spaceCommaKey: cur.spaceCommaKey,
+        keyLongPressAlternates: cur.keyLongPressAlternates,
+        backspaceSwipeClear: cur.backspaceSwipeClear,
+        keyboardHoldCursor: cur.keyboardHoldCursor,
+        enableRareCharset: cur.enableRareCharset,
+        pinyinInitialAbbr: cur.pinyinInitialAbbr,
+        pinyinT9Layout: cur.pinyinT9Layout,
+        shiftToggleMode: cur.shiftToggleMode,
+        pageSize: cur.pageSize,
+        orientation: cur.orientation,
+        evalLogging: cur.evalLogging,
+        emojiCandidates: cur.emojiCandidates,
+        typo: cur.typo,
+    };
+    bridgeApplyAndSaveConfig(s, updated, true)
+}
+
+def imkToggleVoiceProviderMode(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    voiceToggleProviderMode()
+
+def imkToggleVoiceSmartPolish(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    voiceToggleSmartPolish()
+
+def imkReloadConfigAndLexicon(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    bridgeLoadConfigAndUser(activeSession(), true)
+
+def imkShowPreferences(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    settingsWindowShow(activeSession())
 
 def imkMenu(self: Ptr, _cmd: Ptr): Ptr = {
-    let m = msgSend0(msgSend0(objcClass("NSMenu"), objcSel("alloc")), objcSel("init"));
-    let item1 = msgSend0(msgSend0(objcClass("NSMenuItem"), objcSel("alloc")), objcSel("init"));
-    msgSendVoid1Ptr(item1, objcSel("setTitle:"), nsStr("句序设置…"));
-    msgSendVoid1Ptr(item1, objcSel("setTarget:"), self);
-    msgSendVoid1Ptr(item1, objcSel("setAction:"), objcSel("showSettings:"));
-    msgSendVoid1Ptr(m, objcSel("addItem:"), item1);
+    let s = activeSession();
+    let cfg = cellGet(s.jsConfig);
+    let curSchema = schemaId(cfg.schema);
+    let curCategory = categoryForSchemaId(curSchema);
 
-    let item2 = msgSend0(msgSend0(objcClass("NSMenuItem"), objcSel("alloc")), objcSel("init"));
-    msgSendVoid1Ptr(item2, objcSel("setTitle:"), nsStr("切换中/英文"));
-    msgSendVoid1Ptr(item2, objcSel("setTarget:"), self);
-    msgSendVoid1Ptr(item2, objcSel("setAction:"), objcSel("toggleAsciiMenu:"));
-    msgSendVoid1Ptr(m, objcSel("addItem:"), item2);
+    let m = msgSendMenuInitTitle(
+        msgSend0(objcClass("NSMenu"), objcSel("alloc")),
+        objcSel("initWithTitle:"),
+        nsStr("句序")
+    );
+
+    let cats = allSchemaCategories();
+    let dummyCat = curCategory;
+    let cIdx = cellNew(0);
+    while (cellGet(cIdx) < std.vec.vecLen(cats)) {
+        let cat: InputSchemaCategory = std.vec.vecGetOr(cats, cellGet(cIdx), dummyCat);
+        let catTitle = categoryRawValue(cat);
+        let catItem = makeMenuItem(catTitle, ptrNull(), None, curCategory == cat, 0);
+        let sub = msgSendMenuInitTitle(
+            msgSend0(objcClass("NSMenu"), objcSel("alloc")),
+            objcSel("initWithTitle:"),
+            nsStr(catTitle)
+        );
+        let opts = schemaOptionsForCategory(cat);
+        let dummyOpt = InputSchemaOption {
+            isoId: 86,
+            isoCategory: cat,
+            isoTitle: "",
+            isoShortTitle: "",
+            isoTag: "",
+            isoDesc: "",
+        };
+        let oIdx = cellNew(0);
+        while (cellGet(oIdx) < std.vec.vecLen(opts)) {
+            let opt: InputSchemaOption = std.vec.vecGetOr(opts, cellGet(oIdx), dummyOpt);
+            let optItem = makeMenuItem(
+                opt.isoTitle,
+                self,
+                Some(objcSel("selectSchemaFromMenu:")),
+                curSchema == opt.isoId,
+                opt.isoId
+            );
+            msgSendVoid1Ptr(sub, objcSel("addItem:"), optItem);
+            objcReleaseRaw(optItem);
+            cellSet(oIdx, cellGet(oIdx) + 1)
+        };
+        msgSendVoid1Ptr(catItem, objcSel("setSubmenu:"), sub);
+        objcReleaseRaw(sub);
+        msgSendVoid1Ptr(m, objcSel("addItem:"), catItem);
+        objcReleaseRaw(catItem);
+        cellSet(cIdx, cellGet(cIdx) + 1)
+    };
+
+    msgSendVoid1Ptr(m, objcSel("addItem:"), msgSend0(objcClass("NSMenuItem"), objcSel("separatorItem")));
+
+    let typoItem = makeMenuItem("误触与热区置信度纠正", self, Some(objcSel("toggleTypoCorrection:")), cfg.typo.enabled, 0);
+    msgSendVoid1Ptr(m, objcSel("addItem:"), typoItem);
+    objcReleaseRaw(typoItem);
+
+    if (!configIsPinyinFamily(cfg)) {
+        let slItem = makeMenuItem("流式无空格连打", self, Some(objcSel("toggleSpaceless:")), cfg.spaceless, 0);
+        msgSendVoid1Ptr(m, objcSel("addItem:"), slItem);
+        objcReleaseRaw(slItem)
+    } else ();
+
+    let orientTitle = if (cfg.orientation == Vertical) "切换为横排候选栏" else "切换为竖排候选栏";
+    let orientItem = makeMenuItem(orientTitle, self, Some(objcSel("toggleOrientation:")), false, 0);
+    msgSendVoid1Ptr(m, objcSel("addItem:"), orientItem);
+    objcReleaseRaw(orientItem);
+
+    let asItem = makeMenuItem("中英文之间自动加空格", self, Some(objcSel("toggleAutoSpace:")), cfg.autoSpaceZhEn, 0);
+    msgSendVoid1Ptr(m, objcSel("addItem:"), asItem);
+    objcReleaseRaw(asItem);
+
+    if (voiceIsEnabled()) {
+        msgSendVoid1Ptr(m, objcSel("addItem:"), msgSend0(objcClass("NSMenuItem"), objcSel("separatorItem")));
+        let provTitle = "语音方案：" + voiceProviderDisplayName() + "（点击切换）";
+        let provItem = makeMenuItem(provTitle, self, Some(objcSel("toggleVoiceProviderMode:")), false, 0);
+        msgSendVoid1Ptr(m, objcSel("addItem:"), provItem);
+        objcReleaseRaw(provItem);
+
+        let polItem = makeMenuItem("语音智能整理", self, Some(objcSel("toggleVoiceSmartPolish:")), voiceIsSmartPolishEnabled(), 0);
+        msgSendVoid1Ptr(m, objcSel("addItem:"), polItem);
+        objcReleaseRaw(polItem)
+    } else ();
+
+    msgSendVoid1Ptr(m, objcSel("addItem:"), msgSend0(objcClass("NSMenuItem"), objcSel("separatorItem")));
+
+    let reloadItem = makeMenuItem("重载配置与词库", self, Some(objcSel("reloadConfigAndLexicon:")), false, 0);
+    msgSendVoid1Ptr(m, objcSel("addItem:"), reloadItem);
+    objcReleaseRaw(reloadItem);
+
+    let prefsItem = makeMenuItem("句序偏好设置…", self, Some(objcSel("showPreferences:")), false, 0);
+    msgSendVoid1Ptr(m, objcSel("addItem:"), prefsItem);
+    objcReleaseRaw(prefsItem);
+
     m
 }
 
 extern init(102) def registerInputControllerClass(): Void = {
     let cls = objcAllocateClass("IMKInputController", "JuxuInputController");
     if (!ptrIsNull(cls)) {
-        let _ = objcAddMethod(cls, "handleEvent:client:", cFnPtr(imkHandleEvent), "B@:@@");
+        let _ = objcAddMethod(cls, "initWithServer:delegate:client:", cFnPtr(imkInitWithServerDelegateClient), "@@:@@@");
+        let _ = objcAddMethod(cls, "recognizedEvents:", cFnPtr(imkRecognizedEvents), "Q@:@");
         let _ = objcAddMethod(cls, "activateServer:", cFnPtr(imkActivateServer), "v@:@");
         let _ = objcAddMethod(cls, "deactivateServer:", cFnPtr(imkDeactivateServer), "v@:@");
         let _ = objcAddMethod(cls, "commitComposition:", cFnPtr(imkCommitComposition), "v@:@");
+        let _ = objcAddMethod(cls, "handleEvent:client:", cFnPtr(imkHandleEvent), "B@:@@");
         let _ = objcAddMethod(cls, "menu", cFnPtr(imkMenu), "@@:");
-        let _ = objcAddMethod(cls, "showSettings:", cFnPtr(imkShowSettings), "v@:@");
-        let _ = objcAddMethod(cls, "toggleAsciiMenu:", cFnPtr(imkToggleAsciiMenu), "v@:@");
+        let _ = objcAddMethod(cls, "selectSchemaFromMenu:", cFnPtr(imkSelectSchemaFromMenu), "v@:@");
+        let _ = objcAddMethod(cls, "toggleTypoCorrection:", cFnPtr(imkToggleTypoCorrection), "v@:@");
+        let _ = objcAddMethod(cls, "toggleSpaceless:", cFnPtr(imkToggleSpaceless), "v@:@");
+        let _ = objcAddMethod(cls, "toggleOrientation:", cFnPtr(imkToggleOrientation), "v@:@");
+        let _ = objcAddMethod(cls, "toggleAutoSpace:", cFnPtr(imkToggleAutoSpace), "v@:@");
+        let _ = objcAddMethod(cls, "toggleVoiceProviderMode:", cFnPtr(imkToggleVoiceProviderMode), "v@:@");
+        let _ = objcAddMethod(cls, "toggleVoiceSmartPolish:", cFnPtr(imkToggleVoiceSmartPolish), "v@:@");
+        let _ = objcAddMethod(cls, "reloadConfigAndLexicon:", cFnPtr(imkReloadConfigAndLexicon), "v@:@");
+        let _ = objcAddMethod(cls, "showPreferences:", cFnPtr(imkShowPreferences), "v@:@");
+        let _ = objcAddMethod(cls, "openSettings:", cFnPtr(imkShowPreferences), "v@:@");
         objcRegisterClass(cls)
     } else ()
 }

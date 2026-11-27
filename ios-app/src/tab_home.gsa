@@ -1,0 +1,696 @@
+/// Tab 0 (`IOSHostTab.home` — `"首页与试手"`):
+/// 1:1 port of `HostAppViews.swift` lines 6-19 & 141-313.
+
+use std.option.{Option, Some, None}
+use objc.{
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcAddProtocol, objcRegisterClass,
+    msgSend0, msgSend2Ptr,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool, msgSendVoid1Float,
+}
+use juxu_shared.{
+    cgSize, cgRect,
+    msgSendRect0,
+    msgSendVoid1Rect, msgSendVoid1Size,
+    msgSendVoid1Ptr1Sel, msgSendVoid1Ptr1Sel1U64, msgSendVoid1Ptr1Sel2Ptr,
+    objcSendSuperVoid0, objcSendSuperVoid1Bool, objcSendSuperVoid1Ptr,
+    dispatchMainAfterMs,
+    nsStr, nsStrPtrToString, objcAllocInit, objcAllocInitFrame,
+    hasProcessArgument,
+    bridgeShared,
+}
+use uikit_kit.{
+    ptrEq,
+    colorSystemBackground, colorLabel, colorSecondaryLabel, colorAccent, colorGreen, colorWhite, colorClear,
+    colorWithAlpha, resolveCgColor,
+    fontWeightRegular, fontWeightMedium, fontWeightSemibold, fontWeightBold,
+    sysFont, sysFontRounded,
+    notifTextFieldDidChange, notifTextViewDidChange, notifKeyboardWillChangeFrame, notifKeyboardWillHide,
+    applyContinuousCorner, makeSettingsCard, makeLabel, measureViewSize, makeSymbolImageView,
+    makeRoundedTextField, makeScrollContainer, updateScrollKeyboardInset,
+    dismissAllKeyboards, openSystemKeyboardSettings, setButtonPlainTitle, roundPx,
+}
+use custom_views.{makeHeroIconView}
+
+data HomeTabUi {
+    htuVc: Ptr,
+    htuScroll: Ptr,
+    htuHeroIcon: Ptr,
+    htuHeroTitle: Ptr,
+    htuHeroSubtitle: Ptr,
+    // Card 1: Sandbox
+    htuSandboxCard: Ptr,
+    htuSandboxSym: Ptr,
+    htuSandboxTitle: Ptr,
+    htuClearBtn: Ptr,
+    htuDoneBtn: Ptr,
+    htuPrimaryField: Ptr,
+    htuDualSandbox: Bool,
+    htuSecondaryField: Ptr,
+    htuEditorView: Ptr,
+    htuWebView: Ptr,
+    // Card 2: 3-Step Guide
+    htuGuideCard: Ptr,
+    htuGuideSym: Ptr,
+    htuGuideTitle: Ptr,
+    htuZeroNetPill: Ptr,
+    htuZeroNetLbl: Ptr,
+    htuStep1Circle: Ptr,
+    htuStep1Text: Ptr,
+    htuStep2Circle: Ptr,
+    htuStep2Text: Ptr,
+    htuStep3Circle: Ptr,
+    htuStep3Text: Ptr,
+    htuOpenSettingsBtn: Ptr,
+    htuOpenSettingsSym: Ptr,
+    htuOpenSettingsLbl: Ptr,
+    // State
+    htuPrimaryFocused: Cell Bool,
+    htuSecondaryFocused: Cell Bool,
+    htuEditorFocused: Cell Bool,
+    htuAutofocusFired: Cell Bool,
+}
+
+def gHomeUi: Cell (Option HomeTabUi) = cellNew(None)
+
+def sandboxHtmlString(): String =
+    "<!doctype html><html><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n"
+    + "<body style=\"margin:0;padding:4px\">\n"
+    + "<textarea id=\"wta\" aria-label=\"WebBox\" style=\"width:95%;height:44px;font-size:16px\"></textarea>\n"
+    + "</body></html>"
+
+def fieldText(view: Ptr): String =
+    if (ptrIsNull(view)) ""
+    else nsStrPtrToString(msgSend0(view, objcSel("text")))
+
+def syncSandboxHeaderButtons(ui: HomeTabUi): Void = {
+    let t1 = fieldText(ui.htuPrimaryField);
+    let t2 = fieldText(ui.htuSecondaryField);
+    let t3 = fieldText(ui.htuEditorView);
+    let hasAnyText = strLen(t1) > 0 || strLen(t2) > 0 || strLen(t3) > 0;
+    msgSendVoid1Bool(ui.htuClearBtn, objcSel("setHidden:"), !hasAnyText);
+
+    let anyFocused =
+        cellGet(ui.htuPrimaryFocused)
+        || cellGet(ui.htuSecondaryFocused)
+        || cellGet(ui.htuEditorFocused);
+    let showDone = anyFocused || ui.htuDualSandbox;
+    msgSendVoid1Bool(ui.htuDoneBtn, objcSel("setHidden:"), !showDone)
+}
+
+pub def dismissHomeKeyboardState(): Void = {
+    match cellGet(gHomeUi) {
+        Some(ui) -> {
+            cellSet(ui.htuPrimaryFocused, false);
+            cellSet(ui.htuSecondaryFocused, false);
+            cellSet(ui.htuEditorFocused, false);
+            syncSandboxHeaderButtons(ui);
+            layoutHomeTab(ui)
+        },
+        None -> (),
+    };
+    dismissAllKeyboards()
+}
+
+pub def refreshHomeTab(): Void =
+    match cellGet(gHomeUi) {
+        Some(ui) -> {
+            let s = bridgeShared();
+            let st = cellGet(s.jsState);
+            msgSendVoid1Ptr(
+                ui.htuHeroSubtitle,
+                objcSel("setText:"),
+                nsStr("当前激活：" + st.asSchemaName + " · 零拷贝 mmap 内核")
+            );
+            syncSandboxHeaderButtons(ui);
+            layoutHomeTab(ui)
+        },
+        None -> (),
+    }
+
+def layoutStepLine(circle: Ptr, txtLbl: Ptr, x: Float, y: Float, innerW: Float): Float = {
+    let circleD = 19.0;
+    let gap = 9.0;
+    let txtW = innerW - circleD - gap;
+    let tSz = measureViewSize(txtLbl, txtW);
+    msgSendVoid1Rect(circle, objcSel("setFrame:"), cgRect(x, y, circleD, circleD));
+    msgSendVoid1Rect(txtLbl, objcSel("setFrame:"), cgRect(x + circleD + gap, y, txtW, tSz.height));
+    let h = if (tSz.height > circleD) tSz.height else circleD;
+    y + h
+}
+
+def layoutHomeTab(ui: HomeTabUi): Void = {
+    let view = msgSend0(ui.htuVc, objcSel("view"));
+    if (!ptrIsNull(view)) {
+        let bounds = msgSendRect0(view, objcSel("bounds"));
+        let viewW = bounds.size.width;
+        if (viewW > 40.0) {
+            let outerPad = 16.0;
+            let contentW = viewW - outerPad * 2.0;
+            let cardPad = 14.0;
+            let innerW = contentW - cardPad * 2.0;
+
+            // 1. Hero Banner (`padding(.top, 4)`)
+            let heroTop = outerPad + 4.0;
+            let iconSz = 54.0;
+            msgSendVoid1Rect(ui.htuHeroIcon, objcSel("setFrame:"), cgRect(outerPad, heroTop, iconSz, iconSz));
+            let heroTxtX = outerPad + iconSz + 14.0;
+            let heroTxtW = contentW - iconSz - 14.0;
+            let htSz = measureViewSize(ui.htuHeroTitle, heroTxtW);
+            let hsSz = measureViewSize(ui.htuHeroSubtitle, heroTxtW);
+            let heroTxtH = htSz.height + 3.0 + hsSz.height;
+            let heroH = if (heroTxtH > iconSz) heroTxtH else iconSz;
+            let heroTxtTop = heroTop + roundPx((heroH - heroTxtH) * 0.5);
+            msgSendVoid1Rect(ui.htuHeroTitle, objcSel("setFrame:"), cgRect(heroTxtX, heroTxtTop, heroTxtW, htSz.height));
+            msgSendVoid1Rect(
+                ui.htuHeroSubtitle,
+                objcSel("setFrame:"),
+                cgRect(heroTxtX, heroTxtTop + htSz.height + 3.0, heroTxtW, hsSz.height)
+            );
+
+            // 2. Live Typing Test Box (`spacing: 8`, `.iosSettingsCard()`)
+            let sbCardY = heroTop + heroH + 14.0;
+            let symW = 18.0;
+            let symH = 18.0;
+            let sbTitleSz = measureViewSize(ui.htuSandboxTitle, innerW - 110.0);
+            let hdrH = if (sbTitleSz.height > 24.0) sbTitleSz.height else 24.0;
+            msgSendVoid1Rect(
+                ui.htuSandboxSym,
+                objcSel("setFrame:"),
+                cgRect(cardPad, cardPad + roundPx((hdrH - symH) * 0.5), symW, symH)
+            );
+            msgSendVoid1Rect(
+                ui.htuSandboxTitle,
+                objcSel("setFrame:"),
+                cgRect(cardPad + symW + 6.0, cardPad + roundPx((hdrH - sbTitleSz.height) * 0.5), sbTitleSz.width, sbTitleSz.height)
+            );
+
+            let rightCursor = cellNew(cardPad + innerW);
+            let anyFocused =
+                cellGet(ui.htuPrimaryFocused)
+                || cellGet(ui.htuSecondaryFocused)
+                || cellGet(ui.htuEditorFocused);
+            if (anyFocused || ui.htuDualSandbox) {
+                let doneW = 36.0;
+                cellSet(rightCursor, cellGet(rightCursor) - doneW);
+                msgSendVoid1Rect(ui.htuDoneBtn, objcSel("setFrame:"), cgRect(cellGet(rightCursor), cardPad, doneW, hdrH));
+                cellSet(rightCursor, cellGet(rightCursor) - 10.0)
+            } else ();
+            let hasAnyText =
+                strLen(fieldText(ui.htuPrimaryField)) > 0
+                || strLen(fieldText(ui.htuSecondaryField)) > 0
+                || strLen(fieldText(ui.htuEditorView)) > 0;
+            if (hasAnyText) {
+                let clrW = 34.0;
+                cellSet(rightCursor, cellGet(rightCursor) - clrW);
+                msgSendVoid1Rect(ui.htuClearBtn, objcSel("setFrame:"), cgRect(cellGet(rightCursor), cardPad, clrW, hdrH))
+            } else ();
+
+            let sbCurY = cellNew(cardPad + hdrH + 8.0);
+            msgSendVoid1Rect(ui.htuPrimaryField, objcSel("setFrame:"), cgRect(cardPad, cellGet(sbCurY), innerW, 34.0));
+            cellSet(sbCurY, cellGet(sbCurY) + 34.0);
+
+            if (ui.htuDualSandbox) {
+                cellSet(sbCurY, cellGet(sbCurY) + 8.0);
+                msgSendVoid1Rect(ui.htuSecondaryField, objcSel("setFrame:"), cgRect(cardPad, cellGet(sbCurY), innerW, 34.0));
+                cellSet(sbCurY, cellGet(sbCurY) + 34.0 + 8.0);
+                msgSendVoid1Rect(ui.htuEditorView, objcSel("setFrame:"), cgRect(cardPad, cellGet(sbCurY), innerW, 54.0));
+                cellSet(sbCurY, cellGet(sbCurY) + 54.0 + 8.0);
+                msgSendVoid1Rect(ui.htuWebView, objcSel("setFrame:"), cgRect(cardPad, cellGet(sbCurY), innerW, 60.0));
+                cellSet(sbCurY, cellGet(sbCurY) + 60.0)
+            } else ();
+
+            let sbCardH = cellGet(sbCurY) + cardPad;
+            msgSendVoid1Rect(ui.htuSandboxCard, objcSel("setFrame:"), cgRect(outerPad, sbCardY, contentW, sbCardH));
+
+            // 3. 3-Step Enable Guide Card (`spacing: 11`, `.iosSettingsCard()`)
+            let gdCardY = sbCardY + sbCardH + 14.0;
+            let znLblSz = measureViewSize(ui.htuZeroNetLbl, 120.0);
+            let pillW = znLblSz.width + 14.0;
+            let pillH = znLblSz.height + 5.0;
+            let gdTitleSz = measureViewSize(ui.htuGuideTitle, innerW - pillW - 32.0);
+            let gdHdrH = if (gdTitleSz.height > pillH) gdTitleSz.height else pillH;
+            msgSendVoid1Rect(
+                ui.htuGuideSym,
+                objcSel("setFrame:"),
+                cgRect(cardPad, cardPad + roundPx((gdHdrH - 18.0) * 0.5), 18.0, 18.0)
+            );
+            msgSendVoid1Rect(
+                ui.htuGuideTitle,
+                objcSel("setFrame:"),
+                cgRect(cardPad + 24.0, cardPad + roundPx((gdHdrH - gdTitleSz.height) * 0.5), gdTitleSz.width, gdTitleSz.height)
+            );
+            msgSendVoid1Rect(
+                ui.htuZeroNetPill,
+                objcSel("setFrame:"),
+                cgRect(cardPad + innerW - pillW, cardPad + roundPx((gdHdrH - pillH) * 0.5), pillW, pillH)
+            );
+            let pillLayer = msgSend0(ui.htuZeroNetPill, objcSel("layer"));
+            if (!ptrIsNull(pillLayer)) {
+                msgSendVoid1Float(pillLayer, objcSel("setCornerRadius:"), pillH * 0.5)
+            } else ();
+            msgSendVoid1Rect(ui.htuZeroNetLbl, objcSel("setFrame:"), cgRect(7.0, 2.5, znLblSz.width, znLblSz.height));
+
+            let gdY1 = layoutStepLine(ui.htuStep1Circle, ui.htuStep1Text, cardPad, cardPad + gdHdrH + 11.0, innerW);
+            let gdY2 = layoutStepLine(ui.htuStep2Circle, ui.htuStep2Text, cardPad, gdY1 + 11.0, innerW);
+            let gdY3 = layoutStepLine(ui.htuStep3Circle, ui.htuStep3Text, cardPad, gdY2 + 11.0, innerW);
+
+            let openBtnY = gdY3 + 11.0 + 2.0;
+            let openLblSz = measureViewSize(ui.htuOpenSettingsLbl, innerW - 36.0);
+            let openBtnH = openLblSz.height + 20.0;
+            msgSendVoid1Rect(ui.htuOpenSettingsBtn, objcSel("setFrame:"), cgRect(cardPad, openBtnY, innerW, openBtnH));
+            let comboW = 16.0 + 6.0 + openLblSz.width;
+            let comboX = roundPx((innerW - comboW) * 0.5);
+            msgSendVoid1Rect(
+                ui.htuOpenSettingsSym,
+                objcSel("setFrame:"),
+                cgRect(comboX, roundPx((openBtnH - 16.0) * 0.5), 16.0, 16.0)
+            );
+            msgSendVoid1Rect(
+                ui.htuOpenSettingsLbl,
+                objcSel("setFrame:"),
+                cgRect(comboX + 22.0, roundPx((openBtnH - openLblSz.height) * 0.5), openLblSz.width, openLblSz.height)
+            );
+
+            let gdCardH = openBtnY + openBtnH + cardPad;
+            msgSendVoid1Rect(ui.htuGuideCard, objcSel("setFrame:"), cgRect(outerPad, gdCardY, contentW, gdCardH));
+
+            let totalH = gdCardY + gdCardH + outerPad;
+            msgSendVoid1Size(ui.htuScroll, objcSel("setContentSize:"), cgSize(viewW, totalH))
+        } else ()
+    } else ()
+}
+
+def makeStepCircleLabel(numStr: String): Ptr = {
+    let lbl = makeLabel(numStr, sysFontRounded(11.5, fontWeightBold()), colorWhite(), 1);
+    msgSendVoid1Ptr(lbl, objcSel("setBackgroundColor:"), colorAccent());
+    // NSTextAlignmentCenter = 1
+    msgSendVoid1I64(lbl, objcSel("setTextAlignment:"), intToI64(1));
+    let layer = msgSend0(lbl, objcSel("layer"));
+    if (!ptrIsNull(layer)) {
+        msgSendVoid1Float(layer, objcSel("setCornerRadius:"), 9.5);
+        msgSendVoid1Bool(layer, objcSel("setMasksToBounds:"), true)
+    } else ();
+    lbl
+}
+
+// ============================================================================
+// Objective-C Callbacks on `JuxuHomeTabVC`
+// ============================================================================
+
+def homeOnClearSandbox(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    match cellGet(gHomeUi) {
+        Some(ui) -> {
+            msgSendVoid1Ptr(ui.htuPrimaryField, objcSel("setText:"), nsStr(""));
+            if (!ptrIsNull(ui.htuSecondaryField)) {
+                msgSendVoid1Ptr(ui.htuSecondaryField, objcSel("setText:"), nsStr(""))
+            } else ();
+            if (!ptrIsNull(ui.htuEditorView)) {
+                msgSendVoid1Ptr(ui.htuEditorView, objcSel("setText:"), nsStr(""))
+            } else ();
+            syncSandboxHeaderButtons(ui);
+            layoutHomeTab(ui)
+        },
+        None -> (),
+    }
+
+def homeOnDoneSandbox(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    dismissHomeKeyboardState()
+
+def homeOnOpenSettings(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    openSystemKeyboardSettings()
+
+def homeOnBgTap(_self: Ptr, _cmd: Ptr, _gr: Ptr): Void =
+    match cellGet(gHomeUi) {
+        Some(ui) ->
+            if (cellGet(ui.htuPrimaryFocused) || cellGet(ui.htuSecondaryFocused) || cellGet(ui.htuEditorFocused)) {
+                dismissHomeKeyboardState()
+            } else (),
+        None -> (),
+    }
+
+def homeOnTextChanged(_self: Ptr, _cmd: Ptr, _arg: Ptr): Void =
+    match cellGet(gHomeUi) {
+        Some(ui) -> {
+            syncSandboxHeaderButtons(ui);
+            layoutHomeTab(ui)
+        },
+        None -> (),
+    }
+
+def homeTextFieldDidBeginEditing(_self: Ptr, _cmd: Ptr, tf: Ptr): Void =
+    match cellGet(gHomeUi) {
+        Some(ui) -> {
+            if (ptrEq(tf, ui.htuPrimaryField)) cellSet(ui.htuPrimaryFocused, true)
+            else if (ptrEq(tf, ui.htuSecondaryField)) cellSet(ui.htuSecondaryFocused, true)
+            else ();
+            syncSandboxHeaderButtons(ui);
+            layoutHomeTab(ui)
+        },
+        None -> (),
+    }
+
+def homeTextFieldDidEndEditing(_self: Ptr, _cmd: Ptr, tf: Ptr): Void =
+    match cellGet(gHomeUi) {
+        Some(ui) -> {
+            if (ptrEq(tf, ui.htuPrimaryField)) cellSet(ui.htuPrimaryFocused, false)
+            else if (ptrEq(tf, ui.htuSecondaryField)) cellSet(ui.htuSecondaryFocused, false)
+            else ();
+            syncSandboxHeaderButtons(ui);
+            layoutHomeTab(ui)
+        },
+        None -> (),
+    }
+
+def homeTextFieldShouldReturn(_self: Ptr, _cmd: Ptr, _tf: Ptr): Bool = {
+    dismissHomeKeyboardState();
+    true
+}
+
+def homeTextViewDidBeginEditing(_self: Ptr, _cmd: Ptr, tv: Ptr): Void =
+    match cellGet(gHomeUi) {
+        Some(ui) ->
+            if (ptrEq(tv, ui.htuEditorView)) {
+                cellSet(ui.htuEditorFocused, true);
+                syncSandboxHeaderButtons(ui);
+                layoutHomeTab(ui)
+            } else (),
+        None -> (),
+    }
+
+def homeTextViewDidEndEditing(_self: Ptr, _cmd: Ptr, tv: Ptr): Void =
+    match cellGet(gHomeUi) {
+        Some(ui) ->
+            if (ptrEq(tv, ui.htuEditorView)) {
+                cellSet(ui.htuEditorFocused, false);
+                syncSandboxHeaderButtons(ui);
+                layoutHomeTab(ui)
+            } else (),
+        None -> (),
+    }
+
+def homeTextViewDidChange(_self: Ptr, _cmd: Ptr, _tv: Ptr): Void =
+    match cellGet(gHomeUi) {
+        Some(ui) -> {
+            syncSandboxHeaderButtons(ui);
+            layoutHomeTab(ui)
+        },
+        None -> (),
+    }
+
+def homeOnKeyboardWillChange(self: Ptr, _cmd: Ptr, notif: Ptr): Void =
+    match cellGet(gHomeUi) {
+        Some(ui) -> updateScrollKeyboardInset(ui.htuScroll, msgSend0(self, objcSel("view")), notif, false),
+        None -> (),
+    }
+
+def homeOnKeyboardWillHide(self: Ptr, _cmd: Ptr, notif: Ptr): Void =
+    match cellGet(gHomeUi) {
+        Some(ui) -> updateScrollKeyboardInset(ui.htuScroll, msgSend0(self, objcSel("view")), notif, true),
+        None -> (),
+    }
+
+def homeVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIViewController", objcSel("viewDidLoad"));
+    let s = bridgeShared();
+    let st = cellGet(s.jsState);
+    let view = msgSend0(self, objcSel("view"));
+    msgSendVoid1Ptr(view, objcSel("setBackgroundColor:"), colorSystemBackground());
+
+    let sv = makeScrollContainer(true);
+    msgSendVoid1Rect(sv, objcSel("setFrame:"), msgSendRect0(view, objcSel("bounds")));
+    msgSendVoid1Ptr(view, objcSel("addSubview:"), sv);
+
+    // Background tap gesture (`cancelsTouchesInView = false` so child controls receive taps cleanly)
+    let tapAlloc = msgSend0(objcClass("UITapGestureRecognizer"), objcSel("alloc"));
+    let tapGr = objcAllocInit("UITapGestureRecognizer");
+    let _ = tapAlloc;
+    msgSendVoid1Ptr1Sel(tapGr, objcSel("addTarget:action:"), self, objcSel("onHomeBgTap:"));
+    msgSendVoid1Bool(tapGr, objcSel("setCancelsTouchesInView:"), false);
+    msgSendVoid1Ptr(sv, objcSel("addGestureRecognizer:"), tapGr);
+
+    // 1. Hero Banner
+    let heroIcon = makeHeroIconView();
+    let heroTitle = makeLabel("句序 Juxu", sysFont(20.0, fontWeightBold()), colorLabel(), 1);
+    let heroSub = makeLabel(
+        "当前激活：" + st.asSchemaName + " · 零拷贝 mmap 内核",
+        sysFont(13.0, fontWeightRegular()),
+        colorSecondaryLabel(),
+        0
+    );
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), heroIcon);
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), heroTitle);
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), heroSub);
+
+    // 2. Live Typing Test Box (`键盘实时试手区`)
+    let sbCard = makeSettingsCard();
+    let sbSym = makeSymbolImageView("character.cursor.ibeam", 14.0, 6, colorLabel());
+    let sbTitle = makeLabel("键盘实时试手区", sysFont(14.0, fontWeightSemibold()), colorLabel(), 1);
+
+    let clearBtn = objcAllocInitFrame("UIButton", cgRect(0.0, 0.0, 34.0, 24.0));
+    setButtonPlainTitle(clearBtn, "清空", sysFont(13.0, fontWeightRegular()), colorSecondaryLabel());
+    msgSendVoid1Ptr1Sel1U64(clearBtn, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onHomeClearSandbox:"), intToI64(64));
+    msgSendVoid1Bool(clearBtn, objcSel("setHidden:"), true);
+
+    let doneBtn = objcAllocInitFrame("UIButton", cgRect(0.0, 0.0, 36.0, 24.0));
+    setButtonPlainTitle(doneBtn, "完成", sysFont(13.5, fontWeightSemibold()), colorAccent());
+    msgSendVoid1Ptr(doneBtn, objcSel("setAccessibilityIdentifier:"), nsStr("JuxuSandboxDone"));
+    msgSendVoid1Ptr1Sel1U64(doneBtn, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onHomeDoneSandbox:"), intToI64(64));
+
+    let primaryField = makeRoundedTextField(
+        "点此弹出键盘试打汉字、长按空格滑动移光标…",
+        Some("JuxuSandboxPrimary"),
+        self,
+        self,
+        objcSel("onHomeTextChanged:")
+    );
+
+    msgSendVoid1Ptr(sbCard, objcSel("addSubview:"), sbSym);
+    msgSendVoid1Ptr(sbCard, objcSel("addSubview:"), sbTitle);
+    msgSendVoid1Ptr(sbCard, objcSel("addSubview:"), clearBtn);
+    msgSendVoid1Ptr(sbCard, objcSel("addSubview:"), doneBtn);
+    msgSendVoid1Ptr(sbCard, objcSel("addSubview:"), primaryField);
+
+    let isDual = hasProcessArgument("--dual-sandbox");
+    msgSendVoid1Bool(doneBtn, objcSel("setHidden:"), !isDual);
+
+    let (secField, edView, webView) =
+        if (isDual) {
+            let f2 = makeRoundedTextField(
+                "第二个输入框",
+                Some("JuxuSandboxSecondary"),
+                self,
+                self,
+                objcSel("onHomeTextChanged:")
+            );
+            let tv = objcAllocInitFrame("UITextView", cgRect(0.0, 0.0, 240.0, 54.0));
+            msgSendVoid1Ptr(tv, objcSel("setBackgroundColor:"), colorSystemBackground());
+            msgSendVoid1Ptr(tv, objcSel("setTextColor:"), colorLabel());
+            msgSendVoid1Ptr(tv, objcSel("setFont:"), sysFont(15.0, fontWeightRegular()));
+            msgSendVoid1Ptr(tv, objcSel("setDelegate:"), self);
+            msgSendVoid1Ptr(tv, objcSel("setAccessibilityIdentifier:"), nsStr("JuxuSandboxEditor"));
+            applyContinuousCorner(tv, 6.0);
+            let tvLayer = msgSend0(tv, objcSel("layer"));
+            if (!ptrIsNull(tvLayer)) {
+                msgSendVoid1Float(tvLayer, objcSel("setBorderWidth:"), 1.0);
+                msgSendVoid1Ptr(tvLayer, objcSel("setBorderColor:"), resolveCgColor(colorWithAlpha(colorSecondaryLabel(), 0.3), tv))
+            } else ();
+
+            let wv = objcAllocInitFrame("WKWebView", cgRect(0.0, 0.0, 240.0, 60.0));
+            msgSendVoid1Ptr(wv, objcSel("setAccessibilityIdentifier:"), nsStr("JuxuSandboxWeb"));
+            let _ = msgSend2Ptr(wv, objcSel("loadHTMLString:baseURL:"), nsStr(sandboxHtmlString()), ptrNull());
+
+            msgSendVoid1Ptr(sbCard, objcSel("addSubview:"), f2);
+            msgSendVoid1Ptr(sbCard, objcSel("addSubview:"), tv);
+            msgSendVoid1Ptr(sbCard, objcSel("addSubview:"), wv);
+            (f2, tv, wv)
+        } else (ptrNull(), ptrNull(), ptrNull());
+
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), sbCard);
+
+    // 3. 3-Step Enable Guide Card (`三步启用系统键盘`)
+    let gdCard = makeSettingsCard();
+    let gdSym = makeSymbolImageView("checkmark.shield.fill", 15.0, 6, colorLabel());
+    let gdTitle = makeLabel("三步启用系统键盘", sysFont(15.0, fontWeightSemibold()), colorLabel(), 1);
+    let znPill = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 74.0, 20.0));
+    msgSendVoid1Ptr(znPill, objcSel("setBackgroundColor:"), colorWithAlpha(colorGreen(), 0.14));
+    let znLbl = makeLabel("默认零联网", sysFont(11.0, fontWeightMedium()), colorGreen(), 1);
+    msgSendVoid1Ptr(znPill, objcSel("addSubview:"), znLbl);
+
+    let s1Circle = makeStepCircleLabel("1");
+    let s1Text = makeLabel(
+        "进入「设置 → 通用 → 键盘 → 键盘 → 添加新键盘」",
+        sysFont(13.0, fontWeightRegular()),
+        colorLabel(),
+        0
+    );
+    let s2Circle = makeStepCircleLabel("2");
+    let s2Text = makeLabel(
+        "在第三方键盘中选择「句序」即可离线极速盲打",
+        sysFont(13.0, fontWeightRegular()),
+        colorLabel(),
+        0
+    );
+    let s3Circle = makeStepCircleLabel("3");
+    let s3Text = makeLabel(
+        "如需候选栏剪贴板提示，开启「允许完全访问」并在「设置 → App → 句序 → 从其他 App 粘贴」设为「允许」",
+        sysFont(13.0, fontWeightRegular()),
+        colorLabel(),
+        0
+    );
+
+    let openBtn = objcAllocInitFrame("UIButton", cgRect(0.0, 0.0, 240.0, 40.0));
+    msgSendVoid1Ptr(openBtn, objcSel("setBackgroundColor:"), colorAccent());
+    applyContinuousCorner(openBtn, 10.0);
+    msgSendVoid1Bool(openBtn, objcSel("setIsAccessibilityElement:"), true);
+    msgSendVoid1Ptr(openBtn, objcSel("setAccessibilityLabel:"), nsStr("打开系统键盘设置"));
+    msgSendVoid1Ptr1Sel1U64(openBtn, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onHomeOpenSettings:"), intToI64(64));
+
+    let openSym = makeSymbolImageView("gearshape.fill", 14.0, 6, colorWhite());
+    msgSendVoid1Bool(openSym, objcSel("setUserInteractionEnabled:"), false);
+    msgSendVoid1Bool(openSym, objcSel("setIsAccessibilityElement:"), false);
+    let openLbl = makeLabel("打开系统键盘设置", sysFont(15.0, fontWeightSemibold()), colorWhite(), 1);
+    msgSendVoid1Bool(openLbl, objcSel("setUserInteractionEnabled:"), false);
+    msgSendVoid1Bool(openLbl, objcSel("setIsAccessibilityElement:"), false);
+    msgSendVoid1Ptr(openBtn, objcSel("addSubview:"), openSym);
+    msgSendVoid1Ptr(openBtn, objcSel("addSubview:"), openLbl);
+
+    msgSendVoid1Ptr(gdCard, objcSel("addSubview:"), gdSym);
+    msgSendVoid1Ptr(gdCard, objcSel("addSubview:"), gdTitle);
+    msgSendVoid1Ptr(gdCard, objcSel("addSubview:"), znPill);
+    msgSendVoid1Ptr(gdCard, objcSel("addSubview:"), s1Circle);
+    msgSendVoid1Ptr(gdCard, objcSel("addSubview:"), s1Text);
+    msgSendVoid1Ptr(gdCard, objcSel("addSubview:"), s2Circle);
+    msgSendVoid1Ptr(gdCard, objcSel("addSubview:"), s2Text);
+    msgSendVoid1Ptr(gdCard, objcSel("addSubview:"), s3Circle);
+    msgSendVoid1Ptr(gdCard, objcSel("addSubview:"), s3Text);
+    msgSendVoid1Ptr(gdCard, objcSel("addSubview:"), openBtn);
+
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), gdCard);
+
+    // Observe text changes & keyboard frame notifications
+    let nc = msgSend0(objcClass("NSNotificationCenter"), objcSel("defaultCenter"));
+    if (!ptrIsNull(nc)) {
+        msgSendVoid1Ptr1Sel2Ptr(nc, objcSel("addObserver:selector:name:object:"), self, objcSel("onHomeTextChanged:"), notifTextFieldDidChange(), primaryField);
+        if (!ptrIsNull(secField)) {
+            msgSendVoid1Ptr1Sel2Ptr(nc, objcSel("addObserver:selector:name:object:"), self, objcSel("onHomeTextChanged:"), notifTextFieldDidChange(), secField)
+        } else ();
+        if (!ptrIsNull(edView)) {
+            msgSendVoid1Ptr1Sel2Ptr(nc, objcSel("addObserver:selector:name:object:"), self, objcSel("onHomeTextChanged:"), notifTextViewDidChange(), edView)
+        } else ();
+        msgSendVoid1Ptr1Sel2Ptr(nc, objcSel("addObserver:selector:name:object:"), self, objcSel("onHomeKeyboardWillChange:"), notifKeyboardWillChangeFrame(), ptrNull());
+        msgSendVoid1Ptr1Sel2Ptr(nc, objcSel("addObserver:selector:name:object:"), self, objcSel("onHomeKeyboardWillHide:"), notifKeyboardWillHide(), ptrNull())
+    } else ();
+
+    let ui = HomeTabUi {
+        htuVc: self,
+        htuScroll: sv,
+        htuHeroIcon: heroIcon,
+        htuHeroTitle: heroTitle,
+        htuHeroSubtitle: heroSub,
+        htuSandboxCard: sbCard,
+        htuSandboxSym: sbSym,
+        htuSandboxTitle: sbTitle,
+        htuClearBtn: clearBtn,
+        htuDoneBtn: doneBtn,
+        htuPrimaryField: primaryField,
+        htuDualSandbox: isDual,
+        htuSecondaryField: secField,
+        htuEditorView: edView,
+        htuWebView: webView,
+        htuGuideCard: gdCard,
+        htuGuideSym: gdSym,
+        htuGuideTitle: gdTitle,
+        htuZeroNetPill: znPill,
+        htuZeroNetLbl: znLbl,
+        htuStep1Circle: s1Circle,
+        htuStep1Text: s1Text,
+        htuStep2Circle: s2Circle,
+        htuStep2Text: s2Text,
+        htuStep3Circle: s3Circle,
+        htuStep3Text: s3Text,
+        htuOpenSettingsBtn: openBtn,
+        htuOpenSettingsSym: openSym,
+        htuOpenSettingsLbl: openLbl,
+        htuPrimaryFocused: cellNew(false),
+        htuSecondaryFocused: cellNew(false),
+        htuEditorFocused: cellNew(false),
+        htuAutofocusFired: cellNew(false),
+    };
+    cellSet(gHomeUi, Some(ui));
+    layoutHomeTab(ui)
+}
+
+def homeVcViewWillAppear(self: Ptr, _cmd: Ptr, animated: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIViewController", objcSel("viewWillAppear:"), animated);
+    refreshHomeTab()
+}
+
+def homeVcViewDidAppear(self: Ptr, _cmd: Ptr, animated: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIViewController", objcSel("viewDidAppear:"), animated);
+    match cellGet(gHomeUi) {
+        Some(ui) ->
+            if (hasProcessArgument("--autofocus") && !cellGet(ui.htuAutofocusFired)) {
+                cellSet(ui.htuAutofocusFired, true);
+                dispatchMainAfterMs(500, () -> {
+                    if (!ptrIsNull(ui.htuPrimaryField)) {
+                        let _ = msgSend0(ui.htuPrimaryField, objcSel("becomeFirstResponder"));
+                        ()
+                    } else ()
+                })
+            } else (),
+        None -> (),
+    }
+}
+
+def homeVcViewDidLayoutSubviews(self: Ptr, _cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIViewController", objcSel("viewDidLayoutSubviews"));
+    match cellGet(gHomeUi) {
+        Some(ui) -> layoutHomeTab(ui),
+        None -> (),
+    }
+}
+
+def homeVcTraitChanged(self: Ptr, _cmd: Ptr, prevTraits: Ptr): Void = {
+    objcSendSuperVoid1Ptr(self, "UIViewController", objcSel("traitCollectionDidChange:"), prevTraits);
+    match cellGet(gHomeUi) {
+        Some(ui) ->
+            if (!ptrIsNull(ui.htuEditorView)) {
+                let tvLayer = msgSend0(ui.htuEditorView, objcSel("layer"));
+                if (!ptrIsNull(tvLayer)) {
+                    msgSendVoid1Ptr(
+                        tvLayer,
+                        objcSel("setBorderColor:"),
+                        resolveCgColor(colorWithAlpha(colorSecondaryLabel(), 0.3), ui.htuEditorView)
+                    )
+                } else ()
+            } else (),
+        None -> (),
+    }
+}
+
+pub def registerHomeTabClass(): Void = {
+    let cls = objcAllocateClass("UIViewController", "JuxuHomeTabVC");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddProtocol(cls, "UITextFieldDelegate");
+        let _ = objcAddProtocol(cls, "UITextViewDelegate");
+        let _ = objcAddMethod(cls, "viewDidLoad", cFnPtr(homeVcViewDidLoad), "v@:");
+        let _ = objcAddMethod(cls, "viewWillAppear:", cFnPtr(homeVcViewWillAppear), "v@:B");
+        let _ = objcAddMethod(cls, "viewDidAppear:", cFnPtr(homeVcViewDidAppear), "v@:B");
+        let _ = objcAddMethod(cls, "viewDidLayoutSubviews", cFnPtr(homeVcViewDidLayoutSubviews), "v@:");
+        let _ = objcAddMethod(cls, "traitCollectionDidChange:", cFnPtr(homeVcTraitChanged), "v@:@");
+        let _ = objcAddMethod(cls, "onHomeClearSandbox:", cFnPtr(homeOnClearSandbox), "v@:@");
+        let _ = objcAddMethod(cls, "onHomeDoneSandbox:", cFnPtr(homeOnDoneSandbox), "v@:@");
+        let _ = objcAddMethod(cls, "onHomeOpenSettings:", cFnPtr(homeOnOpenSettings), "v@:@");
+        let _ = objcAddMethod(cls, "onHomeBgTap:", cFnPtr(homeOnBgTap), "v@:@");
+        let _ = objcAddMethod(cls, "onHomeTextChanged:", cFnPtr(homeOnTextChanged), "v@:@");
+        let _ = objcAddMethod(cls, "onHomeKeyboardWillChange:", cFnPtr(homeOnKeyboardWillChange), "v@:@");
+        let _ = objcAddMethod(cls, "onHomeKeyboardWillHide:", cFnPtr(homeOnKeyboardWillHide), "v@:@");
+        let _ = objcAddMethod(cls, "textFieldDidBeginEditing:", cFnPtr(homeTextFieldDidBeginEditing), "v@:@");
+        let _ = objcAddMethod(cls, "textFieldDidEndEditing:", cFnPtr(homeTextFieldDidEndEditing), "v@:@");
+        let _ = objcAddMethod(cls, "textFieldShouldReturn:", cFnPtr(homeTextFieldShouldReturn), "B@:@");
+        let _ = objcAddMethod(cls, "textViewDidBeginEditing:", cFnPtr(homeTextViewDidBeginEditing), "v@:@");
+        let _ = objcAddMethod(cls, "textViewDidEndEditing:", cFnPtr(homeTextViewDidEndEditing), "v@:@");
+        let _ = objcAddMethod(cls, "textViewDidChange:", cFnPtr(homeTextViewDidChange), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}

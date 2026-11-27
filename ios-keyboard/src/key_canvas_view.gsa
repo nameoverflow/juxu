@@ -1,0 +1,1969 @@
+/// Complete 1:1 port of `iOS/KeyboardExtension/IOSKeyCanvasView.swift` (1,261 lines):
+/// - `IOSKeycapNodeView` (`CALayer` continuous squircle `7.8pt`, cached SF Symbols, dual-weight `中/英`,
+///   2-line Wubi radicals, swipe-up hints, `usesFunctionFill` & `isBlueAccent`, `0.065s` release)
+/// - `IOSKeyCanvasView : UIInputView <UIInputViewAudioFeedback>` (`JuxuKeyCanvas`, causal multi-touch rollover,
+///   sticky press-lock hysteresis, `123` hold-and-slide-to-insert, spacebar & whole-keyboard trackpad,
+///   backspace swipe-up line clear & swipe-down undo, long-press alternates, edge-gate `touchesCancelled` rescue)
+/// - `IOST9SidebarView` (scrollable idle punctuation column / live Pinyin syllable lock filter).
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGet, vecGetOr, vecSet, vecClear}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert}
+use std.math.{abs, floor, sqrt}
+use objc.{
+    Id, NSObject, idAdoptOpt, idRetain,
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcAddProtocol, objcRegisterClass,
+    objcSetAssocHandle, objcGetAssocHandle,
+    msgSend0, msgSend1I64, msgSendI64_0, msgSendFloat0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1Bool, msgSendVoid1I64, msgSendVoid1Float,
+}
+use juxu_shared.{
+    CGPoint, CGSize, CGRect, cgPoint, cgSize, cgRect,
+    cgAffineIdentity, cgAffineTranslate,
+    rectContainsPoint, rectInset,
+    ptrToI64, msgSend1I64_1Ptr, msgSendVoid1Size, msgSendVoid1Ptr1I64,
+    msgSendVoid1Ptr1Sel1U64,
+    objcSendSuperVoid0, objcSendSuperVoid1Ptr, objcSendSuperVoid1Bool,
+    nsStr, objcAllocInitFrame, systemUptimeSeconds, dispatchMainAfterMs,
+    utf8FirstScalar, utf8ScalarCount,
+}
+use layout_engine.{
+    IOSKeyPlane, PlaneNumbers, PlaneSymbols,
+    IOSKeyKind, KeyLetter, KeyT9, KeyT9Clear, KeySymbol, KeyShift, KeyBackspace,
+    KeyPlaneSwitch, KeyGlobe, KeyModeToggle, KeySpace, KeyReturn,
+    IOSKeySpec, keySpecSimple, keySpecEq, rectEq, rectOffset, optStrEq,
+    LayoutSnapshot, keyCornerRadius, shouldReturnToLettersAfterSymbol,
+    hitTest, hitTestFull,
+}
+use gestures_editing.{
+    swipeUpIsActive,
+    keyAlternatesSymbolOptions,
+    trackpadMoveCancelDistance, supportsTrackpadHold, trackpadHoldDelay, alternatesDelay,
+    shouldCancelAlternatesInTrackpad,
+    SpaceTrackpadAccumulator, trackpadNew, trackpadIsActive, trackpadBegin, trackpadUpdate, trackpadEnd,
+}
+use ios_ui_kit.{
+    setContinuousCorner,
+    uiColorRgba, uiColorWhite, uiColorSystemBlue, uiColorSystemBgAlpha,
+    uiColorPureWhite, uiColorBlack,
+    uiSystemFont, uiSymbolImage,
+    uiSetDualAttributedLabel, uiSetRadicalAttributedLabel,
+    uiPerformWithoutAnimation, uiAnimate,
+    uiAnimOptCurveEaseOut, uiAnimOptAllowUserInteraction, uiAnimOptBeginFromCurrentState,
+    extractSortedTouches, touchLocationInView, msgSendInitStyle,
+    viewLayer, setViewHidden, isViewHidden, viewBounds, viewFrame, setViewFrame,
+    setViewAlpha, setViewTransform, setViewBgColor, setAccessibilityId,
+    setLabelText, setLabelTextColor, setLabelFont, setLabelAlignment,
+    setScrollContentOffsetZero,
+}
+
+def maxFloat(a: Float, b: Float): Float = if (a > b) a else b
+def hypot2(dx: Float, dy: Float): Float = sqrt(dx * dx + dy * dy)
+
+def asciiUpperStr(s: String): String = {
+    let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let n = strLen(s);
+    if (n == 1) {
+        let b = strByteAt(s, 0);
+        if (b >= 97 && b <= 122) strSlice(letters, b - 97, b - 96)
+        else s
+    } else s
+}
+
+// ============================================================================
+// Symbol Cache & IOSKeycapNodeView (`IOSKeyCanvasView.swift` lines 7–323)
+// ============================================================================
+
+def gKeycapSymbolCache: Cell (StrMap (Ptr, Id NSObject)) = cellNew(strMapNew())
+
+def clearKeycapSymbolCache(): Void =
+    cellSet(gKeycapSymbolCache, strMapNew())
+
+def cachedKeycapSymbolImage(symName: String): Ptr = {
+    let cache = cellGet(gKeycapSymbolCache);
+    match strMapGet(cache, symName) {
+        Some((rawPtr, _)) -> rawPtr,
+        None -> {
+            let img = uiSymbolImage(symName, 19.5, 0, true);
+            if (!ptrIsNull(img)) {
+                let _ = strMapInsert(cache, symName, (img, idRetain(img)));
+                ()
+            } else ();
+            img
+        },
+    }
+}
+
+data IOSKeycapNode {
+    knView: Ptr,
+    knPrimaryLabel: Ptr,
+    knRadicalLabel: Ptr,
+    knSymbolView: Ptr,
+    knSubscriptLabel: Ptr,
+    knSwipeHintLabel: Ptr,
+    knCurrentSpec: Cell (Option IOSKeySpec),
+    knIsDarkTheme: Cell Bool,
+    knIsPressedState: Cell Bool,
+    knIsGlyphCovered: Cell Bool,
+    knHasAppliedPressVisuals: Cell Bool,
+}
+
+def keycapNodeNew(): IOSKeycapNode = {
+    let z = cgRect(0.0, 0.0, 0.0, 0.0);
+    let v = objcAllocInitFrame("UIView", z);
+    let primaryLbl = objcAllocInitFrame("UILabel", z);
+    let radicalLbl = objcAllocInitFrame("UILabel", z);
+    let symView = objcAllocInitFrame("UIImageView", z);
+    let subLbl = objcAllocInitFrame("UILabel", z);
+    let swipeLbl = objcAllocInitFrame("UILabel", z);
+
+    if (!ptrIsNull(v)) {
+        msgSendVoid1Bool(v, objcSel("setUserInteractionEnabled:"), false);
+        setContinuousCorner(viewLayer(v), keyCornerRadius());
+
+        setLabelAlignment(primaryLbl, 1); // .center
+        msgSendVoid1Bool(primaryLbl, objcSel("setUserInteractionEnabled:"), false);
+
+        setLabelAlignment(radicalLbl, 1); // .center
+        msgSendVoid1I64(radicalLbl, objcSel("setNumberOfLines:"), intToI64(2));
+        msgSendVoid1I64(radicalLbl, objcSel("setLineBreakMode:"), intToI64(2)); // .byClipping
+        msgSendVoid1Bool(radicalLbl, objcSel("setUserInteractionEnabled:"), false);
+        setViewHidden(radicalLbl, true);
+
+        msgSendVoid1I64(symView, objcSel("setContentMode:"), intToI64(4)); // .center
+        msgSendVoid1Bool(symView, objcSel("setUserInteractionEnabled:"), false);
+
+        setLabelFont(subLbl, uiSystemFont(12.5, 0));
+        setLabelAlignment(subLbl, 2); // .right
+        msgSendVoid1Bool(subLbl, objcSel("setUserInteractionEnabled:"), false);
+
+        setLabelFont(swipeLbl, uiSystemFont(9.5, 0));
+        setLabelAlignment(swipeLbl, 1); // .center
+        msgSendVoid1Bool(swipeLbl, objcSel("setUserInteractionEnabled:"), false);
+        setViewHidden(swipeLbl, true);
+
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), primaryLbl);
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), radicalLbl);
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), symView);
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), subLbl);
+        msgSendVoid1Ptr(v, objcSel("addSubview:"), swipeLbl);
+
+        msgSendVoid0(primaryLbl, objcSel("release"));
+        msgSendVoid0(radicalLbl, objcSel("release"));
+        msgSendVoid0(symView, objcSel("release"));
+        msgSendVoid0(subLbl, objcSel("release"));
+        msgSendVoid0(swipeLbl, objcSel("release"))
+    } else ();
+
+    IOSKeycapNode {
+        knView: v,
+        knPrimaryLabel: primaryLbl,
+        knRadicalLabel: radicalLbl,
+        knSymbolView: symView,
+        knSubscriptLabel: subLbl,
+        knSwipeHintLabel: swipeLbl,
+        knCurrentSpec: cellNew(None),
+        knIsDarkTheme: cellNew(false),
+        knIsPressedState: cellNew(false),
+        knIsGlyphCovered: cellNew(false),
+        knHasAppliedPressVisuals: cellNew(false),
+    }
+}
+
+def keycapLayoutSublayers(node: IOSKeycapNode, spec: IOSKeySpec): Void =
+    if (!ptrIsNull(node.knView)) {
+        let b = viewBounds(node.knView);
+        setViewFrame(node.knSwipeHintLabel, cgRect(0.0, 1.5, b.size.width, 11.0));
+        let hasRadicals = match spec.ksKeycapRadicals {
+            Some(rad) -> strLen(rad) > 0,
+            None -> false,
+        };
+        if (hasRadicals) {
+            let letterH = maxFloat(13.0, floor(b.size.height * 0.34 + 0.5));
+            setViewFrame(node.knPrimaryLabel, cgRect(0.0, 2.0, b.size.width, letterH));
+            setViewFrame(
+                node.knRadicalLabel,
+                cgRect(
+                    1.0,
+                    2.0 + letterH - 0.5,
+                    maxFloat(0.0, b.size.width - 2.0),
+                    maxFloat(0.0, b.size.height - letterH - 3.5)
+                )
+            );
+            setViewFrame(node.knSymbolView, b);
+            setViewFrame(node.knSubscriptLabel, cgRect(b.size.width - 30.0, b.size.height - 20.0, 24.0, 15.0))
+        } else {
+            let (xNudge, yNudge) = match spec.ksKind {
+                KeyLetter(_) -> {
+                    let (cp, len) = utf8FirstScalar(spec.ksPrimaryLabel);
+                    let isNonASCII = len > 0 && cp >= 128;
+                    let isUpper = len > 0 && cp >= 65 && cp <= 90;
+                    let hintShift = match spec.ksSwipeUpSymbol {
+                        Some(_) -> 2.0,
+                        None -> 0.0,
+                    };
+                    let base = if (isNonASCII) -0.5 else if (isUpper) -0.3 else -2.2;
+                    (0.0, base + hintShift)
+                },
+                KeySymbol(_) -> {
+                    let yn = match spec.ksSwipeUpSymbol {
+                        Some(_) -> 1.2,
+                        None -> -0.8,
+                    };
+                    (0.0, yn)
+                },
+                KeyPlaneSwitch { targetPlane: _, switchLabel: _ } -> (0.0, -0.8),
+                KeyModeToggle -> {
+                    let hasCorner = match spec.ksCornerSubscript {
+                        Some(_) -> true,
+                        None -> false,
+                    };
+                    if (hasCorner) (-6.0, -3.0) else (0.0, -0.5)
+                },
+                _ -> (0.0, 0.0),
+            };
+            setViewFrame(node.knPrimaryLabel, rectOffset(b, xNudge, yNudge));
+            setViewFrame(node.knRadicalLabel, cgRect(0.0, 0.0, 0.0, 0.0));
+            setViewFrame(node.knSymbolView, b);
+            setViewFrame(node.knSubscriptLabel, cgRect(b.size.width - 30.0, b.size.height - 20.0, 24.0, 15.0))
+        }
+    } else ()
+
+def keycapUpdateContent(node: IOSKeycapNode, spec: IOSKeySpec, dark: Bool): Void =
+    if (!ptrIsNull(node.knView)) {
+        let fgColor =
+            if (spec.ksIsBlueAccent) uiColorPureWhite()
+            else if (dark) uiColorPureWhite()
+            else uiColorBlack();
+        let subColor = if (dark) uiColorWhite(1.0, 0.30) else uiColorWhite(0.0, 0.20);
+        let modeSecondaryColor = if (dark) uiColorWhite(1.0, 0.45) else uiColorWhite(0.0, 0.38);
+
+        match spec.ksSystemSymbol {
+            Some(symName) -> {
+                setViewHidden(node.knPrimaryLabel, true);
+                setViewHidden(node.knRadicalLabel, true);
+                setViewHidden(node.knSymbolView, false);
+                let img = cachedKeycapSymbolImage(symName);
+                msgSendVoid1Ptr(node.knSymbolView, objcSel("setImage:"), img);
+                msgSendVoid1Ptr(node.knSymbolView, objcSel("setTintColor:"), fgColor)
+            },
+            None ->
+                if (strLen(spec.ksPrimaryLabel) > 0) {
+                    setViewHidden(node.knSymbolView, true);
+                    setViewHidden(node.knPrimaryLabel, false);
+                    let secInline = match spec.ksSecondaryInlineLabel {
+                        Some(s) -> s,
+                        None -> "",
+                    };
+                    let radTxt = match spec.ksKeycapRadicals {
+                        Some(r) -> r,
+                        None -> "",
+                    };
+                    if (strLen(secInline) > 0) {
+                        setViewHidden(node.knRadicalLabel, true);
+                        let _ = uiSetDualAttributedLabel(
+                            node.knPrimaryLabel,
+                            spec.ksPrimaryLabel,
+                            uiSystemFont(16.5, 1), // medium
+                            fgColor,
+                            secInline,
+                            uiSystemFont(12.0, 0), // regular
+                            modeSecondaryColor
+                        );
+                        ()
+                    } else if (strLen(radTxt) > 0) {
+                        msgSendVoid1Ptr(node.knPrimaryLabel, objcSel("setAttributedText:"), ptrNull());
+                        setLabelFont(node.knPrimaryLabel, uiSystemFont(12.5, 2)); // semibold
+                        setLabelTextColor(node.knPrimaryLabel, fgColor);
+                        setLabelText(node.knPrimaryLabel, asciiUpperStr(spec.ksPrimaryLabel));
+
+                        let radColor = if (dark) uiColorWhite(1.0, 0.74) else uiColorWhite(0.0, 0.64);
+                        uiSetRadicalAttributedLabel(node.knRadicalLabel, radTxt, 9.0, radColor, 1.02, 0.5);
+                        setViewHidden(node.knRadicalLabel, false)
+                    } else {
+                        setViewHidden(node.knRadicalLabel, true);
+                        msgSendVoid1Ptr(node.knPrimaryLabel, objcSel("setAttributedText:"), ptrNull());
+                        let (fontSize, weightCode) = match spec.ksKind {
+                            KeyLetter(_) -> {
+                                let (cp, len) = utf8FirstScalar(spec.ksPrimaryLabel);
+                                let isNonASCII = len > 0 && cp >= 128;
+                                let isUpper = len > 0 && cp >= 65 && cp <= 90;
+                                let sz = if (isNonASCII) 20.5 else if (isUpper) 22.5 else 24.5;
+                                (sz, 0)
+                            },
+                            KeyT9(digit) ->
+                                if (digit == 49) (14.5, 0) else (16.5, 1),
+                            KeyT9Clear -> (15.0, 0),
+                            KeySymbol(s) ->
+                                (if (utf8ScalarCount(s) > 1) 16.5 else 21.5, 0),
+                            KeyPlaneSwitch { targetPlane: _, switchLabel: _ } -> (18.0, 0),
+                            KeyReturn ->
+                                (16.0, if (spec.ksIsBlueAccent) 2 else 0),
+                            _ -> (17.5, 0),
+                        };
+                        setLabelFont(node.knPrimaryLabel, uiSystemFont(fontSize, weightCode));
+                        setLabelTextColor(node.knPrimaryLabel, fgColor);
+                        setLabelText(node.knPrimaryLabel, spec.ksPrimaryLabel)
+                    }
+                } else {
+                    setViewHidden(node.knPrimaryLabel, true);
+                    setViewHidden(node.knRadicalLabel, true);
+                    setViewHidden(node.knSymbolView, true)
+                },
+        };
+
+        let radEmpty = match spec.ksKeycapRadicals {
+            Some(r) -> strLen(r) == 0,
+            None -> true,
+        };
+        match spec.ksSwipeUpSymbol {
+            Some(hint) if (radEmpty) -> {
+                setViewHidden(node.knSwipeHintLabel, false);
+                setLabelText(node.knSwipeHintLabel, hint);
+                setLabelTextColor(
+                    node.knSwipeHintLabel,
+                    if (dark) uiColorWhite(1.0, 0.48) else uiColorWhite(0.0, 0.42)
+                )
+            },
+            _ -> setViewHidden(node.knSwipeHintLabel, true),
+        };
+
+        match spec.ksCornerSubscript {
+            Some(sub) if (strLen(sub) > 0) -> {
+                setViewHidden(node.knSubscriptLabel, false);
+                setLabelText(node.knSubscriptLabel, sub);
+                setLabelTextColor(
+                    node.knSubscriptLabel,
+                    if (spec.ksKind == KeyModeToggle) modeSecondaryColor else subColor
+                )
+            },
+            _ -> setViewHidden(node.knSubscriptLabel, true),
+        }
+    } else ()
+
+def keycapApplyPressVisuals(
+    node: IOSKeycapNode,
+    pressed: Bool,
+    glyphCovered: Bool,
+    spec: IOSKeySpec,
+    dark: Bool,
+    animatedRelease: Bool
+): Void =
+    if (!ptrIsNull(node.knView)) {
+        let normalBg =
+            if (spec.ksIsBlueAccent) uiColorSystemBlue(1.0)
+            else if (spec.ksUsesFunctionFill) {
+                if (dark) uiColorWhite(1.0, 0.09)
+                else uiColorRgba(184.0 / 255.0, 188.0 / 255.0, 198.0 / 255.0, 1.0)
+            } else {
+                if (dark) uiColorWhite(1.0, 0.175)
+                else uiColorPureWhite()
+            };
+        let pressedBg =
+            if (spec.ksIsBlueAccent) uiColorSystemBlue(0.80)
+            else if (dark) uiColorWhite(1.0, 0.30)
+            else uiColorRgba(214.0 / 255.0, 216.0 / 255.0, 222.0 / 255.0, 1.0);
+
+        let targetBg = if (pressed) pressedBg else normalBg;
+        let targetTransform = if (pressed) cgAffineTranslate(0.0, 0.45) else cgAffineIdentity();
+        let contentAlpha = if (glyphCovered) 0.0 else 1.0;
+
+        let applyFn = () -> {
+            setViewBgColor(node.knView, targetBg);
+            setViewTransform(node.knView, targetTransform);
+            setViewAlpha(node.knPrimaryLabel, contentAlpha);
+            if (!isViewHidden(node.knRadicalLabel)) {
+                setViewAlpha(node.knRadicalLabel, contentAlpha)
+            } else ();
+            if (!isViewHidden(node.knSwipeHintLabel)) {
+                setViewAlpha(node.knSwipeHintLabel, contentAlpha)
+            } else ()
+        };
+
+        if (animatedRelease) {
+            let opts = uiAnimOptCurveEaseOut() | uiAnimOptAllowUserInteraction() | uiAnimOptBeginFromCurrentState();
+            uiAnimate(0.065, opts, applyFn)
+        } else {
+            uiPerformWithoutAnimation(applyFn)
+        }
+    } else ()
+
+def keycapConfigure(
+    node: IOSKeycapNode,
+    spec: IOSKeySpec,
+    dark: Bool,
+    pressed: Bool,
+    glyphCovered: Bool
+): Void =
+    if (!ptrIsNull(node.knView)) {
+        if (!rectEq(viewFrame(node.knView), spec.ksFrame)) {
+            uiPerformWithoutAnimation(() -> {
+                setViewFrame(node.knView, spec.ksFrame);
+                keycapLayoutSublayers(node, spec)
+            })
+        } else ();
+
+        let sameSpec = match cellGet(node.knCurrentSpec) {
+            Some(prev) -> keySpecEq(prev, spec),
+            None -> false,
+        };
+        let specOrThemeChanged = !sameSpec || (cellGet(node.knIsDarkTheme) != dark);
+        cellSet(node.knCurrentSpec, Some(spec));
+        cellSet(node.knIsDarkTheme, dark);
+
+        if (specOrThemeChanged) {
+            uiPerformWithoutAnimation(() -> {
+                keycapUpdateContent(node, spec, dark);
+                keycapLayoutSublayers(node, spec)
+            })
+        } else ();
+
+        let wasPressed = cellGet(node.knIsPressedState);
+        let wasCovered = cellGet(node.knIsGlyphCovered);
+        if (specOrThemeChanged || !cellGet(node.knHasAppliedPressVisuals) || pressed != wasPressed || glyphCovered != wasCovered) {
+            keycapApplyPressVisuals(node, pressed, glyphCovered, spec, dark, !pressed && wasPressed);
+            cellSet(node.knHasAppliedPressVisuals, true);
+            cellSet(node.knIsPressedState, pressed);
+            cellSet(node.knIsGlyphCovered, glyphCovered)
+        } else ()
+    } else ()
+
+def keycapUpdatePressState(node: IOSKeycapNode, pressed: Bool, glyphCovered: Bool, dark: Bool): Void =
+    if (cellGet(node.knHasAppliedPressVisuals)) {
+        match cellGet(node.knCurrentSpec) {
+            Some(spec) -> {
+                let wasPressed = cellGet(node.knIsPressedState);
+                let wasCovered = cellGet(node.knIsGlyphCovered);
+                if (pressed != wasPressed || glyphCovered != wasCovered || dark != cellGet(node.knIsDarkTheme)) {
+                    cellSet(node.knIsDarkTheme, dark);
+                    keycapApplyPressVisuals(node, pressed, glyphCovered, spec, dark, !pressed && wasPressed);
+                    cellSet(node.knIsPressedState, pressed);
+                    cellSet(node.knIsGlyphCovered, glyphCovered)
+                } else ()
+            },
+            None -> (),
+        }
+    } else ()
+
+// ============================================================================
+// TrackedTouch & IOSKeyCanvasView (`IOSKeyCanvasView.swift` lines 327–1128)
+// ============================================================================
+
+data TrackedTouch {
+    ttId: Int64,
+    ttTouchPtr: Ptr,
+    ttTouchObj: Id NSObject,
+    ttBeganTimestamp: Float,
+    ttInitialPoint: CGPoint,
+    ttCurrentPoint: Cell CGPoint,
+    ttPrevPoint: Cell CGPoint,
+    ttPrevTimestamp: Cell Float,
+    ttMaxMovedDistance: Cell Float,
+    ttMaxAbsDeltaY: Cell Float,
+    ttLatestStepSpeed: Cell Float,
+    ttInitialKey: IOSKeySpec,
+    ttCurrentKey: Cell IOSKeySpec,
+    ttIsPlaneSlide: Bool,
+    ttDidSlideToSymbol: Cell Bool,
+    ttStartedOnSpace: Bool,
+    ttForwardedGlobe: Bool,
+    ttCommittedByRollover: Cell Bool,
+    ttSwipeUpActive: Cell Bool,
+    ttSwipeDownActive: Cell Bool,
+    ttAlternatesActive: Cell Bool,
+    ttTrackpadActive: Cell Bool,
+}
+
+pub data IOSKeyCanvasView {
+    kcView: Ptr,
+    kcOwner: Option (Id NSObject),
+    kcOnKeyTouchDown: Cell (Option ((IOSKeySpec) -> Void)),
+    kcOnKeySlidePreview: Cell (Option ((Option IOSKeySpec) -> Void)),
+    kcOnKeyTouchUp: Cell (Option ((IOSKeySpec, CGPoint) -> Void)),
+    kcOnKeyTouchCancel: Cell (Option (() -> Void)),
+    kcOnTrackpadStateChanged: Cell (Option ((Bool) -> Void)),
+    kcOnRestorePlane: Cell (Option (() -> Void)),
+    kcOnTrackpadMove: Cell (Option ((Int, Int) -> Void)),
+    kcOnKeySwipeUp: Cell (Option ((String) -> Void)),
+    kcOnBackspaceSwipeArmed: Cell (Option ((IOSKeySpec, Bool) -> Void)),
+    kcOnBackspaceSwipeUp: Cell (Option (() -> Void)),
+    kcOnBackspaceSwipeDownArmed: Cell (Option ((IOSKeySpec, Bool) -> Void)),
+    kcOnBackspaceSwipeDown: Cell (Option (() -> Void)),
+    kcOnAlternatesBegin: Cell (Option ((IOSKeySpec) -> Void)),
+    kcOnAlternatesMove: Cell (Option ((CGPoint) -> Void)),
+    kcOnAlternatesEnd: Cell (Option ((Bool) -> Void)),
+    kcOnGlobeTouchEvent: Cell (Option ((Ptr, Ptr) -> Void)),
+    kcCanUndoLineClear: Cell Bool,
+    kcBackspaceSwipeClearEnabled: Cell Bool,
+    kcKeyboardHoldCursorEnabled: Cell Bool,
+    kcLongPressAlternatesEnabled: Cell Bool,
+    kcAsciiMode: Cell Bool,
+    kcSnapshot: Cell (Option LayoutSnapshot),
+    kcIsComposing: Cell Bool,
+    kcValidNextMask: Cell Int,
+    kcNextKeyPriors: Cell (Vec Int),
+    kcTouchOffsets: Cell (Vec Float),
+    kcT9ValidNextMask: Cell Int,
+    kcT9NextKeyPriors: Cell (Vec Int),
+    kcT9TouchOffsets: Cell (Vec Float),
+    kcCoveredCalloutKeyId: Cell (Option String),
+    kcKeycapNodes: Vec IOSKeycapNode,
+    kcTrackedTouches: Vec TrackedTouch,
+    kcSpaceHoldGen: Cell Int64,
+    kcSpaceHoldTouchId: Cell Int64,
+    kcLongPressGen: Cell Int64,
+    kcLongPressTouchId: Cell Int64,
+    kcTrackpad: SpaceTrackpadAccumulator,
+    kcIsDark: Cell Bool,
+}
+
+def canvasAssocKey(): Ptr = objcSel("__juxuKeyCanvasAssocKey")
+
+def getCanvasFromSelf(self: Ptr): Option IOSKeyCanvasView = {
+    let h = objcGetAssocHandle(self, canvasAssocKey());
+    if (h == intToI64(0)) None
+    else Some(gcHandleGet(h))
+}
+
+def findTrackedIndex(kc: IOSKeyCanvasView, id: Int64): Option Int = {
+    let n = vecLen(kc.kcTrackedTouches);
+    let i = cellNew(0);
+    let found: Cell (Option Int) = cellNew(None);
+    while (cellGet(i) < n && match cellGet(found) { None -> true, Some(_) -> false }) {
+        let idx = cellGet(i);
+        match vecGet(kc.kcTrackedTouches, idx) {
+            Some(tt) -> if (tt.ttId == id) cellSet(found, Some(idx)) else (),
+            None -> (),
+        };
+        cellSet(i, idx + 1)
+    };
+    cellGet(found)
+}
+
+def removeTrackedById(kc: IOSKeyCanvasView, id: Int64): Option TrackedTouch = {
+    let n = vecLen(kc.kcTrackedTouches);
+    let kept: Vec TrackedTouch = vecWithCap(n);
+    let removed: Cell (Option TrackedTouch) = cellNew(None);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        match vecGet(kc.kcTrackedTouches, cellGet(i)) {
+            Some(tt) ->
+                if (tt.ttId == id) cellSet(removed, Some(tt))
+                else vecPush(kept, tt),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    vecClear(kc.kcTrackedTouches);
+    let j = cellNew(0);
+    while (cellGet(j) < vecLen(kept)) {
+        match vecGet(kept, cellGet(j)) {
+            Some(tt) -> vecPush(kc.kcTrackedTouches, tt),
+            None -> (),
+        };
+        cellSet(j, cellGet(j) + 1)
+    };
+    cellGet(removed)
+}
+
+def isKeyIdPressed(kc: IOSKeyCanvasView, keyId: String): Bool =
+    if (trackpadIsActive(kc.kcTrackpad)) false
+    else {
+        let n = vecLen(kc.kcTrackedTouches);
+        let i = cellNew(0);
+        let pressed = cellNew(false);
+        while (cellGet(i) < n && !cellGet(pressed)) {
+            match vecGet(kc.kcTrackedTouches, cellGet(i)) {
+                Some(tt) ->
+                    if (!cellGet(tt.ttCommittedByRollover) && cellGet(tt.ttCurrentKey).ksId == keyId) {
+                        cellSet(pressed, true)
+                    } else (),
+                None -> (),
+            };
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(pressed)
+    }
+
+def isCoveredKeyMatch(kc: IOSKeyCanvasView, keyId: String): Bool =
+    match cellGet(kc.kcCoveredCalloutKeyId) {
+        Some(cid) -> cid == keyId,
+        None -> false,
+    }
+
+def syncKeycapPressStates(kc: IOSKeyCanvasView): Void =
+    match cellGet(kc.kcSnapshot) {
+        None -> (),
+        Some(snap) -> {
+            let dark = cellGet(kc.kcIsDark);
+            let n = vecLen(snap.lsKeys);
+            let nodeCount = vecLen(kc.kcKeycapNodes);
+            let i = cellNew(0);
+            while (cellGet(i) < n && cellGet(i) < nodeCount) {
+                let idx = cellGet(i);
+                match (vecGet(snap.lsKeys, idx), vecGet(kc.kcKeycapNodes, idx)) {
+                    (Some(spec), Some(node)) -> {
+                        let isPressed = isKeyIdPressed(kc, spec.ksId);
+                        let isCovered = isPressed && isCoveredKeyMatch(kc, spec.ksId);
+                        keycapUpdatePressState(node, isPressed, isCovered, dark)
+                    },
+                    _ -> (),
+                };
+                cellSet(i, idx + 1)
+            }
+        },
+    }
+
+def rebuildOrSyncKeycapNodes(kc: IOSKeyCanvasView): Void =
+    match cellGet(kc.kcSnapshot) {
+        None -> (),
+        Some(snap) -> {
+            let needed = vecLen(snap.lsKeys);
+            while (vecLen(kc.kcKeycapNodes) < needed) {
+                let node = keycapNodeNew();
+                if (!ptrIsNull(kc.kcView) && !ptrIsNull(node.knView)) {
+                    msgSendVoid1Ptr(kc.kcView, objcSel("addSubview:"), node.knView);
+                    msgSendVoid0(node.knView, objcSel("release"))
+                } else ();
+                vecPush(kc.kcKeycapNodes, node)
+            };
+            let totalNodes = vecLen(kc.kcKeycapNodes);
+            if (totalNodes > needed) {
+                let hi = cellNew(needed);
+                while (cellGet(hi) < totalNodes) {
+                    match vecGet(kc.kcKeycapNodes, cellGet(hi)) {
+                        Some(node) -> setViewHidden(node.knView, true),
+                        None -> (),
+                    };
+                    cellSet(hi, cellGet(hi) + 1)
+                }
+            } else ();
+            let dark = cellGet(kc.kcIsDark);
+            let i = cellNew(0);
+            while (cellGet(i) < needed) {
+                let idx = cellGet(i);
+                match (vecGet(snap.lsKeys, idx), vecGet(kc.kcKeycapNodes, idx)) {
+                    (Some(spec), Some(node)) -> {
+                        setViewHidden(node.knView, false);
+                        let isPressed = isKeyIdPressed(kc, spec.ksId);
+                        let isCovered = isPressed && isCoveredKeyMatch(kc, spec.ksId);
+                        keycapConfigure(node, spec, dark, isPressed, isCovered)
+                    },
+                    _ -> (),
+                };
+                cellSet(i, idx + 1)
+            }
+        },
+    }
+
+pub def keyCanvasClearCaches(kc: IOSKeyCanvasView): Void = {
+    let _ = kc;
+    clearKeycapSymbolCache()
+}
+
+pub def keyCanvasSetCoveredCalloutKeyId(kc: IOSKeyCanvasView, keyIdOpt: Option String): Void =
+    if (!optStrEq(cellGet(kc.kcCoveredCalloutKeyId), keyIdOpt)) {
+        cellSet(kc.kcCoveredCalloutKeyId, keyIdOpt);
+        syncKeycapPressStates(kc)
+    } else ()
+
+pub def keyCanvasApplyTheme(kc: IOSKeyCanvasView, dark: Bool): Void =
+    if (cellGet(kc.kcIsDark) != dark) {
+        cellSet(kc.kcIsDark, dark);
+        rebuildOrSyncKeycapNodes(kc)
+    } else ()
+
+pub def keyCanvasUpdateSnapshot(kc: IOSKeyCanvasView, snap: LayoutSnapshot): Void = {
+    cellSet(kc.kcSnapshot, Some(snap));
+    rebuildOrSyncKeycapNodes(kc)
+}
+
+def cancelTrackpadHoldTimer(kc: IOSKeyCanvasView, onlyForIdOpt: Option Int64): Void = {
+    let shouldCancel = match onlyForIdOpt {
+        Some(targetId) -> cellGet(kc.kcSpaceHoldTouchId) == targetId,
+        None -> true,
+    };
+    if (shouldCancel) {
+        cellSet(kc.kcSpaceHoldGen, cellGet(kc.kcSpaceHoldGen) + intToI64(1));
+        cellSet(kc.kcSpaceHoldTouchId, intToI64(0))
+    } else ()
+}
+
+def cancelLongPressTimer(kc: IOSKeyCanvasView, onlyForIdOpt: Option Int64): Void = {
+    let shouldCancel = match onlyForIdOpt {
+        Some(targetId) -> cellGet(kc.kcLongPressTouchId) == targetId,
+        None -> true,
+    };
+    if (shouldCancel) {
+        cellSet(kc.kcLongPressGen, cellGet(kc.kcLongPressGen) + intToI64(1));
+        cellSet(kc.kcLongPressTouchId, intToI64(0))
+    } else ()
+}
+
+def startTrackpadHoldTimer(kc: IOSKeyCanvasView, id: Int64): Void =
+    if (!trackpadIsActive(kc.kcTrackpad)) {
+        cancelTrackpadHoldTimer(kc, None);
+        let gen = cellGet(kc.kcSpaceHoldGen) + intToI64(1);
+        cellSet(kc.kcSpaceHoldGen, gen);
+        cellSet(kc.kcSpaceHoldTouchId, id);
+        let delaySec = trackpadHoldDelay(cellGet(kc.kcKeyboardHoldCursorEnabled));
+        let delayMs = floatToInt(delaySec * 1000.0 + 0.5);
+        dispatchMainAfterMs(delayMs, () -> {
+            if (cellGet(kc.kcSpaceHoldGen) == gen && cellGet(kc.kcSpaceHoldTouchId) == id) {
+                cellSet(kc.kcSpaceHoldTouchId, intToI64(0));
+                if (!trackpadIsActive(kc.kcTrackpad)) {
+                    match findTrackedIndex(kc, id) {
+                        Some(idx) -> match vecGet(kc.kcTrackedTouches, idx) {
+                            Some(st) ->
+                                if (!cellGet(st.ttCommittedByRollover)
+                                    && !cellGet(st.ttAlternatesActive)
+                                    && !cellGet(st.ttSwipeUpActive)
+                                    && cellGet(st.ttCurrentKey).ksId == st.ttInitialKey.ksId) {
+                                    cellSet(st.ttTrackpadActive, true);
+                                    trackpadBegin(kc.kcTrackpad, cellGet(st.ttCurrentPoint), systemUptimeSeconds());
+                                    match cellGet(kc.kcOnTrackpadStateChanged) {
+                                        Some(cb) -> cb(true),
+                                        None -> (),
+                                    };
+                                    syncKeycapPressStates(kc)
+                                } else (),
+                            None -> (),
+                        },
+                        None -> (),
+                    }
+                } else ()
+            } else ()
+        })
+    } else ()
+
+def startLongPressTimer(kc: IOSKeyCanvasView, id: Int64): Void = {
+    cancelLongPressTimer(kc, None);
+    let gen = cellGet(kc.kcLongPressGen) + intToI64(1);
+    cellSet(kc.kcLongPressGen, gen);
+    cellSet(kc.kcLongPressTouchId, id);
+    let delaySec = alternatesDelay(cellGet(kc.kcKeyboardHoldCursorEnabled));
+    let delayMs = floatToInt(delaySec * 1000.0 + 0.5);
+    dispatchMainAfterMs(delayMs, () -> {
+        if (cellGet(kc.kcLongPressGen) == gen && cellGet(kc.kcLongPressTouchId) == id) {
+            cellSet(kc.kcLongPressTouchId, intToI64(0));
+            match findTrackedIndex(kc, id) {
+                Some(idx) -> match vecGet(kc.kcTrackedTouches, idx) {
+                    Some(st) ->
+                        if (!cellGet(st.ttCommittedByRollover)
+                            && !cellGet(st.ttSwipeUpActive)
+                            && cellGet(st.ttCurrentKey).ksId == st.ttInitialKey.ksId) {
+                            cancelTrackpadHoldTimer(kc, Some(id));
+                            if (cellGet(st.ttTrackpadActive)) {
+                                cellSet(st.ttTrackpadActive, false);
+                                trackpadEnd(kc.kcTrackpad);
+                                match cellGet(kc.kcOnTrackpadStateChanged) {
+                                    Some(cb) -> cb(false),
+                                    None -> (),
+                                }
+                            } else ();
+                            cellSet(st.ttAlternatesActive, true);
+                            syncKeycapPressStates(kc);
+                            match cellGet(kc.kcOnAlternatesBegin) {
+                                Some(cb) -> cb(st.ttInitialKey),
+                                None -> (),
+                            }
+                        } else (),
+                    None -> (),
+                },
+                None -> (),
+            }
+        } else ()
+    })
+}
+
+pub def keyCanvasResetAllTouches(kc: IOSKeyCanvasView): Void = {
+    cancelLongPressTimer(kc, None);
+    let hadActiveAlt = cellNew(false);
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(kc.kcTrackedTouches)) {
+        match vecGet(kc.kcTrackedTouches, cellGet(i)) {
+            Some(tt) ->
+                if (cellGet(tt.ttAlternatesActive) && !cellGet(tt.ttCommittedByRollover)) {
+                    cellSet(hadActiveAlt, true)
+                } else (),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    if (cellGet(hadActiveAlt)) {
+        match cellGet(kc.kcOnAlternatesEnd) {
+            Some(cb) -> cb(false),
+            None -> (),
+        }
+    } else ();
+    cancelTrackpadHoldTimer(kc, None);
+    if (trackpadIsActive(kc.kcTrackpad)) {
+        trackpadEnd(kc.kcTrackpad);
+        match cellGet(kc.kcOnTrackpadStateChanged) {
+            Some(cb) -> cb(false),
+            None -> (),
+        }
+    } else ();
+    vecClear(kc.kcTrackedTouches);
+    cellSet(kc.kcCoveredCalloutKeyId, None);
+    syncKeycapPressStates(kc)
+}
+
+def commitRolledOver(kc: IOSKeyCanvasView, st: TrackedTouch): Void = {
+    cancelLongPressTimer(kc, None);
+    if (cellGet(st.ttAlternatesActive)) {
+        match cellGet(kc.kcOnAlternatesEnd) {
+            Some(cb) -> cb(true),
+            None -> (),
+        }
+    } else if (st.ttInitialKey.ksKind == KeyBackspace) {
+        if (cellGet(st.ttSwipeUpActive) || cellGet(st.ttSwipeDownActive)) {
+            match cellGet(kc.kcOnKeyTouchCancel) {
+                Some(cb) -> cb(),
+                None -> (),
+            }
+        } else {
+            match cellGet(kc.kcOnKeyTouchUp) {
+                Some(cb) -> cb(st.ttInitialKey, st.ttInitialPoint),
+                None -> (),
+            }
+        }
+    } else if (st.ttForwardedGlobe) {
+        ()
+    } else {
+        let doSwipe =
+            if (!cellGet(st.ttSwipeUpActive)) None
+            else match st.ttInitialKey.ksSwipeUpSymbol {
+                Some(sym) ->
+                    if (cellGet(kc.kcIsComposing) && (cellGet(st.ttPrevTimestamp) - st.ttBeganTimestamp < 0.085)) None
+                    else Some(sym),
+                None -> None,
+            };
+        match doSwipe {
+            Some(sym) -> match cellGet(kc.kcOnKeySwipeUp) {
+                Some(cb) -> cb(sym),
+                None -> (),
+            },
+            None -> {
+                let curKey = cellGet(st.ttCurrentKey);
+                let cleanPt =
+                    if (curKey.ksId == st.ttInitialKey.ksId) st.ttInitialPoint
+                    else cellGet(st.ttCurrentPoint);
+                match cellGet(kc.kcOnKeyTouchUp) {
+                    Some(cb) -> cb(curKey, cleanPt),
+                    None -> (),
+                }
+            },
+        }
+    }
+}
+
+def purgeEndedOrOrphanTouches(kc: IOSKeyCanvasView, refTimestampOpt: Option Float): Void = {
+    let staleIds: Vec Int64 = vecNew();
+    let n = vecLen(kc.kcTrackedTouches);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        match vecGet(kc.kcTrackedTouches, cellGet(i)) {
+            Some(st) -> {
+                // UITouchPhase: ended == 3, cancelled == 4
+                let phase = i64ToInt(msgSendI64_0(st.ttTouchPtr, objcSel("phase")));
+                let committed = cellGet(st.ttCommittedByRollover);
+                if (committed && (phase == 3 || phase == 4)) {
+                    vecPush(staleIds, st.ttId)
+                } else if (!committed) {
+                    if (phase == 4) {
+                        vecPush(staleIds, st.ttId)
+                    } else if (phase == 3) {
+                        match refTimestampOpt {
+                            Some(refTs) if (refTs - st.ttBeganTimestamp > 0.30) -> vecPush(staleIds, st.ttId),
+                            _ -> (),
+                        }
+                    } else ()
+                } else ()
+            },
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+
+    let endedTrackpad = cellNew(false);
+    let si = cellNew(0);
+    while (cellGet(si) < vecLen(staleIds)) {
+        let sid = vecGetOr(staleIds, cellGet(si), intToI64(0));
+        cancelLongPressTimer(kc, Some(sid));
+        cancelTrackpadHoldTimer(kc, Some(sid));
+        match removeTrackedById(kc, sid) {
+            Some(removed) -> if (cellGet(removed.ttTrackpadActive)) cellSet(endedTrackpad, true) else (),
+            None -> (),
+        };
+        cellSet(si, cellGet(si) + 1)
+    };
+    if (cellGet(endedTrackpad) && trackpadIsActive(kc.kcTrackpad)) {
+        trackpadEnd(kc.kcTrackpad);
+        match cellGet(kc.kcOnTrackpadStateChanged) {
+            Some(cb) -> cb(false),
+            None -> (),
+        };
+        syncKeycapPressStates(kc)
+    } else ()
+}
+
+/// Sort `(beganTimestamp, touchId)` pairs ascending by `beganTimestamp`.
+def collectPendingOrderedIds(kc: IOSKeyCanvasView, excludeId: Int64, excludeTs: Float): Vec Int64 = {
+    let pairs: Vec (Float, Int64) = vecNew();
+    let n = vecLen(kc.kcTrackedTouches);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        match vecGet(kc.kcTrackedTouches, cellGet(i)) {
+            Some(st) -> {
+                let sameBounce = (st.ttId == excludeId) && abs(st.ttBeganTimestamp - excludeTs) < 0.0005;
+                if (!sameBounce
+                    && !cellGet(st.ttCommittedByRollover)
+                    && !st.ttIsPlaneSlide
+                    && !cellGet(st.ttTrackpadActive)) {
+                    vecPush(pairs, (st.ttBeganTimestamp, st.ttId))
+                } else ()
+            },
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+
+    // Insertion sort ascending by timestamp
+    let m = vecLen(pairs);
+    let a = cellNew(1);
+    while (cellGet(a) < m) {
+        let curIdx = cellGet(a);
+        let curPair = vecGetOr(pairs, curIdx, (0.0, intToI64(0)));
+        let (curTs, _) = curPair;
+        let b = cellNew(curIdx - 1);
+        let stop = cellNew(false);
+        while (cellGet(b) >= 0 && !cellGet(stop)) {
+            let prevIdx = cellGet(b);
+            let prevPair = vecGetOr(pairs, prevIdx, (0.0, intToI64(0)));
+            let (prevTs, _) = prevPair;
+            if (prevTs > curTs) {
+                vecSet(pairs, prevIdx + 1, prevPair);
+                cellSet(b, prevIdx - 1)
+            } else {
+                cellSet(stop, true)
+            }
+        };
+        vecSet(pairs, cellGet(b) + 1, curPair);
+        cellSet(a, curIdx + 1)
+    };
+
+    let out: Vec Int64 = vecWithCap(m);
+    let k = cellNew(0);
+    while (cellGet(k) < m) {
+        let (_, tid) = vecGetOr(pairs, cellGet(k), (0.0, intToI64(0)));
+        vecPush(out, tid);
+        cellSet(k, cellGet(k) + 1)
+    };
+    out
+}
+
+pub def keyCanvasFlushPendingTouches(kc: IOSKeyCanvasView): Void = {
+    purgeEndedOrOrphanTouches(kc, None);
+    let pendingIds = collectPendingOrderedIds(kc, intToI64(0), -1000.0);
+    let i = cellNew(0);
+    while (cellGet(i) < vecLen(pendingIds)) {
+        let oldId = vecGetOr(pendingIds, cellGet(i), intToI64(0));
+        match findTrackedIndex(kc, oldId) {
+            Some(idx) -> match vecGet(kc.kcTrackedTouches, idx) {
+                Some(oldState) -> {
+                    cancelTrackpadHoldTimer(kc, Some(oldId));
+                    cellSet(oldState.ttCommittedByRollover, true);
+                    commitRolledOver(kc, oldState)
+                },
+                None -> (),
+            },
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    syncKeycapPressStates(kc)
+}
+
+def canvasHitTestDynamic(kc: IOSKeyCanvasView, pt: CGPoint, snap: LayoutSnapshot): Option IOSKeySpec =
+    hitTestFull(
+        pt,
+        snap,
+        cellGet(kc.kcValidNextMask),
+        cellGet(kc.kcNextKeyPriors),
+        cellGet(kc.kcTouchOffsets),
+        cellGet(kc.kcT9ValidNextMask),
+        cellGet(kc.kcT9NextKeyPriors),
+        cellGet(kc.kcT9TouchOffsets)
+    )
+
+def swipePreviewSpec(key: IOSKeySpec, symbol: String): IOSKeySpec =
+    keySpecSimple(key.ksId, KeySymbol(symbol), key.ksFrame, symbol)
+
+// ============================================================================
+// Objective-C Subclass Method Implementations (`JuxuIOSKeyCanvasView`)
+// ============================================================================
+
+def kcEnableInputClicks(_self: Ptr, _cmd: Ptr): Bool = true
+
+def kcPointInside(self: Ptr, _cmd: Ptr, pt: CGPoint, _event: Ptr): Bool = {
+    let b = viewBounds(self);
+    let expanded = cgRect(b.origin.x - 8.0, b.origin.y - 24.0, b.size.width + 16.0, b.size.height + 34.0);
+    rectContainsPoint(expanded, pt)
+}
+
+def kcWillMoveToWindow(self: Ptr, cmd: Ptr, newWindow: Ptr): Void = {
+    objcSendSuperVoid1Ptr(self, "UIInputView", cmd, newWindow);
+    if (ptrIsNull(newWindow)) {
+        match getCanvasFromSelf(self) {
+            Some(kc) -> keyCanvasResetAllTouches(kc),
+            None -> (),
+        }
+    } else ()
+}
+
+def kcSetHidden(self: Ptr, cmd: Ptr, hidden: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIInputView", cmd, hidden);
+    if (hidden) {
+        match getCanvasFromSelf(self) {
+            Some(kc) -> keyCanvasResetAllTouches(kc),
+            None -> (),
+        }
+    } else ()
+}
+
+def kcTouchesBegan(self: Ptr, _cmd: Ptr, touchesSet: Ptr, event: Ptr): Void =
+    match getCanvasFromSelf(self) {
+        None -> (),
+        Some(kc) -> {
+            let ordered = extractSortedTouches(touchesSet);
+            if (!ptrIsNull(ordered)) {
+                let count = i64ToInt(msgSendI64_0(ordered, objcSel("count")));
+                let newestTsOpt =
+                    if (count > 0) {
+                        let lastT = msgSend1I64_1Ptr(ordered, objcSel("objectAtIndex:"), intToI64(count - 1), ptrNull());
+                        Some(msgSendFloat0(lastT, objcSel("timestamp")))
+                    } else None;
+                purgeEndedOrOrphanTouches(kc, newestTsOpt);
+
+                if (!trackpadIsActive(kc.kcTrackpad)) {
+                    let ti = cellNew(0);
+                    while (cellGet(ti) < count) {
+                        let touch = msgSend1I64_1Ptr(ordered, objcSel("objectAtIndex:"), intToI64(cellGet(ti)), ptrNull());
+                        let newId = ptrToI64(touch);
+                        let ts = msgSendFloat0(touch, objcSel("timestamp"));
+
+                        // 1. Unified Multi-Touch Rollover BEFORE hit-testing the new touch!
+                        let pendingIds = collectPendingOrderedIds(kc, newId, ts);
+                        let pi = cellNew(0);
+                        while (cellGet(pi) < vecLen(pendingIds)) {
+                            let oldId = vecGetOr(pendingIds, cellGet(pi), intToI64(0));
+                            match findTrackedIndex(kc, oldId) {
+                                Some(idx) -> match vecGet(kc.kcTrackedTouches, idx) {
+                                    Some(oldSt) -> {
+                                        cancelTrackpadHoldTimer(kc, Some(oldId));
+                                        cellSet(oldSt.ttCommittedByRollover, true);
+                                        commitRolledOver(kc, oldSt)
+                                    },
+                                    None -> (),
+                                },
+                                None -> (),
+                            };
+                            cellSet(pi, cellGet(pi) + 1)
+                        };
+
+                        // 2. Hit-test new touch against freshly updated snapshot & dynamic validNextMask
+                        let point = touchLocationInView(touch, self);
+                        match cellGet(kc.kcSnapshot) {
+                            None -> (),
+                            Some(snap) -> match canvasHitTestDynamic(kc, point, snap) {
+                                None -> (),
+                                Some(hit) -> {
+                                    let isPlane = match hit.ksKind {
+                                        KeyPlaneSwitch { targetPlane: _, switchLabel: _ } -> true,
+                                        _ -> false,
+                                    };
+                                    let isSpace = hit.ksKind == KeySpace;
+                                    let forwardGlobe =
+                                        if (hit.ksKind == KeyGlobe && !ptrIsNull(event)) {
+                                            match cellGet(kc.kcOnGlobeTouchEvent) {
+                                                Some(_) -> true,
+                                                None -> false,
+                                            }
+                                        } else false;
+
+                                    let tracked = TrackedTouch {
+                                        ttId: newId,
+                                        ttTouchPtr: touch,
+                                        ttTouchObj: idRetain(touch),
+                                        ttBeganTimestamp: ts,
+                                        ttInitialPoint: point,
+                                        ttCurrentPoint: cellNew(point),
+                                        ttPrevPoint: cellNew(point),
+                                        ttPrevTimestamp: cellNew(ts),
+                                        ttMaxMovedDistance: cellNew(0.0),
+                                        ttMaxAbsDeltaY: cellNew(0.0),
+                                        ttLatestStepSpeed: cellNew(0.0),
+                                        ttInitialKey: hit,
+                                        ttCurrentKey: cellNew(hit),
+                                        ttIsPlaneSlide: isPlane,
+                                        ttDidSlideToSymbol: cellNew(false),
+                                        ttStartedOnSpace: isSpace,
+                                        ttForwardedGlobe: forwardGlobe,
+                                        ttCommittedByRollover: cellNew(false),
+                                        ttSwipeUpActive: cellNew(false),
+                                        ttSwipeDownActive: cellNew(false),
+                                        ttAlternatesActive: cellNew(false),
+                                        ttTrackpadActive: cellNew(false),
+                                    };
+                                    // Replace any existing entry with same pointer id
+                                    let _ = removeTrackedById(kc, newId);
+                                    vecPush(kc.kcTrackedTouches, tracked);
+
+                                    if (supportsTrackpadHold(hit.ksKind, cellGet(kc.kcKeyboardHoldCursorEnabled))) {
+                                        startTrackpadHoldTimer(kc, newId)
+                                    } else ();
+
+                                    syncKeycapPressStates(kc);
+                                    match cellGet(kc.kcOnKeyTouchDown) {
+                                        Some(cb) -> cb(hit),
+                                        None -> (),
+                                    };
+                                    if (forwardGlobe) {
+                                        match cellGet(kc.kcOnGlobeTouchEvent) {
+                                            Some(gcb) -> gcb(self, event),
+                                            None -> (),
+                                        }
+                                    } else ();
+
+                                    match hit.ksKind {
+                                        KeyLetter(_) ->
+                                            if (cellGet(kc.kcLongPressAlternatesEnabled)) {
+                                                startLongPressTimer(kc, newId)
+                                            } else (),
+                                        KeySymbol(sym) ->
+                                            match keyAlternatesSymbolOptions(sym, cellGet(kc.kcAsciiMode)) {
+                                                Some(_) -> startLongPressTimer(kc, newId),
+                                                None -> (),
+                                            },
+                                        _ -> (),
+                                    }
+                                },
+                            },
+                        };
+                        cellSet(ti, cellGet(ti) + 1)
+                    }
+                } else ()
+            } else ()
+        },
+    }
+
+def kcTouchesMoved(self: Ptr, _cmd: Ptr, touchesSet: Ptr, event: Ptr): Void =
+    match getCanvasFromSelf(self) {
+        None -> (),
+        Some(kc) -> match cellGet(kc.kcSnapshot) {
+            None -> (),
+            Some(snap) -> {
+                let ordered = extractSortedTouches(touchesSet);
+                if (!ptrIsNull(ordered)) {
+                    let count = i64ToInt(msgSendI64_0(ordered, objcSel("count")));
+                    let ti = cellNew(0);
+                    while (cellGet(ti) < count) {
+                        let touch = msgSend1I64_1Ptr(ordered, objcSel("objectAtIndex:"), intToI64(cellGet(ti)), ptrNull());
+                        let id = ptrToI64(touch);
+                        match findTrackedIndex(kc, id) {
+                            None -> (),
+                            Some(idx) -> match vecGet(kc.kcTrackedTouches, idx) {
+                                None -> (),
+                                Some(st) ->
+                                    if (!cellGet(st.ttCommittedByRollover)) {
+                                        if (st.ttForwardedGlobe && !ptrIsNull(event)) {
+                                            match cellGet(kc.kcOnGlobeTouchEvent) {
+                                                Some(gcb) -> gcb(self, event),
+                                                None -> (),
+                                            }
+                                        } else ();
+
+                                        let pt = touchLocationInView(touch, self);
+                                        let ts = msgSendFloat0(touch, objcSel("timestamp"));
+                                        let prevTs = cellGet(st.ttPrevTimestamp);
+                                        let prevPt = cellGet(st.ttPrevPoint);
+                                        let stepDt = ts - prevTs;
+                                        if (prevTs > st.ttBeganTimestamp && stepDt > 0.001) {
+                                            let stepDist = hypot2(pt.x - prevPt.x, pt.y - prevPt.y);
+                                            cellSet(st.ttLatestStepSpeed, stepDist / stepDt)
+                                        } else ();
+                                        cellSet(st.ttPrevPoint, pt);
+                                        cellSet(st.ttPrevTimestamp, ts);
+                                        cellSet(st.ttCurrentPoint, pt);
+                                        let movedDist = hypot2(pt.x - st.ttInitialPoint.x, pt.y - st.ttInitialPoint.y);
+                                        if (movedDist > cellGet(st.ttMaxMovedDistance)) {
+                                            cellSet(st.ttMaxMovedDistance, movedDist)
+                                        } else ();
+                                        let absDy = abs(pt.y - st.ttInitialPoint.y);
+                                        if (absDy > cellGet(st.ttMaxAbsDeltaY)) {
+                                            cellSet(st.ttMaxAbsDeltaY, absDy)
+                                        } else ();
+
+                                        if (cellGet(st.ttAlternatesActive)) {
+                                            match cellGet(kc.kcOnAlternatesMove) {
+                                                Some(cb) -> cb(pt),
+                                                None -> (),
+                                            }
+                                        } else if (cellGet(st.ttTrackpadActive)) {
+                                            let (dx, dy) = trackpadUpdate(kc.kcTrackpad, pt, ts);
+                                            if (shouldCancelAlternatesInTrackpad(st.ttInitialPoint, pt, dx, dy)) {
+                                                cancelLongPressTimer(kc, Some(id))
+                                            } else ();
+                                            if (dx != 0 || dy != 0) {
+                                                match cellGet(kc.kcOnTrackpadMove) {
+                                                    Some(cb) -> cb(dx, dy),
+                                                    None -> (),
+                                                }
+                                            } else ()
+                                        } else {
+                                            if (cellGet(st.ttMaxMovedDistance) > trackpadMoveCancelDistance()) {
+                                                cancelLongPressTimer(kc, Some(id));
+                                                cancelTrackpadHoldTimer(kc, Some(id))
+                                            } else ();
+
+                                            if (st.ttInitialKey.ksKind == KeyBackspace) {
+                                                if (cellGet(kc.kcBackspaceSwipeClearEnabled)) {
+                                                    let kh = st.ttInitialKey.ksFrame.size.height * 1.15;
+                                                    let armed = swipeUpIsActive(
+                                                        st.ttInitialPoint,
+                                                        pt,
+                                                        kh,
+                                                        cellGet(st.ttSwipeUpActive),
+                                                        false
+                                                    );
+                                                    if (armed != cellGet(st.ttSwipeUpActive)) {
+                                                        cellSet(st.ttSwipeUpActive, armed);
+                                                        match cellGet(kc.kcOnBackspaceSwipeArmed) {
+                                                            Some(cb) -> cb(st.ttInitialKey, armed),
+                                                            None -> (),
+                                                        }
+                                                    } else ();
+                                                    let armedDown =
+                                                        cellGet(kc.kcCanUndoLineClear)
+                                                            && !armed
+                                                            && swipeUpIsActive(
+                                                                cgPoint(st.ttInitialPoint.x, 0.0 - st.ttInitialPoint.y),
+                                                                cgPoint(pt.x, 0.0 - pt.y),
+                                                                kh,
+                                                                cellGet(st.ttSwipeDownActive),
+                                                                false
+                                                            );
+                                                    if (armedDown != cellGet(st.ttSwipeDownActive)) {
+                                                        cellSet(st.ttSwipeDownActive, armedDown);
+                                                        match cellGet(kc.kcOnBackspaceSwipeDownArmed) {
+                                                            Some(cb) -> cb(st.ttInitialKey, armedDown),
+                                                            None -> (),
+                                                        }
+                                                    } else ()
+                                                } else ()
+                                            } else if (st.ttIsPlaneSlide) {
+                                                let insideInit = rectContainsPoint(rectInset(st.ttInitialKey.ksFrame, -8.0, -8.0), pt);
+                                                if (!(insideInit && !cellGet(st.ttDidSlideToSymbol))) {
+                                                    match hitTest(pt, snap) {
+                                                        Some(hit) if (hit.ksId != cellGet(st.ttCurrentKey).ksId) -> {
+                                                            cellSet(st.ttCurrentKey, hit);
+                                                            match hit.ksKind {
+                                                                KeySymbol(_) -> cellSet(st.ttDidSlideToSymbol, true),
+                                                                _ -> (),
+                                                            };
+                                                            syncKeycapPressStates(kc);
+                                                            match cellGet(kc.kcOnKeySlidePreview) {
+                                                                Some(cb) -> cb(Some(hit)),
+                                                                None -> (),
+                                                            }
+                                                        },
+                                                        _ -> (),
+                                                    }
+                                                } else ()
+                                            } else if (st.ttStartedOnSpace) {
+                                                ()
+                                            } else {
+                                                let isCharInitial = match st.ttInitialKey.ksKind {
+                                                    KeyLetter(_) -> true,
+                                                    KeyT9(_) -> true,
+                                                    KeySymbol(_) -> true,
+                                                    _ -> false,
+                                                };
+                                                if (isCharInitial) {
+                                                    let handledSwipeUp = cellNew(false);
+                                                    if (cellGet(st.ttCurrentKey).ksId == st.ttInitialKey.ksId) {
+                                                        match st.ttInitialKey.ksSwipeUpSymbol {
+                                                            Some(symbol) -> {
+                                                                let active = swipeUpIsActive(
+                                                                    st.ttInitialPoint,
+                                                                    pt,
+                                                                    st.ttInitialKey.ksFrame.size.height,
+                                                                    cellGet(st.ttSwipeUpActive),
+                                                                    cellGet(kc.kcIsComposing)
+                                                                );
+                                                                if (active != cellGet(st.ttSwipeUpActive)) {
+                                                                    cellSet(st.ttSwipeUpActive, active);
+                                                                    let prevSpec =
+                                                                        if (active) swipePreviewSpec(st.ttInitialKey, symbol)
+                                                                        else st.ttInitialKey;
+                                                                    match cellGet(kc.kcOnKeySlidePreview) {
+                                                                        Some(cb) -> cb(Some(prevSpec)),
+                                                                        None -> (),
+                                                                    }
+                                                                } else ();
+                                                                if (active) cellSet(handledSwipeUp, true) else ()
+                                                            },
+                                                            None -> (),
+                                                        }
+                                                    } else ();
+
+                                                    if (!cellGet(handledSwipeUp)) {
+                                                        let curKey = cellGet(st.ttCurrentKey);
+                                                        let keepRect = rectInset(curKey.ksFrame, -10.5, -13.5);
+                                                        let nearInitial =
+                                                            (curKey.ksId == st.ttInitialKey.ksId)
+                                                                && hypot2(pt.x - st.ttInitialPoint.x, pt.y - st.ttInitialPoint.y) <= 13.0;
+                                                        let dt = maxFloat(0.0, ts - st.ttBeganTimestamp);
+                                                        if (rectContainsPoint(keepRect, pt) || nearInitial) {
+                                                            ()
+                                                        } else if (dt < 0.115) {
+                                                            ()
+                                                        } else if (dt < 0.20 && cellGet(st.ttLatestStepSpeed) > 380.0) {
+                                                            ()
+                                                        } else if (pt.y < -72.0) {
+                                                            match cellGet(kc.kcOnKeySlidePreview) {
+                                                                Some(cb) -> cb(None),
+                                                                None -> (),
+                                                            }
+                                                        } else if (pt.y < 0.0) {
+                                                            ()
+                                                        } else {
+                                                            match canvasHitTestDynamic(kc, pt, snap) {
+                                                                Some(hit) if (hit.ksId != curKey.ksId) -> {
+                                                                    let isCharTarget = match hit.ksKind {
+                                                                        KeyLetter(_) -> true,
+                                                                        KeyT9(_) -> true,
+                                                                        KeySymbol(_) -> true,
+                                                                        _ -> false,
+                                                                    };
+                                                                    if (isCharTarget) {
+                                                                        cellSet(st.ttCurrentKey, hit);
+                                                                        syncKeycapPressStates(kc);
+                                                                        match cellGet(kc.kcOnKeySlidePreview) {
+                                                                            Some(cb) -> cb(Some(hit)),
+                                                                            None -> (),
+                                                                        }
+                                                                    } else ()
+                                                                },
+                                                                _ -> (),
+                                                            }
+                                                        }
+                                                    } else ()
+                                                } else ()
+                                            }
+                                        }
+                                    } else (),
+                            },
+                        };
+                        cellSet(ti, cellGet(ti) + 1)
+                    }
+                } else ()
+            },
+        },
+    }
+
+def snapshotHasKeyId(snap: LayoutSnapshot, targetId: String): Bool = {
+    let n = vecLen(snap.lsKeys);
+    let i = cellNew(0);
+    let found = cellNew(false);
+    while (cellGet(i) < n && !cellGet(found)) {
+        match vecGet(snap.lsKeys, cellGet(i)) {
+            Some(k) -> if (k.ksId == targetId) cellSet(found, true) else (),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+def kcTouchesEnded(self: Ptr, _cmd: Ptr, touchesSet: Ptr, event: Ptr): Void =
+    match getCanvasFromSelf(self) {
+        None -> (),
+        Some(kc) -> {
+            let ordered = extractSortedTouches(touchesSet);
+            if (!ptrIsNull(ordered)) {
+                let count = i64ToInt(msgSendI64_0(ordered, objcSel("count")));
+                let ti = cellNew(0);
+                while (cellGet(ti) < count) {
+                    let touch = msgSend1I64_1Ptr(ordered, objcSel("objectAtIndex:"), intToI64(cellGet(ti)), ptrNull());
+                    let id = ptrToI64(touch);
+                    match removeTrackedById(kc, id) {
+                        None -> (),
+                        Some(st) -> {
+                            let pt = touchLocationInView(touch, self);
+                            let ts = msgSendFloat0(touch, objcSel("timestamp"));
+                            cancelLongPressTimer(kc, Some(id));
+                            cancelTrackpadHoldTimer(kc, Some(id));
+
+                            if (cellGet(st.ttCommittedByRollover)) {
+                                syncKeycapPressStates(kc)
+                            } else if (cellGet(st.ttAlternatesActive)) {
+                                match cellGet(kc.kcOnAlternatesMove) {
+                                    Some(cb) -> cb(pt),
+                                    None -> (),
+                                };
+                                syncKeycapPressStates(kc);
+                                match cellGet(kc.kcOnAlternatesEnd) {
+                                    Some(cb) -> cb(true),
+                                    None -> (),
+                                }
+                            } else if (cellGet(st.ttTrackpadActive)) {
+                                trackpadEnd(kc.kcTrackpad);
+                                match cellGet(kc.kcOnTrackpadStateChanged) {
+                                    Some(cb) -> cb(false),
+                                    None -> (),
+                                };
+                                syncKeycapPressStates(kc)
+                            } else if (st.ttForwardedGlobe && !ptrIsNull(event)) {
+                                syncKeycapPressStates(kc);
+                                match cellGet(kc.kcOnGlobeTouchEvent) {
+                                    Some(gcb) -> gcb(self, event),
+                                    None -> (),
+                                }
+                            } else if (st.ttIsPlaneSlide) {
+                                syncKeycapPressStates(kc);
+                                if (!cellGet(st.ttDidSlideToSymbol)) {
+                                    match cellGet(kc.kcOnKeySlidePreview) {
+                                        Some(cb) -> cb(None),
+                                        None -> (),
+                                    }
+                                } else if (pt.y < -72.0) {
+                                    match cellGet(kc.kcOnRestorePlane) { Some(cb) -> cb(), None -> () };
+                                    match cellGet(kc.kcOnKeyTouchCancel) { Some(cb) -> cb(), None -> () }
+                                } else {
+                                    match cellGet(kc.kcSnapshot) {
+                                        None -> {
+                                            match cellGet(kc.kcOnRestorePlane) { Some(cb) -> cb(), None -> () };
+                                            match cellGet(kc.kcOnKeyTouchCancel) { Some(cb) -> cb(), None -> () }
+                                        },
+                                        Some(snap) -> match hitTest(pt, snap) {
+                                            None -> {
+                                                match cellGet(kc.kcOnRestorePlane) { Some(cb) -> cb(), None -> () };
+                                                match cellGet(kc.kcOnKeyTouchCancel) { Some(cb) -> cb(), None -> () }
+                                            },
+                                            Some(hit) -> match hit.ksKind {
+                                                KeySymbol(sym) -> {
+                                                    let activePlane: IOSKeyPlane =
+                                                        if (snapshotHasKeyId(snap, "P_numbers")) PlaneSymbols
+                                                        else PlaneNumbers;
+                                                    match cellGet(kc.kcOnKeyTouchUp) {
+                                                        Some(cb) -> cb(hit, pt),
+                                                        None -> (),
+                                                    };
+                                                    if (!shouldReturnToLettersAfterSymbol(sym, activePlane)) {
+                                                        match cellGet(kc.kcOnRestorePlane) { Some(cb) -> cb(), None -> () }
+                                                    } else ()
+                                                },
+                                                _ ->
+                                                    if (hit.ksId == st.ttInitialKey.ksId) {
+                                                        match cellGet(kc.kcOnKeySlidePreview) {
+                                                            Some(cb) -> cb(None),
+                                                            None -> (),
+                                                        }
+                                                    } else {
+                                                        match cellGet(kc.kcOnRestorePlane) { Some(cb) -> cb(), None -> () };
+                                                        match cellGet(kc.kcOnKeyTouchCancel) { Some(cb) -> cb(), None -> () }
+                                                    },
+                                            },
+                                        },
+                                    }
+                                }
+                            } else {
+                                let dt = maxFloat(0.0, ts - st.ttBeganTimestamp);
+                                let curKey = cellGet(st.ttCurrentKey);
+                                let armedSwipeSymOpt: Option String =
+                                    if (curKey.ksId == st.ttInitialKey.ksId) {
+                                        match st.ttInitialKey.ksSwipeUpSymbol {
+                                            Some(sym) ->
+                                                if (swipeUpIsActive(
+                                                    st.ttInitialPoint,
+                                                    pt,
+                                                    st.ttInitialKey.ksFrame.size.height,
+                                                    cellGet(st.ttSwipeUpActive),
+                                                    cellGet(kc.kcIsComposing)
+                                                )) Some(sym)
+                                                else None,
+                                            None -> None,
+                                        }
+                                    } else None;
+
+                                let isArmedSwipeUp = match armedSwipeSymOpt {
+                                    Some(_) -> true,
+                                    None -> false,
+                                };
+
+                                if (pt.y < -72.0 && dt >= 0.14 && !isArmedSwipeUp) {
+                                    syncKeycapPressStates(kc);
+                                    match cellGet(kc.kcOnKeyTouchCancel) { Some(cb) -> cb(), None -> () }
+                                } else if (st.ttInitialKey.ksKind == KeyBackspace && cellGet(st.ttSwipeUpActive)) {
+                                    syncKeycapPressStates(kc);
+                                    match cellGet(kc.kcOnBackspaceSwipeUp) { Some(cb) -> cb(), None -> () }
+                                } else if (st.ttInitialKey.ksKind == KeyBackspace && cellGet(st.ttSwipeDownActive)) {
+                                    syncKeycapPressStates(kc);
+                                    match cellGet(kc.kcOnBackspaceSwipeDown) { Some(cb) -> cb(), None -> () }
+                                } else {
+                                    match armedSwipeSymOpt {
+                                        Some(sym) -> {
+                                            syncKeycapPressStates(kc);
+                                            match cellGet(kc.kcOnKeySwipeUp) { Some(cb) -> cb(sym), None -> () }
+                                        },
+                                        None -> {
+                                            let commitPt =
+                                                if (curKey.ksId == st.ttInitialKey.ksId) st.ttInitialPoint else pt;
+                                            syncKeycapPressStates(kc);
+                                            match cellGet(kc.kcOnKeyTouchUp) {
+                                                Some(cb) -> cb(curKey, commitPt),
+                                                None -> (),
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+                        },
+                    };
+                    cellSet(ti, cellGet(ti) + 1)
+                }
+            } else ()
+        },
+    }
+
+def kcTouchesCancelled(self: Ptr, _cmd: Ptr, touchesSet: Ptr, event: Ptr): Void =
+    match getCanvasFromSelf(self) {
+        None -> (),
+        Some(kc) -> {
+            let ordered = extractSortedTouches(touchesSet);
+            let rescuedAny = cellNew(false);
+            if (!ptrIsNull(ordered)) {
+                let count = i64ToInt(msgSendI64_0(ordered, objcSel("count")));
+                let canvasHidden = isViewHidden(self);
+                let b = viewBounds(self);
+                let ti = cellNew(0);
+                while (cellGet(ti) < count) {
+                    let touch = msgSend1I64_1Ptr(ordered, objcSel("objectAtIndex:"), intToI64(cellGet(ti)), ptrNull());
+                    let id = ptrToI64(touch);
+                    match removeTrackedById(kc, id) {
+                        None -> (),
+                        Some(st) -> {
+                            cancelLongPressTimer(kc, Some(id));
+                            cancelTrackpadHoldTimer(kc, Some(id));
+
+                            if (cellGet(st.ttAlternatesActive) && !cellGet(st.ttCommittedByRollover)) {
+                                match cellGet(kc.kcOnAlternatesEnd) {
+                                    Some(cb) -> cb(false),
+                                    None -> (),
+                                };
+                                cellSet(rescuedAny, true)
+                            } else if (st.ttIsPlaneSlide) {
+                                if (cellGet(st.ttDidSlideToSymbol)) {
+                                    match cellGet(kc.kcOnRestorePlane) { Some(cb) -> cb(), None -> () }
+                                } else ()
+                            } else if (cellGet(st.ttTrackpadActive)) {
+                                trackpadEnd(kc.kcTrackpad);
+                                match cellGet(kc.kcOnTrackpadStateChanged) {
+                                    Some(cb) -> cb(false),
+                                    None -> (),
+                                }
+                            } else if (st.ttForwardedGlobe) {
+                                if (!ptrIsNull(event)) {
+                                    match cellGet(kc.kcOnGlobeTouchEvent) {
+                                        Some(gcb) -> gcb(self, event),
+                                        None -> (),
+                                    }
+                                } else ()
+                            } else if (cellGet(st.ttCommittedByRollover) || st.ttInitialKey.ksKind == KeyBackspace) {
+                                ()
+                            } else {
+                                let rescuedSwipe =
+                                    if (cellGet(st.ttSwipeUpActive) && !canvasHidden) {
+                                        match st.ttInitialKey.ksSwipeUpSymbol {
+                                            Some(sym) -> {
+                                                cellSet(rescuedAny, true);
+                                                match cellGet(kc.kcOnKeySwipeUp) { Some(cb) -> cb(sym), None -> () };
+                                                true
+                                            },
+                                            None -> false,
+                                        }
+                                    } else false;
+
+                                if (!rescuedSwipe) {
+                                    let rawEndPt = touchLocationInView(touch, self);
+                                    let ts = msgSendFloat0(touch, objcSel("timestamp"));
+                                    let saneCancelPt = rectContainsPoint(rectInset(b, -48.0, -64.0), rawEndPt);
+                                    let maxMoved = cellGet(st.ttMaxMovedDistance);
+                                    let maxDy = cellGet(st.ttMaxAbsDeltaY);
+                                    let effectiveDrift =
+                                        if (saneCancelPt) {
+                                            maxFloat(maxMoved, hypot2(rawEndPt.x - st.ttInitialPoint.x, rawEndPt.y - st.ttInitialPoint.y))
+                                        } else maxMoved;
+                                    let effectiveAbsDy =
+                                        if (saneCancelPt) {
+                                            maxFloat(maxDy, abs(rawEndPt.y - st.ttInitialPoint.y))
+                                        } else maxDy;
+                                    let dt = maxFloat(0.0, ts - st.ttBeganTimestamp);
+                                    let shouldRescue =
+                                        if (st.ttStartedOnSpace) {
+                                            !canvasHidden && effectiveAbsDy <= 20.0 && effectiveDrift <= 52.0 && dt <= 0.42
+                                        } else {
+                                            !canvasHidden && effectiveDrift <= 20.0 && dt <= 0.38
+                                        };
+                                    if (shouldRescue) {
+                                        cellSet(rescuedAny, true);
+                                        match cellGet(kc.kcOnKeyTouchUp) {
+                                            Some(cb) -> cb(st.ttInitialKey, st.ttInitialPoint),
+                                            None -> (),
+                                        }
+                                    } else ()
+                                } else ()
+                            }
+                        },
+                    };
+                    cellSet(ti, cellGet(ti) + 1)
+                }
+            } else ();
+
+            syncKeycapPressStates(kc);
+            let allRemainingCommitted = cellNew(true);
+            let ri = cellNew(0);
+            while (cellGet(ri) < vecLen(kc.kcTrackedTouches) && cellGet(allRemainingCommitted)) {
+                match vecGet(kc.kcTrackedTouches, cellGet(ri)) {
+                    Some(rem) -> if (!cellGet(rem.ttCommittedByRollover)) cellSet(allRemainingCommitted, false) else (),
+                    None -> (),
+                };
+                cellSet(ri, cellGet(ri) + 1)
+            };
+            if (!cellGet(rescuedAny) && cellGet(allRemainingCommitted)) {
+                match cellGet(kc.kcOnKeyTouchCancel) {
+                    Some(cb) -> cb(),
+                    None -> (),
+                }
+            } else ()
+        },
+    }
+
+pub def keyCanvasViewNew(): IOSKeyCanvasView = {
+    let cls = objcClass("JuxuIOSKeyCanvasView");
+    let v =
+        if (ptrIsNull(cls)) ptrNull()
+        else {
+            let allocObj = msgSend0(cls, objcSel("alloc"));
+            // UIInputViewStyleKeyboard == 1
+            msgSendInitStyle(allocObj, objcSel("initWithFrame:inputViewStyle:"), cgRect(0.0, 0.0, 0.0, 0.0), intToI64(1))
+        };
+    if (!ptrIsNull(v)) {
+        msgSendVoid1Bool(v, objcSel("setMultipleTouchEnabled:"), true);
+        setViewBgColor(v, uiColorSystemBgAlpha(0.02));
+        msgSendVoid1Bool(v, objcSel("setClipsToBounds:"), false);
+        setAccessibilityId(v, "JuxuKeyCanvas")
+    } else ();
+
+    let defaultPriors: Vec Int = vecWithCap(26);
+    let pi = cellNew(0);
+    while (cellGet(pi) < 26) { vecPush(defaultPriors, 100); cellSet(pi, cellGet(pi) + 1) };
+    let defaultOffsets: Vec Float = vecWithCap(52);
+    let oi = cellNew(0);
+    while (cellGet(oi) < 52) { vecPush(defaultOffsets, 0.0); cellSet(oi, cellGet(oi) + 1) };
+    let defaultT9Priors: Vec Int = vecWithCap(8);
+    let tpi = cellNew(0);
+    while (cellGet(tpi) < 8) { vecPush(defaultT9Priors, 100); cellSet(tpi, cellGet(tpi) + 1) };
+    let defaultT9Offsets: Vec Float = vecWithCap(16);
+    let toi = cellNew(0);
+    while (cellGet(toi) < 16) { vecPush(defaultT9Offsets, 0.0); cellSet(toi, cellGet(toi) + 1) };
+
+    let kc = IOSKeyCanvasView {
+        kcView: v,
+        kcOwner: idAdoptOpt(v),
+        kcOnKeyTouchDown: cellNew(None),
+        kcOnKeySlidePreview: cellNew(None),
+        kcOnKeyTouchUp: cellNew(None),
+        kcOnKeyTouchCancel: cellNew(None),
+        kcOnTrackpadStateChanged: cellNew(None),
+        kcOnRestorePlane: cellNew(None),
+        kcOnTrackpadMove: cellNew(None),
+        kcOnKeySwipeUp: cellNew(None),
+        kcOnBackspaceSwipeArmed: cellNew(None),
+        kcOnBackspaceSwipeUp: cellNew(None),
+        kcOnBackspaceSwipeDownArmed: cellNew(None),
+        kcOnBackspaceSwipeDown: cellNew(None),
+        kcOnAlternatesBegin: cellNew(None),
+        kcOnAlternatesMove: cellNew(None),
+        kcOnAlternatesEnd: cellNew(None),
+        kcOnGlobeTouchEvent: cellNew(None),
+        kcCanUndoLineClear: cellNew(false),
+        kcBackspaceSwipeClearEnabled: cellNew(false),
+        kcKeyboardHoldCursorEnabled: cellNew(false),
+        kcLongPressAlternatesEnabled: cellNew(false),
+        kcAsciiMode: cellNew(false),
+        kcSnapshot: cellNew(None),
+        kcIsComposing: cellNew(false),
+        kcValidNextMask: cellNew(0x03FF_FFFF),
+        kcNextKeyPriors: cellNew(defaultPriors),
+        kcTouchOffsets: cellNew(defaultOffsets),
+        kcT9ValidNextMask: cellNew(0xFF),
+        kcT9NextKeyPriors: cellNew(defaultT9Priors),
+        kcT9TouchOffsets: cellNew(defaultT9Offsets),
+        kcCoveredCalloutKeyId: cellNew(None),
+        kcKeycapNodes: vecNew(),
+        kcTrackedTouches: vecNew(),
+        kcSpaceHoldGen: cellNew(intToI64(0)),
+        kcSpaceHoldTouchId: cellNew(intToI64(0)),
+        kcLongPressGen: cellNew(intToI64(0)),
+        kcLongPressTouchId: cellNew(intToI64(0)),
+        kcTrackpad: trackpadNew(),
+        kcIsDark: cellNew(false),
+    };
+    if (!ptrIsNull(v)) {
+        objcSetAssocHandle(v, canvasAssocKey(), gcHandleNew(kc))
+    } else ();
+    kc
+}
+
+// ============================================================================
+// IOST9SidebarView (`IOSKeyCanvasView.swift` lines 1133–1260)
+// ============================================================================
+
+pub data IOST9SidebarView {
+    sbView: Ptr,
+    sbOwner: Option (Id NSObject),
+    sbScrollView: Ptr,
+    sbButtons: Vec Ptr,
+    sbSeparators: Vec Ptr,
+    sbCurrentItems: Vec String,
+    sbIsSyllableMode: Cell Bool,
+    sbIsDark: Cell Bool,
+    sbOnSelectPunctuation: Cell (Option ((String) -> Void)),
+    sbOnSelectSyllable: Cell (Option ((String) -> Void)),
+}
+
+def t9SidebarAssocKey(): Ptr = objcSel("__juxuT9SidebarAssocKey")
+
+def idleT9Punctuations(): Vec String = {
+    let v: Vec String = vecWithCap(8);
+    vecPush(v, "，"); vecPush(v, "。"); vecPush(v, "？"); vecPush(v, "！");
+    vecPush(v, "、"); vecPush(v, "……"); vecPush(v, "“"); vecPush(v, "”");
+    v
+}
+
+def vecStrEq(a: Vec String, b: Vec String): Bool = {
+    let n = vecLen(a);
+    if (n != vecLen(b)) false
+    else {
+        let i = cellNew(0);
+        let same = cellNew(true);
+        while (cellGet(i) < n && cellGet(same)) {
+            if (vecGetOr(a, cellGet(i), "") != vecGetOr(b, cellGet(i), "")) {
+                cellSet(same, false)
+            } else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(same)
+    }
+}
+
+def t9SidebarLayoutRows(sb: IOST9SidebarView): Void =
+    if (!ptrIsNull(sb.sbView) && !ptrIsNull(sb.sbScrollView)) {
+        let b = viewBounds(sb.sbView);
+        setViewFrame(sb.sbScrollView, b);
+        let w = b.size.width;
+        let h = b.size.height;
+        if (w > 4.0 && h > 4.0) {
+            let rowH = maxFloat(36.0, floor(h / 4.0));
+            let n = vecLen(sb.sbButtons);
+            let totalH = maxFloat(h, rowH * intToFloat(n));
+            let sepW = maxFloat(0.0, w - 16.0);
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let idx = cellGet(i);
+                match vecGet(sb.sbButtons, idx) {
+                    Some(btn) -> setViewFrame(btn, cgRect(0.0, intToFloat(idx) * rowH, w, rowH)),
+                    None -> (),
+                };
+                if (idx > 0) {
+                    match vecGet(sb.sbSeparators, idx - 1) {
+                        Some(sep) -> setViewFrame(sep, cgRect(8.0, 0.0, sepW, 0.5)),
+                        None -> (),
+                    }
+                } else ();
+                cellSet(i, idx + 1)
+            };
+            msgSendVoid1Size(sb.sbScrollView, objcSel("setContentSize:"), cgSize(w, totalH))
+        } else ()
+    } else ()
+
+def sbLayoutSubviews(self: Ptr, cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIView", cmd);
+    let h = objcGetAssocHandle(self, t9SidebarAssocKey());
+    if (h != intToI64(0)) {
+        let sb: IOST9SidebarView = gcHandleGet(h);
+        t9SidebarLayoutRows(sb)
+    } else ()
+}
+
+def sbHandleRowTap(self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
+    let h = objcGetAssocHandle(self, t9SidebarAssocKey());
+    if (h != intToI64(0) && !ptrIsNull(sender)) {
+        let sb: IOST9SidebarView = gcHandleGet(h);
+        let idx = i64ToInt(msgSendI64_0(sender, objcSel("tag")));
+        match vecGet(sb.sbCurrentItems, idx) {
+            Some(item) ->
+                if (cellGet(sb.sbIsSyllableMode)) {
+                    match cellGet(sb.sbOnSelectSyllable) { Some(cb) -> cb(item), None -> () }
+                } else {
+                    match cellGet(sb.sbOnSelectPunctuation) { Some(cb) -> cb(item), None -> () }
+                },
+            None -> (),
+        }
+    } else ()
+}
+
+pub def t9SidebarViewNew(): IOST9SidebarView = {
+    let z = cgRect(0.0, 0.0, 0.0, 0.0);
+    let v = objcAllocInitFrame("JuxuIOST9SidebarView", z);
+    let sv = objcAllocInitFrame("UIScrollView", z);
+    if (!ptrIsNull(v)) {
+        setContinuousCorner(viewLayer(v), keyCornerRadius());
+        msgSendVoid1Bool(v, objcSel("setClipsToBounds:"), true);
+        if (!ptrIsNull(sv)) {
+            msgSendVoid1Bool(sv, objcSel("setShowsVerticalScrollIndicator:"), false);
+            msgSendVoid1Bool(sv, objcSel("setShowsHorizontalScrollIndicator:"), false);
+            msgSendVoid1Bool(sv, objcSel("setAlwaysBounceVertical:"), true);
+            msgSendVoid1Bool(sv, objcSel("setDelaysContentTouches:"), false);
+            msgSendVoid1Ptr(v, objcSel("addSubview:"), sv);
+            msgSendVoid0(sv, objcSel("release"))
+        } else ()
+    } else ();
+
+    let sb = IOST9SidebarView {
+        sbView: v,
+        sbOwner: idAdoptOpt(v),
+        sbScrollView: sv,
+        sbButtons: vecNew(),
+        sbSeparators: vecNew(),
+        sbCurrentItems: vecNew(),
+        sbIsSyllableMode: cellNew(false),
+        sbIsDark: cellNew(false),
+        sbOnSelectPunctuation: cellNew(None),
+        sbOnSelectSyllable: cellNew(None),
+    };
+    if (!ptrIsNull(v)) {
+        objcSetAssocHandle(v, t9SidebarAssocKey(), gcHandleNew(sb))
+    } else ();
+    sb
+}
+
+pub def t9SidebarUpdate(
+    sb: IOST9SidebarView,
+    syllables: Vec String,
+    composing: Bool,
+    dark: Bool
+): Void =
+    if (!ptrIsNull(sb.sbView)) {
+        let nextMode = composing && vecLen(syllables) > 0;
+        let nextItems = if (nextMode) syllables else idleT9Punctuations();
+        let needsRebuild =
+            (nextMode != cellGet(sb.sbIsSyllableMode))
+                || !vecStrEq(nextItems, sb.sbCurrentItems)
+                || (dark != cellGet(sb.sbIsDark));
+        cellSet(sb.sbIsSyllableMode, nextMode);
+        cellSet(sb.sbIsDark, dark);
+
+        setViewBgColor(
+            sb.sbView,
+            if (dark) uiColorWhite(1.0, 0.13)
+            else uiColorRgba(229.0 / 255.0, 231.0 / 255.0, 236.0 / 255.0, 1.0)
+        );
+
+        if (needsRebuild) {
+            let bi = cellNew(0);
+            while (cellGet(bi) < vecLen(sb.sbButtons)) {
+                match vecGet(sb.sbButtons, cellGet(bi)) {
+                    Some(btn) -> if (!ptrIsNull(btn)) msgSendVoid0(btn, objcSel("removeFromSuperview")) else (),
+                    None -> (),
+                };
+                cellSet(bi, cellGet(bi) + 1)
+            };
+            vecClear(sb.sbButtons);
+            vecClear(sb.sbSeparators);
+            vecClear(sb.sbCurrentItems);
+
+            let fg = if (dark) uiColorPureWhite() else uiColorBlack();
+            let sepColor = if (dark) uiColorWhite(1.0, 0.12) else uiColorWhite(0.0, 0.09);
+            let font = if (nextMode) uiSystemFont(15.0, 1) else uiSystemFont(18.0, 0);
+            let btnCls = objcClass("UIButton");
+
+            let count = vecLen(nextItems);
+            let idx = cellNew(0);
+            while (cellGet(idx) < count) {
+                let i = cellGet(idx);
+                let item = vecGetOr(nextItems, i, "");
+                vecPush(sb.sbCurrentItems, item);
+
+                // UIButtonTypeSystem == 1
+                let btn = if (ptrIsNull(btnCls)) ptrNull() else msgSend1I64(btnCls, objcSel("buttonWithType:"), intToI64(1));
+                if (!ptrIsNull(btn)) {
+                    msgSendVoid1Ptr1I64(btn, objcSel("setTitle:forState:"), nsStr(item), intToI64(0));
+                    msgSendVoid1Ptr1I64(btn, objcSel("setTitleColor:forState:"), fg, intToI64(0));
+                    let titleLbl = msgSend0(btn, objcSel("titleLabel"));
+                    if (!ptrIsNull(titleLbl)) {
+                        setLabelFont(titleLbl, font);
+                        msgSendVoid1Bool(titleLbl, objcSel("setAdjustsFontSizeToFitWidth:"), true);
+                        msgSendVoid1Float(titleLbl, objcSel("setMinimumScaleFactor:"), 0.72)
+                    } else ();
+                    msgSendVoid1I64(btn, objcSel("setTag:"), intToI64(i));
+                    // UIControlEventTouchUpInside == 1 << 6 == 64
+                    msgSendVoid1Ptr1Sel1U64(btn, objcSel("addTarget:action:forControlEvents:"), sb.sbView, objcSel("handleT9SidebarRowTap:"), intToI64(64));
+
+                    if (i > 0) {
+                        let sep = objcAllocInitFrame("UIView", cgRect(8.0, 0.0, 40.0, 0.5));
+                        if (!ptrIsNull(sep)) {
+                            setViewBgColor(sep, sepColor);
+                            msgSendVoid1Bool(sep, objcSel("setUserInteractionEnabled:"), false);
+                            msgSendVoid1Ptr(btn, objcSel("addSubview:"), sep);
+                            msgSendVoid0(sep, objcSel("release"))
+                        } else ();
+                        vecPush(sb.sbSeparators, sep)
+                    } else ();
+
+                    msgSendVoid1Ptr(sb.sbScrollView, objcSel("addSubview:"), btn)
+                } else ();
+                vecPush(sb.sbButtons, btn);
+                cellSet(idx, i + 1)
+            };
+
+            setScrollContentOffsetZero(sb.sbScrollView);
+            t9SidebarLayoutRows(sb)
+        } else ()
+    } else ()
+
+extern init(101) def registerKeyCanvasObjCClasses(): Void = {
+    let kcCls = objcAllocateClass("UIInputView", "JuxuIOSKeyCanvasView");
+    if (!ptrIsNull(kcCls)) {
+        let _ = objcAddProtocol(kcCls, "UIInputViewAudioFeedback");
+        let _ = objcAddMethod(kcCls, "enableInputClicksWhenVisible", cFnPtr(kcEnableInputClicks), "B@:");
+        let _ = objcAddMethod(kcCls, "pointInside:withEvent:", cFnPtr(kcPointInside), "B@:{CGPoint=dd}@");
+        let _ = objcAddMethod(kcCls, "willMoveToWindow:", cFnPtr(kcWillMoveToWindow), "v@:@");
+        let _ = objcAddMethod(kcCls, "setHidden:", cFnPtr(kcSetHidden), "v@:B");
+        let _ = objcAddMethod(kcCls, "touchesBegan:withEvent:", cFnPtr(kcTouchesBegan), "v@:@@");
+        let _ = objcAddMethod(kcCls, "touchesMoved:withEvent:", cFnPtr(kcTouchesMoved), "v@:@@");
+        let _ = objcAddMethod(kcCls, "touchesEnded:withEvent:", cFnPtr(kcTouchesEnded), "v@:@@");
+        let _ = objcAddMethod(kcCls, "touchesCancelled:withEvent:", cFnPtr(kcTouchesCancelled), "v@:@@");
+        objcRegisterClass(kcCls)
+    } else ();
+
+    let sbCls = objcAllocateClass("UIView", "JuxuIOST9SidebarView");
+    if (!ptrIsNull(sbCls)) {
+        let _ = objcAddMethod(sbCls, "layoutSubviews", cFnPtr(sbLayoutSubviews), "v@:");
+        let _ = objcAddMethod(sbCls, "handleT9SidebarRowTap:", cFnPtr(sbHandleRowTap), "v@:@");
+        objcRegisterClass(sbCls)
+    } else ()
+}

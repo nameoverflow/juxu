@@ -1,0 +1,1357 @@
+/// Complete 1:1 port of:
+/// - `VoiceGlobalKeyRouter`, `VoiceGlobalCommitPolicy`, `VoiceGlobalCommitter`, `VoiceGlobalHotkeyController` (`VoiceGlobalHotkey.swift`)
+/// - `VoiceLocalInstaller` (`VoiceLocalInstaller.swift`)
+/// - `VoiceContextInspectorStore` (`VoiceContextCapture.swift`)
+/// - `VoiceSessionController` & `VoiceCuePlayer` (`VoiceSessionController.swift`)
+
+use std.option.{Option, Some, None}
+use std.result.{Ok, Err}
+use std.vec.{Vec, vecNew, vecLen, vecPush, vecGetOr}
+use std.str.{intToStr, parseFloat, strContains, strStartsWith, strTrim}
+use objc.{objcClass, objcSel, msgSendInt0, msgSendI64_0, msgSendVoid0}
+use juxu_shared.{
+    CGRect, cgRect, nsStr, nsStrPtrToString, nsStrPtrToOpt,
+    systemUptimeSeconds, dispatchMainAfterMs, bridgeShared,
+}
+use juxu_core.{UserPhraseInfo, MkUserPhrase}
+use voice_common.{
+    VoicePreferences, VoiceProviderMode, VpmCloudBYOK, VpmLocal,
+    VoiceCloudPreset, vcpDisplayName,
+    VoiceLocalASRModelPreset, VlaQwen3ASR, VlaWhisperTurbo, VlaWhisperBase, VlaAppleSpeech, VlaCustomHTTP,
+    vlaToRaw, vlaDisplayName, vlaIsEngineBackend,
+    VoiceLocalLLMPreset, VllQwen15B, VllOllamaHTTP, VllNone, vllToRaw, vllDisplayName,
+    VoiceTriggerKey, VtkRightOption, VtkRightCommand, VtkFnKey, VtkOptionSpace,
+    vtkIsHoldToTalk, vtkModifierKeyCode,
+    VoiceOutputMode, VomSmartPolish, VomRawDictation,
+    VoiceHUDState, VhsRecording, VhsTranscribing, VhsPolishing, VhsNotice,
+    voiceHUDShow, voiceHUDHide, voiceHUDUnload,
+    VoiceLocalComponentStatus, vlcsIsReady,
+    VoiceInstallPhase, VipIdle, VipInstallingDep, VipDownloadingModel, VipCompleted, VipFailed, vipIsBusy,
+    VoiceGlobalPermStatus, VoiceContextSummary,
+    voicePrefsGet, voicePrefsUpdate, voiceAxIsTrusted,
+    vpIsGlobalHotkeyEnabled, vpAreVoiceCuesEnabled, vpIsContextCaptureEnabled,
+    vpRespectsContextBlacklist, vpEffectiveCloudASRBaseURL, vpEffectiveCloudASRModel,
+    vpEffectiveCloudLLMBaseURL, vpEffectiveCloudLLMModel,
+    vpEffectiveCloudASRKeyAccount, vpEffectiveCloudLLMKeyAccount,
+    vpParsedCustomVocabulary, voiceKeychainRead,
+    VoiceSessionTimeline, vstNew, vstBegin, vstMark, vstHas, VtmFirstDraw, VtmHudShown, VtmMicRunning, VtmRelease, VtmFinalDone, VtmInserted,
+    gVoiceOnUnloadHook, gVoiceOnHotkeySyncHook,
+    gVoiceAsrStatusHook, gVoiceLlmStatusHook, gVoiceInstallPhaseCell, voiceNotifyInstallerChanged,
+    gVoiceInstallASRHook, gVoiceInstallLLMHook, gVoiceDeleteModelHook, gVoiceCancelInstallHook,
+    gVoiceGlobalPermCurrentHook, gVoiceGlobalPermRequestHook, gVoiceTestConfigHook,
+    gVoiceInspectorPresented, gVoiceInspectorCapturing, gVoiceInspectorCountdown,
+    gVoiceInspectorLastSummary, voiceNotifyInspectorChanged,
+    gVoiceInspectorTriggerHook, gVoiceInspectorCancelHook,
+}
+use voice_prompt.{
+    VoiceContext, emptyVoiceContext, voiceContextWithVocab, vctxMergeSummary,
+    vctxPromptSafe, vctxRestricted, vpRecognitionContext, vpPolishContext,
+    vcpBlacklistReason, vpAsciiLower, vpJoinStrings, vctHead,
+    VoiceASRContextTarget, VatQwen, VatWhisper, VatCloud,
+    vacbRecognitionContext, vacbContextualStrings, vacbIsPromptEcho,
+    VoicePolishContextBudget, VpcbFull, VpcbCompact,
+    vpbPolishPrompts, buildContextPromptPreview,
+    vhfFiltered, vwspNormalizedTranscript,
+}
+
+// ---------------------------------------------------------------------------
+// C / ObjC Bridge Imports
+// ---------------------------------------------------------------------------
+
+extern "juxu_voice_simplified_ns" def c_voiceSimplifiedNs(nsText: Ptr, nsLang: Ptr): Ptr
+extern "juxu_voice_play_cue" def c_voicePlayCue(kind: Int64): Void
+extern "juxu_voice_test_speech_gate" def c_voiceTestSpeechGate(samples: Ptr, count: Int64): Float
+extern "juxu_voice_request_mic_speech" def c_voiceReqMicSpeech(needSpeech: Bool, fnPtr: Ptr, h: Int64): Void
+extern "juxu_voice_probe_asr_status" def c_voiceProbeAsr(nsRaw: Ptr, outDep: Ptr, outMod: Ptr, outBytes: Ptr): Ptr
+extern "juxu_voice_probe_llm_status" def c_voiceProbeLlm(nsRaw: Ptr, outDep: Ptr, outMod: Ptr, outBytes: Ptr): Ptr
+extern "juxu_voice_delete_model_file" def c_voiceDeleteModel(nsFile: Ptr): Void
+extern "juxu_voice_check_apple_speech" def c_voiceCheckAppleSpeech(nsLoc: Ptr, reqOnDev: Bool): Int64
+extern "juxu_voice_recorder_cancel" def c_voiceRecCancel(): Void
+extern "juxu_voice_recorder_mute" def c_voiceRecMute(sec: Float): Void
+extern "juxu_voice_recorder_start" def c_voiceRecStart(
+    useApple: Bool, nsLoc: Ptr, reqOnDev: Bool, nsCtx: Ptr,
+    startFn: Ptr, startH: Int64, levelFn: Ptr, levelH: Int64
+): Void
+extern "juxu_voice_stop_and_transcribe" def c_voiceStopAndTranscribe(
+    isShort: Bool, useApple: Bool, usesLocalEng: Bool,
+    nsPreset: Ptr, nsBase: Ptr, nsKey: Ptr, nsModel: Ptr, nsLang: Ptr, nsPrompt: Ptr,
+    fnPtr: Ptr, cbH: Int64, outVoiced: Ptr
+): Void
+extern "juxu_voice_polish_async" def c_voicePolishAsync(
+    useLlama: Bool, nsBaseOrBin: Ptr, nsKeyOrPath: Ptr, nsModel: Ptr,
+    nsSys: Ptr, nsUsr: Ptr, fnPtr: Ptr, cbH: Int64
+): Void
+extern "juxu_voice_cancel_install" def c_voiceCancelInstall(): Void
+extern "juxu_voice_install_component" def c_voiceInstallComp(
+    isLlm: Bool, nsRaw: Ptr, nsDisp: Ptr, fnPtr: Ptr, h: Int64
+): Void
+
+extern "juxu_voice_perm_input_monitoring" def c_voicePermInputMon(): Bool
+extern "juxu_voice_perm_request_all" def c_voicePermRequestAll(): Void
+extern "juxu_voice_is_secure_event_input" def c_voiceIsSecureInput(): Bool
+extern "juxu_voice_frontmost_bundle_and_name" def c_voiceFrontmostInfo(): Ptr
+extern "juxu_voice_capture_context_async" def c_voiceCaptureCtxAsync(respectBl: Bool, fnPtr: Ptr, h: Int64): Void
+extern "juxu_voice_global_tap_start" def c_voiceTapStart(fnPtr: Ptr): Bool
+extern "juxu_voice_global_tap_stop" def c_voiceTapStop(): Void
+extern "juxu_voice_global_tap_is_listening" def c_voiceTapIsListening(): Bool
+extern "juxu_voice_committer_capture_target" def c_voiceCommitterCapture(outX: Ptr, outY: Ptr): Void
+extern "juxu_voice_committer_selected_text" def c_voiceCommitterSelected(): Ptr
+extern "juxu_voice_committer_commit" def c_voiceCommitterCommit(nsText: Ptr, fnPtr: Ptr, h: Int64): Void
+
+extern "juxu_voice_read_i64" def c_readI64(buf: Ptr, byteOff: Int64): Int64
+extern "juxu_voice_read_f64" def c_readF64(buf: Ptr, byteOff: Int64): Float
+
+// Callback trampolines
+def __trampOkStr(h: Int64, ok: Bool, nsMsg: Ptr): Void = {
+    let f: (Bool, String) -> Void = gcHandleGet(h);
+    f(ok, nsStrPtrToString(nsMsg))
+}
+
+def __trampLevel(h: Int64, lvl: Float, nsPart: Ptr): Void = {
+    let f: (Float, Option String) -> Void = gcHandleGet(h);
+    f(lvl, nsStrPtrToOpt(nsPart))
+}
+
+def __trampProg(h: Int64, kind: Int, prog: Float, nsName: Ptr, nsDet: Ptr): Void = {
+    let f: (Int, Float, String, String) -> Void = gcHandleGet(h);
+    f(kind, prog, nsStrPtrToString(nsName), nsStrPtrToString(nsDet))
+}
+
+def __trampAx(
+    h: Int64,
+    nsAppName: Ptr, nsAppId: Ptr, nsAppType: Ptr,
+    nsWinTitle: Ptr, nsWebUrl: Ptr,
+    enhancedUI: Bool, nsRole: Ptr, isEditable: Bool,
+    isBlacklisted: Bool, nsBlacklistReason: Ptr, isSecureInput: Bool,
+    nsSelected: Ptr, nsBeforeCur: Ptr, nsAfterCur: Ptr,
+    nsBeforeArea: Ptr, nsAfterArea: Ptr, nsVisible: Ptr,
+    elapsedMs: Int64, nsPrettyJson: Ptr
+): Void = {
+    let f: VoiceContextSummary -> Void = gcHandleGet(h);
+    f(VoiceContextSummary {
+        vcsAppName: nsStrPtrToString(nsAppName),
+        vcsAppIdentifier: nsStrPtrToString(nsAppId),
+        vcsAppType: nsStrPtrToString(nsAppType),
+        vcsWindowTitle: nsStrPtrToString(nsWinTitle),
+        vcsWebURL: nsStrPtrToOpt(nsWebUrl),
+        vcsEnhancedUI: enhancedUI,
+        vcsRole: nsStrPtrToString(nsRole),
+        vcsIsEditable: isEditable,
+        vcsIsBlacklisted: isBlacklisted,
+        vcsBlacklistReason: nsStrPtrToOpt(nsBlacklistReason),
+        vcsIsSecureInput: isSecureInput,
+        vcsSelectedText: nsStrPtrToString(nsSelected),
+        vcsTextBeforeCursor: nsStrPtrToString(nsBeforeCur),
+        vcsTextAfterCursor: nsStrPtrToString(nsAfterCur),
+        vcsTextBeforeArea: nsStrPtrToString(nsBeforeArea),
+        vcsTextAfterArea: nsStrPtrToString(nsAfterArea),
+        vcsVisibleScreenContent: nsStrPtrToOpt(nsVisible),
+        vcsElapsedMs: i64ToInt(elapsedMs),
+        vcsPrettyJSON: nsStrPtrToString(nsPrettyJson),
+        vcsAsrTargetLabel: "",
+        vcsAsrContext: "",
+        vcsPolishBudgetLabel: "",
+        vcsPolishContext: "",
+    })
+}
+
+def __trampCommit(h: Int64, nsNotice: Ptr): Void = {
+    let f: (Option String) -> Void = gcHandleGet(h);
+    f(nsStrPtrToOpt(nsNotice))
+}
+
+pub def voiceSimplified(text: String, lang: String): String =
+    nsStrPtrToString(c_voiceSimplifiedNs(nsStr(text), nsStr(lang)))
+
+// ---------------------------------------------------------------------------
+// 1. VoiceGlobalKeyRouter & VoiceGlobalCommitPolicy (`VoiceGlobalHotkey.swift`)
+// ---------------------------------------------------------------------------
+
+pub data VoiceGlobalKeyDecision : Eq {
+    VgkdForward,
+    VgkdIgnore,
+    VgkdCancelChord,
+}
+
+def triggerModifierMask(trigger: VoiceTriggerKey): Option Int64 = match trigger {
+    VtkRightOption  -> Some(intToI64(0x80000)),   // NSEventModifierFlagOption
+    VtkRightCommand -> Some(intToI64(0x100000)),  // NSEventModifierFlagCommand
+    VtkFnKey        -> Some(intToI64(0x800000)),  // NSEventModifierFlagFunction
+    VtkOptionSpace  -> None,
+}
+
+pub def vgkrDecide(
+    isKeyDown: Bool,
+    keyCode: Int,
+    flags: Int64,
+    trigger: VoiceTriggerKey,
+    isSecureInput: Bool,
+    isRecording: Bool
+): VoiceGlobalKeyDecision = match triggerModifierMask(trigger) {
+    None -> VgkdIgnore,
+    Some(modMask) ->
+        if (isKeyDown) {
+            if (isRecording && keyCode == 0x35) VgkdForward
+            else if (isSecureInput) VgkdIgnore
+            else if (isRecording) {
+                if ((flags & modMask) != intToI64(0)) VgkdCancelChord else VgkdIgnore
+            } else VgkdForward
+        } else {
+            if (isSecureInput && !isRecording) VgkdIgnore else VgkdForward
+        },
+}
+
+pub data VoiceGlobalInsertRoute : Eq {
+    VgirInputMethod,
+    VgirAccessibility,
+    VgirPasteFallback,
+    VgirClipboardOnly(String),
+}
+
+pub def vgcpAllowsPasteFallback(bundleIdOpt: Option String, roleOpt: Option String): Bool = {
+    let isFinder = match bundleIdOpt {
+        Some(raw) -> vpAsciiLower(raw) == "com.apple.finder",
+        None      -> false,
+    };
+    if (isFinder) false
+    else {
+        let byBid = match bundleIdOpt {
+            None -> false,
+            Some(raw) -> {
+                let bid = vpAsciiLower(raw);
+                strStartsWith(bid, "com.tencent.xinwechat")
+                || strStartsWith(bid, "com.tencent.wechat")
+                || strStartsWith(bid, "com.tencent.qq")
+                || strStartsWith(bid, "com.electron.")
+                || strStartsWith(bid, "com.bytedance.lark")
+                || strStartsWith(bid, "com.alibaba.dingtalk")
+                || strStartsWith(bid, "com.tinyspeck.slackmacgap")
+                || strStartsWith(bid, "com.hnc.discord")
+                || strStartsWith(bid, "ru.keepcoder.telegram")
+                || strStartsWith(bid, "com.apple.terminal")
+                || strStartsWith(bid, "com.googlecode.iterm2")
+                || strStartsWith(bid, "com.mitchellh.ghostty")
+                || strStartsWith(bid, "dev.warp.warp-stable")
+                || strStartsWith(bid, "net.kovidgoyal.kitty")
+                || strStartsWith(bid, "org.alacritty")
+                || strStartsWith(bid, "com.microsoft.vscode")
+                || strStartsWith(bid, "com.todesktop.230313mzl4w4u92")
+                || strStartsWith(bid, "dev.zed.zed")
+                || strStartsWith(bid, "com.jetbrains.")
+        },
+    };
+        if (byBid) true
+        else match roleOpt {
+            None -> false,
+            Some(r) -> r == "AXWebArea" || r == "AXGroup" || r == "AXScrollArea" || r == "AXUnknown",
+        }
+    }
+}
+
+pub def vgcpRoute(
+    isSecure: Bool,
+    focusUnchanged: Bool,
+    hasInputMethodClient: Bool,
+    hasAccessibility: Bool,
+    hasTextField: Bool,
+    allowsPasteFallback: Bool
+): VoiceGlobalInsertRoute =
+    if (isSecure) VgirClipboardOnly("密码框不会写入，文字已放到剪贴板")
+    else if (!focusUnchanged) VgirClipboardOnly("焦点已变化，文字已放到剪贴板")
+    else if (hasInputMethodClient) VgirInputMethod
+    else if (!hasAccessibility) VgirClipboardOnly("未授权辅助功能，文字已放到剪贴板")
+    else if (hasTextField) VgirAccessibility
+    else if (allowsPasteFallback) VgirPasteFallback
+    else VgirClipboardOnly("没有可输入的位置，文字已放到剪贴板")
+
+// ---------------------------------------------------------------------------
+// 2. Local Installer Status & Actions (`VoiceLocalInstaller`)
+// ---------------------------------------------------------------------------
+
+def splitPipePair(s: String): (Option String, Option String) = {
+    let bar = cellNew(-1);
+    let i = cellNew(0);
+    while (cellGet(bar) < 0 && cellGet(i) < strLen(s)) {
+        if ((strByteAt(s, cellGet(i)) & 0xFF) == 124) cellSet(bar, cellGet(i)) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    let idx = cellGet(bar);
+    if (idx < 0) (None, None)
+    else {
+        let a = strSlice(s, 0, idx);
+        let b = strSlice(s, idx + 1, strLen(s));
+        (if (strLen(a) > 0) Some(a) else None, if (strLen(b) > 0) Some(b) else None)
+    }
+}
+
+pub def voiceProbeAsrStatus(preset: VoiceLocalASRModelPreset): VoiceLocalComponentStatus = {
+    let buf = ptrAllocBytes(24);
+    let pairNs = c_voiceProbeAsr(
+        nsStr(vlaToRaw(preset)),
+        buf,
+        i64ToPtr(ptrToI64(buf) + intToI64(8)),
+        i64ToPtr(ptrToI64(buf) + intToI64(16))
+    );
+    let depOk = c_readI64(buf, intToI64(0)) != intToI64(0);
+    let modOk = c_readI64(buf, intToI64(8)) != intToI64(0);
+    let bytes = c_readI64(buf, intToI64(16));
+    let (depOpt, modOpt) = splitPipePair(nsStrPtrToString(pairNs));
+    VoiceLocalComponentStatus {
+        vlcsDependencyInstalled: depOk,
+        vlcsDependencyPath: depOpt,
+        vlcsModelInstalled: modOk,
+        vlcsModelPath: modOpt,
+        vlcsModelSizeBytes: bytes,
+    }
+}
+
+pub def voiceProbeLlmStatus(preset: VoiceLocalLLMPreset): VoiceLocalComponentStatus = {
+    let buf = ptrAllocBytes(24);
+    let pairNs = c_voiceProbeLlm(
+        nsStr(vllToRaw(preset)),
+        buf,
+        i64ToPtr(ptrToI64(buf) + intToI64(8)),
+        i64ToPtr(ptrToI64(buf) + intToI64(16))
+    );
+    let depOk = c_readI64(buf, intToI64(0)) != intToI64(0);
+    let modOk = c_readI64(buf, intToI64(8)) != intToI64(0);
+    let bytes = c_readI64(buf, intToI64(16));
+    let (depOpt, modOpt) = splitPipePair(nsStrPtrToString(pairNs));
+    VoiceLocalComponentStatus {
+        vlcsDependencyInstalled: depOk,
+        vlcsDependencyPath: depOpt,
+        vlcsModelInstalled: modOk,
+        vlcsModelPath: modOpt,
+        vlcsModelSizeBytes: bytes,
+    }
+}
+
+def ptrToI64(p: Ptr): Int64 = juxu_shared.ptrToI64(p)
+def i64ToPtr(v: Int64): Ptr = juxu_shared.i64ToPtr(v)
+
+def handleInstallerProgress(kind: Int, prog: Float, name: String, detail: String): Void = {
+    let nextPhase =
+        if (kind == 1) VipInstallingDep(name)
+        else if (kind == 2) VipDownloadingModel(name, prog, detail)
+        else if (kind == 3) VipCompleted(detail)
+        else if (kind == 4) VipFailed(detail)
+        else VipIdle;
+    cellSet(gVoiceInstallPhaseCell, nextPhase);
+    voiceNotifyInstallerChanged()
+}
+
+pub def voiceStartInstallASR(preset: VoiceLocalASRModelPreset): Void =
+    if (!vipIsBusy(cellGet(gVoiceInstallPhaseCell))) {
+        c_voiceInstallComp(
+            false,
+            nsStr(vlaToRaw(preset)),
+            nsStr(vlaDisplayName(preset)),
+            cFnPtr(__trampProg),
+            gcHandleNew(handleInstallerProgress)
+        )
+    } else ()
+
+pub def voiceStartInstallLLM(preset: VoiceLocalLLMPreset): Void =
+    if (!vipIsBusy(cellGet(gVoiceInstallPhaseCell))) {
+        c_voiceInstallComp(
+            true,
+            nsStr(vllToRaw(preset)),
+            nsStr(vllDisplayName(preset)),
+            cFnPtr(__trampProg),
+            gcHandleNew(handleInstallerProgress)
+        )
+    } else ()
+
+// ---------------------------------------------------------------------------
+// 3. VoiceSessionController State & Lifecycle (`VoiceSessionController.swift`)
+// ---------------------------------------------------------------------------
+
+pub data VoicePhase : Eq {
+    VphIdle,
+    VphRecording,
+    VphProcessing,
+}
+
+def gImSinkOwner: Cell Ptr = cellNew(ptrNull())
+def gImSinkFn: Cell (Option ((String, Bool) -> Bool)) = cellNew(None)
+
+def gPhase: Cell VoicePhase = cellNew(VphIdle)
+def gIsStarting: Cell Bool = cellNew(false)
+def gStartAborted: Cell Bool = cellNew(false)
+def gSessionGen: Cell Int = cellNew(0)
+def gHandsFree: Cell Bool = cellNew(false)
+def gPressTime: Cell (Option Float) = cellNew(None)
+def gSecondPressTime: Cell (Option Float) = cellNew(None)
+def gTapTimerGen: Cell Int = cellNew(0)
+def gTapWaiting: Cell Bool = cellNew(false)
+def gHoldCueGen: Cell Int = cellNew(0)
+def gStartCueDue: Cell Bool = cellNew(false)
+def gCueSounded: Cell Bool = cellNew(false)
+def gLastEscCancelUptime: Cell Float = cellNew(0.0)
+
+def gActiveCaretRect: Cell CGRect = cellNew(cgRect(0.0, 0.0, 0.0, 0.0))
+def gActiveWinLevel: Cell (Option Int64) = cellNew(None)
+def gActiveContext: Cell VoiceContext = cellNew(emptyVoiceContext())
+def gActiveCommit: Cell (Option ((String, Bool) -> Void)) = cellNew(None)
+def gRecordingStartUptime: Cell Float = cellNew(0.0)
+def gLatestLevel: Cell Float = cellNew(0.0)
+def gPeakLevel: Cell Float = cellNew(0.0)
+def gLatestPartial: Cell String = cellNew("")
+def gLevelCbHandle: Cell Int64 = cellNew(intToI64(0))
+def gHudTickArmed: Cell Bool = cellNew(false)
+def gTimeline: VoiceSessionTimeline = vstNew()
+
+def freeLevelHandleIfAny(): Void = {
+    let h = cellGet(gLevelCbHandle);
+    if (h != intToI64(0)) {
+        cellSet(gLevelCbHandle, intToI64(0));
+        gcHandleFree(h)
+    } else ()
+}
+
+pub def vscIsCapturing(): Bool =
+    cellGet(gPhase) == VphRecording || (cellGet(gIsStarting) && !cellGet(gStartAborted))
+
+pub def vscConsumeRecentEscapeCancel(windowSec: Float): Bool = {
+    let last = cellGet(gLastEscCancelUptime);
+    if (last <= 0.0) false
+    else {
+        let elapsed = systemUptimeSeconds() - last;
+        if (elapsed >= 0.0 && elapsed <= windowSec) {
+            cellSet(gLastEscCancelUptime, 0.0);
+            true
+        } else false
+    }
+}
+
+def resetPressState(): Void = {
+    cellSet(gTapTimerGen, cellGet(gTapTimerGen) + 1);
+    cellSet(gTapWaiting, false);
+    cellSet(gHoldCueGen, cellGet(gHoldCueGen) + 1);
+    cellSet(gSecondPressTime, None);
+    cellSet(gHandsFree, false);
+    cellSet(gStartCueDue, false)
+}
+
+def showVoiceNotice(msg: String, isErr: Bool, dur: Float): Void =
+    voiceHUDShow(VhsNotice(msg, isErr), cellGet(gActiveCaretRect), cellGet(gActiveWinLevel), dur)
+
+pub def vscCancelSession(showNotice: Bool): Void = {
+    resetPressState();
+    cellSet(gCueSounded, false);
+    cellSet(gPressTime, None);
+    if (cellGet(gIsStarting)) cellSet(gStartAborted, true) else ();
+    cellSet(gSessionGen, cellGet(gSessionGen) + 1);
+    c_voiceRecCancel();
+    freeLevelHandleIfAny();
+    cellSet(gActiveCommit, None);
+    cellSet(gActiveContext, emptyVoiceContext());
+    cellSet(gPhase, VphIdle);
+    if (showNotice) showVoiceNotice("已取消语音输入", false, 1.0)
+    else voiceHUDHide()
+}
+
+pub def vscCancelForChord(): Void =
+    if (cellGet(gHandsFree)) ()
+    else if (vscIsCapturing()) vscCancelSession(false)
+    else ()
+
+pub def vscUnloadAll(): Void = {
+    vscCancelSession(false);
+    c_voiceTapStop();
+    c_voiceCancelInstall();
+    voiceHUDUnload()
+}
+
+def playStartCueIfQuiet(): Void = {
+    let prefs = voicePrefsGet();
+    if (vpAreVoiceCuesEnabled(prefs) && !cellGet(gCueSounded)) {
+        if (cellGet(gPhase) != VphRecording) {
+            cellSet(gStartCueDue, true)
+        } else {
+            cellSet(gCueSounded, true);
+            if (cellGet(gPeakLevel) < 0.08 && cellGet(gLatestLevel) < 0.08) {
+                c_voiceRecMute(0.14);
+                c_voicePlayCue(intToI64(0))
+            } else ()
+        }
+    } else ()
+}
+
+def scheduleHoldCue(): Void = {
+    let gen = cellGet(gHoldCueGen) + 1;
+    cellSet(gHoldCueGen, gen);
+    dispatchMainAfterMs(300, () -> {
+        if (cellGet(gHoldCueGen) == gen && vscIsCapturing()) {
+            playStartCueIfQuiet()
+        } else ()
+    })
+}
+
+def armHudTick(): Void =
+    if (!cellGet(gHudTickArmed) && cellGet(gPhase) == VphRecording) {
+        cellSet(gHudTickArmed, true);
+        dispatchMainAfterMs(33, () -> {
+            cellSet(gHudTickArmed, false);
+            if (cellGet(gPhase) == VphRecording) {
+                let partial = cellGet(gLatestPartial);
+                if (strLen(partial) > 0) vstMark(gTimeline, VtmFirstDraw) else ();
+                let pk = cellGet(gPeakLevel);
+                cellSet(gLatestLevel, pk);
+                cellSet(gPeakLevel, pk * 0.82);
+                let elapsed = systemUptimeSeconds() - cellGet(gRecordingStartUptime);
+                let prefs = voicePrefsGet();
+                let modeLbl = match prefs.vpProviderMode {
+                    VpmCloudBYOK -> vcpDisplayName(prefs.vpCloudPreset),
+                    VpmLocal     -> "本地",
+                };
+                voiceHUDShow(
+                    VhsRecording(cellGet(gLatestLevel), elapsed, partial, modeLbl, 0),
+                    cellGet(gActiveCaretRect),
+                    cellGet(gActiveWinLevel),
+                    0.0
+                );
+                armHudTick()
+            } else ()
+        })
+    } else ()
+
+def applyCapturedSummary(sum: VoiceContextSummary): Void = {
+    let prefs = voicePrefsGet();
+    let merged = vctxMergeSummary(cellGet(gActiveContext), sum);
+    cellSet(gActiveContext, merged);
+    if (cellGet(gVoiceInspectorPresented)) {
+        let pv = buildContextPromptPreview(merged, prefs);
+        cellSet(gVoiceInspectorLastSummary, Some(VoiceContextSummary {
+            vcsAppName: sum.vcsAppName,
+            vcsAppIdentifier: sum.vcsAppIdentifier,
+            vcsAppType: sum.vcsAppType,
+            vcsWindowTitle: sum.vcsWindowTitle,
+            vcsWebURL: sum.vcsWebURL,
+            vcsEnhancedUI: sum.vcsEnhancedUI,
+            vcsRole: sum.vcsRole,
+            vcsIsEditable: sum.vcsIsEditable,
+            vcsIsBlacklisted: sum.vcsIsBlacklisted,
+            vcsBlacklistReason: sum.vcsBlacklistReason,
+            vcsIsSecureInput: sum.vcsIsSecureInput,
+            vcsSelectedText: sum.vcsSelectedText,
+            vcsTextBeforeCursor: sum.vcsTextBeforeCursor,
+            vcsTextAfterCursor: sum.vcsTextAfterCursor,
+            vcsTextBeforeArea: sum.vcsTextBeforeArea,
+            vcsTextAfterArea: sum.vcsTextAfterArea,
+            vcsVisibleScreenContent: sum.vcsVisibleScreenContent,
+            vcsElapsedMs: sum.vcsElapsedMs,
+            vcsPrettyJSON: sum.vcsPrettyJSON,
+            vcsAsrTargetLabel: pv.vcppAsrTargetLabel,
+            vcsAsrContext: pv.vcppAsrContext,
+            vcsPolishBudgetLabel: pv.vcppPolishBudgetLabel,
+            vcsPolishContext: pv.vcppPolishContext,
+        }));
+        voiceNotifyInspectorChanged()
+    } else ()
+}
+
+def parseVoicedAndTranscript(packed: String): (Float, String) = {
+    let tabIdx = cellNew(-1);
+    let i = cellNew(0);
+    while (cellGet(tabIdx) < 0 && cellGet(i) < strLen(packed)) {
+        if ((strByteAt(packed, cellGet(i)) & 0xFF) == 9) cellSet(tabIdx, cellGet(i)) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    let t = cellGet(tabIdx);
+    if (t < 0) (1.0, packed)
+    else {
+        let v = match parseFloat(strSlice(packed, 0, t)) { Ok(f) -> f, Err(_) -> 1.0 };
+        (v, strSlice(packed, t + 1, strLen(packed)))
+    }
+}
+
+def finishRecordingAndProcess(): Void =
+    if (cellGet(gPhase) != VphRecording) ()
+    else {
+        let now = systemUptimeSeconds();
+        let isShort = match cellGet(gPressTime) {
+            Some(pt) -> (now - pt) < 0.6,
+            None     -> false,
+        };
+        cellSet(gPressTime, None);
+        let prefs = voicePrefsGet();
+        let endCue = cellGet(gCueSounded) && vpAreVoiceCuesEnabled(prefs);
+        cellSet(gCueSounded, false);
+        resetPressState();
+        vstMark(gTimeline, VtmRelease);
+        let gen = cellGet(gSessionGen);
+        cellSet(gPhase, VphProcessing);
+
+        let modeLbl = match prefs.vpProviderMode {
+            VpmCloudBYOK -> vcpDisplayName(prefs.vpCloudPreset),
+            VpmLocal     -> "本地",
+        };
+        if (!isShort) {
+            voiceHUDShow(VhsTranscribing(modeLbl), cellGet(gActiveCaretRect), cellGet(gActiveWinLevel), 0.0)
+        } else ();
+
+        let useApple = prefs.vpProviderMode == VpmLocal && prefs.vpLocalASRPreset == VlaAppleSpeech;
+        let usesLocalEng = prefs.vpProviderMode == VpmLocal && vlaIsEngineBackend(prefs.vpLocalASRPreset);
+        let recCtx = vpRecognitionContext(prefs, cellGet(gActiveContext));
+        let polCtx = vpPolishContext(prefs, cellGet(gActiveContext));
+        let safePol = vctxPromptSafe(polCtx);
+        let replaceSel = prefs.vpSpeakToEditSelection && (match safePol.vctxSelectedText {
+            Some(s) -> strLen(strTrim(s)) > 0,
+            None    -> false,
+        });
+        let commitOpt = cellGet(gActiveCommit);
+
+        let (baseUrl, apiKey, modelName, promptTarget) = match prefs.vpProviderMode {
+            VpmCloudBYOK -> {
+                let k = voiceKeychainRead(vpEffectiveCloudASRKeyAccount(prefs));
+                let m = vpEffectiveCloudASRModel(prefs);
+                (vpEffectiveCloudASRBaseURL(prefs), k, m, VatCloud(m))
+            },
+            VpmLocal -> match prefs.vpLocalASRPreset {
+                VlaQwen3ASR   -> ("", "", "", VatQwen),
+                VlaCustomHTTP -> (prefs.vpLocalHTTPASRBaseURL, "", prefs.vpLocalHTTPASRModel, VatCloud(prefs.vpLocalHTTPASRModel)),
+                _             -> ("", "", "", VatWhisper),
+            },
+        };
+
+        if (prefs.vpProviderMode == VpmCloudBYOK && strLen(apiKey) == 0) {
+            freeLevelHandleIfAny();
+            cellSet(gPhase, VphIdle);
+            showVoiceNotice("尚未配置 " + vcpDisplayName(prefs.vpCloudPreset) + " API Key，请在「句序偏好设置 → 语音输入」中填写", true, 3.2)
+        } else {
+            let promptStr = match vacbRecognitionContext(recCtx, promptTarget, prefs.vpLanguage) {
+                Some(p) -> p,
+                None    -> "",
+            };
+            let voicedBuf = ptrAllocBytes(8);
+            c_voiceStopAndTranscribe(
+                isShort,
+                useApple,
+                usesLocalEng,
+                nsStr(vlaToRaw(prefs.vpLocalASRPreset)),
+                nsStr(baseUrl),
+                nsStr(apiKey),
+                nsStr(modelName),
+                nsStr(prefs.vpLanguage),
+                nsStr(promptStr),
+                cFnPtr(__trampOkStr),
+                gcHandleNew((ok: Bool, resStr: String) -> {
+                    freeLevelHandleIfAny();
+                    if (endCue) c_voicePlayCue(intToI64(1)) else ();
+                    if (cellGet(gSessionGen) != gen) ()
+                    else if (!ok) {
+                        cellSet(gPhase, VphIdle);
+                        if (resStr == "SILENT_TAP") voiceHUDHide()
+                        else if (resStr == "没听清") {
+                            if (isShort) voiceHUDHide() else showVoiceNotice("没听清", false, 1.4)
+                        } else if (resStr == "录音过短，已忽略") {
+                            showVoiceNotice(resStr, false, 1.1)
+                        } else {
+                            showVoiceNotice(resStr, true, 3.2)
+                        }
+                    } else {
+                        let (voicedSec, rawOut) = if (useApple) (2.0, resStr) else parseVoicedAndTranscript(resStr);
+                        let cleaned = if (usesLocalEng) {
+                            let simp = voiceSimplified(rawOut, prefs.vpLanguage);
+                            vwspNormalizedTranscript(vhfFiltered(simp, voicedSec))
+                        } else strTrim(rawOut);
+
+                        let finalRaw = if (!useApple && vacbIsPromptEcho(cleaned, if (strLen(promptStr) > 0) Some(promptStr) else None)) "" else strTrim(cleaned);
+                        if (strLen(finalRaw) == 0) {
+                            cellSet(gPhase, VphIdle);
+                            showVoiceNotice(if (usesLocalEng) "没听清" else "未识别到有效语音内容", false, 1.4)
+                        } else {
+                            let finishWithText = (txt: String) -> {
+                                if (cellGet(gSessionGen) == gen) {
+                                    vstMark(gTimeline, VtmFinalDone);
+                                    cellSet(gPhase, VphIdle);
+                                    cellSet(gActiveCommit, None);
+                                    voiceHUDHide();
+                                    match commitOpt {
+                                        Some(cf) -> cf(txt, replaceSel),
+                                        None     -> (),
+                                    };
+                                    vstMark(gTimeline, VtmInserted)
+                                } else ()
+                            };
+
+                            let needPolish = prefs.vpOutputMode == VomSmartPolish && (match prefs.vpProviderMode {
+                                VpmCloudBYOK -> prefs.vpCloudPolishEnabled,
+                                VpmLocal     -> prefs.vpLocalLLMPreset != VllNone,
+                            });
+                            if (!needPolish) {
+                                finishWithText(finalRaw)
+                            } else {
+                                voiceHUDShow(
+                                    VhsPolishing(vctHead(finalRaw, 24)),
+                                    cellGet(gActiveCaretRect),
+                                    cellGet(gActiveWinLevel),
+                                    0.0
+                                );
+                                match prefs.vpProviderMode {
+                                    VpmCloudBYOK -> {
+                                        let llmKey = voiceKeychainRead(vpEffectiveCloudLLMKeyAccount(prefs));
+                                        if (strLen(llmKey) == 0) {
+                                            cellSet(gPhase, VphIdle);
+                                            showVoiceNotice("尚未配置云端整理 LLM API Key", true, 3.2)
+                                        } else {
+                                            let (sysP, usrP) = vpbPolishPrompts(finalRaw, prefs.vpToneMode, polCtx, VpcbFull);
+                                            c_voicePolishAsync(
+                                                false,
+                                                nsStr(vpEffectiveCloudLLMBaseURL(prefs)),
+                                                nsStr(llmKey),
+                                                nsStr(vpEffectiveCloudLLMModel(prefs)),
+                                                nsStr(sysP),
+                                                nsStr(usrP),
+                                                cFnPtr(__trampOkStr),
+                                                gcHandleNew((pOk: Bool, pRes: String) -> {
+                                                    if (pOk) finishWithText(if (strLen(pRes) > 0) pRes else finalRaw)
+                                                    else {
+                                                        cellSet(gPhase, VphIdle);
+                                                        showVoiceNotice(pRes, true, 3.2)
+                                                    }
+                                                })
+                                            )
+                                        }
+                                    },
+                                    VpmLocal -> match prefs.vpLocalLLMPreset {
+                                        VllNone -> finishWithText(finalRaw),
+                                        VllQwen15B -> {
+                                            let st = voiceProbeLlmStatus(VllQwen15B);
+                                            match (st.vlcsDependencyPath, st.vlcsModelPath) {
+                                                (Some(bin), Some(mPath)) -> if (vlcsIsReady(st)) {
+                                                    let (sysP, usrP) = vpbPolishPrompts(finalRaw, prefs.vpToneMode, polCtx, VpcbCompact);
+                                                    c_voicePolishAsync(
+                                                        true, nsStr(bin), nsStr(mPath), nsStr(""),
+                                                        nsStr(sysP), nsStr(usrP),
+                                                        cFnPtr(__trampOkStr),
+                                                        gcHandleNew((pOk: Bool, pRes: String) -> {
+                                                            if (pOk) finishWithText(if (strLen(pRes) > 0) pRes else finalRaw)
+                                                            else {
+                                                                cellSet(gPhase, VphIdle);
+                                                                showVoiceNotice(pRes, true, 3.2)
+                                                            }
+                                                        })
+                                                    )
+                                                } else {
+                                                    cellSet(gPhase, VphIdle);
+                                                    showVoiceNotice("尚未安装本地整理模型，请在「句序偏好设置 → 语音输入」中下载", true, 3.2)
+                                                },
+                                                _ -> {
+                                                    cellSet(gPhase, VphIdle);
+                                                    showVoiceNotice("尚未安装本地整理模型，请在「句序偏好设置 → 语音输入」中下载", true, 3.2)
+                                                },
+                                            }
+                                        },
+                                        VllOllamaHTTP -> {
+                                            let (sysP, usrP) = vpbPolishPrompts(finalRaw, prefs.vpToneMode, polCtx, VpcbCompact);
+                                            c_voicePolishAsync(
+                                                false,
+                                                nsStr(prefs.vpLocalHTTPLLMBaseURL),
+                                                nsStr(""),
+                                                nsStr(prefs.vpLocalHTTPLLMModel),
+                                                nsStr(sysP),
+                                                nsStr(usrP),
+                                                cFnPtr(__trampOkStr),
+                                                gcHandleNew((pOk: Bool, pRes: String) -> {
+                                                    if (pOk) finishWithText(if (strLen(pRes) > 0) pRes else finalRaw)
+                                                    else {
+                                                        cellSet(gPhase, VphIdle);
+                                                        showVoiceNotice(pRes, true, 3.2)
+                                                    }
+                                                })
+                                            )
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }),
+                voicedBuf
+            )
+        }
+    }
+
+def startVoiceRecording(
+    caretRect: CGRect,
+    winLevelOpt: Option Int64,
+    initialCtx: VoiceContext,
+    onCommit: (String, Bool) -> Void
+): Void = {
+    let prefs = voicePrefsGet();
+    let useApple = prefs.vpProviderMode == VpmLocal && prefs.vpLocalASRPreset == VlaAppleSpeech;
+    let respectBl = vpRespectsContextBlacklist(prefs);
+    let blacklisted = match initialCtx.vctxBundleIdentifier {
+        Some(bid) -> match vcpBlacklistReason(bid, None, None, respectBl) { Some(_) -> true, None -> false },
+        None      -> false,
+    };
+
+    cellSet(gActiveCaretRect, caretRect);
+    cellSet(gActiveWinLevel, winLevelOpt);
+    cellSet(gActiveContext, vctxRestricted(initialCtx, blacklisted));
+    cellSet(gActiveCommit, Some(onCommit));
+    cellSet(gLatestLevel, 0.0);
+    cellSet(gPeakLevel, 0.0);
+    cellSet(gLatestPartial, "");
+    cellSet(gCueSounded, false);
+
+    let nextGen = cellGet(gSessionGen) + 1;
+    cellSet(gSessionGen, nextGen);
+
+    if (vpIsContextCaptureEnabled(prefs)) {
+        c_voiceCaptureCtxAsync(
+            respectBl,
+            cFnPtr(__trampAx),
+            gcHandleNew((sum: VoiceContextSummary) -> {
+                if (cellGet(gSessionGen) == nextGen) applyCapturedSummary(sum) else ()
+            })
+        )
+    } else ();
+
+    cellSet(gIsStarting, true);
+    cellSet(gStartAborted, false);
+    voiceHUDShow(VhsRecording(0.0, 0.0, "", "", 0), caretRect, winLevelOpt, 0.0);
+    vstMark(gTimeline, VtmHudShown);
+
+    c_voiceReqMicSpeech(
+        useApple,
+        cFnPtr(__trampOkStr),
+        gcHandleNew((granted: Bool, errMsg: String) -> {
+            if (!granted) {
+                cellSet(gIsStarting, false);
+                resetPressState();
+                if (!cellGet(gStartAborted)) showVoiceNotice(errMsg, true, 3.2) else ()
+            } else if (cellGet(gStartAborted)) {
+                cellSet(gIsStarting, false)
+            } else {
+                freeLevelHandleIfAny();
+                let lvlH = gcHandleNew((lvl: Float, partOpt: Option String) -> {
+                    if (lvl >= 0.0) {
+                        if (lvl > cellGet(gPeakLevel)) cellSet(gPeakLevel, lvl) else ()
+                    } else ();
+                    match partOpt {
+                        Some(p) -> cellSet(gLatestPartial, p),
+                        None    -> (),
+                    }
+                });
+                cellSet(gLevelCbHandle, lvlH);
+                let phrases = if (useApple) vpJoinStrings(vacbContextualStrings(cellGet(gActiveContext), 100), "\n") else "";
+                c_voiceRecStart(
+                    useApple,
+                    nsStr(prefs.vpLocalAppleLocale),
+                    prefs.vpLocalAppleRequireOnDevice,
+                    nsStr(phrases),
+                    cFnPtr(__trampOkStr),
+                    gcHandleNew((started: Bool, sErr: String) -> {
+                        cellSet(gIsStarting, false);
+                        if (!started) {
+                            freeLevelHandleIfAny();
+                            resetPressState();
+                            if (!cellGet(gStartAborted)) showVoiceNotice(sErr, true, 3.2) else ()
+                        } else if (cellGet(gStartAborted)) {
+                            c_voiceRecCancel();
+                            freeLevelHandleIfAny()
+                        } else {
+                            vstMark(gTimeline, VtmMicRunning);
+                            cellSet(gPhase, VphRecording);
+                            cellSet(gRecordingStartUptime, systemUptimeSeconds());
+                            armHudTick();
+                            if (cellGet(gStartCueDue)) {
+                                cellSet(gStartCueDue, false);
+                                playStartCueIfQuiet()
+                            } else ()
+                        }
+                    }),
+                    cFnPtr(__trampLevel),
+                    lvlH
+                )
+            }
+        })
+    )
+}
+
+pub def vscHandleNSEvent(
+    nsEvent: Ptr,
+    caretRectFn: () -> CGRect,
+    winLevelOpt: Option Int64,
+    contextFn: () -> VoiceContext,
+    onCommit: (String, Bool) -> Void
+): Bool = {
+    let prefs = voicePrefsGet();
+    if (!prefs.vpEnabled) {
+        vscUnloadAll();
+        false
+    } else if (ptrIsNull(nsEvent)) {
+        false
+    } else {
+        let evType = i64ToInt(msgSendI64_0(nsEvent, objcSel("type")));
+        let keyCode = msgSendInt0(nsEvent, objcSel("keyCode")) & 0xFFFF;
+        let rawFlags = msgSendI64_0(nsEvent, objcSel("modifierFlags")) & intToI64(0xFFFF0000);
+        // NSEventTypeKeyDown = 10, NSEventTypeFlagsChanged = 12
+        if (evType == 10 && keyCode == 0x35 && (cellGet(gPhase) != VphIdle || vscIsCapturing())) {
+            cellSet(gLastEscCancelUptime, systemUptimeSeconds());
+            vscCancelSession(true);
+            true
+        } else if (prefs.vpTriggerKey == VtkOptionSpace) {
+            if (evType == 10) {
+                if (keyCode == 0x31 && rawFlags == intToI64(0x80000)) {
+                    if (cellGet(gPhase) == VphIdle) {
+                        if (!cellGet(gIsStarting)) {
+                            vstBegin(gTimeline);
+                            startVoiceRecording(caretRectFn(), winLevelOpt, contextFn(), onCommit)
+                        } else if (!cellGet(gStartAborted)) {
+                            vscCancelSession(false)
+                        } else ()
+                    } else if (cellGet(gPhase) == VphRecording) {
+                        finishRecordingAndProcess()
+                    } else ();
+                    true
+                } else if (cellGet(gPhase) == VphRecording && (keyCode == 0x24 || keyCode == 0x4C)) {
+                    finishRecordingAndProcess();
+                    true
+                } else false
+            } else false
+        } else {
+            match vtkModifierKeyCode(prefs.vpTriggerKey) {
+                None -> false,
+                Some(targetKc) ->
+                    if (evType == 10) {
+                        vscCancelForChord();
+                        false
+                    } else if (evType != 12) {
+                        false
+                    } else {
+                        let targetFlag = match triggerModifierMask(prefs.vpTriggerKey) {
+                            Some(m) -> m,
+                            None    -> intToI64(0),
+                        };
+                        let nonCaps = rawFlags & (~intToI64(0x10000));
+                        if (keyCode == targetKc) {
+                            let isDown = (nonCaps & targetFlag) != intToI64(0) && (nonCaps & (~targetFlag)) == intToI64(0);
+                            if (isDown) {
+                                if (cellGet(gHandsFree)) {
+                                    if (cellGet(gIsStarting)) vscCancelSession(false)
+                                    else finishRecordingAndProcess();
+                                    true
+                                } else if (cellGet(gTapWaiting)) {
+                                    cellSet(gTapTimerGen, cellGet(gTapTimerGen) + 1);
+                                    cellSet(gTapWaiting, false);
+                                    cellSet(gSecondPressTime, Some(systemUptimeSeconds()));
+                                    scheduleHoldCue();
+                                    false
+                                } else {
+                                    if (cellGet(gPhase) == VphIdle && !cellGet(gIsStarting)) {
+                                        vstBegin(gTimeline);
+                                        cellSet(gPressTime, Some(systemUptimeSeconds()));
+                                        scheduleHoldCue();
+                                        startVoiceRecording(caretRectFn(), winLevelOpt, contextFn(), onCommit)
+                                    } else ();
+                                    false
+                                }
+                            } else {
+                                if (cellGet(gHandsFree)) false
+                                else {
+                                    match cellGet(gSecondPressTime) {
+                                        Some(secT) -> {
+                                            cellSet(gSecondPressTime, None);
+                                            if (vscIsCapturing() && (systemUptimeSeconds() - secT) < 0.3) {
+                                                cellSet(gHandsFree, true);
+                                                cellSet(gPressTime, None);
+                                                cellSet(gHoldCueGen, cellGet(gHoldCueGen) + 1);
+                                                playStartCueIfQuiet();
+                                                true
+                                            } else {
+                                                cellSet(gPressTime, None);
+                                                if (cellGet(gPhase) == VphRecording) { finishRecordingAndProcess(); true } else false
+                                            }
+                                        },
+                                        None -> {
+                                            let quickFirst = match cellGet(gPressTime) {
+                                                Some(pt) -> vscIsCapturing() && (systemUptimeSeconds() - pt) < 0.3,
+                                                None     -> false,
+                                            };
+                                            if (quickFirst) {
+                                                cellSet(gHoldCueGen, cellGet(gHoldCueGen) + 1);
+                                                let tGen = cellGet(gTapTimerGen) + 1;
+                                                cellSet(gTapTimerGen, tGen);
+                                                cellSet(gTapWaiting, true);
+                                                dispatchMainAfterMs(300, () -> {
+                                                    if (cellGet(gTapTimerGen) == tGen && cellGet(gTapWaiting)) {
+                                                        cellSet(gTapWaiting, false);
+                                                        if (cellGet(gIsStarting)) {
+                                                            if (!cellGet(gStartAborted)) vscCancelSession(false) else ()
+                                                        } else {
+                                                            finishRecordingAndProcess()
+                                                        }
+                                                    } else ()
+                                                });
+                                                true
+                                            } else if (cellGet(gIsStarting)) {
+                                                if (!cellGet(gStartAborted)) vscCancelSession(false) else ();
+                                                true
+                                            } else if (cellGet(gPhase) == VphRecording) {
+                                                finishRecordingAndProcess();
+                                                true
+                                            } else false
+                                        },
+                                    }
+                                }
+                            }
+                        } else {
+                            if ((nonCaps & (~targetFlag)) != intToI64(0)) vscCancelForChord() else ();
+                            false
+                        }
+                    },
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Global Hotkey Callback, Configuration Test & Inspector Hooks
+// ---------------------------------------------------------------------------
+
+def buildMergedUserVocab(prefs: VoicePreferences): Vec String = {
+    let vocab = vpParsedCustomVocabulary(prefs);
+    if (prefs.vpSyncJuxuLexicon) {
+        let s = bridgeShared();
+        let phrases = cellGet(s.userPhrases);
+        let lim = if (vecLen(phrases) < 40) vecLen(phrases) else 40;
+        let i = cellNew(0);
+        let dummy = UserPhraseInfo {
+            phrase: MkUserPhrase { text: "", count: 0, lastSeq: intToI64(0), autoComposed: false },
+            encodedCode: "",
+        };
+        while (cellGet(i) < lim) {
+            let info: UserPhraseInfo = vecGetOr(phrases, cellGet(i), dummy);
+            if (strLen(info.phrase.text) > 0) vecPush(vocab, info.phrase.text) else ();
+            cellSet(i, cellGet(i) + 1)
+        }
+    } else ();
+    vocab
+}
+
+def splitTabPair(s: String): (String, String) = {
+    let idx = cellNew(-1);
+    let i = cellNew(0);
+    while (cellGet(idx) < 0 && cellGet(i) < strLen(s)) {
+        if ((strByteAt(s, cellGet(i)) & 0xFF) == 9) cellSet(idx, cellGet(i)) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    let t = cellGet(idx);
+    if (t < 0) (s, "") else (strSlice(s, 0, t), strSlice(s, t + 1, strLen(s)))
+}
+
+def __globalHotkeyCallback(isKeyDown: Bool, keyCode: Int64, modFlags: Int64, nsEvent: Ptr): Void = {
+    let prefs = voicePrefsGet();
+    if (prefs.vpEnabled && vpIsGlobalHotkeyEnabled(prefs) && vtkIsHoldToTalk(prefs.vpTriggerKey)) {
+        let dec = vgkrDecide(
+            isKeyDown,
+            i64ToInt(keyCode),
+            modFlags,
+            prefs.vpTriggerKey,
+            c_voiceIsSecureInput(),
+            vscIsCapturing()
+        );
+        match dec {
+            VgkdIgnore -> (),
+            VgkdCancelChord -> vscCancelForChord(),
+            VgkdForward -> {
+                let _ = vscHandleNSEvent(
+                    nsEvent,
+                    () -> {
+                        let xy = ptrAllocBytes(16);
+                        c_voiceCommitterCapture(xy, i64ToPtr(ptrToI64(xy) + intToI64(8)));
+                        cgRect(c_readF64(xy, intToI64(0)), c_readF64(xy, intToI64(8)), 1.0, 20.0)
+                    },
+                    None,
+                    () -> {
+                        let (bid, appNm) = splitTabPair(nsStrPtrToString(c_voiceFrontmostInfo()));
+                        let selOpt = if (prefs.vpSpeakToEditSelection) nsStrPtrToOpt(c_voiceCommitterSelected()) else None;
+                        VoiceContext {
+                            vctxBundleIdentifier: if (strLen(bid) > 0) Some(bid) else None,
+                            vctxAppName: if (strLen(appNm) > 0) Some(appNm) else None,
+                            vctxWindowTitle: None,
+                            vctxWebURL: None,
+                            vctxSelectedText: selOpt,
+                            vctxBeforeContext: None,
+                            vctxAfterContext: None,
+                            vctxSurroundingBefore: None,
+                            vctxSurroundingAfter: None,
+                            vctxVisibleScreenText: None,
+                            vctxPersonalVocabulary: buildMergedUserVocab(prefs),
+                            vctxCapturedIsSecure: false,
+                            vctxCapturedIsBlacklisted: false,
+                            vctxCapturedAppId: None,
+                            vctxPolicyRestricted: false,
+                        }
+                    },
+                    (text: String, replaceSel: Bool) -> {
+                        match cellGet(gImSinkFn) {
+                            Some(sink) -> {
+                                if (!sink(text, replaceSel)) {
+                                    c_voiceCommitterCommit(
+                                        nsStr(text),
+                                        cFnPtr(__trampCommit),
+                                        gcHandleNew((nOpt: Option String) -> match nOpt {
+                                            Some(n) -> showVoiceNotice(n, false, 3.2),
+                                            None    -> (),
+                                        })
+                                    )
+                                } else ()
+                            },
+                            None -> c_voiceCommitterCommit(
+                                nsStr(text),
+                                cFnPtr(__trampCommit),
+                                gcHandleNew((nOpt: Option String) -> match nOpt {
+                                    Some(n) -> showVoiceNotice(n, false, 3.2),
+                                    None    -> (),
+                                })
+                            ),
+                        }
+                    }
+                );
+                ()
+            },
+        }
+    } else ()
+}
+
+pub def voiceSyncGlobalHotkey(prefs: VoicePreferences): Void =
+    if (prefs.vpEnabled && vpIsGlobalHotkeyEnabled(prefs) && vtkIsHoldToTalk(prefs.vpTriggerKey)) {
+        let _ = c_voiceTapStart(cFnPtr(__globalHotkeyCallback));
+        ()
+    } else {
+        c_voiceTapStop()
+    }
+
+pub def voiceRunTestConfiguration(cb: (Bool, String) -> Void): Void = {
+    let prefs = voicePrefsGet();
+    if (!prefs.vpEnabled) cb(false, "请先开启语音输入总开关")
+    else match prefs.vpProviderMode {
+        VpmCloudBYOK -> {
+            let asrKey = voiceKeychainRead(vpEffectiveCloudASRKeyAccount(prefs));
+            if (strLen(asrKey) == 0) {
+                cb(false, "请先填写 " + vcpDisplayName(prefs.vpCloudPreset) + " 的 API Key")
+            } else if (prefs.vpOutputMode == VomSmartPolish && prefs.vpCloudPolishEnabled) {
+                let llmKey = voiceKeychainRead(vpEffectiveCloudLLMKeyAccount(prefs));
+                if (strLen(llmKey) == 0) cb(false, "未配置整理模型 API Key")
+                else {
+                    let ctx = voiceContextWithVocab(vpParsedCustomVocabulary(prefs));
+                    let (sysP, usrP) = vpbPolishPrompts("嗯，那个，测试一下语音整理功能，明天，不对，后天下午三点开会。", prefs.vpToneMode, ctx, VpcbFull);
+                    c_voicePolishAsync(
+                        false,
+                        nsStr(vpEffectiveCloudLLMBaseURL(prefs)),
+                        nsStr(llmKey),
+                        nsStr(vpEffectiveCloudLLMModel(prefs)),
+                        nsStr(sysP),
+                        nsStr(usrP),
+                        cFnPtr(__trampOkStr),
+                        gcHandleNew((ok: Bool, res: String) -> {
+                            if (ok) cb(true, "连通正常（" + vcpDisplayName(prefs.vpCloudPreset) + "）：" + res)
+                            else cb(false, res)
+                        })
+                    )
+                }
+            } else {
+                cb(true, "云端识别配置就绪（" + vpEffectiveCloudASRModel(prefs) + "）")
+            }
+        },
+        VpmLocal -> {
+            let asrErrOpt: Option String =
+                if (vlaIsEngineBackend(prefs.vpLocalASRPreset)) {
+                    let st = voiceProbeAsrStatus(prefs.vpLocalASRPreset);
+                    if (!vlcsIsReady(st)) Some("尚未安装 " + vlaDisplayName(prefs.vpLocalASRPreset) + "，请点击上方「一键下载并安装」")
+                    else None
+                } else if (prefs.vpLocalASRPreset == VlaAppleSpeech) {
+                    let code = i64ToInt(c_voiceCheckAppleSpeech(nsStr(prefs.vpLocalAppleLocale), prefs.vpLocalAppleRequireOnDevice));
+                    if (code == -1) Some("系统不支持语言 " + prefs.vpLocalAppleLocale)
+                    else if (code == -2) Some("未检测到离线语音模型，请在系统设置 → 键盘 → 听写中下载，或取消勾选「仅离线」")
+                    else None
+                } else {
+                    if (!strStartsWith(prefs.vpLocalHTTPASRBaseURL, "http")) Some("本地 HTTP ASR 地址无效") else None
+                };
+            match asrErrOpt {
+                Some(err) -> cb(false, err),
+                None -> if (prefs.vpOutputMode == VomSmartPolish) {
+                    match prefs.vpLocalLLMPreset {
+                        VllQwen15B -> {
+                            let lst = voiceProbeLlmStatus(VllQwen15B);
+                            if (!vlcsIsReady(lst)) cb(false, "识别引擎已就绪，但本地整理模型尚未下载（请点击上方「一键下载并安装」）")
+                            else cb(true, "本地识别与 Qwen2.5-1.5B AI 整理均已就绪")
+                        },
+                        VllOllamaHTTP -> {
+                            let (sysP, usrP) = vpbPolishPrompts("嗯，那个，测试一下本地整理功能。", prefs.vpToneMode, emptyVoiceContext(), VpcbCompact);
+                            c_voicePolishAsync(
+                                false,
+                                nsStr(prefs.vpLocalHTTPLLMBaseURL),
+                                nsStr(""),
+                                nsStr(prefs.vpLocalHTTPLLMModel),
+                                nsStr(sysP),
+                                nsStr(usrP),
+                                cFnPtr(__trampOkStr),
+                                gcHandleNew((ok: Bool, res: String) -> {
+                                    if (ok) cb(true, "本地模型就绪，LLM 整理正常：" + res)
+                                    else cb(false, "本地 LLM 服务不可达：" + res)
+                                })
+                            )
+                        },
+                        VllNone -> cb(true, "本地语音识别（" + vlaDisplayName(prefs.vpLocalASRPreset) + "）已就绪"),
+                    }
+                } else cb(true, "本地语音识别（" + vlaDisplayName(prefs.vpLocalASRPreset) + "）已就绪"),
+            }
+        },
+    }
+}
+
+def gInspectorTimerGen: Cell Int = cellNew(0)
+
+def runInspectorCountdownStep(gen: Int, rem: Int, respectBl: Bool): Void =
+    if (cellGet(gInspectorTimerGen) != gen || !cellGet(gVoiceInspectorCapturing)) ()
+    else if (rem > 0) {
+        cellSet(gVoiceInspectorCountdown, rem);
+        voiceNotifyInspectorChanged();
+        dispatchMainAfterMs(1000, () -> runInspectorCountdownStep(gen, rem - 1, respectBl))
+    } else {
+        cellSet(gVoiceInspectorCountdown, 0);
+        voiceNotifyInspectorChanged();
+        c_voiceCaptureCtxAsync(
+            respectBl,
+            cFnPtr(__trampAx),
+            gcHandleNew((sum: VoiceContextSummary) -> {
+                if (cellGet(gInspectorTimerGen) == gen) {
+                    cellSet(gVoiceInspectorCapturing, false);
+                    let prefs = voicePrefsGet();
+                    let ctx = vctxMergeSummary(voiceContextWithVocab(buildMergedUserVocab(prefs)), sum);
+                    let pv = buildContextPromptPreview(ctx, prefs);
+                    cellSet(gVoiceInspectorLastSummary, Some(VoiceContextSummary {
+                        vcsAppName: sum.vcsAppName,
+                        vcsAppIdentifier: sum.vcsAppIdentifier,
+                        vcsAppType: sum.vcsAppType,
+                        vcsWindowTitle: sum.vcsWindowTitle,
+                        vcsWebURL: sum.vcsWebURL,
+                        vcsEnhancedUI: sum.vcsEnhancedUI,
+                        vcsRole: sum.vcsRole,
+                        vcsIsEditable: sum.vcsIsEditable,
+                        vcsIsBlacklisted: sum.vcsIsBlacklisted,
+                        vcsBlacklistReason: sum.vcsBlacklistReason,
+                        vcsIsSecureInput: sum.vcsIsSecureInput,
+                        vcsSelectedText: sum.vcsSelectedText,
+                        vcsTextBeforeCursor: sum.vcsTextBeforeCursor,
+                        vcsTextAfterCursor: sum.vcsTextAfterCursor,
+                        vcsTextBeforeArea: sum.vcsTextBeforeArea,
+                        vcsTextAfterArea: sum.vcsTextAfterArea,
+                        vcsVisibleScreenContent: sum.vcsVisibleScreenContent,
+                        vcsElapsedMs: sum.vcsElapsedMs,
+                        vcsPrettyJSON: sum.vcsPrettyJSON,
+                        vcsAsrTargetLabel: pv.vcppAsrTargetLabel,
+                        vcsAsrContext: pv.vcppAsrContext,
+                        vcsPolishBudgetLabel: pv.vcppPolishBudgetLabel,
+                        vcsPolishContext: pv.vcppPolishContext,
+                    }));
+                    voiceNotifyInspectorChanged()
+                } else ()
+            })
+        )
+    }
+
+pub def voiceInstallBackendHooks(): Void = {
+    cellSet(gVoiceOnUnloadHook, vscUnloadAll);
+    cellSet(gVoiceOnHotkeySyncHook, voiceSyncGlobalHotkey);
+    cellSet(gVoiceAsrStatusHook, voiceProbeAsrStatus);
+    cellSet(gVoiceLlmStatusHook, voiceProbeLlmStatus);
+    cellSet(gVoiceInstallASRHook, voiceStartInstallASR);
+    cellSet(gVoiceInstallLLMHook, voiceStartInstallLLM);
+    cellSet(gVoiceDeleteModelHook, (f) -> {
+        c_voiceDeleteModel(nsStr(f));
+        cellSet(gVoiceInstallPhaseCell, VipIdle);
+        voiceNotifyInstallerChanged()
+    });
+    cellSet(gVoiceCancelInstallHook, () -> {
+        c_voiceCancelInstall();
+        cellSet(gVoiceInstallPhaseCell, VipIdle);
+        voiceNotifyInstallerChanged()
+    });
+    cellSet(gVoiceGlobalPermCurrentHook, () -> VoiceGlobalPermStatus {
+        vgpInputMonitoring: c_voicePermInputMon(),
+        vgpAccessibility: voiceAxIsTrusted(),
+    });
+    cellSet(gVoiceGlobalPermRequestHook, c_voicePermRequestAll);
+    cellSet(gVoiceTestConfigHook, voiceRunTestConfiguration);
+    cellSet(gVoiceInspectorTriggerHook, (sec, bl) -> {
+        let gen = cellGet(gInspectorTimerGen) + 1;
+        cellSet(gInspectorTimerGen, gen);
+        cellSet(gVoiceInspectorCapturing, true);
+        runInspectorCountdownStep(gen, sec, bl)
+    });
+    cellSet(gVoiceInspectorCancelHook, () -> {
+        cellSet(gInspectorTimerGen, cellGet(gInspectorTimerGen) + 1);
+        cellSet(gVoiceInspectorCapturing, false);
+        cellSet(gVoiceInspectorCountdown, 0);
+        voiceNotifyInspectorChanged()
+    })
+}
+
+pub def vscSetImSink(owner: Ptr, sink: (String, Bool) -> Bool): Void = {
+    cellSet(gImSinkOwner, owner);
+    cellSet(gImSinkFn, Some(sink))
+}
+
+pub def vscClearImSink(owner: Ptr): Void =
+    if (ptrToI64(cellGet(gImSinkOwner)) == ptrToI64(owner)) {
+        cellSet(gImSinkOwner, ptrNull());
+        cellSet(gImSinkFn, None)
+    } else ()
+
+pub def vscHandleDeactivate(): Void =
+    if (!c_voiceTapIsListening()) {
+        if (vscIsCapturing()) vscCancelSession(false) else ()
+    } else ()
+
+pub def vscHandleImkEvent(
+    nsEvent: Ptr,
+    _client: Ptr,
+    caretRectFn: () -> CGRect,
+    windowLevel: Int64,
+    beforeContextFn: () -> String,
+    onCommitFn: (String, Bool) -> Void
+): Bool = {
+    let prefs = voicePrefsGet();
+    if (!prefs.vpEnabled) false
+    else if (c_voiceTapIsListening()) {
+        // When global listener is active, swallow Esc if it just cancelled a dictation
+        let evType = if (ptrIsNull(nsEvent)) 0 else i64ToInt(msgSendI64_0(nsEvent, objcSel("type")));
+        let kc = if (ptrIsNull(nsEvent)) 0 else (msgSendInt0(nsEvent, objcSel("keyCode")) & 0xFFFF);
+        evType == 10 && kc == 0x35 && vscConsumeRecentEscapeCancel(0.25)
+    } else {
+        vscHandleNSEvent(
+            nsEvent,
+            caretRectFn,
+            Some(windowLevel),
+            () -> {
+                let (bid, appNm) = splitTabPair(nsStrPtrToString(c_voiceFrontmostInfo()));
+                let bef = beforeContextFn();
+                VoiceContext {
+                    vctxBundleIdentifier: if (strLen(bid) > 0) Some(bid) else None,
+                    vctxAppName: if (strLen(appNm) > 0) Some(appNm) else None,
+                    vctxWindowTitle: None,
+                    vctxWebURL: None,
+                    vctxSelectedText: None,
+                    vctxBeforeContext: if (strLen(bef) > 0) Some(bef) else None,
+                    vctxAfterContext: None,
+                    vctxSurroundingBefore: None,
+                    vctxSurroundingAfter: None,
+                    vctxVisibleScreenText: None,
+                    vctxPersonalVocabulary: buildMergedUserVocab(prefs),
+                    vctxCapturedIsSecure: false,
+                    vctxCapturedIsBlacklisted: false,
+                    vctxCapturedAppId: None,
+                    vctxPolicyRestricted: false,
+                }
+            },
+            onCommitFn
+        )
+    }
+}

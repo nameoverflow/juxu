@@ -1,26 +1,42 @@
-/// Pure Geisha macOS Input Method entry (`Juxu.app`).
-/// Registers `JuxuInputController : IMKInputController` (via `extern init`),
-/// supports `--register-system-cache` (macOS 27 global TIS cache) and `--settings`,
-/// and runs `IMKServer` + `NSApplication`.
+/// Complete 1:1 port of `Sources/main.swift` (164 lines) + `--render-previews <outDir>`:
+/// - `--register-system-cache`: global Carbon TIS cache rebuild (`TISRegisterInputSource` + `TISCreateInputSourceList(nil, true)`)
+/// - `--register-and-enable [--select]`: fast-path active check, 20-attempt `TISEnableInputSource` loop,
+///   macOS 26/27 `x-apple.systempreferences:com.apple.Keyboard-Settings.extension?InputSources` sheet fallback, `TISSelectInputSource`
+/// - `--render-previews <outDir>`: 2x Retina PNG preview generation (`candidates-light/dark.png`, `settings-*-*.png`)
+/// - `JuxuAppDelegate` (`applicationDidFinishLaunching:`, `applicationWillTerminate:`):
+///   - `+[IMKServer connectionNameFor:]` resolution (`<bundleId>.Connection`)
+///   - Eager `bridgeShared()` zero-latency mmap initialization + `inputControllerSetSession`
+///   - `voiceInitOnLaunch()` & `voiceShutdownOnTerminate()` + `bridgeFlushUserDataSync`
+///   - Standalone `--settings` / `--settings-section=<name>` launch support.
 
-use std.option.{Some, None}
-use std.path.{pathJoin}
-use sys.env.{argCount, argAt, getEnv}
-use sys.fs.{isDir}
+use std.option.{Option, Some, None}
+use std.str.{strStartsWith}
+use sys.env.{argCount, argAt}
 use sys.proc.{exit}
 use objc.{
-    objcClass, objcSel, withAutoreleasePool,
-    msgSend0, msgSendVoid0, msgSendVoid1Ptr,
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    withAutoreleasePool,
+    msgSend0, msgSend1Ptr, msgSendI64_0, msgSendVoid0, msgSendVoid1Ptr,
 }
 use juxu_shared.{
-    sessionNew, sessionLoadDictsFromDir, sessionLoadPersistence,
-    mainBundleResourcePath, mainBundleIdentifier, nsStr, msgSend2Ptr,
+    bridgeShared, bridgeFlushUserDataSync,
+    mainBundleIdentifier, nsStr, nsStrPtrToString,
+    msgSend2Ptr, msgSend1I64_1Ptr, msgSendBool1Ptr, objcAllocInit,
 }
+use macos_ffi.{tisRegisterSystemCache, tisRegisterAndEnable}
 use input_controller.{inputControllerSetSession}
-use settings_window.{settingsWindowShow}
+use settings_window.{
+    SettingsSection, SecSchema, parseSettingsSection,
+    settingsWindowShowSection, renderAllMacosPreviews,
+}
+use voice_facade.{voiceInitOnLaunch, voiceShutdownOnTerminate}
 
-extern "TISRegisterInputSource" def c_TISRegisterInputSource(url: Ptr): Int
-extern "TISCreateInputSourceList" def c_TISCreateInputSourceList(props: Ptr, includeAll: Bool): Ptr
+def gImkServer: Cell Ptr = cellNew(ptrNull())
+def gAppDelegate: Cell Ptr = cellNew(ptrNull())
+
+// ============================================================================
+// CLI Flag Parsing Helpers
+// ============================================================================
 
 def hasCliFlag(flag: String): Bool = {
     let n = argCount();
@@ -33,40 +49,160 @@ def hasCliFlag(flag: String): Bool = {
     cellGet(found)
 }
 
+def cliFlagValue(flag: String): Option String = {
+    let n = argCount();
+    let eqPrefix = flag + "=";
+    let eqLen = strLen(eqPrefix);
+    let res: Cell (Option String) = cellNew(None);
+    let i = cellNew(1);
+    while (cellGet(i) < n && match cellGet(res) { None -> true, Some(_) -> false }) {
+        let idx = cellGet(i);
+        let a = argAt(idx);
+        if (strStartsWith(a, eqPrefix)) {
+            cellSet(res, Some(strSlice(a, eqLen, strLen(a))))
+        } else if (a == flag && idx + 1 < n) {
+            cellSet(res, Some(argAt(idx + 1)))
+        } else ();
+        cellSet(i, idx + 1)
+    };
+    cellGet(res)
+}
+
+// ============================================================================
+// Bundle Info.plist & IMKServer Connection Name Resolution (`main.swift` lines 40-43, 120-131)
+// ============================================================================
+
+def resolvePrimaryInputModeId(bundle: Ptr, bundleId: String): String = {
+    let fallback = bundleId + ".Hans";
+    if (ptrIsNull(bundle)) fallback
+    else {
+        let info = msgSend0(bundle, objcSel("infoDictionary"));
+        if (ptrIsNull(info)) fallback
+        else {
+            let modeDict = msgSend1Ptr(info, objcSel("objectForKey:"), nsStr("ComponentInputModeDict"));
+            if (ptrIsNull(modeDict)) fallback
+            else {
+                let ordered = msgSend1Ptr(modeDict, objcSel("objectForKey:"), nsStr("tsVisibleInputModeOrderedArrayKey"));
+                if (ptrIsNull(ordered) || msgSendI64_0(ordered, objcSel("count")) == intToI64(0)) fallback
+                else {
+                    let firstObj = msgSend1I64_1Ptr(ordered, objcSel("objectAtIndex:"), intToI64(0), ptrNull());
+                    let s = nsStrPtrToString(firstObj);
+                    if (strLen(s) > 0) s else fallback
+                }
+            }
+        }
+    }
+}
+
+def resolveImkConnectionName(bundle: Ptr, bundleId: String): String = {
+    let fallback = bundleId + ".Connection";
+    let imkCls = objcClass("IMKServer");
+    let connSel = objcSel("connectionNameFor:");
+    let modernName =
+        if (!ptrIsNull(imkCls) && !ptrIsNull(bundle) && msgSendBool1Ptr(imkCls, objcSel("respondsToSelector:"), connSel)) {
+            nsStrPtrToString(msgSend1Ptr(imkCls, connSel, bundle))
+        } else "";
+    if (strLen(modernName) > 0) modernName
+    else if (ptrIsNull(bundle)) fallback
+    else {
+        let info = msgSend0(bundle, objcSel("infoDictionary"));
+        if (ptrIsNull(info)) fallback
+        else {
+            let plistConn = nsStrPtrToString(msgSend1Ptr(info, objcSel("objectForKey:"), nsStr("InputMethodConnectionName")));
+            if (strLen(plistConn) > 0) plistConn else fallback
+        }
+    }
+}
+
+// ============================================================================
+// JuxuAppDelegate (`main.swift` lines 113-159)
+// ============================================================================
+
+def appDidFinishLaunching(_self: Ptr, _cmd: Ptr, _notif: Ptr): Void = {
+    let bundle = msgSend0(objcClass("NSBundle"), objcSel("mainBundle"));
+    let bundleId = mainBundleIdentifier("im.juxu.inputmethod.Juxu");
+    let connName = resolveImkConnectionName(bundle, bundleId);
+
+    let serverAlloc = msgSend0(objcClass("IMKServer"), objcSel("alloc"));
+    let server = msgSend2Ptr(
+        serverAlloc,
+        objcSel("initWithName:bundleIdentifier:"),
+        nsStr(connName),
+        nsStr(bundleId)
+    );
+    cellSet(gImkServer, server);
+
+    // Initialize shared engine eagerly (< 1ms) so first keystroke has 0ms cold latency
+    let session = bridgeShared();
+    inputControllerSetSession(session);
+
+    // Sync global voice hotkey only if enabled by user preferences
+    voiceInitOnLaunch();
+
+    // Allow launching standalone settings UI via `--settings` or `--settings-section=<name>`
+    let sectionOpt = cliFlagValue("--settings-section");
+    let wantSettings = hasCliFlag("--settings") || match sectionOpt {
+        Some(_) -> true,
+        None -> false,
+    };
+    if (wantSettings) {
+        let sec: SettingsSection = match sectionOpt {
+            Some(secName) -> parseSettingsSection(secName),
+            None -> SecSchema,
+        };
+        settingsWindowShowSection(session, sec)
+    } else ()
+}
+
+def appWillTerminate(_self: Ptr, _cmd: Ptr, _notif: Ptr): Void = {
+    voiceShutdownOnTerminate();
+    bridgeFlushUserDataSync(bridgeShared())
+}
+
+extern init(104) def registerAppDelegateClass(): Void = {
+    let cls = objcAllocateClass("NSObject", "JuxuAppDelegate");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "applicationDidFinishLaunching:", cFnPtr(appDidFinishLaunching), "v@:@");
+        let _ = objcAddMethod(cls, "applicationWillTerminate:", cFnPtr(appWillTerminate), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}
+
+// ============================================================================
+// Entry Point (`main.swift` lines 23-164)
+// ============================================================================
+
 def main(): Void = withAutoreleasePool(() -> {
     if (hasCliFlag("--register-system-cache")) {
         let bundle = msgSend0(objcClass("NSBundle"), objcSel("mainBundle"));
-        let url = msgSend0(bundle, objcSel("bundleURL"));
-        let _ = c_TISRegisterInputSource(url);
-        let _ = c_TISCreateInputSourceList(ptrNull(), true);
+        let bundleUrl = if (ptrIsNull(bundle)) ptrNull() else msgSend0(bundle, objcSel("bundleURL"));
+        tisRegisterSystemCache(bundleUrl);
         exit(0)
     } else ();
 
-    let app = msgSend0(objcClass("NSApplication"), objcSel("sharedApplication"));
-    let bundleId = mainBundleIdentifier("im.juxu.inputmethod.Juxu");
-    let connName = bundleId + ".Connection";
-
-    let serverAlloc = msgSend0(objcClass("IMKServer"), objcSel("alloc"));
-    let _server = msgSend2Ptr(serverAlloc, objcSel("initWithName:bundleIdentifier:"), nsStr(connName), nsStr(bundleId));
-
-    let session = sessionNew();
-    let resDir = mainBundleResourcePath();
-    let bundleDicts = pathJoin(resDir, "Dicts");
-    if (strLen(resDir) > 0 && isDir(bundleDicts)) {
-        let _ = sessionLoadDictsFromDir(session, bundleDicts);
-        ()
+    if (hasCliFlag("--register-and-enable")) {
+        let _ = msgSend0(objcClass("NSApplication"), objcSel("sharedApplication"));
+        let bundle = msgSend0(objcClass("NSBundle"), objcSel("mainBundle"));
+        let bundleUrl = if (ptrIsNull(bundle)) ptrNull() else msgSend0(bundle, objcSel("bundleURL"));
+        let bundleId = mainBundleIdentifier("im.juxu.inputmethod.Juxu");
+        let modeId = resolvePrimaryInputModeId(bundle, bundleId);
+        let shouldSelect = hasCliFlag("--select");
+        tisRegisterAndEnable(bundleUrl, bundleId, modeId, shouldSelect);
+        exit(0)
     } else ();
 
-    match getEnv("HOME") {
-        Some(home) -> sessionLoadPersistence(session, pathJoin(home, "Library/Application Support/Juxu")),
+    match cliFlagValue("--render-previews") {
+        Some(outDir) -> {
+            let ok = renderAllMacosPreviews(outDir);
+            printLn("Rendered 2x Retina previews in " + outDir);
+            exit(if (ok) 0 else 1)
+        },
         None -> (),
     };
 
-    inputControllerSetSession(session);
-
-    if (hasCliFlag("--settings")) {
-        settingsWindowShow(session)
-    } else ();
-
+    let app = msgSend0(objcClass("NSApplication"), objcSel("sharedApplication"));
+    let delegate = objcAllocInit("JuxuAppDelegate");
+    cellSet(gAppDelegate, delegate);
+    msgSendVoid1Ptr(app, objcSel("setDelegate:"), delegate);
     msgSendVoid0(app, objcSel("run"))
 })

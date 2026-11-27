@@ -1,7 +1,18 @@
-/// CoreGraphics / Foundation C ABI geometry structs and typed `objc_msgSend` helpers
+/// CoreGraphics / Foundation C ABI geometry structs, UTF-8/UTF-16 string helpers,
+/// `objc_msgSend` / `objc_msgSendSuper` wrappers, Grand Central Dispatch, and dynamic colors
 /// shared across macOS (AppKit/InputMethodKit) and iOS (UIKit).
 
-use objc.{objcClass, objcSel, msgSend0, msgSend1Ptr, msgSendVoid0, msgSendVoid1Ptr, nsString, withId}
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGetOr}
+use std.buf.{StringBuf, bufWithCap, bufPushByte, bufToString}
+use objc.{
+    objcClass, objcSel, msgSend0, msgSend1Ptr, msgSendI64_0, msgSendFloat0,
+    msgSendVoid0, msgSendVoid1Ptr,
+}
+
+// ============================================================================
+// CoreGraphics & Foundation C ABI Value Structs
+// ============================================================================
 
 pub extern data CGPoint {
     x: Float,
@@ -23,6 +34,22 @@ pub extern data NSRange {
     length: Int64,
 }
 
+pub extern data UIEdgeInsets {
+    top: Float,
+    left: Float,
+    bottom: Float,
+    right: Float,
+}
+
+pub extern data CGAffineTransform {
+    a: Float,
+    b: Float,
+    c: Float,
+    d: Float,
+    tx: Float,
+    ty: Float,
+}
+
 pub def cgPoint(x: Float, y: Float): CGPoint =
     CGPoint { x: x, y: y }
 
@@ -35,6 +62,18 @@ pub def cgRect(x: Float, y: Float, w: Float, h: Float): CGRect =
 pub def nsRange(loc: Int64, len: Int64): NSRange =
     NSRange { location: loc, length: len }
 
+pub def uiEdgeInsets(top: Float, left: Float, bottom: Float, right: Float): UIEdgeInsets =
+    UIEdgeInsets { top: top, left: left, bottom: bottom, right: right }
+
+pub def cgAffineIdentity(): CGAffineTransform =
+    CGAffineTransform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0 }
+
+pub def cgAffineScale(sx: Float, sy: Float): CGAffineTransform =
+    CGAffineTransform { a: sx, b: 0.0, c: 0.0, d: sy, tx: 0.0, ty: 0.0 }
+
+pub def cgAffineTranslate(tx: Float, ty: Float): CGAffineTransform =
+    CGAffineTransform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: tx, ty: ty }
+
 pub def nsNotFound(): Int64 =
     intToI64(2147483647) * intToI64(65536) * intToI64(65536)
         + intToI64(2147483647) * intToI64(2)
@@ -46,25 +85,87 @@ pub def rectContainsPoint(r: CGRect, p: CGPoint): Bool =
         && p.y >= r.origin.y
         && p.y <= r.origin.y + r.size.height
 
+pub def rectIntersectsRect(a: CGRect, b: CGRect): Bool =
+    a.origin.x < b.origin.x + b.size.width
+        && a.origin.x + a.size.width > b.origin.x
+        && a.origin.y < b.origin.y + b.size.height
+        && a.origin.y + a.size.height > b.origin.y
+
+pub def rectInset(r: CGRect, dx: Float, dy: Float): CGRect =
+    cgRect(
+        r.origin.x + dx,
+        r.origin.y + dy,
+        r.size.width - dx * 2.0,
+        r.size.height - dy * 2.0
+    )
+
 pub def rectMidX(r: CGRect): Float = r.origin.x + r.size.width * 0.5
 pub def rectMidY(r: CGRect): Float = r.origin.y + r.size.height * 0.5
 pub def rectMaxX(r: CGRect): Float = r.origin.x + r.size.width
 pub def rectMaxY(r: CGRect): Float = r.origin.y + r.size.height
 
 // ============================================================================
-// Typed `objc_msgSend` helpers for C ABI structs & Apple frameworks
+// Pointer / Integer & Buffer Struct Marshalling
+// ============================================================================
+
+pub extern noalloc "juxu_ptr_to_i64" def ptrToI64(p: Ptr): Int64
+pub extern noalloc "juxu_i64_to_ptr" def i64ToPtr(v: Int64): Ptr
+
+/// Read a `CGRect` (4 IEEE-754 doubles = 32 bytes) from a raw C buffer `buf`.
+pub def readCGRectFromBuf(buf: Ptr): CGRect =
+    cgRect(
+        ptrReadF64Le(buf, 0),
+        ptrReadF64Le(buf, 8),
+        ptrReadF64Le(buf, 16),
+        ptrReadF64Le(buf, 24)
+    )
+
+/// Write a `CGRect` (32 bytes) into a raw C buffer `buf`.
+pub def writeCGRectToBuf(buf: Ptr, r: CGRect): Void = {
+    ptrWriteF64Le(buf, 0, r.origin.x);
+    ptrWriteF64Le(buf, 8, r.origin.y);
+    ptrWriteF64Le(buf, 16, r.size.width);
+    ptrWriteF64Le(buf, 24, r.size.height)
+}
+
+/// Read an `NSRange` (16 bytes) from a raw C buffer `buf`.
+pub def readNSRangeFromBuf(buf: Ptr): NSRange =
+    nsRange(ptrReadI64Le(buf, 0), ptrReadI64Le(buf, 8))
+
+/// Write an `NSRange` (16 bytes) into a raw C buffer `buf`.
+pub def writeNSRangeToBuf(buf: Ptr, r: NSRange): Void = {
+    ptrWriteI64Le(buf, 0, r.location);
+    ptrWriteI64Le(buf, 8, r.length)
+}
+
+// ============================================================================
+// Typed `objc_msgSend` & `objc_msgSendSuper` Helpers
 // ============================================================================
 
 pub extern "objc_msgSend" def msgSendRect0(obj: Ptr, sel: Ptr): CGRect
+pub extern "objc_msgSend" def msgSendRect1Ptr(obj: Ptr, sel: Ptr, a0: Ptr): CGRect
+pub extern "objc_msgSend" def msgSendRect1Rect1Ptr(obj: Ptr, sel: Ptr, r: CGRect, a1: Ptr): CGRect
 pub extern "objc_msgSend" def msgSendPoint0(obj: Ptr, sel: Ptr): CGPoint
 pub extern "objc_msgSend" def msgSendSize0(obj: Ptr, sel: Ptr): CGSize
+pub extern "objc_msgSend" def msgSendSize1Ptr(obj: Ptr, sel: Ptr, a0: Ptr): CGSize
+pub extern "objc_msgSend" def msgSendSize1Size(obj: Ptr, sel: Ptr, s: CGSize): CGSize
 pub extern "objc_msgSend" def msgSendRange0(obj: Ptr, sel: Ptr): NSRange
+pub extern "objc_msgSend" def msgSendInsets0(obj: Ptr, sel: Ptr): UIEdgeInsets
 pub extern "objc_msgSend" def msgSendPoint1Ptr(obj: Ptr, sel: Ptr, a0: Ptr): CGPoint
 pub extern "objc_msgSend" def msgSendPoint1Point1Ptr(obj: Ptr, sel: Ptr, p: CGPoint, a1: Ptr): CGPoint
 pub extern "objc_msgSend" def msgSendInitFrame(obj: Ptr, sel: Ptr, frame: CGRect): Ptr
+pub extern "objc_msgSend" def msgSend1Rect1F(obj: Ptr, sel: Ptr, r: CGRect, f: Float): Ptr
+pub extern "objc_msgSend" def msgSend1Rect1U64_1F(obj: Ptr, sel: Ptr, r: CGRect, corners: Int64, radii: CGSize): Ptr
 pub extern "objc_msgSend" def msgSendVoid1Rect(obj: Ptr, sel: Ptr, r: CGRect): Void
+pub extern "objc_msgSend" def msgSendVoid1Rect1Ptr(obj: Ptr, sel: Ptr, r: CGRect, a1: Ptr): Void
+pub extern "objc_msgSend" def msgSendVoid1Rect1I64_1F(obj: Ptr, sel: Ptr, r: CGRect, mode: Int64, alpha: Float): Void
 pub extern "objc_msgSend" def msgSendVoid1Point(obj: Ptr, sel: Ptr, p: CGPoint): Void
+pub extern "objc_msgSend" def msgSendVoid1Point1Ptr(obj: Ptr, sel: Ptr, p: CGPoint, a1: Ptr): Void
+pub extern "objc_msgSend" def msgSendVoid1Point1Bool(obj: Ptr, sel: Ptr, p: CGPoint, b: Bool): Void
 pub extern "objc_msgSend" def msgSendVoid1Size(obj: Ptr, sel: Ptr, s: CGSize): Void
+pub extern "objc_msgSend" def msgSendVoid1Insets(obj: Ptr, sel: Ptr, ins: UIEdgeInsets): Void
+pub extern "objc_msgSend" def msgSendVoid1Transform(obj: Ptr, sel: Ptr, t: CGAffineTransform): Void
+pub extern "objc_msgSend" def msgSendVoid1Range(obj: Ptr, sel: Ptr, r: NSRange): Void
 pub extern "objc_msgSend" def msgSendVoid1Ptr1Range(obj: Ptr, sel: Ptr, a0: Ptr, r: NSRange): Void
 pub extern "objc_msgSend" def msgSendVoid1Ptr2Range(obj: Ptr, sel: Ptr, a0: Ptr, r1: NSRange, r2: NSRange): Void
 pub extern "objc_msgSend" def msgSend1Rect1U64_1I64_1Bool(
@@ -73,54 +174,100 @@ pub extern "objc_msgSend" def msgSend1Rect1U64_1I64_1Bool(
 pub extern "objc_msgSend" def msgSend4Float(
     obj: Ptr, sel: Ptr, a0: Float, a1: Float, a2: Float, a3: Float
 ): Ptr
+pub extern "objc_msgSend" def msgSend3Float(
+    obj: Ptr, sel: Ptr, a0: Float, a1: Float, a2: Float
+): Ptr
 pub extern "objc_msgSend" def msgSend2Float(obj: Ptr, sel: Ptr, a0: Float, a1: Float): Ptr
+pub extern "objc_msgSend" def msgSend2Float1I64(obj: Ptr, sel: Ptr, a0: Float, a1: Float, a2: Int64): Ptr
+pub extern "objc_msgSend" def msgSend1Float1I64(obj: Ptr, sel: Ptr, a0: Float, a1: Int64): Ptr
 pub extern "objc_msgSend" def msgSend2Ptr(obj: Ptr, sel: Ptr, a0: Ptr, a1: Ptr): Ptr
+pub extern "objc_msgSend" def msgSend4Ptr(obj: Ptr, sel: Ptr, a0: Ptr, a1: Ptr, a2: Ptr, a3: Ptr): Ptr
 pub extern "objc_msgSend" def msgSend1Ptr1Bool(obj: Ptr, sel: Ptr, a0: Ptr, a1: Bool): Ptr
+pub extern "objc_msgSend" def msgSend1Ptr1Float(obj: Ptr, sel: Ptr, a0: Ptr, a1: Float): Ptr
 pub extern "objc_msgSend" def msgSend1Ptr1I64(obj: Ptr, sel: Ptr, a0: Ptr, a1: Int64): Ptr
+pub extern "objc_msgSend" def msgSend1Ptr2I64(obj: Ptr, sel: Ptr, a0: Ptr, a1: Int64, a2: Int64): Ptr
 pub extern "objc_msgSend" def msgSend1I64_1Ptr(obj: Ptr, sel: Ptr, a0: Int64, a1: Ptr): Ptr
 pub extern "objc_msgSend" def msgSend1Range(obj: Ptr, sel: Ptr, r: NSRange): Ptr
+pub extern "objc_msgSend" def msgSend1Range1Ptr(obj: Ptr, sel: Ptr, r: NSRange, outPtr: Ptr): Ptr
+pub extern "objc_msgSend" def msgSend1I64_1PtrOut(obj: Ptr, sel: Ptr, idx: Int64, rectOut: Ptr): Ptr
 pub extern "objc_msgSend" def msgSendVoid1I64(obj: Ptr, sel: Ptr, a0: Int64): Void
 pub extern "objc_msgSend" def msgSendVoid1F32(obj: Ptr, sel: Ptr, a0: Float32): Void
+pub extern "objc_msgSend" def msgSendVoid1F32_1Bool(obj: Ptr, sel: Ptr, a0: Float32, a1: Bool): Void
+pub extern "objc_msgSend" def msgSendF32_0(obj: Ptr, sel: Ptr): Float32
 pub extern "objc_msgSend" def msgSendBool1Ptr(obj: Ptr, sel: Ptr, a0: Ptr): Bool
 pub extern "objc_msgSend" def msgSendBool2Ptr(obj: Ptr, sel: Ptr, a0: Ptr, a1: Ptr): Bool
+pub extern "objc_msgSend" def msgSendBool1Sel1Ptr2Ptr(obj: Ptr, sel: Ptr, action: Ptr, to: Ptr, from: Ptr, ev: Ptr): Bool
 pub extern "objc_msgSend" def msgSendVoid1Ptr1Bool(obj: Ptr, sel: Ptr, a0: Ptr, a1: Bool): Void
+pub extern "objc_msgSend" def msgSendVoid1Ptr1Bool1Ptr(obj: Ptr, sel: Ptr, a0: Ptr, a1: Bool, a2: Ptr): Void
 pub extern "objc_msgSend" def msgSendVoid1Int1Bool(obj: Ptr, sel: Ptr, a0: Int, a1: Bool): Void
 pub extern "objc_msgSend" def msgSendVoid2I64(obj: Ptr, sel: Ptr, a0: Int64, a1: Int64): Void
 pub extern "objc_msgSend" def msgSendVoid1Ptr1I64(obj: Ptr, sel: Ptr, a0: Ptr, a1: Int64): Void
+pub extern "objc_msgSend" def msgSendVoid1Ptr1I64_1Bool(obj: Ptr, sel: Ptr, a0: Ptr, a1: Int64, a2: Bool): Void
+pub extern "objc_msgSend" def msgSendVoid2Ptr1Ptr(obj: Ptr, sel: Ptr, a0: Ptr, a1: Ptr, a2: Ptr): Void
+pub extern "objc_msgSend" def msgSendVoid3Ptr(obj: Ptr, sel: Ptr, a0: Ptr, a1: Ptr, a2: Ptr): Void
+pub extern "objc_msgSend" def msgSendVoid4Ptr(obj: Ptr, sel: Ptr, a0: Ptr, a1: Ptr, a2: Ptr, a3: Ptr): Void
 pub extern "objc_msgSend" def msgSendVoid1Ptr1Sel(obj: Ptr, sel: Ptr, target: Ptr, action: Ptr): Void
 pub extern "objc_msgSend" def msgSendVoid1Ptr1Sel1U64(obj: Ptr, sel: Ptr, target: Ptr, action: Ptr, events: Int64): Void
-
-/// Return `NSBundle.mainBundle.resourcePath` (or `""` if unavailable).
-pub def mainBundleResourcePath(): String = {
-    let cls = objcClass("NSBundle");
-    let bundle = msgSend0(cls, objcSel("mainBundle"));
-    if (ptrIsNull(bundle)) ""
-    else {
-        let p = msgSend0(bundle, objcSel("resourcePath"));
-        if (ptrIsNull(p)) ""
-        else {
-            let utf8 = msgSend0(p, objcSel("UTF8String"));
-            if (ptrIsNull(utf8)) "" else ptrToString(utf8)
-        }
-    }
-}
-
-/// Return `NSBundle.mainBundle.bundleIdentifier` (or `fallback`).
-pub def mainBundleIdentifier(fallback: String): String = {
-    let cls = objcClass("NSBundle");
-    let bundle = msgSend0(cls, objcSel("mainBundle"));
-    if (ptrIsNull(bundle)) fallback
-    else {
-        let p = msgSend0(bundle, objcSel("bundleIdentifier"));
-        if (ptrIsNull(p)) fallback
-        else {
-            let utf8 = msgSend0(p, objcSel("UTF8String"));
-            if (ptrIsNull(utf8)) fallback else ptrToString(utf8)
-        }
-    }
-}
-
+pub extern "objc_msgSend" def msgSendVoid1Ptr1Sel1Ptr(obj: Ptr, sel: Ptr, obs: Ptr, action: Ptr, name: Ptr): Void
+pub extern "objc_msgSend" def msgSendVoid1Ptr1Sel2Ptr(obj: Ptr, sel: Ptr, obs: Ptr, action: Ptr, name: Ptr, obj2: Ptr): Void
+pub extern "objc_msgSend" def msgSend1Float1Bool1Ptr(obj: Ptr, sel: Ptr, secs: Float, repeats: Bool, blk: ScopedPtr): Ptr
+pub extern "objc_msgSend" def msgSend1Float2Ptr1Ptr1Bool(obj: Ptr, sel: Ptr, secs: Float, target: Ptr, sel2: Ptr, info: Ptr, repeats: Bool): Ptr
+pub extern "objc_msgSend" def msgSendVoid1Float2Ptr(obj: Ptr, sel: Ptr, dur: Float, animBlk: ScopedPtr, compBlk: ScopedPtr): Void
+pub extern "objc_msgSend" def msgSendVoid1Float1Ptr(obj: Ptr, sel: Ptr, dur: Float, animBlk: ScopedPtr): Void
 pub extern "objc_msgSend" def msgSend1Str(obj: Ptr, sel: Ptr, a0: String): Ptr
+
+pub extern "juxu_msgSendSuper_void0" def objcSendSuperVoid0(receiver: Ptr, superClassName: String, sel: Ptr): Void
+pub extern "juxu_msgSendSuper_void1ptr" def objcSendSuperVoid1Ptr(receiver: Ptr, superClassName: String, sel: Ptr, a0: Ptr): Void
+pub extern "juxu_msgSendSuper_void1bool" def objcSendSuperVoid1Bool(receiver: Ptr, superClassName: String, sel: Ptr, a0: Bool): Void
+pub extern "juxu_msgSendSuper_bool1ptr" def objcSendSuperBool1Ptr(receiver: Ptr, superClassName: String, sel: Ptr, a0: Ptr): Bool
+pub extern "juxu_msgSendSuper_id0" def objcSendSuperId0(receiver: Ptr, superClassName: String, sel: Ptr): Ptr
+
+// ============================================================================
+// Grand Central Dispatch & Dynamic Colors
+// ============================================================================
+
+extern "juxu_dispatch_main_async" def c_dispatch_main_async(tramp: Ptr, handle: Int64): Void
+extern "juxu_dispatch_main_after_ms" def c_dispatch_main_after_ms(delayMs: Int64, tramp: Ptr, handle: Int64): Void
+pub extern "juxu_dispatch_queue_serial_new" def dispatchQueueCreateSerial(label: String): Ptr
+extern "juxu_dispatch_async_on" def c_dispatch_async_on(queue: Ptr, tramp: Ptr, handle: Int64): Void
+extern "juxu_dispatch_sync_on" def c_dispatch_sync_on(queue: Ptr, tramp: Ptr, handle: Int64): Void
+
+def __juxuGcdTramp0(h: Int64): Void = {
+    let f: () -> Void = gcHandleGet(h);
+    f()
+}
+
+/// Schedule `cb` asynchronously on the main RunLoop / `dispatch_get_main_queue()`.
+pub def dispatchMainAsync(cb: () -> Void): Void =
+    c_dispatch_main_async(cFnPtr(__juxuGcdTramp0), gcHandleNew(cb))
+
+/// Schedule `cb` on `dispatch_get_main_queue()` after `delayMs` milliseconds.
+pub def dispatchMainAfterMs(delayMs: Int, cb: () -> Void): Void =
+    c_dispatch_main_after_ms(intToI64(delayMs), cFnPtr(__juxuGcdTramp0), gcHandleNew(cb))
+
+/// Enqueue `cb` asynchronously on a serial dispatch queue created with `dispatchQueueCreateSerial`.
+pub def dispatchAsync(queue: Ptr, cb: () -> Void): Void =
+    c_dispatch_async_on(queue, cFnPtr(__juxuGcdTramp0), gcHandleNew(cb))
+
+/// Execute `cb` synchronously as a barrier on a serial dispatch queue.
+pub def dispatchSync(queue: Ptr, cb: () -> Void): Void =
+    c_dispatch_sync_on(queue, cFnPtr(__juxuGcdTramp0), gcHandleNew(cb))
+
+/// Create a `UIColor*` (`colorWithDynamicProvider:`) resolving to `(lr,lg,lb,la)` in Light and `(dr,dg,db,da)` in Dark.
+pub extern "juxu_uicolor_dynamic" def uiDynamicColor(
+    lr: Float, lg: Float, lb: Float, la: Float,
+    dr: Float, dg: Float, db: Float, da: Float
+): Ptr
+
+/// Create an `NSColor*` (`colorWithName:dynamicProvider:`) resolving to `(lr,lg,lb,la)` in Aqua and `(dr,dg,db,da)` in DarkAqua.
+pub extern "juxu_nscolor_dynamic" def nsDynamicColor(
+    lr: Float, lg: Float, lb: Float, la: Float,
+    dr: Float, dg: Float, db: Float, da: Float
+): Ptr
+
+// ============================================================================
+// Foundation String, Bundle & Process Helpers
+// ============================================================================
 
 /// Create an autoreleased `NSString*` from a Geisha UTF-8 `String` (`+[NSString stringWithUTF8String:]`).
 pub def nsStr(s: String): Ptr =
@@ -134,25 +281,369 @@ pub def nsStrPtrToString(p: Ptr): String =
         if (ptrIsNull(utf8)) "" else ptrToString(utf8)
     }
 
+/// Convert a nullable `NSString*` pointer into `Option String` (`None` only if pointer is `nil`).
+pub def nsStrPtrToOpt(p: Ptr): Option String =
+    if (ptrIsNull(p)) None else Some(nsStrPtrToString(p))
+
+/// Return the UTF-16 length (`[ns length]`) of a raw `NSString*` pointer.
+pub def nsStrUtf16Len(p: Ptr): Int64 =
+    if (ptrIsNull(p)) intToI64(0)
+    else msgSendI64_0(p, objcSel("length"))
+
+/// Compute the exact UTF-16 code-unit length of a Geisha UTF-8 `String` (pure, zero ObjC allocation).
+pub def strUtf16Len(s: String): Int64 = {
+    let n = strLen(s);
+    let i = cellNew(0);
+    let u16 = cellNew(intToI64(0));
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let b0 = strByteAt(s, idx);
+        if (b0 < 0x80) {
+            cellSet(u16, cellGet(u16) + intToI64(1));
+            cellSet(i, idx + 1)
+        } else if ((b0 & 0xE0) == 0xC0) {
+            cellSet(u16, cellGet(u16) + intToI64(1));
+            cellSet(i, idx + 2)
+        } else if ((b0 & 0xF0) == 0xE0) {
+            cellSet(u16, cellGet(u16) + intToI64(1));
+            cellSet(i, idx + 3)
+        } else if ((b0 & 0xF8) == 0xF0) {
+            // Astral plane scalar -> UTF-16 surrogate pair (2 code units)
+            cellSet(u16, cellGet(u16) + intToI64(2));
+            cellSet(i, idx + 4)
+        } else {
+            cellSet(u16, cellGet(u16) + intToI64(1));
+            cellSet(i, idx + 1)
+        }
+    };
+    cellGet(u16)
+}
+
 /// Allocate and initialize an ObjC object with `[[cls alloc] init]`.
 pub def objcAllocInit(className: String): Ptr = {
     let cls = objcClass(className);
-    let obj = msgSend0(cls, objcSel("alloc"));
-    msgSend0(obj, objcSel("init"))
+    if (ptrIsNull(cls)) ptrNull()
+    else {
+        let obj = msgSend0(cls, objcSel("alloc"));
+        msgSend0(obj, objcSel("init"))
+    }
 }
-
-/// Read a `CGRect` (4 IEEE-754 doubles = 32 bytes) from a raw C buffer `buf`.
-pub def readCGRectFromBuf(buf: Ptr): CGRect =
-    cgRect(
-        ptrReadF64Le(buf, 0),
-        ptrReadF64Le(buf, 8),
-        ptrReadF64Le(buf, 16),
-        ptrReadF64Le(buf, 24)
-    )
 
 /// Allocate and initialize an ObjC view with `[[cls alloc] initWithFrame:frame]`.
 pub def objcAllocInitFrame(className: String, frame: CGRect): Ptr = {
     let cls = objcClass(className);
-    let obj = msgSend0(cls, objcSel("alloc"));
-    msgSendInitFrame(obj, objcSel("initWithFrame:"), frame)
+    if (ptrIsNull(cls)) ptrNull()
+    else {
+        let obj = msgSend0(cls, objcSel("alloc"));
+        msgSendInitFrame(obj, objcSel("initWithFrame:"), frame)
+    }
+}
+
+/// Return `NSBundle.mainBundle.resourcePath` (or `""` if unavailable).
+pub def mainBundleResourcePath(): String = {
+    let cls = objcClass("NSBundle");
+    if (ptrIsNull(cls)) ""
+    else {
+        let bundle = msgSend0(cls, objcSel("mainBundle"));
+        if (ptrIsNull(bundle)) ""
+        else nsStrPtrToString(msgSend0(bundle, objcSel("resourcePath")))
+    }
+}
+
+/// Return `NSBundle.mainBundle.bundlePath` (or `""` if unavailable).
+pub def mainBundlePath(): String = {
+    let cls = objcClass("NSBundle");
+    if (ptrIsNull(cls)) ""
+    else {
+        let bundle = msgSend0(cls, objcSel("mainBundle"));
+        if (ptrIsNull(bundle)) ""
+        else nsStrPtrToString(msgSend0(bundle, objcSel("bundlePath")))
+    }
+}
+
+/// Return `NSBundle.mainBundle.bundleIdentifier` (or `fallback`).
+pub def mainBundleIdentifier(fallback: String): String = {
+    let cls = objcClass("NSBundle");
+    if (ptrIsNull(cls)) fallback
+    else {
+        let bundle = msgSend0(cls, objcSel("mainBundle"));
+        if (ptrIsNull(bundle)) fallback
+        else {
+            let s = nsStrPtrToString(msgSend0(bundle, objcSel("bundleIdentifier")));
+            if (strLen(s) == 0) fallback else s
+        }
+    }
+}
+
+/// Return `ProcessInfo.processInfo.arguments` as a `Vec String`.
+pub def processArguments(): Vec String = {
+    let out: Vec String = vecNew();
+    let cls = objcClass("NSProcessInfo");
+    if (!ptrIsNull(cls)) {
+        let pi = msgSend0(cls, objcSel("processInfo"));
+        if (!ptrIsNull(pi)) {
+            let arr = msgSend0(pi, objcSel("arguments"));
+            if (!ptrIsNull(arr)) {
+                let n = i64ToInt(msgSendI64_0(arr, objcSel("count")));
+                let i = cellNew(0);
+                while (cellGet(i) < n) {
+                    let idx = cellGet(i);
+                    let item = msgSend1I64_1Ptr(arr, objcSel("objectAtIndex:"), intToI64(idx), ptrNull());
+                    vecPush(out, nsStrPtrToString(item));
+                    cellSet(i, idx + 1)
+                }
+            } else ()
+        } else ()
+    } else ();
+    out
+}
+
+/// Return `true` if `ProcessInfo.processInfo.arguments` contains `flag`.
+pub def hasProcessArgument(flag: String): Bool = {
+    let args = processArguments();
+    let n = vecLen(args);
+    let i = cellNew(0);
+    let found = cellNew(false);
+    while (cellGet(i) < n && !cellGet(found)) {
+        if (vecGetOr(args, cellGet(i), "") == flag) cellSet(found, true) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+/// Return `ProcessInfo.processInfo.systemUptime` in seconds.
+pub def systemUptimeSeconds(): Float = {
+    let cls = objcClass("NSProcessInfo");
+    if (ptrIsNull(cls)) 0.0
+    else {
+        let pi = msgSend0(cls, objcSel("processInfo"));
+        if (ptrIsNull(pi)) 0.0 else msgSendFloat0(pi, objcSel("systemUptime"))
+    }
+}
+
+/// Return `NSHomeDirectory()` as a Geisha `String`.
+extern "NSHomeDirectory" def c_NSHomeDirectory(): Ptr
+pub def appleHomeDirectory(): String =
+    nsStrPtrToString(c_NSHomeDirectory())
+
+/// Return `NSTemporaryDirectory()` as a Geisha `String`.
+extern "NSTemporaryDirectory" def c_NSTemporaryDirectory(): Ptr
+pub def appleTemporaryDirectory(): String =
+    nsStrPtrToString(c_NSTemporaryDirectory())
+
+// ============================================================================
+// Pure UTF-8 Unicode Scalar Helpers (used across TextFormatting, LineClear & Context Slicing)
+// ============================================================================
+
+/// Decode one UTF-8 scalar at byte offset `off` in `s`; returns `(codepoint, nextByteOffset)`.
+pub def utf8DecodeAt(s: String, off: Int): (Int, Int) = {
+    let n = strLen(s);
+    if (off >= n) (0, n)
+    else {
+        let b0 = strByteAt(s, off);
+        if (b0 < 0x80) (b0, off + 1)
+        else if ((b0 & 0xE0) == 0xC0 && off + 1 < n) {
+            let b1 = strByteAt(s, off + 1);
+            (((b0 & 0x1F) << 6) | (b1 & 0x3F), off + 2)
+        } else if ((b0 & 0xF0) == 0xE0 && off + 2 < n) {
+            let b1 = strByteAt(s, off + 1);
+            let b2 = strByteAt(s, off + 2);
+            (((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F), off + 3)
+        } else if ((b0 & 0xF8) == 0xF0 && off + 3 < n) {
+            let b1 = strByteAt(s, off + 1);
+            let b2 = strByteAt(s, off + 2);
+            let b3 = strByteAt(s, off + 3);
+            (((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F), off + 4)
+        } else (b0, off + 1)
+    }
+}
+
+/// Push a single Unicode scalar `cp` encoded as UTF-8 into `buf`.
+pub def bufPushScalar(buf: StringBuf, cp: Int): Void =
+    if (cp < 0x80) {
+        bufPushByte(buf, cp)
+    } else if (cp < 0x800) {
+        bufPushByte(buf, 0xC0 | (cp >> 6));
+        bufPushByte(buf, 0x80 | (cp & 0x3F))
+    } else if (cp < 0x10000) {
+        bufPushByte(buf, 0xE0 | (cp >> 12));
+        bufPushByte(buf, 0x80 | ((cp >> 6) & 0x3F));
+        bufPushByte(buf, 0x80 | (cp & 0x3F))
+    } else {
+        bufPushByte(buf, 0xF0 | (cp >> 18));
+        bufPushByte(buf, 0x80 | ((cp >> 12) & 0x3F));
+        bufPushByte(buf, 0x80 | ((cp >> 6) & 0x3F));
+        bufPushByte(buf, 0x80 | (cp & 0x3F))
+    }
+
+/// Encode a single Unicode scalar `cp` to a UTF-8 `String`.
+pub def scalarToString(cp: Int): String = {
+    let b = bufWithCap(4);
+    bufPushScalar(b, cp);
+    bufToString(b)
+}
+
+/// Decode the first Unicode scalar of `s` (`(codepoint, byteLen)`, or `(0, 0)` if empty).
+pub def utf8FirstScalar(s: String): (Int, Int) =
+    if (strLen(s) == 0) (0, 0) else utf8DecodeAt(s, 0)
+
+/// Return the first UTF-8 character of `s` as a `String` (or `""` if empty).
+pub def firstCharStr(s: String): String = {
+    let (_, len) = utf8FirstScalar(s);
+    if (len == 0) "" else strSlice(s, 0, len)
+}
+
+/// Decode the last Unicode scalar of `s` (`(codepoint, startByteIdx)`).
+pub def utf8LastScalar(s: String): (Int, Int) = {
+    let n = strLen(s);
+    if (n == 0) (0, 0)
+    else {
+        let idx = cellNew(n - 1);
+        while (cellGet(idx) > 0 && (strByteAt(s, cellGet(idx)) & 0xC0) == 0x80) {
+            cellSet(idx, cellGet(idx) - 1)
+        };
+        let start = cellGet(idx);
+        let (cp, _) = utf8DecodeAt(s, start);
+        (cp, start)
+    }
+}
+
+/// Return the last UTF-8 character of `s` as a `String` (or `""` if empty).
+pub def lastCharStr(s: String): String = {
+    let n = strLen(s);
+    if (n == 0) ""
+    else {
+        let (_, start) = utf8LastScalar(s);
+        strSlice(s, start, n)
+    }
+}
+
+/// Decode all Unicode scalars of `s` into a `Vec Int`.
+pub def utf8ToScalars(s: String): Vec Int = {
+    let n = strLen(s);
+    let out: Vec Int = vecWithCap(n);
+    let off = cellNew(0);
+    while (cellGet(off) < n) {
+        let (cp, nextOff) = utf8DecodeAt(s, cellGet(off));
+        vecPush(out, cp);
+        cellSet(off, nextOff)
+    };
+    out
+}
+
+/// Count Unicode scalars in `s`.
+pub def utf8ScalarCount(s: String): Int = {
+    let n = strLen(s);
+    let cnt = cellNew(0);
+    let off = cellNew(0);
+    while (cellGet(off) < n) {
+        let (_, nextOff) = utf8DecodeAt(s, cellGet(off));
+        cellSet(cnt, cellGet(cnt) + 1);
+        cellSet(off, nextOff)
+    };
+    cellGet(cnt)
+}
+
+/// Encode `scalars[start..end]` back into a UTF-8 `String`.
+pub def scalarsToUtf8(scalars: Vec Int, start: Int, end: Int): String = {
+    let n = vecLen(scalars);
+    let lo = if (start < 0) 0 else if (start > n) n else start;
+    let hi = if (end < lo) lo else if (end > n) n else end;
+    let b = bufWithCap((hi - lo) * 3);
+    let i = cellNew(lo);
+    while (cellGet(i) < hi) {
+        bufPushScalar(b, vecGetOr(scalars, cellGet(i), 0));
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+/// Return the last `maxScalars` Unicode scalars of `s`.
+pub def tailScalars(s: String, maxScalars: Int): String =
+    if (maxScalars <= 0 || strLen(s) == 0) ""
+    else {
+        let scs = utf8ToScalars(s);
+        let n = vecLen(scs);
+        if (n <= maxScalars) s
+        else scalarsToUtf8(scs, n - maxScalars, n)
+    }
+
+/// Return the first `maxScalars` Unicode scalars of `s`.
+pub def headScalars(s: String, maxScalars: Int): String =
+    if (maxScalars <= 0 || strLen(s) == 0) ""
+    else {
+        let scs = utf8ToScalars(s);
+        let n = vecLen(scs);
+        if (n <= maxScalars) s
+        else scalarsToUtf8(scs, 0, maxScalars)
+    }
+
+/// Drop the last `dropCount` Unicode scalars of `s`.
+pub def dropLastScalars(s: String, dropCount: Int): String =
+    if (dropCount <= 0 || strLen(s) == 0) s
+    else {
+        let scs = utf8ToScalars(s);
+        let n = vecLen(scs);
+        if (dropCount >= n) ""
+        else scalarsToUtf8(scs, 0, n - dropCount)
+    }
+
+/// Safe UTF-16 cursor context slicer (`(before, selected, after)`), handling surrogate pairs cleanly.
+pub def utf16SliceContext(
+    fullText: String,
+    selectionLocationUTF16: Int,
+    selectionLengthUTF16: Int,
+    maxBeforeChars: Int,
+    maxAfterChars: Int,
+    maxSelectedChars: Int
+): (String, String, String) = {
+    let scs = utf8ToScalars(fullText);
+    let n = vecLen(scs);
+    let selStartU16 = if (selectionLocationUTF16 < 0) 0 else selectionLocationUTF16;
+    let selEndU16 = selStartU16 + (if (selectionLengthUTF16 < 0) 0 else selectionLengthUTF16);
+
+    let u16Pos = cellNew(0);
+    let startScalarIdx = cellNew(n);
+    let endScalarIdx = cellNew(n);
+    let foundStart = cellNew(false);
+    let foundEnd = cellNew(false);
+
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let idx = cellGet(i);
+        let curU16 = cellGet(u16Pos);
+        if (!cellGet(foundStart) && curU16 >= selStartU16) {
+            cellSet(startScalarIdx, idx);
+            cellSet(foundStart, true)
+        } else ();
+        if (!cellGet(foundEnd) && curU16 >= selEndU16) {
+            cellSet(endScalarIdx, idx);
+            cellSet(foundEnd, true)
+        } else ();
+        let cp = vecGetOr(scs, idx, 0);
+        let w = if (cp >= 0x10000) 2 else 1;
+        // If selection lands inside a surrogate pair, snap cleanly to scalar boundary
+        if (!cellGet(foundStart) && curU16 + w > selStartU16) {
+            cellSet(startScalarIdx, idx);
+            cellSet(foundStart, true)
+        } else ();
+        if (!cellGet(foundEnd) && curU16 + w > selEndU16) {
+            cellSet(endScalarIdx, idx + 1);
+            cellSet(foundEnd, true)
+        } else ();
+        cellSet(u16Pos, curU16 + w);
+        cellSet(i, idx + 1)
+    };
+
+    let sIdx = cellGet(startScalarIdx);
+    let eIdx = if (cellGet(endScalarIdx) < sIdx) sIdx else cellGet(endScalarIdx);
+    let beforeLo = if (sIdx > maxBeforeChars) sIdx - maxBeforeChars else 0;
+    let selHi = if (eIdx - sIdx > maxSelectedChars) sIdx + maxSelectedChars else eIdx;
+    let afterHi = if (n - eIdx > maxAfterChars) eIdx + maxAfterChars else n;
+
+    (
+        scalarsToUtf8(scs, beforeLo, sIdx),
+        scalarsToUtf8(scs, sIdx, selHi),
+        scalarsToUtf8(scs, eIdx, afterHi)
+    )
 }

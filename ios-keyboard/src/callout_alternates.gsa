@@ -1,0 +1,488 @@
+/// Complete 1:1 port of `iOS/KeyboardExtension/IOSKeyCalloutAndAlternates.swift` (336 lines):
+/// - `IOSKeyAlternatesView` (long-press horizontal alternates strip with `13.0pt` continuous squircle,
+///   `9.0pt` `systemBlue` selection highlight, shadow `0.34`/`0.16`, `23.0pt` glyphs)
+/// - `IOSKeyCalloutView` (iOS 26 floating `61.33 x 65.0pt` squircle for Row 1/2 + docked tapered
+///   balloon path for Row 0 `q..p`, spring entrance `0.072s` damping `0.84`, delayed `38ms` + `52ms` fade release).
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecLen, vecPush, vecGet, vecClear}
+use objc.{
+    Id, NSObject, idAdoptOpt,
+    objcClass, objcSel, msgSend0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1Bool, msgSendVoid1Float,
+}
+use juxu_shared.{
+    CGPoint, CGRect, CGAffineTransform,
+    cgPoint, cgSize, cgRect, cgAffineIdentity,
+    rectInset, rectMidX, rectMaxX, rectMaxY,
+    msgSend1Rect1F, msgSendVoid1Rect, msgSendVoid1Point,
+    objcAllocInit, objcAllocInitFrame, dispatchMainAfterMs,
+}
+use layout_engine.{keyCornerRadius}
+use gestures_editing.{
+    keyAlternatesStripFrame, keyAlternatesIndexAtX,
+}
+use ios_ui_kit.{
+    setContinuousCorner, caTransactionBeginNoActions, caTransactionCommit,
+    uiColorRgba, uiColorWhite, uiColorSystemBlue, uiColorPureWhite, uiColorBlack, uiCGColor,
+    uiSystemFont, uiPerformWithoutAnimation, uiAnimateWithCompletion, uiAnimateSpring,
+    uiAnimOptAllowUserInteraction, uiAnimOptBeginFromCurrentState, uiAnimOptCurveEaseIn,
+    viewLayer, setLayerShadowOpacity, setLayerShadowOffset, setLayerShadowRadius,
+    setLayerShadowColor, setLayerShadowPath,
+    setViewHidden, isViewHidden, viewBounds, viewFrame, setViewFrame,
+    setViewAlpha, viewAlpha, setViewTransform, setViewBgColor,
+    setLabelText, setLabelTextColor, setLabelFont, setLabelAlignment,
+    removeAllLayerAnimations, msgSendVoid2Point, msgSendVoid3Point,
+}
+
+pub use gestures_editing.{
+    keyAlternatesOptions, keyAlternatesSymbolOptions,
+    keyAlternatesCellWidth, keyAlternatesStripFrame, keyAlternatesIndexAtX,
+}
+
+def minFloat(a: Float, b: Float): Float = if (a < b) a else b
+def maxFloat(a: Float, b: Float): Float = if (a > b) a else b
+
+def scaleAndTranslateTransform(sx: Float, sy: Float, tx: Float, ty: Float): CGAffineTransform =
+    CGAffineTransform { a: sx, b: 0.0, c: 0.0, d: sy, tx: sx * tx, ty: sy * ty }
+
+// ============================================================================
+// IOSKeyAlternatesView (`IOSKeyCalloutAndAlternates.swift` lines 5–88)
+// ============================================================================
+
+pub data IOSKeyAlternatesView {
+    avView: Ptr,
+    avOwner: Option (Id NSObject),
+    avHighlight: Ptr,
+    avHighlightOwner: Option (Id NSObject),
+    avLabels: Vec Ptr,
+    avItems: Vec String,
+    avSelectedIndex: Cell Int,
+    avIsDarkStyle: Cell Bool,
+}
+
+pub def alternatesViewNew(): IOSKeyAlternatesView = {
+    let v = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 0.0, 0.0));
+    let hl = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 0.0, 0.0));
+    if (!ptrIsNull(v)) {
+        msgSendVoid1Bool(v, objcSel("setUserInteractionEnabled:"), false);
+        setViewHidden(v, true);
+        let layer = viewLayer(v);
+        setContinuousCorner(layer, 13.0);
+        setLayerShadowColor(layer, uiCGColor(uiColorBlack()));
+        setLayerShadowOffset(layer, cgSize(0.0, 3.5));
+        setLayerShadowRadius(layer, 11.0);
+
+        if (!ptrIsNull(hl)) {
+            setViewBgColor(hl, uiColorSystemBlue(1.0));
+            setContinuousCorner(viewLayer(hl), 9.0);
+            msgSendVoid1Ptr(v, objcSel("addSubview:"), hl)
+        } else ()
+    } else ();
+
+    IOSKeyAlternatesView {
+        avView: v,
+        avOwner: idAdoptOpt(v),
+        avHighlight: hl,
+        avHighlightOwner: idAdoptOpt(hl),
+        avLabels: vecNew(),
+        avItems: vecNew(),
+        avSelectedIndex: cellNew(0),
+        avIsDarkStyle: cellNew(false),
+    }
+}
+
+pub def alternatesSelectedText(av: IOSKeyAlternatesView): Option String =
+    vecGet(av.avItems, cellGet(av.avSelectedIndex))
+
+def removeAndClearLabels(av: IOSKeyAlternatesView): Void = {
+    let n = vecLen(av.avLabels);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        match vecGet(av.avLabels, cellGet(i)) {
+            Some(lbl) -> if (!ptrIsNull(lbl)) msgSendVoid0(lbl, objcSel("removeFromSuperview")) else (),
+            None -> (),
+        };
+        cellSet(i, cellGet(i) + 1)
+    };
+    vecClear(av.avLabels)
+}
+
+def alternatesSelect(av: IOSKeyAlternatesView, idx: Int): Void = {
+    cellSet(av.avSelectedIndex, idx);
+    let dark = cellGet(av.avIsDarkStyle);
+    match vecGet(av.avLabels, idx) {
+        Some(selLbl) -> setViewFrame(av.avHighlight, rectInset(viewFrame(selLbl), 2.0, 4.0)),
+        None -> (),
+    };
+    let n = vecLen(av.avLabels);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let cur = cellGet(i);
+        match vecGet(av.avLabels, cur) {
+            Some(lbl) -> {
+                let col =
+                    if (cur == idx) uiColorPureWhite()
+                    else if (dark) uiColorPureWhite()
+                    else uiColorBlack();
+                setLabelTextColor(lbl, col)
+            },
+            None -> (),
+        };
+        cellSet(i, cur + 1)
+    }
+}
+
+pub def alternatesPresent(
+    av: IOSKeyAlternatesView,
+    items: Vec String,
+    defaultIndex: Int,
+    keyFrame: CGRect,
+    containerWidth: Float,
+    dark: Bool
+): Void =
+    if (!ptrIsNull(av.avView)) {
+        removeAndClearLabels(av);
+        vecClear(av.avItems);
+        let n = vecLen(items);
+        let k = cellNew(0);
+        while (cellGet(k) < n) {
+            match vecGet(items, cellGet(k)) {
+                Some(it) -> vecPush(av.avItems, it),
+                None -> (),
+            };
+            cellSet(k, cellGet(k) + 1)
+        };
+
+        let f = keyAlternatesStripFrame(keyFrame, n, defaultIndex, containerWidth);
+        setViewFrame(av.avView, f);
+        setViewBgColor(av.avView, if (dark) uiColorRgba(0.29, 0.29, 0.30, 1.0) else uiColorPureWhite());
+        let layer = viewLayer(av.avView);
+        setLayerShadowOpacity(layer, if (dark) 0.34 else 0.16);
+        let localBounds = cgRect(0.0, 0.0, f.size.width, f.size.height);
+        let bz = msgSend1Rect1F(objcClass("UIBezierPath"), objcSel("bezierPathWithRoundedRect:cornerRadius:"), localBounds, 13.0);
+        if (!ptrIsNull(bz)) {
+            setLayerShadowPath(layer, msgSend0(bz, objcSel("CGPath")))
+        } else ();
+
+        let denom = if (n > 1) n else 1;
+        let cellW = f.size.width / intToFloat(denom);
+        let font = uiSystemFont(23.0, 0);
+        let idx = cellNew(0);
+        while (cellGet(idx) < n) {
+            let i = cellGet(idx);
+            let txt = match vecGet(av.avItems, i) { Some(s) -> s, None -> "" };
+            let lbl = objcAllocInitFrame("UILabel", cgRect(intToFloat(i) * cellW, 0.0, cellW, f.size.height));
+            if (!ptrIsNull(lbl)) {
+                setLabelText(lbl, txt);
+                setLabelAlignment(lbl, 1); // NSTextAlignmentCenter
+                setLabelFont(lbl, font);
+                msgSendVoid1Bool(lbl, objcSel("setAdjustsFontSizeToFitWidth:"), true);
+                msgSendVoid1Float(lbl, objcSel("setMinimumScaleFactor:"), 0.5);
+                msgSendVoid1Ptr(av.avView, objcSel("addSubview:"), lbl);
+                // `addSubview:` retains `lbl`; release +1 alloc/init ownership
+                msgSendVoid0(lbl, objcSel("release"))
+            } else ();
+            vecPush(av.avLabels, lbl);
+            cellSet(idx, i + 1)
+        };
+
+        setViewHidden(av.avView, false);
+        cellSet(av.avIsDarkStyle, dark);
+        alternatesSelect(av, defaultIndex)
+    } else ()
+
+/// Updates highlighted cell from superview X; returns `true` when selection changed.
+pub def alternatesUpdate(av: IOSKeyAlternatesView, xInSuperview: Float): Bool = {
+    let idx = keyAlternatesIndexAtX(xInSuperview, viewFrame(av.avView), vecLen(av.avItems));
+    if (idx == cellGet(av.avSelectedIndex)) false
+    else {
+        alternatesSelect(av, idx);
+        true
+    }
+}
+
+pub def alternatesHide(av: IOSKeyAlternatesView): Void =
+    if (!ptrIsNull(av.avView)) {
+        setViewHidden(av.avView, true);
+        vecClear(av.avItems);
+        removeAndClearLabels(av);
+        setLayerShadowPath(viewLayer(av.avView), ptrNull())
+    } else ()
+
+// ============================================================================
+// IOSKeyCalloutView (`IOSKeyCalloutAndAlternates.swift` lines 94–335)
+// ============================================================================
+
+pub data IOSKeyCalloutView {
+    cvView: Ptr,
+    cvOwner: Option (Id NSObject),
+    cvShapeLayer: Ptr,
+    cvGlyphLabel: Ptr,
+    cvDismissGen: Cell Int64,
+    cvCoveredKeyId: Cell (Option String),
+}
+
+pub def calloutViewNew(): IOSKeyCalloutView = {
+    let v = objcAllocInitFrame("UIView", cgRect(0.0, 0.0, 61.33, 65.0));
+    let shapeCls = objcClass("CAShapeLayer");
+    let shape = if (ptrIsNull(shapeCls)) ptrNull() else msgSend0(shapeCls, objcSel("layer"));
+    let lbl = objcAllocInitFrame("UILabel", cgRect(0.0, 0.0, 61.33, 65.0));
+
+    if (!ptrIsNull(v)) {
+        msgSendVoid1Bool(v, objcSel("setOpaque:"), false);
+        msgSendVoid1Bool(v, objcSel("setUserInteractionEnabled:"), false);
+        msgSendVoid1Bool(v, objcSel("setClipsToBounds:"), false);
+        setViewHidden(v, true);
+
+        if (!ptrIsNull(shape)) {
+            setLayerShadowColor(shape, uiCGColor(uiColorBlack()));
+            setLayerShadowOffset(shape, cgSize(0.0, 3.5));
+            setLayerShadowRadius(shape, 11.0);
+            msgSendVoid1Ptr(viewLayer(v), objcSel("addSublayer:"), shape)
+        } else ();
+
+        if (!ptrIsNull(lbl)) {
+            setLabelFont(lbl, uiSystemFont(36.5, 0));
+            setLabelAlignment(lbl, 1); // NSTextAlignmentCenter
+            msgSendVoid1Bool(lbl, objcSel("setAdjustsFontSizeToFitWidth:"), true);
+            msgSendVoid1Float(lbl, objcSel("setMinimumScaleFactor:"), 0.45);
+            msgSendVoid1Ptr(v, objcSel("addSubview:"), lbl);
+            msgSendVoid0(lbl, objcSel("release"))
+        } else ()
+    } else ();
+
+    IOSKeyCalloutView {
+        cvView: v,
+        cvOwner: idAdoptOpt(v),
+        cvShapeLayer: shape,
+        cvGlyphLabel: lbl,
+        cvDismissGen: cellNew(intToI64(0)),
+        cvCoveredKeyId: cellNew(None),
+    }
+}
+
+pub def calloutCoveredKeyId(cv: IOSKeyCalloutView): Option String =
+    cellGet(cv.cvCoveredKeyId)
+
+pub def calloutHideImmediately(cv: IOSKeyCalloutView): Void = {
+    cellSet(cv.cvDismissGen, cellGet(cv.cvDismissGen) + intToI64(1));
+    if (!ptrIsNull(cv.cvView)) {
+        removeAllLayerAnimations(cv.cvView);
+        cellSet(cv.cvCoveredKeyId, None);
+        setViewAlpha(cv.cvView, 1.0);
+        setViewTransform(cv.cvView, cgAffineIdentity());
+        setViewHidden(cv.cvView, true)
+    } else ()
+}
+
+pub def calloutReleasePreview(cv: IOSKeyCalloutView, onCleared: () -> Void): Void = {
+    let gen = cellGet(cv.cvDismissGen) + intToI64(1);
+    cellSet(cv.cvDismissGen, gen);
+    if (!ptrIsNull(cv.cvView)) {
+        dispatchMainAfterMs(38, () -> {
+            if (cellGet(cv.cvDismissGen) == gen) {
+                let opts = uiAnimOptCurveEaseIn() | uiAnimOptBeginFromCurrentState() | uiAnimOptAllowUserInteraction();
+                uiAnimateWithCompletion(
+                    0.052,
+                    opts,
+                    () -> {
+                        setViewAlpha(cv.cvView, 0.0);
+                        setViewTransform(cv.cvView, scaleAndTranslateTransform(0.94, 0.94, 0.0, 2.0))
+                    },
+                    (finished: Bool) ->
+                        if (finished && cellGet(cv.cvDismissGen) == gen) {
+                            cellSet(cv.cvCoveredKeyId, None);
+                            setViewHidden(cv.cvView, true);
+                            setViewAlpha(cv.cvView, 1.0);
+                            setViewTransform(cv.cvView, cgAffineIdentity());
+                            onCleared()
+                        } else ()
+                )
+            } else ()
+        })
+    } else ()
+}
+
+def makeDockedBalloonCGPath(
+    headLeft: Float,
+    headRight: Float,
+    keyLeft: Float,
+    keyRight: Float,
+    waistTop: Float,
+    waistBot: Float,
+    totalHeight: Float,
+    rT: Float,
+    rB: Float
+): Ptr = {
+    let bz = objcAllocInit("UIBezierPath");
+    if (ptrIsNull(bz)) ptrNull()
+    else {
+        let midY = (waistTop + waistBot) * 0.5;
+        msgSendVoid1Point(bz, objcSel("moveToPoint:"), cgPoint(headLeft + rT, 0.0));
+        msgSendVoid1Point(bz, objcSel("addLineToPoint:"), cgPoint(headRight - rT, 0.0));
+        msgSendVoid2Point(
+            bz,
+            objcSel("addQuadCurveToPoint:controlPoint:"),
+            cgPoint(headRight, rT),
+            cgPoint(headRight, 0.0)
+        );
+        msgSendVoid1Point(bz, objcSel("addLineToPoint:"), cgPoint(headRight, waistTop));
+
+        // Right waist curve into keycap right edge
+        msgSendVoid3Point(
+            bz,
+            objcSel("addCurveToPoint:controlPoint1:controlPoint2:"),
+            cgPoint(keyRight, waistBot),
+            cgPoint(headRight, midY),
+            cgPoint(keyRight, midY)
+        );
+        msgSendVoid1Point(bz, objcSel("addLineToPoint:"), cgPoint(keyRight, totalHeight - rB));
+        msgSendVoid2Point(
+            bz,
+            objcSel("addQuadCurveToPoint:controlPoint:"),
+            cgPoint(keyRight - rB, totalHeight),
+            cgPoint(keyRight, totalHeight)
+        );
+        msgSendVoid1Point(bz, objcSel("addLineToPoint:"), cgPoint(keyLeft + rB, totalHeight));
+        msgSendVoid2Point(
+            bz,
+            objcSel("addQuadCurveToPoint:controlPoint:"),
+            cgPoint(keyLeft, totalHeight - rB),
+            cgPoint(keyLeft, totalHeight)
+        );
+        msgSendVoid1Point(bz, objcSel("addLineToPoint:"), cgPoint(keyLeft, waistBot));
+
+        // Left waist curve back up into head left edge
+        msgSendVoid3Point(
+            bz,
+            objcSel("addCurveToPoint:controlPoint1:controlPoint2:"),
+            cgPoint(headLeft, waistTop),
+            cgPoint(keyLeft, midY),
+            cgPoint(headLeft, midY)
+        );
+        msgSendVoid1Point(bz, objcSel("addLineToPoint:"), cgPoint(headLeft, rT));
+        msgSendVoid2Point(
+            bz,
+            objcSel("addQuadCurveToPoint:controlPoint:"),
+            cgPoint(headLeft + rT, 0.0),
+            cgPoint(headLeft, 0.0)
+        );
+        msgSendVoid0(bz, objcSel("closePath"));
+        let cgP = msgSend0(bz, objcSel("CGPath"));
+        // Autorelease `UIBezierPath` so `cgP` stays valid through current CATransaction
+        let _ = msgSend0(bz, objcSel("autorelease"));
+        cgP
+    }
+}
+
+/// Presents the full-size callout and returns `true` when Row 0's docked skirt covers the underlying keycap glyph.
+pub def calloutPresent(
+    cv: IOSKeyCalloutView,
+    label: String,
+    keyId: String,
+    keyFrameInSuperview: CGRect,
+    dark: Bool
+): Bool = {
+    cellSet(cv.cvDismissGen, cellGet(cv.cvDismissGen) + intToI64(1));
+    if (ptrIsNull(cv.cvView)) false
+    else {
+        let wasHidden = isViewHidden(cv.cvView) || viewAlpha(cv.cvView) < 0.2;
+        removeAllLayerAnimations(cv.cvView);
+
+        let headW = maxFloat(61.33, keyFrameInSuperview.size.width * 1.66);
+        let headH = 65.0;
+        let hoverGap = 4.0;
+        let superView = msgSend0(cv.cvView, objcSel("superview"));
+        let superW =
+            if (ptrIsNull(superView)) 440.0
+            else {
+                let sw = viewBounds(superView).size.width;
+                if (sw > 0.0) sw else 440.0
+            };
+
+        let headMinX = minFloat(
+            maxFloat(3.5, rectMidX(keyFrameInSuperview) - headW * 0.5),
+            maxFloat(3.5, superW - headW - 3.5)
+        );
+        let rawFloatingY = keyFrameInSuperview.origin.y - hoverGap - headH;
+
+        let fillCol = if (dark) uiColorRgba(0.29, 0.29, 0.30, 1.0) else uiColorPureWhite();
+        let strokeCol = if (dark) uiColorWhite(1.0, 0.14) else uiColorWhite(0.0, 0.06);
+
+        caTransactionBeginNoActions();
+        let isDockedRow0 = rawFloatingY < 4.0;
+
+        if (!isDockedRow0) {
+            cellSet(cv.cvCoveredKeyId, None);
+            let targetFrame = cgRect(headMinX, rawFloatingY, headW, headH);
+            uiPerformWithoutAnimation(() -> {
+                setViewTransform(cv.cvView, cgAffineIdentity());
+                setViewFrame(cv.cvView, targetFrame);
+                let localBounds = cgRect(0.0, 0.0, headW, headH);
+                let bz = msgSend1Rect1F(objcClass("UIBezierPath"), objcSel("bezierPathWithRoundedRect:cornerRadius:"), localBounds, 13.5);
+                let cgP = if (ptrIsNull(bz)) ptrNull() else msgSend0(bz, objcSel("CGPath"));
+                msgSendVoid1Rect(cv.cvShapeLayer, objcSel("setFrame:"), localBounds);
+                msgSendVoid1Ptr(cv.cvShapeLayer, objcSel("setPath:"), cgP);
+                setLayerShadowPath(cv.cvShapeLayer, cgP);
+                setLabelFont(cv.cvGlyphLabel, uiSystemFont(36.5, 0));
+                setViewFrame(cv.cvGlyphLabel, cgRect(0.0, -1.0, headW, headH))
+            })
+        } else {
+            cellSet(cv.cvCoveredKeyId, Some(keyId));
+            let topY = 6.0;
+            let botY = rectMaxY(keyFrameInSuperview);
+            let isLeftEdge = keyFrameInSuperview.origin.x < 18.0;
+            let isRightEdge = rectMaxX(keyFrameInSuperview) > superW - 18.0;
+            let row0HeadW = if (isLeftEdge || isRightEdge) 55.0 else headW;
+            let row0HeadMinX =
+                if (isLeftEdge) keyFrameInSuperview.origin.x
+                else if (isRightEdge) rectMaxX(keyFrameInSuperview) - row0HeadW
+                else rectMidX(keyFrameInSuperview) - row0HeadW * 0.5;
+            let row0HeadMaxX = row0HeadMinX + row0HeadW;
+
+            let unionMinX = minFloat(row0HeadMinX, keyFrameInSuperview.origin.x);
+            let unionMaxX = maxFloat(row0HeadMaxX, rectMaxX(keyFrameInSuperview));
+            let totalW = unionMaxX - unionMinX;
+            let totalH = botY - topY;
+
+            let hL = row0HeadMinX - unionMinX;
+            let hR = row0HeadMaxX - unionMinX;
+            let kL = keyFrameInSuperview.origin.x - unionMinX;
+            let kR = rectMaxX(keyFrameInSuperview) - unionMinX;
+
+            let path = makeDockedBalloonCGPath(hL, hR, kL, kR, 49.0, 62.0, totalH, 13.0, keyCornerRadius());
+            uiPerformWithoutAnimation(() -> {
+                setViewTransform(cv.cvView, cgAffineIdentity());
+                setViewFrame(cv.cvView, cgRect(unionMinX, topY, totalW, totalH));
+                let localBounds = cgRect(0.0, 0.0, totalW, totalH);
+                msgSendVoid1Rect(cv.cvShapeLayer, objcSel("setFrame:"), localBounds);
+                msgSendVoid1Ptr(cv.cvShapeLayer, objcSel("setPath:"), path);
+                setLayerShadowPath(cv.cvShapeLayer, path);
+                setLabelFont(cv.cvGlyphLabel, uiSystemFont(35.5, 0));
+                setViewFrame(cv.cvGlyphLabel, cgRect(hL, -1.5, row0HeadW, 51.0))
+            })
+        };
+
+        msgSendVoid1Ptr(cv.cvShapeLayer, objcSel("setFillColor:"), uiCGColor(fillCol));
+        msgSendVoid1Ptr(cv.cvShapeLayer, objcSel("setStrokeColor:"), uiCGColor(strokeCol));
+        msgSendVoid1Float(cv.cvShapeLayer, objcSel("setLineWidth:"), 0.5);
+        setLayerShadowOpacity(cv.cvShapeLayer, if (dark) 0.34 else 0.14);
+        caTransactionCommit();
+
+        setLabelText(cv.cvGlyphLabel, label);
+        setLabelTextColor(cv.cvGlyphLabel, if (dark) uiColorPureWhite() else uiColorBlack());
+        setViewAlpha(cv.cvView, 1.0);
+        setViewHidden(cv.cvView, false);
+
+        if (wasHidden) {
+            setViewTransform(cv.cvView, scaleAndTranslateTransform(0.91, 0.91, 0.0, 3.5));
+            let opts = uiAnimOptBeginFromCurrentState() | uiAnimOptAllowUserInteraction();
+            uiAnimateSpring(0.072, 0.84, 0.5, opts, () -> {
+                setViewTransform(cv.cvView, cgAffineIdentity())
+            })
+        } else ();
+
+        isDockedRow0
+    }
+}

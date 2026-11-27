@@ -1,0 +1,312 @@
+/// Strongly-typed UIKit / QuartzCore / CoreHaptics Geisha wrappers for `ios-keyboard`.
+
+use objc.{
+    objcClass, objcSel,
+    msgSend0, msgSend1Ptr, msgSend1Float, msgSendI64_0, msgSendFloat0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1Bool, msgSendVoid1I64, msgSendVoid1Float,
+}
+use juxu_shared.{
+    CGPoint, CGSize, CGRect, CGAffineTransform,
+    msgSend1Ptr1Float, msgSendVoid1F32, msgSendVoid1Rect, msgSendVoid1Point,
+    msgSendVoid1Size, msgSendVoid1Transform,
+    msgSendRect0, msgSendPoint1Ptr, msgSendPoint1Point1Ptr, msgSendRect1Rect1Ptr,
+    nsStr,
+}
+
+// ============================================================================
+// C ABI Imports (`csrc/ios_ui_abi.c`)
+// ============================================================================
+
+pub extern "juxu_ios_set_continuous_corner" def setContinuousCorner(layer: Ptr, radius: Float): Void
+pub extern "juxu_ios_set_top_masked_corners" def setTopMaskedCorners(layer: Ptr): Void
+pub extern "juxu_ios_catransaction_begin_no_actions" def caTransactionBeginNoActions(): Void
+pub extern "juxu_ios_catransaction_commit" def caTransactionCommit(): Void
+pub extern "juxu_ios_init_edge_fade_layer" def initEdgeFadeLayer(gradLayer: Ptr): Void
+pub extern "juxu_ios_apply_edge_fade_mask" def applyEdgeFadeMask(
+    gradLayer: Ptr,
+    clipView: Ptr,
+    hasLeft: Bool,
+    hasRight: Bool,
+    availW: Float,
+    availH: Float
+): Void
+
+pub extern "juxu_ios_color_rgba" def uiColorRgba(r: Float, g: Float, b: Float, a: Float): Ptr
+pub extern "juxu_ios_color_white" def uiColorWhite(w: Float, a: Float): Ptr
+pub extern "juxu_ios_color_system_blue" def uiColorSystemBlue(alpha: Float): Ptr
+pub extern "juxu_ios_color_system_bg_alpha" def uiColorSystemBgAlpha(alpha: Float): Ptr
+pub extern "juxu_ios_color_label_alpha" def uiColorLabelAlpha(alpha: Float): Ptr
+pub extern "juxu_ios_cgcolor" def uiCGColor(uiColor: Ptr): Ptr
+
+/// `weightCode`: `0 = Regular`, `1 = Medium`, `2 = Semibold`, `3 = Bold`.
+pub extern "juxu_ios_system_font" def uiSystemFont(size: Float, weightCode: Int): Ptr
+pub extern "juxu_ios_monospaced_font" def uiMonospacedFont(size: Float, weightCode: Int): Ptr
+pub extern "juxu_ios_monospaced_digit_font" def uiMonospacedDigitFont(size: Float, weightCode: Int): Ptr
+
+/// `weightCode`: `-1 = unconfigured`, `0 = Regular`, `1 = Medium`, `2 = Semibold`.
+pub extern "juxu_ios_symbol_image" def uiSymbolImage(
+    name: String,
+    pointSize: Float,
+    weightCode: Int,
+    alwaysTemplate: Bool
+): Ptr
+
+pub extern "juxu_ios_measure_text_width" def uiMeasureTextWidth(text: String, uiFont: Ptr): Float
+pub extern "juxu_ios_set_dual_attributed_label" def uiSetDualAttributedLabel(
+    uiLabel: Ptr,
+    primary: String,
+    primaryFont: Ptr,
+    primaryColor: Ptr,
+    secondary: String,
+    secondaryFont: Ptr,
+    secondaryColor: Ptr
+): Float
+pub extern "juxu_ios_set_radical_attributed_label" def uiSetRadicalAttributedLabel(
+    uiLabel: Ptr,
+    radicals: String,
+    fontSize: Float,
+    textColor: Ptr,
+    lineHeightMultiple: Float,
+    lineSpacing: Float
+): Void
+
+extern "juxu_ios_perform_without_animation" def c_perform_without_animation(tramp: Ptr, h: Int64): Void
+extern "juxu_ios_animate" def c_animate(
+    dur: Float,
+    opts: Int64,
+    animTramp: Ptr,
+    animH: Int64,
+    compTramp: Ptr,
+    compH: Int64
+): Void
+extern "juxu_ios_animate_spring" def c_animate_spring(
+    dur: Float,
+    damping: Float,
+    vel: Float,
+    opts: Int64,
+    animTramp: Ptr,
+    animH: Int64
+): Void
+
+pub extern "juxu_ios_accessibility_trait_button" def uiAccessibilityTraitButton(): Int64
+pub extern "juxu_ios_pasteboard_changed_notification_name" def uiPasteboardChangedNotificationName(): Ptr
+extern "juxu_ios_register_style_trait_observer" def c_register_style_trait_observer(
+    vc: Ptr,
+    tramp: Ptr,
+    h: Int64
+): Void
+
+pub extern "juxu_ios_proxy_is_one_time_code" def proxyIsOneTimeCode(proxy: Ptr): Bool
+pub extern "juxu_ios_proxy_is_sensitive_eval" def proxyIsSensitiveEval(proxy: Ptr): Bool
+pub extern "juxu_ios_proxy_is_autospace_allowed" def proxyIsAutoSpaceAllowed(proxy: Ptr): Bool
+pub extern "juxu_ios_is_dark_appearance" def vcIsDarkAppearance(vc: Ptr, proxy: Ptr): Bool
+pub extern "juxu_ios_display_scale" def viewDisplayScale(view: Ptr): Float
+pub extern "juxu_ios_main_screen_width" def mainScreenWidth(): Float
+pub extern "juxu_ios_now_seconds_1970" def nowSeconds1970(): Float
+pub extern "juxu_ios_now_ms_1970" def nowMs1970(): Int64
+pub extern "juxu_ios_extract_sorted_touches" def extractSortedTouches(uiSet: Ptr): Ptr
+pub extern "juxu_ios_disable_container_touch_delays" def disableContainerTouchDelays(startView: Ptr): Void
+pub extern "juxu_ios_suppress_ios26_scroll_edge_effects" def suppressIOS26ScrollEdgeEffects(scrollView: Ptr): Void
+pub extern "juxu_ios_open_settings_url" def openHostSettingsURL(vc: Ptr): Void
+pub extern "juxu_ios_msgSendSuper_hitTest" def objcSendSuperHitTest(
+    receiver: Ptr,
+    superClsName: String,
+    sel: Ptr,
+    px: Float,
+    py: Float,
+    ev: Ptr
+): Ptr
+
+pub extern "juxu_ios_haptics_acquire" def coreHapticsAcquire(): Void
+pub extern "juxu_ios_haptics_release" def coreHapticsRelease(): Void
+pub extern "juxu_ios_haptics_play_key_tap" def coreHapticsPlayKeyTap(): Bool
+pub extern "juxu_ios_haptics_play_soft_tick" def coreHapticsPlaySoftTick(): Bool
+
+// Additional `objc_msgSend` signatures for UIBezierPath & UIButton
+pub extern "objc_msgSend" def msgSendVoid2Point(obj: Ptr, sel: Ptr, p1: CGPoint, p2: CGPoint): Void
+pub extern "objc_msgSend" def msgSendVoid3Point(obj: Ptr, sel: Ptr, p1: CGPoint, p2: CGPoint, p3: CGPoint): Void
+pub extern "objc_msgSend" def msgSendInitStyle(obj: Ptr, sel: Ptr, frame: CGRect, style: Int64): Ptr
+
+// ============================================================================
+// Trampolines & High-Level Animation / Layout Helpers
+// ============================================================================
+
+def __uiAnimTramp0(h: Int64): Void = {
+    let f: () -> Void = gcHandleGet(h);
+    f()
+}
+
+def __uiAnimCompTramp(h: Int64, finished: Bool): Void = {
+    let f: (Bool) -> Void = gcHandleGet(h);
+    f(finished)
+}
+
+pub def uiPerformWithoutAnimation(body: () -> Void): Void =
+    c_perform_without_animation(cFnPtr(__uiAnimTramp0), gcHandleNew(body))
+
+/// UIViewAnimationOptionAllowUserInteraction = 1 << 1 (2)
+/// UIViewAnimationOptionBeginFromCurrentState = 1 << 2 (4)
+/// UIViewAnimationOptionCurveEaseIn = 1 << 16 (65536)
+/// UIViewAnimationOptionCurveEaseOut = 2 << 16 (131072)
+pub def uiAnimOptAllowUserInteraction(): Int64 = intToI64(2)
+pub def uiAnimOptBeginFromCurrentState(): Int64 = intToI64(4)
+pub def uiAnimOptCurveEaseIn(): Int64 = intToI64(65536)
+pub def uiAnimOptCurveEaseOut(): Int64 = intToI64(131072)
+
+pub def uiAnimate(duration: Float, options: Int64, animations: () -> Void): Void =
+    c_animate(duration, options, cFnPtr(__uiAnimTramp0), gcHandleNew(animations), ptrNull(), intToI64(0))
+
+pub def uiAnimateWithCompletion(
+    duration: Float,
+    options: Int64,
+    animations: () -> Void,
+    completion: (Bool) -> Void
+): Void =
+    c_animate(
+        duration,
+        options,
+        cFnPtr(__uiAnimTramp0),
+        gcHandleNew(animations),
+        cFnPtr(__uiAnimCompTramp),
+        gcHandleNew(completion)
+    )
+
+pub def uiAnimateSpring(
+    duration: Float,
+    damping: Float,
+    velocity: Float,
+    options: Int64,
+    animations: () -> Void
+): Void =
+    c_animate_spring(duration, damping, velocity, options, cFnPtr(__uiAnimTramp0), gcHandleNew(animations))
+
+pub def registerUserInterfaceStyleObserver(vc: Ptr, onChanged: () -> Void): Void =
+    c_register_style_trait_observer(vc, cFnPtr(__uiAnimTramp0), gcHandleNew(onChanged))
+
+// ============================================================================
+// Common Color & View / Constraint Helpers
+// ============================================================================
+
+pub def uiColorPureWhite(): Ptr = {
+    let cls = objcClass("UIColor");
+    if (ptrIsNull(cls)) ptrNull() else msgSend0(cls, objcSel("whiteColor"))
+}
+
+pub def uiColorBlack(): Ptr = {
+    let cls = objcClass("UIColor");
+    if (ptrIsNull(cls)) ptrNull() else msgSend0(cls, objcSel("blackColor"))
+}
+
+pub def uiColorClear(): Ptr = {
+    let cls = objcClass("UIColor");
+    if (ptrIsNull(cls)) ptrNull() else msgSend0(cls, objcSel("clearColor"))
+}
+
+pub def viewLayer(v: Ptr): Ptr =
+    if (ptrIsNull(v)) ptrNull() else msgSend0(v, objcSel("layer"))
+
+pub def setLayerShadowOpacity(layer: Ptr, opacity: Float): Void =
+    if (!ptrIsNull(layer)) {
+        msgSendVoid1F32(layer, objcSel("setShadowOpacity:"), floatToF32(opacity))
+    } else ()
+
+pub def setViewHidden(v: Ptr, hidden: Bool): Void =
+    if (!ptrIsNull(v)) msgSendVoid1Bool(v, objcSel("setHidden:"), hidden) else ()
+
+pub def isViewHidden(v: Ptr): Bool =
+    if (ptrIsNull(v)) true
+    else msgSendI64_0(v, objcSel("isHidden")) != intToI64(0)
+
+pub def viewBounds(v: Ptr): CGRect =
+    msgSendRect0(v, objcSel("bounds"))
+
+pub def viewFrame(v: Ptr): CGRect =
+    msgSendRect0(v, objcSel("frame"))
+
+pub def setViewFrame(v: Ptr, r: CGRect): Void =
+    if (!ptrIsNull(v)) msgSendVoid1Rect(v, objcSel("setFrame:"), r) else ()
+
+pub def setViewAlpha(v: Ptr, a: Float): Void =
+    if (!ptrIsNull(v)) msgSendVoid1Float(v, objcSel("setAlpha:"), a) else ()
+
+pub def viewAlpha(v: Ptr): Float =
+    if (ptrIsNull(v)) 0.0 else msgSendFloat0(v, objcSel("alpha"))
+
+pub def setViewTransform(v: Ptr, t: CGAffineTransform): Void =
+    if (!ptrIsNull(v)) msgSendVoid1Transform(v, objcSel("setTransform:"), t) else ()
+
+pub def setViewBgColor(v: Ptr, col: Ptr): Void =
+    if (!ptrIsNull(v) && !ptrIsNull(col)) msgSendVoid1Ptr(v, objcSel("setBackgroundColor:"), col) else ()
+
+pub def setAccessibilityId(v: Ptr, ident: String): Void =
+    if (!ptrIsNull(v)) msgSendVoid1Ptr(v, objcSel("setAccessibilityIdentifier:"), nsStr(ident)) else ()
+
+pub def setAccessibilityLabelStr(v: Ptr, lbl: String): Void =
+    if (!ptrIsNull(v)) msgSendVoid1Ptr(v, objcSel("setAccessibilityLabel:"), nsStr(lbl)) else ()
+
+pub def pinAnchorEqual(a: Ptr, b: Ptr): Ptr = {
+    let c = msgSend1Ptr(a, objcSel("constraintEqualToAnchor:"), b);
+    msgSendVoid1Bool(c, objcSel("setActive:"), true);
+    c
+}
+
+pub def pinAnchorConst(a: Ptr, b: Ptr, constant: Float): Ptr = {
+    let c = msgSend1Ptr1Float(a, objcSel("constraintEqualToAnchor:constant:"), b, constant);
+    msgSendVoid1Bool(c, objcSel("setActive:"), true);
+    c
+}
+
+pub def pinDimensionConst(dimAnchor: Ptr, constant: Float): Ptr = {
+    let c = msgSend1Float(dimAnchor, objcSel("constraintEqualToConstant:"), constant);
+    msgSendVoid1Bool(c, objcSel("setActive:"), true);
+    c
+}
+
+pub def convertRectToView(srcView: Ptr, r: CGRect, dstView: Ptr): CGRect =
+    if (ptrIsNull(srcView) || ptrIsNull(dstView)) r
+    else msgSendRect1Rect1Ptr(srcView, objcSel("convertRect:toView:"), r, dstView)
+
+pub def convertPointToView(srcView: Ptr, p: CGPoint, dstView: Ptr): CGPoint =
+    if (ptrIsNull(srcView) || ptrIsNull(dstView)) p
+    else msgSendPoint1Point1Ptr(srcView, objcSel("convertPoint:toView:"), p, dstView)
+
+pub def touchLocationInView(touch: Ptr, view: Ptr): CGPoint =
+    msgSendPoint1Ptr(touch, objcSel("locationInView:"), view)
+
+pub def setLabelText(lbl: Ptr, s: String): Void =
+    if (!ptrIsNull(lbl)) msgSendVoid1Ptr(lbl, objcSel("setText:"), nsStr(s)) else ()
+
+pub def setLabelTextColor(lbl: Ptr, col: Ptr): Void =
+    if (!ptrIsNull(lbl) && !ptrIsNull(col)) msgSendVoid1Ptr(lbl, objcSel("setTextColor:"), col) else ()
+
+pub def setLabelFont(lbl: Ptr, font: Ptr): Void =
+    if (!ptrIsNull(lbl) && !ptrIsNull(font)) msgSendVoid1Ptr(lbl, objcSel("setFont:"), font) else ()
+
+pub def setLabelAlignment(lbl: Ptr, align: Int): Void =
+    if (!ptrIsNull(lbl)) msgSendVoid1I64(lbl, objcSel("setTextAlignment:"), intToI64(align)) else ()
+
+pub def setViewSize(v: Ptr, s: CGSize): Void = {
+    let _ = v;
+    let _ = s;
+    ()
+}
+
+pub def setLayerShadowOffset(layer: Ptr, s: CGSize): Void =
+    if (!ptrIsNull(layer)) msgSendVoid1Size(layer, objcSel("setShadowOffset:"), s) else ()
+
+pub def setLayerShadowRadius(layer: Ptr, r: Float): Void =
+    if (!ptrIsNull(layer)) msgSendVoid1Float(layer, objcSel("setShadowRadius:"), r) else ()
+
+pub def setLayerShadowColor(layer: Ptr, cgCol: Ptr): Void =
+    if (!ptrIsNull(layer)) msgSendVoid1Ptr(layer, objcSel("setShadowColor:"), cgCol) else ()
+
+pub def setLayerShadowPath(layer: Ptr, cgPath: Ptr): Void =
+    if (!ptrIsNull(layer)) msgSendVoid1Ptr(layer, objcSel("setShadowPath:"), cgPath) else ()
+
+pub def setScrollContentOffsetZero(sv: Ptr): Void =
+    if (!ptrIsNull(sv)) msgSendVoid1Point(sv, objcSel("setContentOffset:"), CGPoint { x: 0.0, y: 0.0 }) else ()
+
+pub def removeAllLayerAnimations(v: Ptr): Void = {
+    let l = viewLayer(v);
+    if (!ptrIsNull(l)) msgSendVoid0(l, objcSel("removeAllAnimations")) else ()
+}

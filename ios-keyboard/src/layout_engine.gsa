@@ -1,394 +1,1764 @@
-/// Pixel-accurate iOS 26/27 virtual keyboard geometry & hit-testing (`IOSKeyboardLayoutEngine`).
-/// Matches `main`'s exact portrait metrics:
-/// - Total height: 273pt (53pt transparent candidate ribbon + 220pt 4-row keyboard)
-/// - On 440pt width: outerX = 6.67pt, gapX = 6.00pt, stdKeyW = 37.27pt, keyH = 45.0pt, rowGap = 11.0pt, bottomPad = 7.0pt
-/// - Row 1 (`a..l`) locked to `outerX + pitchX * 0.5`; Row 2 (`z..m`) locked to `colRow1X[1..7]` (`s..k`)
-/// - Row 3 exact iOS 26 4-key grid: `[123]` | `[中/英]` | `[空格]` (white char fill) | `[换行]` (systemBlue accent)
-/// - No duplicate globe key on Face ID devices (`needsInputModeSwitchKey == false`).
+/// 1:1 port of `iOS/Shared/IOSKeyboardLayoutEngine.swift` (1,247 lines)
+/// plus `IOSSwipeUp` (`iOS/Shared/IOSKeyboardGesturesAndEditing.swift` lines 4–50).
 
 use std.option.{Option, Some, None}
-use std.vec.{Vec, vecNew, vecLen, vecPush, vecGetOr}
-use std.math.{floor}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGetOr}
+use std.str.{intToStr}
+use std.math.{abs, floor, sqrt}
 use std.generic
-use juxu_shared.{CGRect, CGPoint, cgRect, rectContainsPoint}
+use juxu_shared.{
+    CGPoint, CGSize, CGRect, cgPoint, cgSize, cgRect,
+    rectContainsPoint, rectInset, rectMaxX, rectMaxY,
+    utf8ToScalars,
+}
 
+// ============================================================================
+// Math & Geometry Helpers
+// ============================================================================
+
+def minFloat(a: Float, b: Float): Float = if (a < b) a else b
+def maxFloat(a: Float, b: Float): Float = if (a > b) a else b
+def clampFloat(v: Float, lo: Float, hi: Float): Float = maxFloat(lo, minFloat(hi, v))
+
+def roundHalfAway(x: Float): Float =
+    if (x >= 0.0) floor(x + 0.5) else 0.0 - floor(0.0 - x + 0.5)
+
+def hypot2(dx: Float, dy: Float): Float =
+    sqrt(dx * dx + dy * dy)
+
+pub def rectOffset(r: CGRect, dx: Float, dy: Float): CGRect =
+    cgRect(r.origin.x + dx, r.origin.y + dy, r.size.width, r.size.height)
+
+pub def rectEq(a: CGRect, b: CGRect): Bool =
+    a.origin.x == b.origin.x
+        && a.origin.y == b.origin.y
+        && a.size.width == b.size.width
+        && a.size.height == b.size.height
+
+pub def sizeEq(a: CGSize, b: CGSize): Bool =
+    a.width == b.width && a.height == b.height
+
+pub def optStrEq(a: Option String, b: Option String): Bool =
+    match (a, b) {
+        (None, None) -> true,
+        (Some(sa), Some(sb)) -> sa == sb,
+        _ -> false,
+    }
+
+pub def optBoolEq(a: Option Bool, b: Option Bool): Bool =
+    match (a, b) {
+        (None, None) -> true,
+        (Some(ba), Some(bb)) -> ba == bb,
+        _ -> false,
+    }
+
+// ============================================================================
+// Core Algebraic Types (`IOSKeyPlane`, `IOSShiftState`, `IOSReturnKeyRole`, `IOSKeyKind`, `IOSKeySpec`)
+// ============================================================================
+
+pub data IOSKeyPlane : Eq {
+    PlaneLetters,
+    PlaneNumbers,
+    PlaneSymbols,
+}
+
+pub data IOSShiftState : Eq {
+    ShiftLower,
+    ShiftUpperOnce,
+    ShiftCapsLocked,
+}
+
+pub def shiftIsUppercase(s: IOSShiftState): Bool =
+    s != ShiftLower
+
+pub data IOSReturnKeyRole : Eq {
+    ReturnNormal,
+    ReturnGo,
+    ReturnSearch,
+    ReturnSend,
+    ReturnNext,
+    ReturnDone,
+    ReturnJoin,
+    ReturnContinue,
+}
+
+pub def returnRoleTitle(r: IOSReturnKeyRole): String =
+    match r {
+        ReturnNormal -> "",
+        ReturnGo -> "前往",
+        ReturnSearch -> "搜索",
+        ReturnSend -> "发送",
+        ReturnNext -> "下一项",
+        ReturnDone -> "完成",
+        ReturnJoin -> "加入",
+        ReturnContinue -> "继续",
+    }
+
+pub def returnRoleIsBlueProminent(r: IOSReturnKeyRole): Bool =
+    r != ReturnNormal
+
+/// Map `UIReturnKeyType` (`NSInteger`) to `IOSReturnKeyRole` (`KeyboardViewController.mapReturnKeyType`).
+pub def mapUIReturnKeyType(rawType: Int64): IOSReturnKeyRole = {
+    let t = i64ToInt(rawType);
+    if (t == 1) ReturnGo
+    else if (t == 2 || t == 6 || t == 8) ReturnSearch
+    else if (t == 3) ReturnJoin
+    else if (t == 4) ReturnNext
+    else if (t == 7) ReturnSend
+    else if (t == 9) ReturnDone
+    else if (t == 11) ReturnContinue
+    else ReturnNormal
+}
+
+pub data IOSKeyKind : Eq {
+    KeyLetter(Int),
+    KeyT9(Int),
+    KeyT9Clear,
+    KeySymbol(String),
+    KeyShift,
+    KeyBackspace,
+    KeyPlaneSwitch { targetPlane: IOSKeyPlane, switchLabel: String },
+    KeyGlobe,
+    KeyModeToggle,
+    KeySpace,
+    KeyReturn,
+}
+
+pub data IOSKeySpec {
+    ksId: String,
+    ksKind: IOSKeyKind,
+    ksFrame: CGRect,
+    ksPrimaryLabel: String,
+    ksSecondaryInlineLabel: Option String,
+    ksCornerSubscript: Option String,
+    ksKeycapRadicals: Option String,
+    ksSystemSymbol: Option String,
+    ksIsBlueAccent: Bool,
+    ksSwipeUpSymbol: Option String,
+    ksUsesFunctionFill: Bool,
+}
+
+pub def makeKeySpec(
+    id: String,
+    kind: IOSKeyKind,
+    frame: CGRect,
+    primaryLabel: String,
+    secondaryInlineLabel: Option String,
+    cornerSubscript: Option String,
+    keycapRadicals: Option String,
+    systemSymbol: Option String,
+    isBlueAccent: Bool,
+    swipeUpSymbol: Option String,
+    usesFunctionFill: Bool
+): IOSKeySpec =
+    IOSKeySpec {
+        ksId: id,
+        ksKind: kind,
+        ksFrame: frame,
+        ksPrimaryLabel: primaryLabel,
+        ksSecondaryInlineLabel: secondaryInlineLabel,
+        ksCornerSubscript: cornerSubscript,
+        ksKeycapRadicals: keycapRadicals,
+        ksSystemSymbol: systemSymbol,
+        ksIsBlueAccent: isBlueAccent,
+        ksSwipeUpSymbol: swipeUpSymbol,
+        ksUsesFunctionFill: usesFunctionFill,
+    }
+
+pub def keySpecSimple(id: String, kind: IOSKeyKind, frame: CGRect, primaryLabel: String): IOSKeySpec =
+    makeKeySpec(id, kind, frame, primaryLabel, None, None, None, None, false, None, false)
+
+pub def keySpecEq(a: IOSKeySpec, b: IOSKeySpec): Bool =
+    a.ksId == b.ksId
+        && a.ksKind == b.ksKind
+        && rectEq(a.ksFrame, b.ksFrame)
+        && a.ksPrimaryLabel == b.ksPrimaryLabel
+        && optStrEq(a.ksSecondaryInlineLabel, b.ksSecondaryInlineLabel)
+        && optStrEq(a.ksCornerSubscript, b.ksCornerSubscript)
+        && optStrEq(a.ksKeycapRadicals, b.ksKeycapRadicals)
+        && optStrEq(a.ksSystemSymbol, b.ksSystemSymbol)
+        && a.ksIsBlueAccent == b.ksIsBlueAccent
+        && optStrEq(a.ksSwipeUpSymbol, b.ksSwipeUpSymbol)
+        && a.ksUsesFunctionFill == b.ksUsesFunctionFill
+
+pub instance Eq IOSKeySpec {
+    def (==)(a: IOSKeySpec, b: IOSKeySpec): Bool = keySpecEq(a, b)
+    def (!=)(a: IOSKeySpec, b: IOSKeySpec): Bool = !keySpecEq(a, b)
+}
+
+// ============================================================================
+// IOSSwipeUp (`iOS/Shared/IOSKeyboardGesturesAndEditing.swift` lines 4–50)
+// ============================================================================
+
+/// Secondary character entered by swiping up on letter `a..z`.
+pub def swipeUpSymbolForLetter(letter: Int, asciiMode: Bool): Option String =
+    if (letter == 113) Some("1")       // q
+    else if (letter == 119) Some("2")  // w
+    else if (letter == 101) Some("3")  // e
+    else if (letter == 114) Some("4")  // r
+    else if (letter == 116) Some("5")  // t
+    else if (letter == 121) Some("6")  // y
+    else if (letter == 117) Some("7")  // u
+    else if (letter == 105) Some("8")  // i
+    else if (letter == 111) Some("9")  // o
+    else if (letter == 112) Some("0")  // p
+    else if (letter == 97) Some("-")   // a
+    else if (letter == 115) Some("/")  // s
+    else if (letter == 100) Some(if (asciiMode) ":" else "：")   // d
+    else if (letter == 102) Some(if (asciiMode) ";" else "；")   // f
+    else if (letter == 103) Some(if (asciiMode) "(" else "（")   // g
+    else if (letter == 104) Some(if (asciiMode) ")" else "）")   // h
+    else if (letter == 106) Some(if (asciiMode) "~" else "～")   // j
+    else if (letter == 107) Some(if (asciiMode) "'" else "“")    // k
+    else if (letter == 108) Some(if (asciiMode) "\"" else "”")   // l
+    else if (letter == 122) Some("@")                            // z
+    else if (letter == 120) Some(if (asciiMode) "_" else "·")    // x
+    else if (letter == 99) Some("#")                             // c
+    else if (letter == 118) Some(if (asciiMode) "&" else "`")    // v
+    else if (letter == 98) Some(if (asciiMode) "?" else "？")    // b
+    else if (letter == 110) Some(if (asciiMode) "!" else "！")    // n
+    else if (letter == 109) Some(if (asciiMode) "..." else "…")  // m
+    else None
+
+pub def swipeUpArmDistance(keyHeight: Float, isComposing: Bool): Float =
+    if (isComposing) maxFloat(35.0, keyHeight * 0.80)
+    else maxFloat(26.0, keyHeight * 0.60)
+
+pub def swipeUpIsActive(
+    start: CGPoint,
+    current: CGPoint,
+    keyHeight: Float,
+    wasActive: Bool,
+    isComposing: Bool
+): Bool = {
+    let up = start.y - current.y;
+    let threshold = swipeUpArmDistance(keyHeight, isComposing) * (if (wasActive) 0.6 else 1.0);
+    let maxLateralRatio = if (isComposing) 0.42 else 0.55;
+    up >= threshold && abs(current.x - start.x) <= up * maxLateralRatio
+}
+
+// ============================================================================
+// Metrics & Constants
+// ============================================================================
+
+pub def keyCornerRadius(): Float = 7.8
+pub def trayTopCornerRadius(): Float = 26.0
+pub def candidateBarHeight(): Float = 53.0
+pub def landscapeCandidateBarHeight(): Float = 40.0
+pub def ergonomicThumbYBias(): Float = 2.6
 pub def portraitTotalHeight(): Float = 273.0
 pub def landscapeTotalHeight(): Float = 204.0
-pub def portraitRibbonHeight(): Float = 53.0
-pub def landscapeRibbonHeight(): Float = 40.0
-pub def keyCornerRadius(): Float = 7.8
-pub def ergonomicThumbYBias(): Float = 2.6
-pub def t9SyllableRailWidth(): Float = 72.0
 
-pub def isLandscapeWidth(viewWidth: Float): Bool = viewWidth > 540.0
+pub def targetTrayHeight(width: Float): Float =
+    if (width > 540.0) landscapeTotalHeight() else portraitTotalHeight()
 
-pub def targetTrayHeight(viewWidth: Float): Float =
-    if (isLandscapeWidth(viewWidth)) landscapeTotalHeight() else portraitTotalHeight()
+pub def targetRibbonHeight(width: Float): Float =
+    if (width > 540.0) landscapeCandidateBarHeight() else candidateBarHeight()
 
-pub def ribbonHeightForWidth(viewWidth: Float): Float =
-    if (isLandscapeWidth(viewWidth)) landscapeRibbonHeight() else portraitRibbonHeight()
+def commaRowSideWidth(): Float = 1.85
+def commaRowModeWidth(): Float = 1.15
 
-pub def ribbonHeight(): Float = portraitRibbonHeight()
-
-pub data KeyboardMode : Eq {
-    ModeQwerty,
-    ModeT9,
-    ModeNumbers,
-    ModeSymbols,
+def makeFilledIntVec(n: Int, val: Int): Vec Int = {
+    let v: Vec Int = vecWithCap(n);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        vecPush(v, val);
+        cellSet(i, cellGet(i) + 1)
+    };
+    v
 }
 
-pub data KeyClass : Eq {
-    CharClass,
-    FuncClass,
+def makeFilledFloatVec(n: Int, val: Float): Vec Float = {
+    let v: Vec Float = vecWithCap(n);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        vecPush(v, val);
+        cellSet(i, cellGet(i) + 1)
+    };
+    v
 }
 
-pub data KeyAction : Eq {
-    ActLetter(Int),
-    ActDigitT9(Int),
-    ActSymbol(String),
-    ActShift,
-    ActBackspace,
-    ActSwitchMode(KeyboardMode),
-    ActToggleAscii,
-    ActGlobe,
-    ActSpace,
-    ActReturn,
+pub def canonicalT9Centers16(): Vec Float = {
+    let v: Vec Float = vecWithCap(16);
+    // 2: ABC (1, 0)
+    vecPush(v, 1.0); vecPush(v, 0.0);
+    // 3: DEF (2, 0)
+    vecPush(v, 2.0); vecPush(v, 0.0);
+    // 4: GHI (0, 1)
+    vecPush(v, 0.0); vecPush(v, 1.0);
+    // 5: JKL (1, 1)
+    vecPush(v, 1.0); vecPush(v, 1.0);
+    // 6: MNO (2, 1)
+    vecPush(v, 2.0); vecPush(v, 1.0);
+    // 7: PQRS (0, 2)
+    vecPush(v, 0.0); vecPush(v, 2.0);
+    // 8: TUV (1, 2)
+    vecPush(v, 1.0); vecPush(v, 2.0);
+    // 9: WXYZ (2, 2)
+    vecPush(v, 2.0); vecPush(v, 2.0);
+    v
 }
 
-pub data KeySpec {
-    label: String,
-    secondaryLabel: String,
-    sfSymbol: String,
-    action: KeyAction,
-    keyClass: KeyClass,
-    usesFuncFill: Bool,
-    isBlueAccent: Bool,
-    frame: CGRect,
+// ============================================================================
+// Cangjie & Wubi 86 / 98 / 06 Radical Tables
+// ============================================================================
+
+pub def cangjieRadicalTable(): Vec String = {
+    let v: Vec String = vecWithCap(26);
+    vecPush(v, "日"); vecPush(v, "月"); vecPush(v, "金"); vecPush(v, "木"); vecPush(v, "水");
+    vecPush(v, "火"); vecPush(v, "土"); vecPush(v, "竹"); vecPush(v, "戈"); vecPush(v, "十");
+    vecPush(v, "大"); vecPush(v, "中"); vecPush(v, "一"); vecPush(v, "弓"); vecPush(v, "人");
+    vecPush(v, "心"); vecPush(v, "手"); vecPush(v, "口"); vecPush(v, "尸"); vecPush(v, "廿");
+    vecPush(v, "山"); vecPush(v, "女"); vecPush(v, "田"); vecPush(v, "難"); vecPush(v, "卜");
+    vecPush(v, "重");
+    v
 }
 
-pub def emptyKeySpec(): KeySpec =
-    KeySpec {
-        label: "",
-        secondaryLabel: "",
-        sfSymbol: "",
-        action: ActSpace,
-        keyClass: FuncClass,
-        usesFuncFill: true,
-        isBlueAccent: false,
-        frame: cgRect(0.0, 0.0, 0.0, 0.0),
+pub def cangjieRadicalForAscii(ascii: Int): Option String = {
+    let idx =
+        if (ascii >= 97 && ascii <= 122) ascii - 97
+        else if (ascii >= 65 && ascii <= 90) ascii - 65
+        else -1;
+    if (idx < 0) None
+    else Some(vecGetOr(cangjieRadicalTable(), idx, ""))
+}
+
+pub def wubi86RadicalTable(): Vec String = {
+    let v: Vec String = vecWithCap(26);
+    vecPush(v, "工戈艹\n匚七廿"); // a
+    vecPush(v, "子耳了\n也阝");   // b
+    vecPush(v, "又巴马\n厶予");   // c
+    vecPush(v, "大犬三\n古石厂"); // d
+    vecPush(v, "月彡乃\n用豕");   // e
+    vecPush(v, "土士二\n干十寸"); // f
+    vecPush(v, "王戋\n五一");     // g
+    vecPush(v, "目上止\n卜皮");   // h
+    vecPush(v, "水氵小\n氺");     // i
+    vecPush(v, "日早虫\n曰刂");   // j
+    vecPush(v, "口川");           // k
+    vecPush(v, "田甲四\n车力囗"); // l
+    vecPush(v, "山由贝\n骨几");   // m
+    vecPush(v, "已己尸\n心羽");   // n
+    vecPush(v, "火灬米\n业");     // o
+    vecPush(v, "之宀冖\n辶礻");   // p
+    vecPush(v, "金钅勹\n夕儿");   // q
+    vecPush(v, "白手扌\n斤丘");   // r
+    vecPush(v, "木丁西");         // s
+    vecPush(v, "禾竹彳\n攵夂");   // t
+    vecPush(v, "立辛六\n门疒");   // u
+    vecPush(v, "女刀九\n臼彐");   // v
+    vecPush(v, "人亻八");         // w
+    vecPush(v, "纟幺弓\n匕母");   // x
+    vecPush(v, "言讠文\n方广");   // y
+    vecPush(v, "万能");           // z
+    v
+}
+
+pub def wubi98RadicalTable(): Vec String = {
+    let v: Vec String = vecWithCap(26);
+    vecPush(v, "工戈艹\n匚七廿"); // a
+    vecPush(v, "子耳了\n也皮");   // b
+    vecPush(v, "又巴马\n厶予");   // c
+    vecPush(v, "大犬三\n古石厂"); // d
+    vecPush(v, "月彡用\n力且");   // e
+    vecPush(v, "土士二\n干十寸"); // f
+    vecPush(v, "王戋\n五一");     // g
+    vecPush(v, "目上止\n卜具");   // h
+    vecPush(v, "水氵小\n氺");     // i
+    vecPush(v, "日早虫\n曰刂");   // j
+    vecPush(v, "口川");           // k
+    vecPush(v, "田甲四\n车囗皿"); // l
+    vecPush(v, "山由贝\n骨冂");   // m
+    vecPush(v, "已己尸\n心羽");   // n
+    vecPush(v, "火灬米\n业广");   // o
+    vecPush(v, "之宀冖\n辶礻");   // p
+    vecPush(v, "金钅勹\n夕儿");   // q
+    vecPush(v, "白手扌\n斤气");   // r
+    vecPush(v, "木丁西");         // s
+    vecPush(v, "禾竹彳\n攵夂");   // t
+    vecPush(v, "立辛六\n门疒");   // u
+    vecPush(v, "女刀九\n彐巛");   // v
+    vecPush(v, "人亻八\n几");     // w
+    vecPush(v, "纟幺弓\n匕母");   // x
+    vecPush(v, "言讠文\n方主");   // y
+    vecPush(v, "万能");           // z
+    v
+}
+
+pub def wubi06RadicalTable(): Vec String = {
+    let v: Vec String = vecWithCap(26);
+    vecPush(v, "工戈艹\n匚七廿"); // a
+    vecPush(v, "子耳了\n也阝");   // b
+    vecPush(v, "又巴马\n厶予");   // c
+    vecPush(v, "大犬三\n古石厂"); // d
+    vecPush(v, "月彡用\n力且");   // e
+    vecPush(v, "土士二\n干十寸"); // f
+    vecPush(v, "王五一\n青");     // g
+    vecPush(v, "目上止\n卜皮");   // h
+    vecPush(v, "水氵小\n氺");     // i
+    vecPush(v, "日早虫\n曰刂");   // j
+    vecPush(v, "口川");           // k
+    vecPush(v, "田甲四\n车囗皿"); // l
+    vecPush(v, "山由贝\n骨冂");   // m
+    vecPush(v, "已己尸\n心羽");   // n
+    vecPush(v, "火灬米\n业广");   // o
+    vecPush(v, "之宀冖\n辶礻");   // p
+    vecPush(v, "金钅勹\n夕儿");   // q
+    vecPush(v, "白手扌\n斤气");   // r
+    vecPush(v, "木丁西");         // s
+    vecPush(v, "禾竹彳\n攵夂");   // t
+    vecPush(v, "立辛门\n疒丬");   // u
+    vecPush(v, "女刀九\n彐巛");   // v
+    vecPush(v, "人亻八\n几");     // w
+    vecPush(v, "纟幺弓\n匕母");   // x
+    vecPush(v, "言讠文\n方六");   // y
+    vecPush(v, "万能");           // z
+    v
+}
+
+pub def wubiRadicalsForAscii(ascii: Int, schemaId: Int): Option String = {
+    let idx =
+        if (ascii >= 97 && ascii <= 122) ascii - 97
+        else if (ascii >= 65 && ascii <= 90) ascii - 65
+        else -1;
+    if (idx < 0) None
+    else if (schemaId == 86) Some(vecGetOr(wubi86RadicalTable(), idx, ""))
+    else if (schemaId == 98) Some(vecGetOr(wubi98RadicalTable(), idx, ""))
+    else if (schemaId == 6) Some(vecGetOr(wubi06RadicalTable(), idx, ""))
+    else None
+}
+
+// ============================================================================
+// Bottom Row Punctuation & Plane Stay-vs-Return Rules
+// ============================================================================
+
+pub def bottomRowPunctuation(asciiMode: Bool): (String, String) =
+    if (asciiMode) (",", ".") else ("，", "。")
+
+def isAllNumberScalars(s: String): Bool = {
+    let scs = utf8ToScalars(s);
+    let n = vecLen(scs);
+    if (n == 0) false
+    else {
+        let i = cellNew(0);
+        let ok = cellNew(true);
+        while (cellGet(i) < n && cellGet(ok)) {
+            let cp = vecGetOr(scs, cellGet(i), 0);
+            // ASCII '0'..'9' or fullwidth '０'..'９'
+            let isNum = (cp >= 48 && cp <= 57) || (cp >= 0xFF10 && cp <= 0xFF19);
+            if (!isNum) cellSet(ok, false) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(ok)
+    }
+}
+
+pub def shouldReturnToLettersAfterSymbol(sym: String, plane: IOSKeyPlane): Bool =
+    if (strLen(sym) > 0 && isAllNumberScalars(sym)) false
+    else match plane {
+        PlaneNumbers -> {
+            let stay = sym == "-"
+                || sym == "/"
+                || sym == ":"
+                || sym == "："
+                || sym == "."
+                || sym == "￥"
+                || sym == "¥"
+                || sym == "$";
+            !stay
+        },
+        PlaneSymbols -> {
+            let stay = sym == "~" || sym == "～" || sym == "…";
+            !stay
+        },
+        PlaneLetters -> false,
     }
 
-def round3(v: Float): Float =
-    floor(v * 3.0 + 0.5) / 3.0
+// ============================================================================
+// IOSKeyboardLayoutEngine & LayoutSnapshot
+// ============================================================================
 
-def makeCharKey(label: String, act: KeyAction, frame: CGRect): KeySpec =
-    KeySpec {
-        label: label,
-        secondaryLabel: "",
-        sfSymbol: "",
-        action: act,
-        keyClass: CharClass,
-        usesFuncFill: false,
-        isBlueAccent: false,
-        frame: frame,
+pub data LayoutSnapshot {
+    lsBounds: CGRect,
+    lsKeys: Vec IOSKeySpec,
+    lsCenters52: Vec Float,
+    lsOriginX: Float,
+    lsOriginY: Float,
+    lsPitchX: Float,
+    lsPitchY: Float,
+    lsBottomRowMinY: Float,
+    lsIsT9Layout: Bool,
+    lsT9SidebarFrame: CGRect,
+    lsT9Centers16: Vec Float,
+    lsT9OriginX: Float,
+    lsT9OriginY: Float,
+    lsT9PitchX: Float,
+    lsT9PitchY: Float,
+}
+
+pub data IOSKeyboardLayoutEngine {
+    lePlane: Cell IOSKeyPlane,
+    leShiftState: Cell IOSShiftState,
+    leAsciiMode: Cell Bool,
+    leSchemaId: Cell Int,
+    lePinyinT9Layout: Cell Bool,
+    leCangjieKeycapRadicals: Cell Bool,
+    leWubiKeycapRadicals: Cell Bool,
+    leSwipeUpInputEnabled: Cell Bool,
+    leSpaceCommaKeyEnabled: Cell Bool,
+    leIsZLookupActive: Cell Bool,
+    leShowInlineGlobeKey: Cell Bool,
+    leReturnRole: Cell IOSReturnKeyRole,
+    leIsComposing: Cell Bool,
+    leIsTrackpadActive: Cell Bool,
+    leValidNextMask: Cell Int,
+    leNextKeyPriors: Cell (Vec Int),
+    leTouchOffsets: Cell (Vec Float),
+    leT9ValidNextMask: Cell Int,
+    leT9NextKeyPriors: Cell (Vec Int),
+    leT9TouchOffsets: Cell (Vec Float),
+    leLastShiftTapTime: Cell Float,
+}
+
+pub def layoutEngineNew(): IOSKeyboardLayoutEngine =
+    IOSKeyboardLayoutEngine {
+        lePlane: cellNew(PlaneLetters),
+        leShiftState: cellNew(ShiftLower),
+        leAsciiMode: cellNew(false),
+        leSchemaId: cellNew(86),
+        lePinyinT9Layout: cellNew(false),
+        leCangjieKeycapRadicals: cellNew(true),
+        leWubiKeycapRadicals: cellNew(false),
+        leSwipeUpInputEnabled: cellNew(false),
+        leSpaceCommaKeyEnabled: cellNew(false),
+        leIsZLookupActive: cellNew(false),
+        leShowInlineGlobeKey: cellNew(false),
+        leReturnRole: cellNew(ReturnNormal),
+        leIsComposing: cellNew(false),
+        leIsTrackpadActive: cellNew(false),
+        leValidNextMask: cellNew(0x03FF_FFFF),
+        leNextKeyPriors: cellNew(makeFilledIntVec(26, 100)),
+        leTouchOffsets: cellNew(makeFilledFloatVec(52, 0.0)),
+        leT9ValidNextMask: cellNew(0xFF),
+        leT9NextKeyPriors: cellNew(makeFilledIntVec(8, 100)),
+        leT9TouchOffsets: cellNew(makeFilledFloatVec(16, 0.0)),
+        leLastShiftTapTime: cellNew(0.0),
     }
 
-def makeFuncKey(label: String, secondary: String, sym: String, act: KeyAction, frame: CGRect, blue: Bool): KeySpec =
-    KeySpec {
-        label: label,
-        secondaryLabel: secondary,
-        sfSymbol: sym,
-        action: act,
-        keyClass: FuncClass,
-        usesFuncFill: false,
-        isBlueAccent: blue,
-        frame: frame,
+pub def layoutIsT9PinyinActive(eng: IOSKeyboardLayoutEngine): Bool =
+    cellGet(eng.lePlane) == PlaneLetters
+        && !cellGet(eng.leAsciiMode)
+        && cellGet(eng.leSchemaId) == 20
+        && cellGet(eng.lePinyinT9Layout)
+
+pub def layoutTapShift(eng: IOSKeyboardLayoutEngine, timestamp: Float): Void =
+    match cellGet(eng.leShiftState) {
+        ShiftLower -> {
+            cellSet(eng.leShiftState, ShiftUpperOnce);
+            cellSet(eng.leLastShiftTapTime, timestamp)
+        },
+        ShiftUpperOnce -> {
+            if (timestamp - cellGet(eng.leLastShiftTapTime) <= 0.34) {
+                cellSet(eng.leShiftState, ShiftCapsLocked)
+            } else {
+                cellSet(eng.leShiftState, ShiftLower)
+            };
+            cellSet(eng.leLastShiftTapTime, 0.0)
+        },
+        ShiftCapsLocked -> {
+            cellSet(eng.leShiftState, ShiftLower);
+            cellSet(eng.leLastShiftTapTime, 0.0)
+        },
     }
 
-/// Compute exact iOS 26/27 responsive metrics for any width (iPhone SE/mini/Pro/Pro Max, Landscape, iPad).
-/// Returns `(outerX, gapX, stdKeyW, pitchX, y0, keyH, pitchY)`.
-def computeFullMetrics(viewWidth: Float): (Float, Float, Float, Float, Float, Float, Float) = {
-    let w = if (viewWidth < 280.0) 280.0 else viewWidth;
-    let isLand = isLandscapeWidth(w);
-    let outerX = if (isLand) 8.0 else round3(w * (20.0 / 1320.0));
-    let gapX = if (isLand) 6.5 else round3(w * (18.0 / 1320.0));
+pub def layoutConsumeOneShotShiftIfNeeded(eng: IOSKeyboardLayoutEngine): Void =
+    if (cellGet(eng.leShiftState) == ShiftUpperOnce) {
+        cellSet(eng.leShiftState, ShiftLower)
+    } else ()
+
+pub def layoutSwitchPlane(eng: IOSKeyboardLayoutEngine, target: IOSKeyPlane): Void = {
+    cellSet(eng.lePlane, target);
+    if (target != PlaneLetters && cellGet(eng.leShiftState) == ShiftUpperOnce) {
+        cellSet(eng.leShiftState, ShiftLower)
+    } else ()
+}
+
+pub def layoutSpaceCornerTag(eng: IOSKeyboardLayoutEngine): Option String =
+    if (cellGet(eng.leIsTrackpadActive)) None
+    else if (cellGet(eng.leAsciiMode)) Some("EN")
+    else {
+        let sid = cellGet(eng.leSchemaId);
+        if (sid == 20) Some(if (cellGet(eng.lePinyinT9Layout)) "九" else "拼")
+        else if (sid == 21) Some("双")
+        else if (sid == 10) Some("鹤")
+        else if (sid == 33 || sid == 35 || sid == 36) Some("仓")
+        else Some("五")
+    }
+
+pub def layoutShowsCangjieRadicals(eng: IOSKeyboardLayoutEngine): Bool = {
+    let sid = cellGet(eng.leSchemaId);
+    cellGet(eng.leCangjieKeycapRadicals)
+        && !cellGet(eng.leAsciiMode)
+        && !shiftIsUppercase(cellGet(eng.leShiftState))
+        && !cellGet(eng.leIsZLookupActive)
+        && (sid == 33 || sid == 35 || sid == 36)
+}
+
+pub def layoutShowsWubiRadicals(eng: IOSKeyboardLayoutEngine): Bool = {
+    let sid = cellGet(eng.leSchemaId);
+    cellGet(eng.leWubiKeycapRadicals)
+        && !cellGet(eng.leAsciiMode)
+        && !shiftIsUppercase(cellGet(eng.leShiftState))
+        && (sid == 86 || sid == 98 || sid == 6)
+}
+
+def formatWubiRadicals(eng: IOSKeyboardLayoutEngine, ascii: Int): Option String =
+    if (cellGet(eng.leIsTrackpadActive) || !layoutShowsWubiRadicals(eng)) None
+    else wubiRadicalsForAscii(ascii, cellGet(eng.leSchemaId))
+
+def asciiByteToLetterStr(ascii: Int, upper: Bool): String = {
+    let lower = if (ascii >= 65 && ascii <= 90) ascii + 32 else ascii;
+    let target = if (upper && lower >= 97 && lower <= 122) lower - 32 else lower;
+    let alphabet = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    let offset = target - 32;
+    if (offset >= 0 && offset < strLen(alphabet)) strSlice(alphabet, offset, offset + 1)
+    else ""
+}
+
+def formatLetter(eng: IOSKeyboardLayoutEngine, ascii: Int): String =
+    if (cellGet(eng.leIsTrackpadActive)) ""
+    else if (layoutShowsCangjieRadicals(eng)) {
+        match cangjieRadicalForAscii(ascii) {
+            Some(rad) -> rad,
+            None -> asciiByteToLetterStr(ascii, shiftIsUppercase(cellGet(eng.leShiftState))),
+        }
+    } else asciiByteToLetterStr(ascii, shiftIsUppercase(cellGet(eng.leShiftState)))
+
+def appendTenRow(
+    labels: Vec String,
+    rowIdx: Int,
+    rowY: Float,
+    outerX: Float,
+    pitchX: Float,
+    keyW: Float,
+    keyH: Float,
+    trackpadActive: Bool,
+    specs: Vec IOSKeySpec
+): Void = {
+    let n = vecLen(labels);
+    let c = cellNew(0);
+    while (cellGet(c) < n) {
+        let idx = cellGet(c);
+        let s = vecGetOr(labels, idx, "");
+        let x = outerX + intToFloat(idx) * pitchX;
+        vecPush(
+            specs,
+            keySpecSimple(
+                "S_" + intToStr(rowIdx) + "_" + intToStr(idx),
+                KeySymbol(s),
+                cgRect(x, rowY, keyW, keyH),
+                if (trackpadActive) "" else s
+            )
+        );
+        cellSet(c, idx + 1)
+    }
+}
+
+def appendSpanSymbols(
+    labels: Vec String,
+    rowY: Float,
+    minX: Float,
+    maxX: Float,
+    gapX: Float,
+    keyH: Float,
+    trackpadActive: Bool,
+    specs: Vec IOSKeySpec
+): Void = {
+    let cnt = vecLen(labels);
+    if (cnt > 0) {
+        let nf = intToFloat(cnt);
+        let kw = ((maxX - minX) - gapX * (nf - 1.0)) / nf;
+        let i = cellNew(0);
+        while (cellGet(i) < cnt) {
+            let idx = cellGet(i);
+            let s = vecGetOr(labels, idx, "");
+            let x = minX + intToFloat(idx) * (kw + gapX);
+            vecPush(
+                specs,
+                keySpecSimple(
+                    "SM_" + intToStr(idx),
+                    KeySymbol(s),
+                    cgRect(x, rowY, kw, keyH),
+                    if (trackpadActive) "" else s
+                )
+            );
+            cellSet(i, idx + 1)
+        }
+    } else ()
+}
+
+def vecFrom10(
+    s0: String, s1: String, s2: String, s3: String, s4: String,
+    s5: String, s6: String, s7: String, s8: String, s9: String
+): Vec String = {
+    let v: Vec String = vecWithCap(10);
+    vecPush(v, s0); vecPush(v, s1); vecPush(v, s2); vecPush(v, s3); vecPush(v, s4);
+    vecPush(v, s5); vecPush(v, s6); vecPush(v, s7); vecPush(v, s8); vecPush(v, s9);
+    v
+}
+
+def vecFrom5(s0: String, s1: String, s2: String, s3: String, s4: String): Vec String = {
+    let v: Vec String = vecWithCap(5);
+    vecPush(v, s0); vecPush(v, s1); vecPush(v, s2); vecPush(v, s3); vecPush(v, s4);
+    v
+}
+
+def vecFrom6(s0: String, s1: String, s2: String, s3: String, s4: String, s5: String): Vec String = {
+    let v: Vec String = vecWithCap(6);
+    vecPush(v, s0); vecPush(v, s1); vecPush(v, s2); vecPush(v, s3); vecPush(v, s4); vecPush(v, s5);
+    v
+}
+
+def appendCommaBottomRow(
+    eng: IOSKeyboardLayoutEngine,
+    w: Float,
+    outerX: Float,
+    gapX: Float,
+    pitchX: Float,
+    keyW: Float,
+    keyH: Float,
+    y: Float,
+    specs: Vec IOSKeySpec
+): Void = {
+    let trackpad = cellGet(eng.leIsTrackpadActive);
+    let ascii = cellGet(eng.leAsciiMode);
+    let role = cellGet(eng.leReturnRole);
+    let sideW = pitchX * commaRowSideWidth();
+    let modeW = pitchX * commaRowModeWidth();
+    let hasCommaKey = cellGet(eng.lePlane) == PlaneLetters;
+    let commaX = outerX + sideW + gapX;
+    let spaceX = if (hasCommaKey) commaX + keyW + gapX else commaX;
+    let modeX = w - outerX - sideW - gapX - modeW;
+    let spaceW = modeX - gapX - spaceX;
+    let returnX = modeX + modeW + gapX;
+    let targetPlane = if (hasCommaKey) PlaneNumbers else PlaneLetters;
+    let planeLabel = if (hasCommaKey) "123" else "ABC";
+
+    vecPush(
+        specs,
+        makeKeySpec(
+            "B_plane",
+            KeyPlaneSwitch { targetPlane: targetPlane, switchLabel: planeLabel },
+            cgRect(outerX, y, sideW, keyH),
+            if (trackpad) "" else planeLabel,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            true
+        )
+    );
+
+    if (hasCommaKey) {
+        let (commaSym, periodSym) = bottomRowPunctuation(ascii);
+        vecPush(
+            specs,
+            makeKeySpec(
+                "B_comma",
+                KeySymbol(commaSym),
+                cgRect(commaX, y, keyW, keyH),
+                if (trackpad) "" else commaSym,
+                None,
+                None,
+                None,
+                None,
+                false,
+                if (trackpad) None else Some(periodSym),
+                false
+            )
+        )
+    } else ();
+
+    vecPush(
+        specs,
+        makeKeySpec(
+            "B_space",
+            KeySpace,
+            cgRect(spaceX, y, spaceW, keyH),
+            "",
+            None,
+            layoutSpaceCornerTag(eng),
+            None,
+            None,
+            false,
+            None,
+            false
+        )
+    );
+
+    let modeFrame = cgRect(modeX, y, modeW, keyH);
+    if (cellGet(eng.leShowInlineGlobeKey)) {
+        vecPush(
+            specs,
+            makeKeySpec(
+                "B_globe",
+                KeyGlobe,
+                modeFrame,
+                "",
+                None,
+                None,
+                None,
+                if (trackpad) None else Some("globe"),
+                false,
+                None,
+                false
+            )
+        )
+    } else {
+        vecPush(
+            specs,
+            makeKeySpec(
+                "B_mode",
+                KeyModeToggle,
+                modeFrame,
+                if (trackpad) "" else (if (ascii) "英" else "中"),
+                None,
+                if (trackpad) None else Some(if (ascii) "中" else "英"),
+                None,
+                None,
+                false,
+                None,
+                false
+            )
+        )
+    };
+
+    let useBlue = returnRoleIsBlueProminent(role);
+    vecPush(
+        specs,
+        makeKeySpec(
+            "B_return",
+            KeyReturn,
+            cgRect(returnX, y, w - outerX - returnX, keyH),
+            if (trackpad) "" else (if (useBlue) returnRoleTitle(role) else ""),
+            None,
+            None,
+            None,
+            if (trackpad) None else (if (useBlue) None else Some("return.left")),
+            useBlue,
+            None,
+            true
+        )
+    )
+}
+
+def computeT9Layout(
+    eng: IOSKeyboardLayoutEngine,
+    w: Float,
+    h: Float,
+    outerX: Float,
+    gapX: Float,
+    rowGap: Float,
+    keyH: Float,
+    pitchY: Float,
+    row0Y: Float,
+    row1Y: Float,
+    row2Y: Float,
+    row3Y: Float
+): LayoutSnapshot = {
+    let trackpad = cellGet(eng.leIsTrackpadActive);
+    let role = cellGet(eng.leReturnRole);
+    let usableW = w - outerX * 2.0 - gapX * 4.0;
+    let sideW = floor(usableW * 0.175);
+    let midW = (usableW - sideW * 2.0) / 3.0;
+    let col0X = outerX;
+    let col1X = col0X + sideW + gapX;
+    let col2X = col1X + midW + gapX;
+    let col3X = col2X + midW + gapX;
+    let col4X = col3X + midW + gapX;
+    let midPitchX = midW + gapX;
+
+    let sidebarFrame = cgRect(col0X, row0Y, sideW, row2Y + keyH - row0Y);
+    let specs: Vec IOSKeySpec = vecWithCap(15);
+
+    let pushT9 = (digit: Int, label: String, sub: String, x: Float, y: Float) -> {
+        let subOpt = if (trackpad || strLen(sub) == 0) None else Some(sub);
+        vecPush(
+            specs,
+            makeKeySpec(
+                "T9_" + intToStr(digit),
+                KeyT9(digit),
+                cgRect(x, y, midW, keyH),
+                if (trackpad) "" else label,
+                None,
+                subOpt,
+                None,
+                None,
+                false,
+                None,
+                false
+            )
+        )
+    };
+
+    pushT9(49, "分词", "", col1X, row0Y);
+    pushT9(50, "ABC", "2", col2X, row0Y);
+    pushT9(51, "DEF", "3", col3X, row0Y);
+    pushT9(52, "GHI", "4", col1X, row1Y);
+    pushT9(53, "JKL", "5", col2X, row1Y);
+    pushT9(54, "MNO", "6", col3X, row1Y);
+    pushT9(55, "PQRS", "7", col1X, row2Y);
+    pushT9(56, "TUV", "8", col2X, row2Y);
+    pushT9(57, "WXYZ", "9", col3X, row2Y);
+
+    vecPush(
+        specs,
+        makeKeySpec(
+            "K_backspace",
+            KeyBackspace,
+            cgRect(col4X, row0Y, sideW, keyH),
+            "",
+            None,
+            None,
+            None,
+            if (trackpad) None else Some("delete.backward"),
+            false,
+            None,
+            false
+        )
+    );
+    vecPush(
+        specs,
+        keySpecSimple(
+            "T9_clear",
+            KeyT9Clear,
+            cgRect(col4X, row1Y, sideW, keyH),
+            if (trackpad) "" else "重输"
+        )
+    );
+
+    let useBlue = returnRoleIsBlueProminent(role);
+    vecPush(
+        specs,
+        makeKeySpec(
+            "B_return",
+            KeyReturn,
+            cgRect(col4X, row2Y, sideW, keyH * 2.0 + rowGap),
+            if (trackpad) "" else (if (useBlue) returnRoleTitle(role) else ""),
+            None,
+            None,
+            None,
+            if (trackpad) None else (if (useBlue) None else Some("return.left")),
+            useBlue,
+            None,
+            false
+        )
+    );
+
+    vecPush(
+        specs,
+        keySpecSimple(
+            "B_plane",
+            KeyPlaneSwitch { targetPlane: PlaneNumbers, switchLabel: "123" },
+            cgRect(col0X, row3Y, sideW, keyH),
+            if (trackpad) "" else "123"
+        )
+    );
+
+    if (cellGet(eng.leShowInlineGlobeKey)) {
+        vecPush(
+            specs,
+            makeKeySpec(
+                "B_globe",
+                KeyGlobe,
+                cgRect(col1X, row3Y, midW, keyH),
+                "",
+                None,
+                None,
+                None,
+                if (trackpad) None else Some("globe"),
+                false,
+                None,
+                false
+            )
+        )
+    } else {
+        vecPush(
+            specs,
+            makeKeySpec(
+                "B_mode",
+                KeyModeToggle,
+                cgRect(col1X, row3Y, midW, keyH),
+                if (trackpad) "" else "中",
+                if (trackpad) None else Some("/英"),
+                None,
+                None,
+                None,
+                false,
+                None,
+                false
+            )
+        )
+    };
+
+    vecPush(
+        specs,
+        makeKeySpec(
+            "B_space",
+            KeySpace,
+            cgRect(col2X, row3Y, midW * 2.0 + gapX, keyH),
+            "",
+            None,
+            layoutSpaceCornerTag(eng),
+            None,
+            None,
+            false,
+            None,
+            false
+        )
+    );
+
+    let k1MidX = col1X + midW * 0.5;
+    let k1MidY = row0Y + keyH * 0.5;
+    LayoutSnapshot {
+        lsBounds: cgRect(0.0, 0.0, w, h),
+        lsKeys: specs,
+        lsCenters52: makeFilledFloatVec(52, 0.0),
+        lsOriginX: k1MidX,
+        lsOriginY: k1MidY,
+        lsPitchX: midPitchX,
+        lsPitchY: pitchY,
+        lsBottomRowMinY: row3Y,
+        lsIsT9Layout: true,
+        lsT9SidebarFrame: sidebarFrame,
+        lsT9Centers16: canonicalT9Centers16(),
+        lsT9OriginX: k1MidX,
+        lsT9OriginY: k1MidY,
+        lsT9PitchX: midPitchX,
+        lsT9PitchY: pitchY,
+    }
+}
+
+pub def computeLayout(eng: IOSKeyboardLayoutEngine, size: CGSize): LayoutSnapshot = {
+    let w = maxFloat(280.0, size.width);
+    let isLandscape = w > 540.0;
+    let maxReasonableH = if (isLandscape) 220.0 else 225.0;
+    let h = minFloat(maxFloat(168.0, size.height), maxReasonableH);
+
+    let outerX = if (isLandscape) 8.0 else roundHalfAway(w * (20.0 / 1320.0) * 3.0) / 3.0;
+    let gapX = if (isLandscape) 6.5 else roundHalfAway(w * (18.0 / 1320.0) * 3.0) / 3.0;
+    let topPad = if (isLandscape) 2.0 else 0.0;
+    let bottomPad = if (isLandscape) 4.5 else 7.0;
+    let rowGap = if (isLandscape) 8.0 else 11.0;
+
+    let usableH = h - topPad - bottomPad - rowGap * 3.0;
+    let keyH = maxFloat(34.0, floor(usableH / 4.0));
+    let pitchY = keyH + rowGap;
+
     let stdKeyW = (w - outerX * 2.0 - gapX * 9.0) / 10.0;
     let pitchX = stdKeyW + gapX;
 
-    let ribH = ribbonHeightForWidth(w);
-    let totalH = targetTrayHeight(w);
-    let keyAreaH = totalH - ribH;
-    let topPad = if (isLand) 2.0 else 0.0;
-    let bottomPad = if (isLand) 4.5 else 7.0;
-    let rGap = if (isLand) 8.0 else 11.0;
-    let usableH = keyAreaH - topPad - bottomPad - rGap * 3.0;
-    let rawKh = floor(usableH / 4.0);
-    let kh = if (rawKh < 33.0) 33.0 else rawKh;
-    let pitchY = kh + rGap;
-    (outerX, gapX, stdKeyW, pitchX, ribH + topPad, kh, pitchY)
-}
+    let row0Y = topPad;
+    let row1Y = topPad + pitchY;
+    let row2Y = topPad + pitchY * 2.0;
+    let row3Y = topPad + pitchY * 3.0;
 
-def appendBottomRow4Key(
-    out: Vec KeySpec,
-    viewWidth: Float,
-    outerX: Float,
-    gapX: Float,
-    stdKeyW: Float,
-    pitchX: Float,
-    y3: Float,
-    kh: Float,
-    mode: KeyboardMode,
-    asciiMode: Bool,
-    showGlobe: Bool,
-): Void = {
-    let row1StartX = outerX + pitchX * 0.5;
-    let col1X = row1StartX + pitchX;
-    let col2X = row1StartX + pitchX * 2.0;
-    let col6MaxX = row1StartX + pitchX * 6.0 + stdKeyW;
-
-    let leftPairSpan = (col1X + stdKeyW) - outerX;
-    let leftEachW = (leftPairSpan - gapX) * 0.5;
-
-    let (planeLbl, targetMode) = match mode {
-        ModeQwerty -> ("123", ModeNumbers),
-        _ -> ("ABC", ModeQwerty),
-    };
-    vecPush(out, makeFuncKey(planeLbl, "", "", ActSwitchMode(targetMode), cgRect(outerX, y3, leftEachW, kh), false));
-
-    let secondLeftX = outerX + leftEachW + gapX;
-    if (showGlobe) {
-        vecPush(out, makeFuncKey("", "", "globe", ActGlobe, cgRect(secondLeftX, y3, leftEachW, kh), false))
+    if (layoutIsT9PinyinActive(eng)) {
+        computeT9Layout(eng, w, h, outerX, gapX, rowGap, keyH, pitchY, row0Y, row1Y, row2Y, row3Y)
     } else {
-        let (pLbl, sLbl) = if (asciiMode) ("EN", "/中") else ("中", "/英");
-        vecPush(out, makeFuncKey(pLbl, sLbl, "", ActToggleAscii, cgRect(secondLeftX, y3, leftEachW, kh), false))
-    };
+        let row1StartX = outerX + pitchX * 0.5;
+        let colRow1X = (i: Int) -> row1StartX + intToFloat(i) * pitchX;
+        let specs: Vec IOSKeySpec = vecWithCap(33);
+        let plane = cellGet(eng.lePlane);
+        let ascii = cellGet(eng.leAsciiMode);
+        let trackpad = cellGet(eng.leIsTrackpadActive);
+        let swipeOn = cellGet(eng.leSwipeUpInputEnabled);
 
-    // Spacebar: d.minX .. j.maxX, white char-key fill like native iOS 26!
-    let spaceX = col2X;
-    let spaceW = col6MaxX - col2X;
-    vecPush(out, KeySpec {
-        label: if (asciiMode) "space" else "空格",
-        secondaryLabel: "",
-        sfSymbol: "",
-        action: ActSpace,
-        keyClass: FuncClass,
-        usesFuncFill: false,
-        isBlueAccent: false,
-        frame: cgRect(spaceX, y3, spaceW, kh),
-    });
+        match plane {
+            PlaneLetters -> {
+                let row0 = "qwertyuiop";
+                let c0 = cellNew(0);
+                while (cellGet(c0) < 10) {
+                    let c = cellGet(c0);
+                    let b = strByteAt(row0, c);
+                    let x = outerX + intToFloat(c) * pitchX;
+                    let swipeSym = if (trackpad || !swipeOn) None else swipeUpSymbolForLetter(b, ascii);
+                    vecPush(
+                        specs,
+                        makeKeySpec(
+                            "L_" + intToStr(b),
+                            KeyLetter(b),
+                            cgRect(x, row0Y, stdKeyW, keyH),
+                            formatLetter(eng, b),
+                            None,
+                            None,
+                            formatWubiRadicals(eng, b),
+                            None,
+                            false,
+                            swipeSym,
+                            false
+                        )
+                    );
+                    cellSet(c0, c + 1)
+                };
 
-    // Return key: uniform pure-white keycap with `return.left` SF Symbol (blue only for prominent action roles)
-    let retX = col6MaxX + gapX;
-    let retW = (viewWidth - outerX) - retX;
-    vecPush(out, makeFuncKey("", "", "return.left", ActReturn, cgRect(retX, y3, retW, kh), false))
-}
+                let row1 = "asdfghjkl";
+                let c1 = cellNew(0);
+                while (cellGet(c1) < 9) {
+                    let c = cellGet(c1);
+                    let b = strByteAt(row1, c);
+                    let swipeSym = if (trackpad || !swipeOn) None else swipeUpSymbolForLetter(b, ascii);
+                    vecPush(
+                        specs,
+                        makeKeySpec(
+                            "L_" + intToStr(b),
+                            KeyLetter(b),
+                            cgRect(colRow1X(c), row1Y, stdKeyW, keyH),
+                            formatLetter(eng, b),
+                            None,
+                            None,
+                            formatWubiRadicals(eng, b),
+                            None,
+                            false,
+                            swipeSym,
+                            false
+                        )
+                    );
+                    cellSet(c1, c + 1)
+                };
 
-/// Build the pixel-exact iOS 26/27 QWERTY layout for any screen width (portrait / landscape / iPad).
-pub def buildQwertyLayout(viewWidth: Float, asciiMode: Bool, shifted: Bool, showGlobe: Bool): Vec KeySpec = {
-    let out: Vec KeySpec = vecNew();
-    let (outerX, gapX, stdKeyW, pitchX, y0, kh, pitchY) = computeFullMetrics(viewWidth);
-    let y1 = y0 + pitchY;
-    let y2 = y0 + pitchY * 2.0;
-    let y3 = y0 + pitchY * 3.0;
-    let row1StartX = outerX + pitchX * 0.5;
+                let sideKeyW = stdKeyW * 1.342;
+                let shiftSym = match cellGet(eng.leShiftState) {
+                    ShiftLower -> "shift",
+                    ShiftUpperOnce -> "shift.fill",
+                    ShiftCapsLocked -> "capslock.fill",
+                };
+                vecPush(
+                    specs,
+                    makeKeySpec(
+                        "K_shift",
+                        KeyShift,
+                        cgRect(outerX, row2Y, sideKeyW, keyH),
+                        "",
+                        None,
+                        None,
+                        None,
+                        if (trackpad) None else Some(shiftSym),
+                        false,
+                        None,
+                        false
+                    )
+                );
 
-    // Row 0: q w e r t y u i o p
-    let r0 = if (shifted) "QWERTYUIOP" else "qwertyuiop";
-    let r0Lower = "qwertyuiop";
-    let i0 = cellNew(0);
-    while (cellGet(i0) < 10) {
-        let idx = cellGet(i0);
-        let x = outerX + intToFloat(idx) * pitchX;
-        vecPush(out, makeCharKey(
-            strSlice(r0, idx, idx + 1),
-            ActLetter(strByteAt(r0Lower, idx)),
-            cgRect(x, y0, stdKeyW, kh)
-        ));
-        cellSet(i0, idx + 1)
-    };
+                let row2 = "zxcvbnm";
+                let c2 = cellNew(0);
+                while (cellGet(c2) < 7) {
+                    let c = cellGet(c2);
+                    let b = strByteAt(row2, c);
+                    let swipeSym = if (trackpad || !swipeOn) None else swipeUpSymbolForLetter(b, ascii);
+                    vecPush(
+                        specs,
+                        makeKeySpec(
+                            "L_" + intToStr(b),
+                            KeyLetter(b),
+                            cgRect(colRow1X(c + 1), row2Y, stdKeyW, keyH),
+                            formatLetter(eng, b),
+                            None,
+                            None,
+                            formatWubiRadicals(eng, b),
+                            None,
+                            false,
+                            swipeSym,
+                            false
+                        )
+                    );
+                    cellSet(c2, c + 1)
+                };
 
-    // Row 1: a s d f g h j k l
-    let r1 = if (shifted) "ASDFGHJKL" else "asdfghjkl";
-    let r1Lower = "asdfghjkl";
-    let i1 = cellNew(0);
-    while (cellGet(i1) < 9) {
-        let idx = cellGet(i1);
-        let x = row1StartX + intToFloat(idx) * pitchX;
-        vecPush(out, makeCharKey(
-            strSlice(r1, idx, idx + 1),
-            ActLetter(strByteAt(r1Lower, idx)),
-            cgRect(x, y1, stdKeyW, kh)
-        ));
-        cellSet(i1, idx + 1)
-    };
+                vecPush(
+                    specs,
+                    makeKeySpec(
+                        "K_backspace",
+                        KeyBackspace,
+                        cgRect(w - outerX - sideKeyW, row2Y, sideKeyW, keyH),
+                        "",
+                        None,
+                        None,
+                        None,
+                        if (trackpad) None else Some("delete.backward"),
+                        false,
+                        None,
+                        false
+                    )
+                )
+            },
+            PlaneNumbers -> {
+                let r0 = vecFrom10("1", "2", "3", "4", "5", "6", "7", "8", "9", "0");
+                appendTenRow(r0, 0, row0Y, outerX, pitchX, stdKeyW, keyH, trackpad, specs);
 
-    // Row 2: [shift] + z x c v b n m (aligned with s..k) + [delete.backward]
-    let sideKeyW = stdKeyW * 1.342;
-    let shiftSym = if (shifted) "shift.fill" else "shift";
-    vecPush(out, makeFuncKey("", "", shiftSym, ActShift, cgRect(outerX, y2, sideKeyW, kh), false));
+                let r1 =
+                    if (ascii) vecFrom10("-", "/", ":", ";", "(", ")", "$", "&", "@", "\"")
+                    else vecFrom10("-", "/", "：", "；", "（", "）", "￥", "@", "“", "”");
+                appendTenRow(r1, 1, row1Y, outerX, pitchX, stdKeyW, keyH, trackpad, specs);
 
-    let r2 = if (shifted) "ZXCVBNM" else "zxcvbnm";
-    let r2Lower = "zxcvbnm";
-    let i2 = cellNew(0);
-    while (cellGet(i2) < 7) {
-        let idx = cellGet(i2);
-        let x = row1StartX + intToFloat(idx + 1) * pitchX;
-        vecPush(out, makeCharKey(
-            strSlice(r2, idx, idx + 1),
-            ActLetter(strByteAt(r2Lower, idx)),
-            cgRect(x, y2, stdKeyW, kh)
-        ));
-        cellSet(i2, idx + 1)
-    };
-    vecPush(out, makeFuncKey("", "", "delete.backward", ActBackspace, cgRect(viewWidth - outerX - sideKeyW, y2, sideKeyW, kh), false));
+                let sideKeyW = stdKeyW * 1.342;
+                vecPush(
+                    specs,
+                    keySpecSimple(
+                        "P_symbols",
+                        KeyPlaneSwitch { targetPlane: PlaneSymbols, switchLabel: "#+=" },
+                        cgRect(outerX, row2Y, sideKeyW, keyH),
+                        if (trackpad) "" else "#+="
+                    )
+                );
 
-    // Row 3: exact 4-key grid
-    appendBottomRow4Key(out, viewWidth, outerX, gapX, stdKeyW, pitchX, y3, kh, ModeQwerty, asciiMode, showGlobe);
-    out
-}
+                let puncMid =
+                    if (ascii) vecFrom5(".", ",", "?", "!", "'")
+                    else vecFrom6("。", "，", "、", "？", "！", ".");
+                appendSpanSymbols(puncMid, row2Y, colRow1X(1), colRow1X(7) + stdKeyW, gapX, keyH, trackpad, specs);
 
-/// Build the Numbers & Symbols layouts matching `main`'s `.numbers` and `.symbols` planes.
-pub def buildNumbersOrSymbolsLayout(viewWidth: Float, isSymbols: Bool, asciiMode: Bool, showGlobe: Bool): Vec KeySpec = {
-    let out: Vec KeySpec = vecNew();
-    let (outerX, gapX, stdKeyW, pitchX, y0, kh, pitchY) = computeFullMetrics(viewWidth);
-    let y1 = y0 + pitchY;
-    let y2 = y0 + pitchY * 2.0;
-    let y3 = y0 + pitchY * 3.0;
-    let row1StartX = outerX + pitchX * 0.5;
+                vecPush(
+                    specs,
+                    makeKeySpec(
+                        "K_backspace",
+                        KeyBackspace,
+                        cgRect(w - outerX - sideKeyW, row2Y, sideKeyW, keyH),
+                        "",
+                        None,
+                        None,
+                        None,
+                        if (trackpad) None else Some("delete.backward"),
+                        false,
+                        None,
+                        false
+                    )
+                )
+            },
+            PlaneSymbols -> {
+                let r0 = vecFrom10("[", "]", "{", "}", "#", "%", "^", "*", "+", "=");
+                appendTenRow(r0, 0, row0Y, outerX, pitchX, stdKeyW, keyH, trackpad, specs);
 
-    let pushRow10 = (y: Float, items: Vec String) -> {
-        let i = cellNew(0);
-        while (cellGet(i) < 10) {
-            let idx = cellGet(i);
-            let s = vecGetOr(items, idx, "");
-            vecPush(out, makeCharKey(s, ActSymbol(s), cgRect(outerX + intToFloat(idx) * pitchX, y, stdKeyW, kh)));
-            cellSet(i, idx + 1)
-        }
-    };
+                let r1 =
+                    if (ascii) vecFrom10("_", "\\", "|", "~", "<", ">", "€", "£", "¥", "•")
+                    else vecFrom10("——", "\\", "|", "～", "《", "》", "【", "】", "…", "·");
+                appendTenRow(r1, 1, row1Y, outerX, pitchX, stdKeyW, keyH, trackpad, specs);
 
-    let r0: Vec String = vecNew();
-    let r1: Vec String = vecNew();
-    if (!isSymbols) {
-        vecPush(r0, "1"); vecPush(r0, "2"); vecPush(r0, "3"); vecPush(r0, "4"); vecPush(r0, "5");
-        vecPush(r0, "6"); vecPush(r0, "7"); vecPush(r0, "8"); vecPush(r0, "9"); vecPush(r0, "0");
-        if (asciiMode) {
-            vecPush(r1, "-"); vecPush(r1, "/"); vecPush(r1, ":"); vecPush(r1, ";"); vecPush(r1, "(");
-            vecPush(r1, ")"); vecPush(r1, "$"); vecPush(r1, "&"); vecPush(r1, "@"); vecPush(r1, "\"")
+                let sideKeyW = stdKeyW * 1.342;
+                vecPush(
+                    specs,
+                    keySpecSimple(
+                        "P_numbers",
+                        KeyPlaneSwitch { targetPlane: PlaneNumbers, switchLabel: "123" },
+                        cgRect(outerX, row2Y, sideKeyW, keyH),
+                        if (trackpad) "" else "123"
+                    )
+                );
+
+                let symMid = vecFrom5("…", "‘", "’", "〈", "〉");
+                appendSpanSymbols(symMid, row2Y, colRow1X(1), colRow1X(7) + stdKeyW, gapX, keyH, trackpad, specs);
+
+                vecPush(
+                    specs,
+                    makeKeySpec(
+                        "K_backspace",
+                        KeyBackspace,
+                        cgRect(w - outerX - sideKeyW, row2Y, sideKeyW, keyH),
+                        "",
+                        None,
+                        None,
+                        None,
+                        if (trackpad) None else Some("delete.backward"),
+                        false,
+                        None,
+                        false
+                    )
+                )
+            },
+        };
+
+        if (cellGet(eng.leSpaceCommaKeyEnabled)) {
+            appendCommaBottomRow(eng, w, outerX, gapX, pitchX, stdKeyW, keyH, row3Y, specs)
         } else {
-            vecPush(r1, "-"); vecPush(r1, "/"); vecPush(r1, "："); vecPush(r1, "；"); vecPush(r1, "（");
-            vecPush(r1, "）"); vecPush(r1, "￥"); vecPush(r1, "@"); vecPush(r1, "“"); vecPush(r1, "”")
+            let leftPairSpan = (colRow1X(1) + stdKeyW) - outerX;
+            let leftEachW = (leftPairSpan - gapX) * 0.5;
+            let targetPlane = if (plane == PlaneLetters) PlaneNumbers else PlaneLetters;
+            let planeLabel = if (plane == PlaneLetters) "123" else "ABC";
+
+            vecPush(
+                specs,
+                keySpecSimple(
+                    "B_plane",
+                    KeyPlaneSwitch { targetPlane: targetPlane, switchLabel: planeLabel },
+                    cgRect(outerX, row3Y, leftEachW, keyH),
+                    if (trackpad) "" else planeLabel
+                )
+            );
+
+            let secondLeftX = outerX + leftEachW + gapX;
+            if (cellGet(eng.leShowInlineGlobeKey)) {
+                vecPush(
+                    specs,
+                    makeKeySpec(
+                        "B_globe",
+                        KeyGlobe,
+                        cgRect(secondLeftX, row3Y, leftEachW, keyH),
+                        "",
+                        None,
+                        None,
+                        None,
+                        if (trackpad) None else Some("globe"),
+                        false,
+                        None,
+                        false
+                    )
+                )
+            } else {
+                vecPush(
+                    specs,
+                    makeKeySpec(
+                        "B_mode",
+                        KeyModeToggle,
+                        cgRect(secondLeftX, row3Y, leftEachW, keyH),
+                        if (trackpad) "" else (if (ascii) "EN" else "中"),
+                        if (trackpad) None else Some(if (ascii) "/中" else "/英"),
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        false
+                    )
+                )
+            };
+
+            let spaceMinX = colRow1X(2);
+            let spaceMaxX = colRow1X(6) + stdKeyW;
+            vecPush(
+                specs,
+                makeKeySpec(
+                    "B_space",
+                    KeySpace,
+                    cgRect(spaceMinX, row3Y, spaceMaxX - spaceMinX, keyH),
+                    "",
+                    None,
+                    layoutSpaceCornerTag(eng),
+                    None,
+                    None,
+                    false,
+                    None,
+                    false
+                )
+            );
+
+            let returnMinX = colRow1X(7);
+            let returnMaxX = w - outerX;
+            let role = cellGet(eng.leReturnRole);
+            let useBlue = returnRoleIsBlueProminent(role);
+            vecPush(
+                specs,
+                makeKeySpec(
+                    "B_return",
+                    KeyReturn,
+                    cgRect(returnMinX, row3Y, returnMaxX - returnMinX, keyH),
+                    if (trackpad) "" else (if (useBlue) returnRoleTitle(role) else ""),
+                    None,
+                    None,
+                    None,
+                    if (trackpad) None else (if (useBlue) None else Some("return.left")),
+                    useBlue,
+                    None,
+                    false
+                )
+            )
+        };
+
+        let qMidX = outerX + stdKeyW * 0.5;
+        let qMidY = row0Y + keyH * 0.5;
+        let centersArr = arrayNew(52, 0.0);
+        let fillRowCenters = (rowStr: String, xBias: Float, yRow: Float) -> {
+            let len = strLen(rowStr);
+            let i = cellNew(0);
+            while (cellGet(i) < len) {
+                let c = cellGet(i);
+                let idx = strByteAt(rowStr, c) - 97;
+                arraySet(centersArr, idx * 2, intToFloat(c) + xBias);
+                arraySet(centersArr, idx * 2 + 1, yRow);
+                cellSet(i, c + 1)
+            }
+        };
+        fillRowCenters("qwertyuiop", 0.0, 0.0);
+        fillRowCenters("asdfghjkl", 0.5, 1.0);
+        fillRowCenters("zxcvbnm", 1.5, 2.0);
+        let centers52: Vec Float = vecWithCap(52);
+        let k = cellNew(0);
+        while (cellGet(k) < 52) {
+            vecPush(centers52, arrayGet(centersArr, cellGet(k)));
+            cellSet(k, cellGet(k) + 1)
+        };
+
+        LayoutSnapshot {
+            lsBounds: cgRect(0.0, 0.0, w, h),
+            lsKeys: specs,
+            lsCenters52: centers52,
+            lsOriginX: qMidX,
+            lsOriginY: qMidY,
+            lsPitchX: pitchX,
+            lsPitchY: pitchY,
+            lsBottomRowMinY: row3Y,
+            lsIsT9Layout: false,
+            lsT9SidebarFrame: cgRect(0.0, 0.0, 0.0, 0.0),
+            lsT9Centers16: canonicalT9Centers16(),
+            lsT9OriginX: 0.0,
+            lsT9OriginY: 0.0,
+            lsT9PitchX: 1.0,
+            lsT9PitchY: 1.0,
         }
-    } else {
-        vecPush(r0, "["); vecPush(r0, "]"); vecPush(r0, "{"); vecPush(r0, "}"); vecPush(r0, "#");
-        vecPush(r0, "%"); vecPush(r0, "^"); vecPush(r0, "*"); vecPush(r0, "+"); vecPush(r0, "=");
-        vecPush(r1, "——"); vecPush(r1, "\\"); vecPush(r1, "|"); vecPush(r1, "～"); vecPush(r1, "《");
-        vecPush(r1, "》"); vecPush(r1, "【"); vecPush(r1, "】"); vecPush(r1, "…"); vecPush(r1, "·")
-    };
-    pushRow10(y0, r0);
-    pushRow10(y1, r1);
-
-    let sideKeyW = stdKeyW * 1.342;
-    let (swLbl, swMode) = if (!isSymbols) ("#+=", ModeSymbols) else ("123", ModeNumbers);
-    vecPush(out, makeFuncKey(swLbl, "", "", ActSwitchMode(swMode), cgRect(outerX, y2, sideKeyW, kh), false));
-
-    let mid: Vec String = vecNew();
-    if (!isSymbols) {
-        vecPush(mid, "。"); vecPush(mid, "，"); vecPush(mid, "、"); vecPush(mid, "？"); vecPush(mid, "！"); vecPush(mid, ".")
-    } else {
-        vecPush(mid, "…"); vecPush(mid, "‘"); vecPush(mid, "’"); vecPush(mid, "〈"); vecPush(mid, "〉")
-    };
-    let mn = vecLen(mid);
-    let minX = row1StartX + pitchX;
-    let maxX = row1StartX + pitchX * 7.0 + stdKeyW;
-    let spanW = maxX - minX;
-    let mw = (spanW - gapX * intToFloat(mn - 1)) / intToFloat(mn);
-    let mi = cellNew(0);
-    while (cellGet(mi) < mn) {
-        let idx = cellGet(mi);
-        let s = vecGetOr(mid, idx, "");
-        vecPush(out, makeCharKey(s, ActSymbol(s), cgRect(minX + intToFloat(idx) * (mw + gapX), y2, mw, kh)));
-        cellSet(mi, idx + 1)
-    };
-    vecPush(out, makeFuncKey("", "", "delete.backward", ActBackspace, cgRect(viewWidth - outerX - sideKeyW, y2, sideKeyW, kh), false));
-
-    let curMode = if (isSymbols) ModeSymbols else ModeNumbers;
-    appendBottomRow4Key(out, viewWidth, outerX, gapX, stdKeyW, pitchX, y3, kh, curMode, asciiMode, showGlobe);
-    out
+    }
 }
 
-/// Build the T9 9-key Pinyin layout (portrait / landscape / iPad).
-pub def buildT9Layout(viewWidth: Float, asciiMode: Bool, showGlobe: Bool): Vec KeySpec = {
-    let out: Vec KeySpec = vecNew();
-    let (outerX, gapX, _, _, y0, kh, pitchY) = computeFullMetrics(viewWidth);
-    let railW = t9SyllableRailWidth();
-    let rightW = 64.0;
-    let gridX = outerX + railW + gapX;
-    let gridW = viewWidth - outerX * 2.0 - railW - rightW - gapX * 2.0;
-    let cellW = (gridW - gapX * 2.0) / 3.0;
-    let rightX = gridX + gridW + gapX;
+// ============================================================================
+// Compensated Letter Point & Dynamic Voronoi Hit-Testing
+// ============================================================================
 
-    let addPad = (row: Int, col: Int, label: String, act: KeyAction) -> {
-        let x = gridX + intToFloat(col) * (cellW + gapX);
-        let y = y0 + intToFloat(row) * pitchY;
-        vecPush(out, makeCharKey(label, act, cgRect(x, y, cellW, kh)))
-    };
-
-    addPad(0, 0, "，。", ActSymbol("，"));
-    addPad(0, 1, "ABC", ActDigitT9(2));
-    addPad(0, 2, "DEF", ActDigitT9(3));
-    vecPush(out, makeFuncKey("", "", "delete.backward", ActBackspace, cgRect(rightX, y0, rightW, kh), false));
-
-    addPad(1, 0, "GHI", ActDigitT9(4));
-    addPad(1, 1, "JKL", ActDigitT9(5));
-    addPad(1, 2, "MNO", ActDigitT9(6));
-    let (pLbl, sLbl) = if (asciiMode) ("EN", "/中") else ("中", "/英");
-    vecPush(out, makeFuncKey(pLbl, sLbl, "", ActToggleAscii, cgRect(rightX, y0 + pitchY, rightW, kh), false));
-
-    addPad(2, 0, "PQRS", ActDigitT9(7));
-    addPad(2, 1, "TUV", ActDigitT9(8));
-    addPad(2, 2, "WXYZ", ActDigitT9(9));
-    vecPush(out, makeFuncKey("全键", "", "", ActSwitchMode(ModeQwerty), cgRect(rightX, y0 + pitchY * 2.0, rightW, kh), false));
-
-    let y3 = y0 + pitchY * 3.0;
-    vecPush(out, makeFuncKey("123", "", "", ActSwitchMode(ModeNumbers), cgRect(outerX, y3, railW, kh), false));
-    if (showGlobe) {
-        vecPush(out, makeFuncKey("", "", "globe", ActGlobe, cgRect(gridX, y3, cellW, kh), false));
-        vecPush(out, KeySpec {
-            label: "空格", secondaryLabel: "", sfSymbol: "",
-            action: ActSpace, keyClass: FuncClass, usesFuncFill: false, isBlueAccent: false,
-            frame: cgRect(gridX + cellW + gapX, y3, cellW * 2.0 + gapX, kh),
-        })
+pub def compensatedLetterPoint(point: CGPoint, snap: LayoutSnapshot): CGPoint = {
+    let row0MidY = snap.lsOriginY;
+    if (point.y > row0MidY && point.y < snap.lsBottomRowMinY - 5.0) {
+        cgPoint(point.x, point.y - ergonomicThumbYBias())
     } else {
-        vecPush(out, KeySpec {
-            label: "空格", secondaryLabel: "", sfSymbol: "",
-            action: ActSpace, keyClass: FuncClass, usesFuncFill: false, isBlueAccent: false,
-            frame: cgRect(gridX, y3, gridW, kh),
-        })
-    };
-    vecPush(out, makeFuncKey("", "", "return.left", ActReturn, cgRect(rightX, y3, rightW, kh), false));
-    out
+        point
+    }
 }
 
-pub def buildLayoutForMode(mode: KeyboardMode, viewWidth: Float, asciiMode: Bool, shifted: Bool, showGlobe: Bool): Vec KeySpec =
-    match mode {
-        ModeQwerty -> buildQwertyLayout(viewWidth, asciiMode, shifted, showGlobe),
-        ModeT9 -> buildT9Layout(viewWidth, asciiMode, showGlobe),
-        ModeNumbers -> buildNumbersOrSymbolsLayout(viewWidth, false, asciiMode, showGlobe),
-        ModeSymbols -> buildNumbersOrSymbolsLayout(viewWidth, true, asciiMode, showGlobe),
+def anyPriorNonNeutral(priors: Vec Int, expectedLen: Int): Bool =
+    if (vecLen(priors) != expectedLen) false
+    else {
+        let i = cellNew(0);
+        let found = cellNew(false);
+        while (cellGet(i) < expectedLen && !cellGet(found)) {
+            if (vecGetOr(priors, cellGet(i), 100) != 100) cellSet(found, true) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(found)
     }
 
-/// Hit-test a touch point against `keys` (applying 2.6pt ergonomic thumb downward bias on letter keys).
-pub def hitTestKeys(keys: Vec KeySpec, pt: CGPoint): Option KeySpec = {
-    let n = vecLen(keys);
-    let dummy = emptyKeySpec();
-    let adjPt = CGPoint { x: pt.x, y: pt.y - ergonomicThumbYBias() };
-    let found: Cell (Option KeySpec) = cellNew(None);
-    let i = cellNew(0);
-    while (cellGet(i) < n && match cellGet(found) { None -> true, Some(_) -> false }) {
-        let k = vecGetOr(keys, cellGet(i), dummy);
-        let testPt = if (k.keyClass == CharClass) adjPt else pt;
-        if (rectContainsPoint(k.frame, testPt)) cellSet(found, Some(k)) else ();
-        cellSet(i, cellGet(i) + 1)
-    };
-    cellGet(found)
-}
+def anyTouchOffsetNonZero(offsets: Vec Float, expectedLen: Int): Bool =
+    if (vecLen(offsets) != expectedLen) false
+    else {
+        let i = cellNew(0);
+        let found = cellNew(false);
+        while (cellGet(i) < expectedLen && !cellGet(found)) {
+            if (abs(vecGetOr(offsets, cellGet(i), 0.0)) > 0.0001) cellSet(found, true) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(found)
+    }
+
+def isCharacterKeyKind(kind: IOSKeyKind): Bool =
+    match kind {
+        KeyLetter(_) -> true,
+        KeyT9(_) -> true,
+        KeySymbol(_) -> true,
+        _ -> false,
+    }
+
+pub def hitTestFull(
+    point: CGPoint,
+    snap: LayoutSnapshot,
+    validNextMask: Int,
+    nextKeyPriors: Vec Int,
+    touchOffsets: Vec Float,
+    t9ValidNextMask: Int,
+    t9NextKeyPriors: Vec Int,
+    t9TouchOffsets: Vec Float
+): Option IOSKeySpec =
+    if (!rectContainsPoint(rectInset(snap.lsBounds, -18.0, -28.0), point)) None
+    else {
+        let keys = snap.lsKeys;
+        let keyCount = vecLen(keys);
+        let dummyKey = keySpecSimple("", KeySpace, cgRect(0.0, 0.0, 0.0, 0.0), "");
+
+        // 1. Functional keys checked against unbiased `point` first
+        let funcHit: Cell (Option IOSKeySpec) = cellNew(None);
+        let fi = cellNew(0);
+        while (cellGet(fi) < keyCount && match cellGet(funcHit) { None -> true, Some(_) -> false }) {
+            let k = vecGetOr(keys, cellGet(fi), dummyKey);
+            if (!isCharacterKeyKind(k.ksKind) && rectContainsPoint(k.ksFrame, point)) {
+                cellSet(funcHit, Some(k))
+            } else ();
+            cellSet(fi, cellGet(fi) + 1)
+        };
+
+        match cellGet(funcHit) {
+            Some(fk) -> Some(fk),
+            None -> {
+                // 2. Apply ergonomic upward compensation strictly inside the 3 letter/symbol rows
+                let qPt = compensatedLetterPoint(point, snap);
+
+                let hasMaskWeights =
+                    if (snap.lsIsT9Layout) (t9ValidNextMask != 0xFF && t9ValidNextMask != 0)
+                    else (validNextMask != 0x03FF_FFFF && validNextMask != 0);
+                let hasNeuralPriors =
+                    if (snap.lsIsT9Layout) anyPriorNonNeutral(t9NextKeyPriors, 8)
+                    else anyPriorNonNeutral(nextKeyPriors, 26);
+                let hasTouchOffsets =
+                    if (snap.lsIsT9Layout) anyTouchOffsetNonZero(t9TouchOffsets, 16)
+                    else anyTouchOffsetNonZero(touchOffsets, 52);
+                let hasDynamicWeights = hasMaskWeights || hasNeuralPriors || hasTouchOffsets;
+
+                let personalShift = (ascii: Int) ->
+                    if (!hasTouchOffsets || ascii < 97 || ascii > 122) (0.0, 0.0)
+                    else {
+                        let idx = ascii - 97;
+                        let dx = clampFloat(vecGetOr(touchOffsets, idx * 2, 0.0), -0.20, 0.20) * snap.lsPitchX;
+                        let dy = clampFloat(vecGetOr(touchOffsets, idx * 2 + 1, 0.0), -0.20, 0.20) * snap.lsPitchY;
+                        (dx, dy)
+                    };
+
+                let personalT9Shift = (digit: Int) ->
+                    if (!hasTouchOffsets || digit < 50 || digit > 57) (0.0, 0.0)
+                    else {
+                        let idx = digit - 50;
+                        let dx = clampFloat(vecGetOr(t9TouchOffsets, idx * 2, 0.0), -0.20, 0.20) * snap.lsT9PitchX;
+                        let dy = clampFloat(vecGetOr(t9TouchOffsets, idx * 2 + 1, 0.0), -0.20, 0.20) * snap.lsT9PitchY;
+                        (dx, dy)
+                    };
+
+                let directOrCoreHit: Cell (Option IOSKeySpec) = cellNew(None);
+                if (!hasDynamicWeights) {
+                    let di = cellNew(0);
+                    while (cellGet(di) < keyCount && match cellGet(directOrCoreHit) { None -> true, Some(_) -> false }) {
+                        let k = vecGetOr(keys, cellGet(di), dummyKey);
+                        if (rectContainsPoint(k.ksFrame, qPt)) {
+                            cellSet(directOrCoreHit, Some(k))
+                        } else ();
+                        cellSet(di, cellGet(di) + 1)
+                    }
+                } else {
+                    // Sacred Keycap Core
+                    let ci = cellNew(0);
+                    while (cellGet(ci) < keyCount && match cellGet(directOrCoreHit) { None -> true, Some(_) -> false }) {
+                        let k = vecGetOr(keys, cellGet(ci), dummyKey);
+                        match k.ksKind {
+                            KeyLetter(ascii) -> {
+                                let (px, py) = personalShift(ascii);
+                                let core = rectInset(rectOffset(k.ksFrame, px * 0.5, py * 0.5), 3.0, 2.6);
+                                if (rectContainsPoint(core, qPt)) cellSet(directOrCoreHit, Some(k)) else ()
+                            },
+                            KeyT9(digit) -> {
+                                let (px, py) = personalT9Shift(digit);
+                                let core = rectInset(rectOffset(k.ksFrame, px * 0.5, py * 0.5), 4.5, 2.8);
+                                if (rectContainsPoint(core, qPt)) cellSet(directOrCoreHit, Some(k)) else ()
+                            },
+                            KeySymbol(_) ->
+                                if (rectContainsPoint(k.ksFrame, qPt)) cellSet(directOrCoreHit, Some(k)) else (),
+                            _ -> (),
+                        };
+                        cellSet(ci, cellGet(ci) + 1)
+                    }
+                };
+
+                match cellGet(directOrCoreHit) {
+                    Some(ck) -> Some(ck),
+                    None -> {
+                        // 3. C⁰-continuous signed distance Voronoi evaluation across all keys
+                        let best: Cell (Option IOSKeySpec) = cellNew(None);
+                        let bestScore = cellNew(1.0e18);
+                        let maxLetterBottomY = snap.lsBottomRowMinY - 6.0;
+
+                        let vi = cellNew(0);
+                        while (cellGet(vi) < keyCount) {
+                            let k = vecGetOr(keys, cellGet(vi), dummyKey);
+                            let effRect = cellNew(k.ksFrame);
+                            let deadKeyPenalty = cellNew(0.0);
+                            let evalPt = cellNew(qPt);
+
+                            match k.ksKind {
+                                KeySpace -> {
+                                    cellSet(evalPt, point);
+                                    cellSet(
+                                        effRect,
+                                        cgRect(
+                                            k.ksFrame.origin.x - 2.2,
+                                            k.ksFrame.origin.y - 4.5,
+                                            k.ksFrame.size.width + 4.4,
+                                            k.ksFrame.size.height + 14.5
+                                        )
+                                    )
+                                },
+                                KeyPlaneSwitch { targetPlane: _, switchLabel: lbl } ->
+                                    if (k.ksFrame.origin.y >= snap.lsBottomRowMinY - 1.0 && lbl != "#+=") {
+                                        cellSet(evalPt, point);
+                                        cellSet(
+                                            effRect,
+                                            cgRect(
+                                                k.ksFrame.origin.x - 2.0,
+                                                k.ksFrame.origin.y - 3.0,
+                                                k.ksFrame.size.width + 2.0,
+                                                k.ksFrame.size.height + 12.0
+                                            )
+                                        )
+                                    } else (),
+                                KeySymbol(_) ->
+                                    if (k.ksFrame.origin.y >= snap.lsBottomRowMinY - 1.0) {
+                                        cellSet(evalPt, point);
+                                        cellSet(
+                                            effRect,
+                                            cgRect(
+                                                k.ksFrame.origin.x,
+                                                k.ksFrame.origin.y - 3.0,
+                                                k.ksFrame.size.width,
+                                                k.ksFrame.size.height + 12.0
+                                            )
+                                        )
+                                    } else (),
+                                KeyModeToggle -> {
+                                    cellSet(evalPt, point);
+                                    cellSet(
+                                        effRect,
+                                        cgRect(
+                                            k.ksFrame.origin.x,
+                                            k.ksFrame.origin.y - 3.0,
+                                            k.ksFrame.size.width,
+                                            k.ksFrame.size.height + 12.0
+                                        )
+                                    )
+                                },
+                                KeyGlobe -> {
+                                    cellSet(evalPt, point);
+                                    cellSet(
+                                        effRect,
+                                        cgRect(
+                                            k.ksFrame.origin.x,
+                                            k.ksFrame.origin.y - 3.0,
+                                            k.ksFrame.size.width,
+                                            k.ksFrame.size.height + 12.0
+                                        )
+                                    )
+                                },
+                                KeyReturn -> {
+                                    cellSet(evalPt, point);
+                                    cellSet(
+                                        effRect,
+                                        cgRect(
+                                            k.ksFrame.origin.x,
+                                            k.ksFrame.origin.y - 3.0,
+                                            k.ksFrame.size.width,
+                                            k.ksFrame.size.height + 12.0
+                                        )
+                                    )
+                                },
+                                KeyShift -> cellSet(evalPt, point),
+                                KeyBackspace -> cellSet(evalPt, point),
+                                KeyT9Clear -> cellSet(evalPt, point),
+                                KeyT9(digit) ->
+                                    if (hasDynamicWeights && digit >= 50 && digit <= 57) {
+                                        let (px, py) = personalT9Shift(digit);
+                                        let shifted = rectOffset(cellGet(effRect), px, py);
+                                        let idx = digit - 50;
+                                        let bit = 1 << idx;
+                                        let pVal =
+                                            if (vecLen(t9NextKeyPriors) == 8) vecGetOr(t9NextKeyPriors, idx, 100)
+                                            else if ((t9ValidNextMask & bit) != 0) 100
+                                            else 0;
+                                        if ((hasMaskWeights && (t9ValidNextMask & bit) == 0) || pVal == 0) {
+                                            cellSet(effRect, rectInset(shifted, 3.2, 2.4));
+                                            cellSet(deadKeyPenalty, 4.2)
+                                        } else {
+                                            let bias = intToFloat(pVal - 100) / 25.0;
+                                            let expX =
+                                                if (hasMaskWeights) clampFloat(3.6 + bias * 1.0, 1.0, 5.2)
+                                                else clampFloat(bias * 1.3, -1.5, 3.4);
+                                            let expY =
+                                                if (hasMaskWeights) clampFloat(2.8 + bias * 0.7, 0.8, 3.8)
+                                                else clampFloat(bias * 0.9, -1.0, 2.4);
+                                            cellSet(deadKeyPenalty, (0.0 - bias) * (if (hasMaskWeights) 1.05 else 0.8));
+                                            let expanded = rectInset(shifted, 0.0 - expX, 0.0 - expY);
+                                            if (rectMaxY(expanded) > maxLetterBottomY) {
+                                                let clampedH = maxFloat(k.ksFrame.size.height, maxLetterBottomY - expanded.origin.y);
+                                                cellSet(effRect, cgRect(expanded.origin.x, expanded.origin.y, expanded.size.width, clampedH))
+                                            } else {
+                                                cellSet(effRect, expanded)
+                                            }
+                                        }
+                                    } else (),
+                                KeyLetter(ascii) ->
+                                    if (hasDynamicWeights && ascii >= 97 && ascii <= 122) {
+                                        let (px, py) = personalShift(ascii);
+                                        let shifted = rectOffset(cellGet(effRect), px, py);
+                                        let idx = ascii - 97;
+                                        let bit = 1 << idx;
+                                        let pVal =
+                                            if (vecLen(nextKeyPriors) == 26) vecGetOr(nextKeyPriors, idx, 100)
+                                            else if ((validNextMask & bit) != 0) 100
+                                            else 0;
+                                        if ((hasMaskWeights && (validNextMask & bit) == 0) || pVal == 0) {
+                                            cellSet(effRect, rectInset(shifted, 2.8, 2.2));
+                                            cellSet(deadKeyPenalty, 4.2)
+                                        } else {
+                                            let bias = intToFloat(pVal - 100) / 25.0;
+                                            let (expX, expY, pen) =
+                                                if (!hasMaskWeights) {
+                                                    (
+                                                        clampFloat(bias * 1.45, -1.6, 3.8),
+                                                        clampFloat(bias * 0.95, -1.0, 2.4),
+                                                        (0.0 - bias) * 0.85
+                                                    )
+                                                } else {
+                                                    (
+                                                        clampFloat(4.8 + bias * 1.65, 0.0, 6.8),
+                                                        clampFloat(3.2 + bias * 0.75, 0.6, 4.0),
+                                                        (0.0 - bias) * 1.15
+                                                    )
+                                                };
+                                            cellSet(deadKeyPenalty, pen);
+                                            let expanded = rectInset(shifted, 0.0 - expX, 0.0 - expY);
+                                            if (rectMaxY(expanded) > maxLetterBottomY) {
+                                                let clampedH = maxFloat(k.ksFrame.size.height, maxLetterBottomY - expanded.origin.y);
+                                                cellSet(effRect, cgRect(expanded.origin.x, expanded.origin.y, expanded.size.width, clampedH))
+                                            } else {
+                                                cellSet(effRect, expanded)
+                                            }
+                                        }
+                                    } else (),
+                            };
+
+                            let er = cellGet(effRect);
+                            let ep = cellGet(evalPt);
+                            let erMaxX = rectMaxX(er);
+                            let erMaxY = rectMaxY(er);
+                            let dx = maxFloat(er.origin.x - ep.x, maxFloat(0.0, ep.x - erMaxX));
+                            let dy = maxFloat(er.origin.y - ep.y, maxFloat(0.0, ep.y - erMaxY));
+                            let score =
+                                if (dx == 0.0 && dy == 0.0) {
+                                    let innerDepth = minFloat(
+                                        minFloat(ep.x - er.origin.x, erMaxX - ep.x),
+                                        minFloat(ep.y - er.origin.y, erMaxY - ep.y)
+                                    );
+                                    (0.0 - innerDepth) + cellGet(deadKeyPenalty)
+                                } else {
+                                    hypot2(dx, dy) + cellGet(deadKeyPenalty)
+                                };
+
+                            if (score < cellGet(bestScore)) {
+                                cellSet(bestScore, score);
+                                cellSet(best, Some(k))
+                            } else ();
+
+                            cellSet(vi, cellGet(vi) + 1)
+                        };
+                        cellGet(best)
+                    },
+                }
+            },
+        }
+    }
+
+/// Convenience `hitTest` with default neutral weights.
+pub def hitTest(point: CGPoint, snap: LayoutSnapshot): Option IOSKeySpec =
+    hitTestFull(point, snap, 0x03FF_FFFF, vecNew(), vecNew(), 0xFF, vecNew(), vecNew())
+
+/// Convenience `hitTest` with `validNextMask` only.
+pub def hitTestWithMask(point: CGPoint, snap: LayoutSnapshot, validNextMask: Int): Option IOSKeySpec =
+    hitTestFull(point, snap, validNextMask, vecNew(), vecNew(), 0xFF, vecNew(), vecNew())

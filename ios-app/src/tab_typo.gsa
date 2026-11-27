@@ -1,0 +1,670 @@
+/// Tab 2 (`IOSHostTab.typo` — `"误触与热区"`):
+/// 1:1 port of `HostAppViews.swift` lines 88-93, 485-599, 835-840 & 851-969.
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecWithCap, vecLen, vecPush, vecGetOr}
+use std.str.{intToStr}
+use std.math.{abs}
+use sys.fs.{removeFile}
+use objc.{
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    msgSend0, msgSend1Ptr, msgSend2Ptr, msgSendBool0, msgSendI64_0,
+    msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool,
+}
+use juxu_core.{JuxuConfig}
+use juxu_core.config.{MkJuxuConfig, MkTypoConfig}
+use juxu_shared.{
+    cgSize, cgRect,
+    msgSendRect0,
+    msgSendVoid1Rect, msgSendVoid1Size,
+    msgSendVoid1F32, msgSendF32_0,
+    msgSendVoid1Ptr1I64, msgSendVoid1Ptr1Bool1Ptr, msgSendVoid1Ptr1Sel1U64,
+    objcSendSuperVoid0, objcSendSuperVoid1Bool,
+    nsStr, objcAllocInitFrame,
+    EvalLogMetricItem, evalLogMetrics,
+    bridgeShared, bridgeApplyAndSaveConfig,
+    bridgeReloadTouchCalibration, bridgeResetTouchCalibration,
+    bridgeReloadEvalLogSummary, bridgeExportEvalLogFilePath, bridgeClearEvalLog,
+}
+use uikit_kit.{
+    colorSystemBackground, colorLabel, colorSecondaryLabel, colorTertiaryLabel,
+    colorAccent, colorRed, colorWhite,
+    colorPrimary08,
+    fontWeightRegular, fontWeightMedium, fontWeightSemibold,
+    sysFont, sysFontMonospaced, hairlineHeight,
+    applyContinuousCorner, makeSettingsCard, makeDivider,
+    makeLabel, measureViewSize, makeSymbolImageView, makeSwitch, makeSlider, makeScrollContainer,
+    layoutToggleRow, setButtonPlainTitle, roundPx,
+}
+use custom_views.{
+    HitboxMapCard, buildHitboxMapCard, updateHitboxMapCard, layoutHitboxMapCard,
+    EvalMetricCell, buildEvalMetricCell, updateEvalMetricCell, layoutEvalMetricCell,
+}
+
+data TypoTabUi {
+    tyuVc: Ptr,
+    tyuScroll: Ptr,
+    // Card 1: 26-Key Hitbox Map
+    tyuHitboxCard: HitboxMapCard,
+    // Card 2: Bayesian Typo Controls
+    tyuDecoderCard: Ptr,
+    tyuSw1Title: Ptr, tyuSw1Sub: Ptr, tyuSw1: Ptr,
+    tyuDiv1: Ptr,
+    tyuSw2Title: Ptr, tyuSw2Sub: Ptr, tyuSw2: Ptr,
+    tyuDiv2: Ptr,
+    tyuSw3Title: Ptr, tyuSw3Sub: Ptr, tyuSw3: Ptr,
+    tyuDiv3: Ptr,
+    tyuSw4Title: Ptr, tyuSw4Sub: Ptr, tyuSw4: Ptr,
+    tyuDiv4: Ptr,
+    tyuPromTitle: Ptr, tyuPromValLbl: Ptr, tyuPromSlider: Ptr,
+    tyuDiv5: Ptr,
+    tyuSuggTitle: Ptr, tyuSuggValLbl: Ptr, tyuSuggSlider: Ptr,
+    // Card 3: Eval Log Card
+    tyuEvalCard: Ptr,
+    tyuEvalTitle: Ptr, tyuEvalSub: Ptr, tyuEvalSw: Ptr,
+    tyuEvalDiv: Ptr,
+    tyuMetricCells: Vec EvalMetricCell,
+    tyuRefreshBtn: Ptr,
+    tyuExportBtn: Ptr,
+    tyuExportSym: Ptr,
+    tyuExportLbl: Ptr,
+    tyuClearBtn: Ptr,
+    tyuExportedPath: Cell (Option String),
+}
+
+def gTypoUi: Cell (Option TypoTabUi) = cellNew(None)
+
+def clampFloat(lo: Float, hi: Float, v: Float): Float =
+    if (v < lo) lo else if (v > hi) hi else v
+
+def snapStep(raw: Float, lo: Float, hi: Float, stepSz: Float): Float = {
+    let clamped = clampFloat(lo, hi, raw);
+    let steps = floatToInt((clamped - lo) / stepSz + 0.5);
+    clampFloat(lo, hi, lo + intToFloat(steps) * stepSz)
+}
+
+def pctLabelText(v: Float): String =
+    intToStr(floatToInt(v * 100.0 + 0.5)) + "%"
+
+def updateTypoConfigToggle(c: JuxuConfig, tag: Int, v: Bool): JuxuConfig = {
+    let t = c.typo;
+    let nextTypo = MkTypoConfig {
+        enabled: if (tag == 1) v else t.enabled,
+        touchHitboxAdapt: if (tag == 4) v else t.touchHitboxAdapt,
+        promoteThreshold: t.promoteThreshold,
+        suggestThreshold: t.suggestThreshold,
+        suppressAutoCommitOnCorrection: if (tag == 2) v else t.suppressAutoCommitOnCorrection,
+        missedSpaceCorrection: if (tag == 3) v else t.missedSpaceCorrection,
+    };
+    MkJuxuConfig {
+        schema: c.schema,
+        fourthCodeAutoCommit: c.fourthCodeAutoCommit,
+        fifthCodePushCommit: c.fifthCodePushCommit,
+        fourthEmptyBehavior: c.fourthEmptyBehavior,
+        shortestCodeFirst: c.shortestCodeFirst,
+        strictShortcode: c.strictShortcode,
+        spaceless: c.spaceless,
+        showShortcodeHint: c.showShortcodeHint,
+        dynamicWordFreq: c.dynamicWordFreq,
+        dynamicCharFreq: c.dynamicCharFreq,
+        autoPhrase: c.autoPhrase,
+        autoPhraseThreshold: c.autoPhraseThreshold,
+        zOmnipotent: c.zOmnipotent,
+        semicolonQuoteSelect: c.semicolonQuoteSelect,
+        smartPunctuation: c.smartPunctuation,
+        autoSpaceZhEn: c.autoSpaceZhEn,
+        autoSpaceDigits: c.autoSpaceDigits,
+        clipboardSuggestion: c.clipboardSuggestion,
+        cangjieKeycapRadicals: c.cangjieKeycapRadicals,
+        wubiKeycapRadicals: c.wubiKeycapRadicals,
+        keySwipeUpInput: c.keySwipeUpInput,
+        spaceCommaKey: c.spaceCommaKey,
+        keyLongPressAlternates: c.keyLongPressAlternates,
+        backspaceSwipeClear: c.backspaceSwipeClear,
+        keyboardHoldCursor: c.keyboardHoldCursor,
+        enableRareCharset: c.enableRareCharset,
+        pinyinInitialAbbr: c.pinyinInitialAbbr,
+        pinyinT9Layout: c.pinyinT9Layout,
+        shiftToggleMode: c.shiftToggleMode,
+        pageSize: c.pageSize,
+        orientation: c.orientation,
+        evalLogging: if (tag == 5) v else c.evalLogging,
+        emojiCandidates: c.emojiCandidates,
+        typo: nextTypo,
+    }
+}
+
+def updateTypoThresholds(c: JuxuConfig, prom: Float, sugg: Float): JuxuConfig = {
+    let t = c.typo;
+    let nextTypo = MkTypoConfig {
+        enabled: t.enabled,
+        touchHitboxAdapt: t.touchHitboxAdapt,
+        promoteThreshold: prom,
+        suggestThreshold: sugg,
+        suppressAutoCommitOnCorrection: t.suppressAutoCommitOnCorrection,
+        missedSpaceCorrection: t.missedSpaceCorrection,
+    };
+    MkJuxuConfig {
+        schema: c.schema,
+        fourthCodeAutoCommit: c.fourthCodeAutoCommit,
+        fifthCodePushCommit: c.fifthCodePushCommit,
+        fourthEmptyBehavior: c.fourthEmptyBehavior,
+        shortestCodeFirst: c.shortestCodeFirst,
+        strictShortcode: c.strictShortcode,
+        spaceless: c.spaceless,
+        showShortcodeHint: c.showShortcodeHint,
+        dynamicWordFreq: c.dynamicWordFreq,
+        dynamicCharFreq: c.dynamicCharFreq,
+        autoPhrase: c.autoPhrase,
+        autoPhraseThreshold: c.autoPhraseThreshold,
+        zOmnipotent: c.zOmnipotent,
+        semicolonQuoteSelect: c.semicolonQuoteSelect,
+        smartPunctuation: c.smartPunctuation,
+        autoSpaceZhEn: c.autoSpaceZhEn,
+        autoSpaceDigits: c.autoSpaceDigits,
+        clipboardSuggestion: c.clipboardSuggestion,
+        cangjieKeycapRadicals: c.cangjieKeycapRadicals,
+        wubiKeycapRadicals: c.wubiKeycapRadicals,
+        keySwipeUpInput: c.keySwipeUpInput,
+        spaceCommaKey: c.spaceCommaKey,
+        keyLongPressAlternates: c.keyLongPressAlternates,
+        backspaceSwipeClear: c.backspaceSwipeClear,
+        keyboardHoldCursor: c.keyboardHoldCursor,
+        enableRareCharset: c.enableRareCharset,
+        pinyinInitialAbbr: c.pinyinInitialAbbr,
+        pinyinT9Layout: c.pinyinT9Layout,
+        shiftToggleMode: c.shiftToggleMode,
+        pageSize: c.pageSize,
+        orientation: c.orientation,
+        evalLogging: c.evalLogging,
+        emojiCandidates: c.emojiCandidates,
+        typo: nextTypo,
+    }
+}
+
+def syncTypoControlsFromSession(ui: TypoTabUi): Void = {
+    let s = bridgeShared();
+    let cfg = cellGet(s.jsConfig);
+    let t = cfg.typo;
+
+    updateHitboxMapCard(ui.tyuHitboxCard, cellGet(s.touchCalibrations));
+
+    msgSendVoid1Bool(ui.tyuSw1, objcSel("setOn:"), t.enabled);
+    msgSendVoid1Bool(ui.tyuSw2, objcSel("setOn:"), t.suppressAutoCommitOnCorrection);
+    msgSendVoid1Bool(ui.tyuSw3, objcSel("setOn:"), t.missedSpaceCorrection);
+    msgSendVoid1Bool(ui.tyuSw4, objcSel("setOn:"), t.touchHitboxAdapt);
+
+    msgSendVoid1Ptr(ui.tyuPromValLbl, objcSel("setText:"), nsStr(pctLabelText(t.promoteThreshold)));
+    msgSendVoid1F32(ui.tyuPromSlider, objcSel("setValue:"), floatToF32(t.promoteThreshold));
+
+    msgSendVoid1Ptr(ui.tyuSuggValLbl, objcSel("setText:"), nsStr(pctLabelText(t.suggestThreshold)));
+    msgSendVoid1F32(ui.tyuSuggSlider, objcSel("setValue:"), floatToF32(t.suggestThreshold));
+
+    msgSendVoid1Bool(ui.tyuEvalSw, objcSel("setOn:"), cfg.evalLogging);
+
+    let summary = cellGet(s.evalLogSummary);
+    let metrics = evalLogMetrics(summary, true);
+    let dummyMetric = EvalLogMetricItem { elmId: "", elmTitle: "", elmValue: "0" };
+    let dummyCell = EvalMetricCell { emcBox: ptrNull(), emcTitleLbl: ptrNull(), emcValueLbl: ptrNull() };
+    let i = cellNew(0);
+    while (cellGet(i) < 6 && cellGet(i) < vecLen(ui.tyuMetricCells)) {
+        let idx = cellGet(i);
+        updateEvalMetricCell(
+            vecGetOr(ui.tyuMetricCells, idx, dummyCell),
+            vecGetOr(metrics, idx, dummyMetric)
+        );
+        cellSet(i, idx + 1)
+    };
+
+    let hasExport = match cellGet(ui.tyuExportedPath) { Some(_) -> true, None -> false };
+    msgSendVoid1Bool(ui.tyuExportBtn, objcSel("setHidden:"), !hasExport);
+    msgSendVoid1Bool(ui.tyuClearBtn, objcSel("setEnabled:"), summary.elsTotalEvents > 0);
+    layoutTypoTab(ui)
+}
+
+def refreshEvalLogStateInternal(ui: TypoTabUi): Void = {
+    let s = bridgeShared();
+    let summary = bridgeReloadEvalLogSummary(s);
+    let expOpt =
+        if (summary.elsTotalEvents > 0) bridgeExportEvalLogFilePath(s)
+        else None;
+    cellSet(ui.tyuExportedPath, expOpt)
+}
+
+pub def refreshTypoTab(): Void =
+    match cellGet(gTypoUi) {
+        Some(ui) -> {
+            let s = bridgeShared();
+            bridgeReloadTouchCalibration(s);
+            refreshEvalLogStateInternal(ui);
+            syncTypoControlsFromSession(ui)
+        },
+        None -> (),
+    }
+
+def layoutSliderBlock(
+    titleLbl: Ptr,
+    valLbl: Ptr,
+    slider: Ptr,
+    x: Float,
+    y: Float,
+    innerW: Float
+): Float = {
+    let vSz = measureViewSize(valLbl, 70.0);
+    let vW = if (vSz.width > 36.0) vSz.width else 36.0;
+    let tW = innerW - vW - 8.0;
+    let tSz = measureViewSize(titleLbl, tW);
+    let hdrH = if (tSz.height > vSz.height) tSz.height else vSz.height;
+    msgSendVoid1Rect(titleLbl, objcSel("setFrame:"), cgRect(x, y, tW, hdrH));
+    msgSendVoid1Rect(valLbl, objcSel("setFrame:"), cgRect(x + innerW - vW, y, vW, hdrH));
+    let slY = y + hdrH + 4.0;
+    let slH = 30.0;
+    msgSendVoid1Rect(slider, objcSel("setFrame:"), cgRect(x, slY, innerW, slH));
+    slY + slH
+}
+
+def layoutTypoTab(ui: TypoTabUi): Void = {
+    let view = msgSend0(ui.tyuVc, objcSel("view"));
+    if (!ptrIsNull(view)) {
+        let bounds = msgSendRect0(view, objcSel("bounds"));
+        let viewW = bounds.size.width;
+        if (viewW > 40.0) {
+            let outerPad = 16.0;
+            let contentW = viewW - outerPad * 2.0;
+            let cardPad = 14.0;
+            let innerW = contentW - cardPad * 2.0;
+            let hh = hairlineHeight();
+
+            // Card 1: 26-Key Hitbox Map
+            let c1H = layoutHitboxMapCard(ui.tyuHitboxCard, outerPad, outerPad, contentW);
+
+            // Card 2: Bayesian Typo Controls (`spacing: 12`)
+            let c2Y = outerPad + c1H + 14.0;
+            let y1 = layoutToggleRow(ui.tyuSw1Title, ui.tyuSw1Sub, ui.tyuSw1, cardPad, cardPad, innerW);
+            let d1Y = y1 + 12.0;
+            msgSendVoid1Rect(ui.tyuDiv1, objcSel("setFrame:"), cgRect(cardPad, d1Y, innerW, hh));
+
+            let y2 = layoutToggleRow(ui.tyuSw2Title, ui.tyuSw2Sub, ui.tyuSw2, cardPad, d1Y + hh + 12.0, innerW);
+            let d2Y = y2 + 12.0;
+            msgSendVoid1Rect(ui.tyuDiv2, objcSel("setFrame:"), cgRect(cardPad, d2Y, innerW, hh));
+
+            let y3 = layoutToggleRow(ui.tyuSw3Title, ui.tyuSw3Sub, ui.tyuSw3, cardPad, d2Y + hh + 12.0, innerW);
+            let d3Y = y3 + 12.0;
+            msgSendVoid1Rect(ui.tyuDiv3, objcSel("setFrame:"), cgRect(cardPad, d3Y, innerW, hh));
+
+            let y4 = layoutToggleRow(ui.tyuSw4Title, ui.tyuSw4Sub, ui.tyuSw4, cardPad, d3Y + hh + 12.0, innerW);
+            let d4Y = y4 + 12.0;
+            msgSendVoid1Rect(ui.tyuDiv4, objcSel("setFrame:"), cgRect(cardPad, d4Y, innerW, hh));
+
+            let y5 = layoutSliderBlock(ui.tyuPromTitle, ui.tyuPromValLbl, ui.tyuPromSlider, cardPad, d4Y + hh + 12.0, innerW);
+            let d5Y = y5 + 12.0;
+            msgSendVoid1Rect(ui.tyuDiv5, objcSel("setFrame:"), cgRect(cardPad, d5Y, innerW, hh));
+
+            let y6 = layoutSliderBlock(ui.tyuSuggTitle, ui.tyuSuggValLbl, ui.tyuSuggSlider, cardPad, d5Y + hh + 12.0, innerW);
+            let c2H = y6 + cardPad;
+            msgSendVoid1Rect(ui.tyuDecoderCard, objcSel("setFrame:"), cgRect(outerPad, c2Y, contentW, c2H));
+
+            // Card 3: Eval Log Card (`spacing: 11`)
+            let c3Y = c2Y + c2H + 14.0;
+            let ey1 = layoutToggleRow(ui.tyuEvalTitle, ui.tyuEvalSub, ui.tyuEvalSw, cardPad, cardPad, innerW);
+            let edY = ey1 + 11.0;
+            msgSendVoid1Rect(ui.tyuEvalDiv, objcSel("setFrame:"), cgRect(cardPad, edY, innerW, hh));
+
+            let cellW = (innerW - 20.0) / 3.0;
+            let dummyCell = EvalMetricCell { emcBox: ptrNull(), emcTitleLbl: ptrNull(), emcValueLbl: ptrNull() };
+            let r1Y = edY + hh + 11.0;
+            let h0 = layoutEvalMetricCell(vecGetOr(ui.tyuMetricCells, 0, dummyCell), cardPad, r1Y, cellW);
+            let h1 = layoutEvalMetricCell(vecGetOr(ui.tyuMetricCells, 1, dummyCell), cardPad + cellW + 10.0, r1Y, cellW);
+            let h2 = layoutEvalMetricCell(vecGetOr(ui.tyuMetricCells, 2, dummyCell), cardPad + (cellW + 10.0) * 2.0, r1Y, cellW);
+            let row1H = if (h0 >= h1 && h0 >= h2) h0 else if (h1 >= h2) h1 else h2;
+
+            let r2Y = r1Y + row1H + 11.0;
+            let h3 = layoutEvalMetricCell(vecGetOr(ui.tyuMetricCells, 3, dummyCell), cardPad, r2Y, cellW);
+            let h4 = layoutEvalMetricCell(vecGetOr(ui.tyuMetricCells, 4, dummyCell), cardPad + cellW + 10.0, r2Y, cellW);
+            let h5 = layoutEvalMetricCell(vecGetOr(ui.tyuMetricCells, 5, dummyCell), cardPad + (cellW + 10.0) * 2.0, r2Y, cellW);
+            let row2H = if (h3 >= h4 && h3 >= h5) h3 else if (h4 >= h5) h4 else h5;
+
+            let btnRowY = r2Y + row2H + 11.0;
+            let btnH = 28.0;
+            let refW = 74.0;
+            msgSendVoid1Rect(ui.tyuRefreshBtn, objcSel("setFrame:"), cgRect(cardPad, btnRowY, refW, btnH));
+
+            let expLblSz = measureViewSize(ui.tyuExportLbl, 120.0);
+            let expW = 10.0 + 13.0 + 5.0 + expLblSz.width + 10.0;
+            msgSendVoid1Rect(ui.tyuExportBtn, objcSel("setFrame:"), cgRect(cardPad + refW + 10.0, btnRowY, expW, btnH));
+            msgSendVoid1Rect(ui.tyuExportSym, objcSel("setFrame:"), cgRect(10.0, roundPx((btnH - 13.0) * 0.5), 13.0, 13.0));
+            msgSendVoid1Rect(
+                ui.tyuExportLbl,
+                objcSel("setFrame:"),
+                cgRect(28.0, roundPx((btnH - expLblSz.height) * 0.5), expLblSz.width, expLblSz.height)
+            );
+
+            let clrW = 52.0;
+            msgSendVoid1Rect(ui.tyuClearBtn, objcSel("setFrame:"), cgRect(cardPad + innerW - clrW, btnRowY, clrW, btnH));
+
+            let c3H = btnRowY + btnH + cardPad;
+            msgSendVoid1Rect(ui.tyuEvalCard, objcSel("setFrame:"), cgRect(outerPad, c3Y, contentW, c3H));
+
+            let totalH = c3Y + c3H + outerPad;
+            msgSendVoid1Size(ui.tyuScroll, objcSel("setContentSize:"), cgSize(viewW, totalH))
+        } else ()
+    } else ()
+}
+
+// ============================================================================
+// Objective-C Callbacks on `JuxuTypoTabVC`
+// ============================================================================
+
+def typoOnResetCalibration(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    match cellGet(gTypoUi) {
+        Some(ui) -> {
+            let s = bridgeShared();
+            bridgeResetTouchCalibration(s, true);
+            updateHitboxMapCard(ui.tyuHitboxCard, cellGet(s.touchCalibrations))
+        },
+        None -> (),
+    }
+
+def typoOnSwitchChanged(_self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
+    let tag = i64ToInt(msgSendI64_0(sender, objcSel("tag")));
+    let isOn = msgSendBool0(sender, objcSel("isOn"));
+    let s = bridgeShared();
+    let nextCfg = updateTypoConfigToggle(cellGet(s.jsConfig), tag, isOn);
+    bridgeApplyAndSaveConfig(s, nextCfg, true)
+}
+
+def typoOnPromoteSliderChanged(_self: Ptr, _cmd: Ptr, sender: Ptr): Void =
+    match cellGet(gTypoUi) {
+        Some(ui) -> {
+            let raw = f32ToFloat(msgSendF32_0(sender, objcSel("value")));
+            let snapped = snapStep(raw, 0.60, 0.96, 0.02);
+            msgSendVoid1F32(sender, objcSel("setValue:"), floatToF32(snapped));
+            msgSendVoid1Ptr(ui.tyuPromValLbl, objcSel("setText:"), nsStr(pctLabelText(snapped)));
+            let s = bridgeShared();
+            let curCfg = cellGet(s.jsConfig);
+            if (abs(curCfg.typo.promoteThreshold - snapped) > 0.001) {
+                let nextCfg = updateTypoThresholds(curCfg, snapped, curCfg.typo.suggestThreshold);
+                bridgeApplyAndSaveConfig(s, nextCfg, true)
+            } else ()
+        },
+        None -> (),
+    }
+
+def typoOnSuggestSliderChanged(_self: Ptr, _cmd: Ptr, sender: Ptr): Void =
+    match cellGet(gTypoUi) {
+        Some(ui) -> {
+            let raw = f32ToFloat(msgSendF32_0(sender, objcSel("value")));
+            let snapped = snapStep(raw, 0.15, 0.70, 0.05);
+            msgSendVoid1F32(sender, objcSel("setValue:"), floatToF32(snapped));
+            msgSendVoid1Ptr(ui.tyuSuggValLbl, objcSel("setText:"), nsStr(pctLabelText(snapped)));
+            let s = bridgeShared();
+            let curCfg = cellGet(s.jsConfig);
+            if (abs(curCfg.typo.suggestThreshold - snapped) > 0.001) {
+                let nextCfg = updateTypoThresholds(curCfg, curCfg.typo.promoteThreshold, snapped);
+                bridgeApplyAndSaveConfig(s, nextCfg, true)
+            } else ()
+        },
+        None -> (),
+    }
+
+def typoOnRefreshEval(self: Ptr, _cmd: Ptr, _sender: Ptr): Void = {
+    let _ = self;
+    match cellGet(gTypoUi) {
+        Some(ui) -> {
+            refreshEvalLogStateInternal(ui);
+            syncTypoControlsFromSession(ui)
+        },
+        None -> (),
+    }
+}
+
+def typoOnExportEval(self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    match cellGet(gTypoUi) {
+        Some(ui) -> match cellGet(ui.tyuExportedPath) {
+            Some(path) -> {
+                let fileUrl = msgSend1Ptr(objcClass("NSURL"), objcSel("fileURLWithPath:"), nsStr(path));
+                if (!ptrIsNull(fileUrl)) {
+                    let items = msgSend1Ptr(objcClass("NSArray"), objcSel("arrayWithObject:"), fileUrl);
+                    let avcAlloc = msgSend0(objcClass("UIActivityViewController"), objcSel("alloc"));
+                    let avc = msgSend2Ptr(
+                        avcAlloc,
+                        objcSel("initWithActivityItems:applicationActivities:"),
+                        items,
+                        ptrNull()
+                    );
+                    if (!ptrIsNull(avc)) {
+                        // Configure iPad popover anchor so `UIDeviceFamily = [1, 2]` never crashes on iPad!
+                        let pop = msgSend0(avc, objcSel("popoverPresentationController"));
+                        if (!ptrIsNull(pop)) {
+                            msgSendVoid1Ptr(pop, objcSel("setSourceView:"), ui.tyuExportBtn);
+                            msgSendVoid1Rect(pop, objcSel("setSourceRect:"), msgSendRect0(ui.tyuExportBtn, objcSel("bounds")))
+                        } else ();
+                        msgSendVoid1Ptr1Bool1Ptr(self, objcSel("presentViewController:animated:completion:"), avc, true, ptrNull())
+                    } else ()
+                } else ()
+            },
+            None -> (),
+        },
+        None -> (),
+    }
+
+def typoOnClearEval(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    match cellGet(gTypoUi) {
+        Some(ui) -> {
+            let s = bridgeShared();
+            bridgeClearEvalLog(s);
+            match cellGet(ui.tyuExportedPath) {
+                Some(oldPath) -> {
+                    let _ = removeFile(oldPath);
+                    ()
+                },
+                None -> (),
+            };
+            cellSet(ui.tyuExportedPath, None);
+            syncTypoControlsFromSession(ui)
+        },
+        None -> (),
+    }
+
+def typoVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIViewController", objcSel("viewDidLoad"));
+    let s = bridgeShared();
+    let cfg = cellGet(s.jsConfig);
+    let t = cfg.typo;
+
+    let view = msgSend0(self, objcSel("view"));
+    msgSendVoid1Ptr(view, objcSel("setBackgroundColor:"), colorSystemBackground());
+
+    let sv = makeScrollContainer(false);
+    msgSendVoid1Rect(sv, objcSel("setFrame:"), msgSendRect0(view, objcSel("bounds")));
+    msgSendVoid1Ptr(view, objcSel("addSubview:"), sv);
+
+    // Card 1: 26-Key Hitbox Map
+    let hmc = buildHitboxMapCard(self, objcSel("onTypoResetCalibration:"));
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), hmc.hmcCardView);
+
+    // Card 2: Bayesian Typo Decoder Controls
+    let decCard = makeSettingsCard();
+    let sw1T = makeLabel("统计 + 触控高斯误触纠正", sysFont(14.5, fontWeightMedium()), colorLabel(), 0);
+    let sw1S = makeLabel("融合 2D 触点似然、语料 Bigram 与个人输入历史", sysFont(11.5, fontWeightRegular()), colorSecondaryLabel(), 0);
+    let sw1 = makeSwitch("统计 + 触控高斯误触纠正", t.enabled, self, objcSel("onTypoSwitchChanged:"));
+    msgSendVoid1I64(sw1, objcSel("setTag:"), intToI64(1));
+    let div1 = makeDivider();
+
+    let sw2T = makeLabel("纠错项抑制四码盲目上屏", sysFont(14.5, fontWeightMedium()), colorLabel(), 0);
+    let sw2S = makeLabel("非精确救回项留待空格或第 5 码确认，防顶错字", sysFont(11.5, fontWeightRegular()), colorSecondaryLabel(), 0);
+    let sw2 = makeSwitch("纠错项抑制四码盲目上屏", t.suppressAutoCommitOnCorrection, self, objcSel("onTypoSwitchChanged:"));
+    msgSendVoid1I64(sw2, objcSel("setTag:"), intToI64(2));
+    let div2 = makeDivider();
+
+    let sw3T = makeLabel("语言模型漏空格切分纠错", sysFont(14.5, fontWeightMedium()), colorLabel(), 0);
+    let sw3S = makeLabel("简码/三码字漏按空格续打时智能顶屏切分，减少空码截停与误上屏", sysFont(11.5, fontWeightRegular()), colorSecondaryLabel(), 0);
+    let sw3 = makeSwitch("语言模型漏空格切分纠错", t.missedSpaceCorrection, self, objcSel("onTypoSwitchChanged:"));
+    msgSendVoid1I64(sw3, objcSel("setTag:"), intToI64(3));
+    let div3 = makeDivider();
+
+    let sw4T = makeLabel("个人拇指热区 EMA 自适应", sysFont(14.5, fontWeightMedium()), colorLabel(), 0);
+    let sw4S = makeLabel("确认选词后微调每键判定中心（限幅 ±0.20 键宽）", sysFont(11.5, fontWeightRegular()), colorSecondaryLabel(), 0);
+    let sw4 = makeSwitch("个人拇指热区 EMA 自适应", t.touchHitboxAdapt, self, objcSel("onTypoSwitchChanged:"));
+    msgSendVoid1I64(sw4, objcSel("setTag:"), intToI64(4));
+    let div4 = makeDivider();
+
+    let promT = makeLabel("空码 / 边缘滑偏直推首选阈值", sysFont(14.0, fontWeightMedium()), colorLabel(), 0);
+    let promV = makeLabel(pctLabelText(t.promoteThreshold), sysFontMonospaced(13.0, fontWeightSemibold()), colorAccent(), 1);
+    // NSTextAlignmentRight = 2
+    msgSendVoid1I64(promV, objcSel("setTextAlignment:"), intToI64(2));
+    let promSl = makeSlider("空码 / 边缘滑偏直推首选阈值", 0.60, 0.96, t.promoteThreshold, self, objcSel("onTypoPromoteSliderChanged:"));
+    let div5 = makeDivider();
+
+    let suggT = makeLabel("次选纠错候选提示阈值", sysFont(14.0, fontWeightMedium()), colorLabel(), 0);
+    let suggV = makeLabel(pctLabelText(t.suggestThreshold), sysFontMonospaced(13.0, fontWeightSemibold()), colorAccent(), 1);
+    msgSendVoid1I64(suggV, objcSel("setTextAlignment:"), intToI64(2));
+    let suggSl = makeSlider("次选纠错候选提示阈值", 0.15, 0.70, t.suggestThreshold, self, objcSel("onTypoSuggestSliderChanged:"));
+
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), sw1T);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), sw1S);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), sw1);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), div1);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), sw2T);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), sw2S);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), sw2);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), div2);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), sw3T);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), sw3S);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), sw3);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), div3);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), sw4T);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), sw4S);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), sw4);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), div4);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), promT);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), promV);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), promSl);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), div5);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), suggT);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), suggV);
+    msgSendVoid1Ptr(decCard, objcSel("addSubview:"), suggSl);
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), decCard);
+
+    // Card 3: Eval Log Card
+    let evalCard = makeSettingsCard();
+    let evalT = makeLabel("记录输入与选词诊断日志", sysFont(14.5, fontWeightMedium()), colorLabel(), 0);
+    let evalS = makeLabel("仅本地保存手选非首选、纠错、退格重打与 2D 落点，用于制作 eval set 改进排序策略", sysFont(11.5, fontWeightRegular()), colorSecondaryLabel(), 0);
+    let evalSw = makeSwitch("记录输入与选词诊断日志", cfg.evalLogging, self, objcSel("onTypoSwitchChanged:"));
+    msgSendVoid1I64(evalSw, objcSel("setTag:"), intToI64(5));
+    let evalDiv = makeDivider();
+
+    msgSendVoid1Ptr(evalCard, objcSel("addSubview:"), evalT);
+    msgSendVoid1Ptr(evalCard, objcSel("addSubview:"), evalS);
+    msgSendVoid1Ptr(evalCard, objcSel("addSubview:"), evalSw);
+    msgSendVoid1Ptr(evalCard, objcSel("addSubview:"), evalDiv);
+
+    let initMetrics = evalLogMetrics(cellGet(s.evalLogSummary), true);
+    let dummyMetric = EvalLogMetricItem { elmId: "", elmTitle: "", elmValue: "0" };
+    let mCells: Vec EvalMetricCell = vecWithCap(6);
+    let mi = cellNew(0);
+    while (cellGet(mi) < 6) {
+        let idx = cellGet(mi);
+        let m = vecGetOr(initMetrics, idx, dummyMetric);
+        let mc = buildEvalMetricCell(m.elmTitle, m.elmValue);
+        msgSendVoid1Ptr(evalCard, objcSel("addSubview:"), mc.emcBox);
+        vecPush(mCells, mc);
+        cellSet(mi, idx + 1)
+    };
+
+    let refBtn = objcAllocInitFrame("UIButton", cgRect(0.0, 0.0, 74.0, 28.0));
+    msgSendVoid1Ptr(refBtn, objcSel("setBackgroundColor:"), colorPrimary08());
+    applyContinuousCorner(refBtn, 7.0);
+    setButtonPlainTitle(refBtn, "刷新统计", sysFont(12.5, fontWeightMedium()), colorAccent());
+    msgSendVoid1Ptr1Sel1U64(refBtn, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onTypoRefreshEval:"), intToI64(64));
+
+    let expBtn = objcAllocInitFrame("UIButton", cgRect(0.0, 0.0, 100.0, 28.0));
+    msgSendVoid1Ptr(expBtn, objcSel("setBackgroundColor:"), colorAccent());
+    applyContinuousCorner(expBtn, 7.0);
+    msgSendVoid1Bool(expBtn, objcSel("setIsAccessibilityElement:"), true);
+    msgSendVoid1Ptr(expBtn, objcSel("setAccessibilityLabel:"), nsStr("导出 JSONL"));
+    msgSendVoid1Ptr1Sel1U64(expBtn, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onTypoExportEval:"), intToI64(64));
+
+    let expSym = makeSymbolImageView("square.and.arrow.up", 11.5, 6, colorWhite());
+    msgSendVoid1Bool(expSym, objcSel("setUserInteractionEnabled:"), false);
+    msgSendVoid1Bool(expSym, objcSel("setIsAccessibilityElement:"), false);
+    let expLbl = makeLabel("导出 JSONL", sysFont(12.5, fontWeightSemibold()), colorWhite(), 1);
+    msgSendVoid1Bool(expLbl, objcSel("setUserInteractionEnabled:"), false);
+    msgSendVoid1Bool(expLbl, objcSel("setIsAccessibilityElement:"), false);
+    msgSendVoid1Ptr(expBtn, objcSel("addSubview:"), expSym);
+    msgSendVoid1Ptr(expBtn, objcSel("addSubview:"), expLbl);
+    msgSendVoid1Bool(expBtn, objcSel("setHidden:"), true);
+
+    let clrBtn = objcAllocInitFrame("UIButton", cgRect(0.0, 0.0, 52.0, 28.0));
+    msgSendVoid1Ptr(clrBtn, objcSel("setBackgroundColor:"), colorPrimary08());
+    applyContinuousCorner(clrBtn, 7.0);
+    setButtonPlainTitle(clrBtn, "清空", sysFont(12.5, fontWeightMedium()), colorRed());
+    // UIControlStateDisabled = 2
+    msgSendVoid1Ptr1I64(clrBtn, objcSel("setTitleColor:forState:"), colorTertiaryLabel(), intToI64(2));
+    msgSendVoid1Ptr1Sel1U64(clrBtn, objcSel("addTarget:action:forControlEvents:"), self, objcSel("onTypoClearEval:"), intToI64(64));
+
+    msgSendVoid1Ptr(evalCard, objcSel("addSubview:"), refBtn);
+    msgSendVoid1Ptr(evalCard, objcSel("addSubview:"), expBtn);
+    msgSendVoid1Ptr(evalCard, objcSel("addSubview:"), clrBtn);
+    msgSendVoid1Ptr(sv, objcSel("addSubview:"), evalCard);
+
+    let ui = TypoTabUi {
+        tyuVc: self,
+        tyuScroll: sv,
+        tyuHitboxCard: hmc,
+        tyuDecoderCard: decCard,
+        tyuSw1Title: sw1T, tyuSw1Sub: sw1S, tyuSw1: sw1,
+        tyuDiv1: div1,
+        tyuSw2Title: sw2T, tyuSw2Sub: sw2S, tyuSw2: sw2,
+        tyuDiv2: div2,
+        tyuSw3Title: sw3T, tyuSw3Sub: sw3S, tyuSw3: sw3,
+        tyuDiv3: div3,
+        tyuSw4Title: sw4T, tyuSw4Sub: sw4S, tyuSw4: sw4,
+        tyuDiv4: div4,
+        tyuPromTitle: promT, tyuPromValLbl: promV, tyuPromSlider: promSl,
+        tyuDiv5: div5,
+        tyuSuggTitle: suggT, tyuSuggValLbl: suggV, tyuSuggSlider: suggSl,
+        tyuEvalCard: evalCard,
+        tyuEvalTitle: evalT, tyuEvalSub: evalS, tyuEvalSw: evalSw,
+        tyuEvalDiv: evalDiv,
+        tyuMetricCells: mCells,
+        tyuRefreshBtn: refBtn,
+        tyuExportBtn: expBtn,
+        tyuExportSym: expSym,
+        tyuExportLbl: expLbl,
+        tyuClearBtn: clrBtn,
+        tyuExportedPath: cellNew(None),
+    };
+    cellSet(gTypoUi, Some(ui));
+    refreshTypoTab()
+}
+
+def typoVcViewWillAppear(self: Ptr, _cmd: Ptr, animated: Bool): Void = {
+    objcSendSuperVoid1Bool(self, "UIViewController", objcSel("viewWillAppear:"), animated);
+    refreshTypoTab()
+}
+
+def typoVcViewDidLayoutSubviews(self: Ptr, _cmd: Ptr): Void = {
+    objcSendSuperVoid0(self, "UIViewController", objcSel("viewDidLayoutSubviews"));
+    match cellGet(gTypoUi) {
+        Some(ui) -> layoutTypoTab(ui),
+        None -> (),
+    }
+}
+
+pub def registerTypoTabClass(): Void = {
+    let cls = objcAllocateClass("UIViewController", "JuxuTypoTabVC");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "viewDidLoad", cFnPtr(typoVcViewDidLoad), "v@:");
+        let _ = objcAddMethod(cls, "viewWillAppear:", cFnPtr(typoVcViewWillAppear), "v@:B");
+        let _ = objcAddMethod(cls, "viewDidLayoutSubviews", cFnPtr(typoVcViewDidLayoutSubviews), "v@:");
+        let _ = objcAddMethod(cls, "onTypoResetCalibration:", cFnPtr(typoOnResetCalibration), "v@:@");
+        let _ = objcAddMethod(cls, "onTypoSwitchChanged:", cFnPtr(typoOnSwitchChanged), "v@:@");
+        let _ = objcAddMethod(cls, "onTypoPromoteSliderChanged:", cFnPtr(typoOnPromoteSliderChanged), "v@:@");
+        let _ = objcAddMethod(cls, "onTypoSuggestSliderChanged:", cFnPtr(typoOnSuggestSliderChanged), "v@:@");
+        let _ = objcAddMethod(cls, "onTypoRefreshEval:", cFnPtr(typoOnRefreshEval), "v@:@");
+        let _ = objcAddMethod(cls, "onTypoExportEval:", cFnPtr(typoOnExportEval), "v@:@");
+        let _ = objcAddMethod(cls, "onTypoClearEval:", cFnPtr(typoOnClearEval), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}

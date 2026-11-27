@@ -1,0 +1,130 @@
+/// 1:1 port of `Shared/SharedSettingsComponents.swift`:
+/// - `SharedCalibrationFormatting`
+/// - `EvalLogMetricItem`
+/// - `SharedSchemaDisplayHelpers`
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecWithCap, vecLen, vecPush, vecGetOr}
+use std.str.{intToStr}
+use std.math.{abs}
+use std.generic
+use juxu_core.{
+    KeyTouchSample, touchKeyOffsetZero,
+    CandidateBadge, NoBadge, Shortcode, TypoCorrected, Wildcard, PinyinLookup, UserPhraseBadge, EmojiBadge,
+}
+use models.{EvalLogSummary, evalLogTop1RatePercent}
+
+// ============================================================================
+// Fixed-Decimal Formatting Helpers
+// ============================================================================
+
+def roundNonNegInt(v: Float): Int =
+    floatToInt(v + 0.5)
+
+pub def formatFixed2Signed(v: Float): String = {
+    let av = abs(v);
+    let scaled = roundNonNegInt(av * 100.0);
+    let whole = scaled / 100;
+    let frac = scaled % 100;
+    let sign = if (v < 0.0) "-" else "+";
+    let pad = if (frac < 10) "0" else "";
+    sign + intToStr(whole) + "." + pad + intToStr(frac)
+}
+
+pub def formatFixed1(v: Float): String = {
+    let av = if (v < 0.0) 0.0 else v;
+    let scaled = roundNonNegInt(av * 10.0);
+    let whole = scaled / 10;
+    let frac = scaled % 10;
+    intToStr(whole) + "." + intToStr(frac)
+}
+
+// ============================================================================
+// SharedCalibrationFormatting
+// ============================================================================
+
+pub def activeCalibratedCount(items: Vec KeyTouchSample): Int = {
+    let n = vecLen(items);
+    let dummy = KeyTouchSample { keyLabel: "a", offset: touchKeyOffsetZero() };
+    let cnt = cellNew(0);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        if (vecGetOr(items, cellGet(i), dummy).offset.samples > 0) {
+            cellSet(cnt, cellGet(cnt) + 1)
+        } else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(cnt)
+}
+
+pub def calibratedProgressText(calibratedCount: Int, totalKeys: Int): String =
+    intToStr(calibratedCount) + " / " + intToStr(totalKeys)
+
+pub def formatSignedPitch(delta: Float): String =
+    if (abs(delta) < 0.005) "±0.00"
+    else formatFixed2Signed(delta)
+
+pub def formatSignedMillimeters(deltaPitch: Float, keyPitchMm: Float): String = {
+    let mm = deltaPitch * keyPitchMm;
+    if (abs(mm) < 0.005) "±0.00 mm"
+    else formatFixed2Signed(mm) + " mm"
+}
+
+pub def formatOffsetVector(dx: Float, dy: Float): String =
+    "(" + formatSignedPitch(dx) + ", " + formatSignedPitch(dy) + ")"
+
+// ============================================================================
+// EvalLogMetricItem
+// ============================================================================
+
+pub data EvalLogMetricItem : Eq {
+    elmId: String,
+    elmTitle: String,
+    elmValue: String,
+}
+
+pub def formatTop1Rate(summary: EvalLogSummary): String =
+    if (summary.elsCommits > 0) formatFixed1(evalLogTop1RatePercent(summary)) + "%"
+    else "—"
+
+pub def evalLogMetrics(summary: EvalLogSummary, compactTop1Title: Bool): Vec EvalLogMetricItem = {
+    let out: Vec EvalLogMetricItem = vecWithCap(6);
+    vecPush(out, EvalLogMetricItem { elmId: "commits", elmTitle: "总上屏", elmValue: intToStr(summary.elsCommits) });
+    vecPush(out, EvalLogMetricItem {
+        elmId: "top1",
+        elmTitle: if (compactTop1Title) "Top-1 率" else "Top-1 命中率",
+        elmValue: formatTop1Rate(summary),
+    });
+    vecPush(out, EvalLogMetricItem { elmId: "manual", elmTitle: "手选非首选", elmValue: intToStr(summary.elsManualSelects) });
+    vecPush(out, EvalLogMetricItem { elmId: "lm_overruled", elmTitle: "策略压制模型", elmValue: intToStr(summary.elsLmOverruled) });
+    vecPush(out, EvalLogMetricItem { elmId: "backspace", elmTitle: "退格重打", elmValue: intToStr(summary.elsBackspaceAfterCommit) });
+    vecPush(out, EvalLogMetricItem { elmId: "typo", elmTitle: "纠错触发", elmValue: intToStr(summary.elsTypoTriggered) });
+    out
+}
+
+// ============================================================================
+// SharedSchemaDisplayHelpers
+// ============================================================================
+
+pub def maxCodeChineseNumeral(isCangjie: Bool): String =
+    if (isCangjie) "五" else "四"
+
+pub def pushCodeChineseNumeral(isCangjie: Bool): String =
+    if (isCangjie) "六" else "五"
+
+pub def maxCodeDigits(isCangjie: Bool): Int =
+    if (isCangjie) 5 else 4
+
+pub def pushCodeDigits(isCangjie: Bool): Int =
+    if (isCangjie) 6 else 5
+
+pub def badgeSymbolForKind(kind: CandidateBadge): Option String =
+    match kind {
+        Shortcode -> Some("⚡"),
+        TypoCorrected -> Some("⌖"),
+        Wildcard -> Some("反查"),
+        PinyinLookup -> Some("反查"),
+        UserPhraseBadge -> Some("词"),
+        EmojiBadge -> None,
+        NoBadge -> None,
+    }

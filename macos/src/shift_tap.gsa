@@ -1,13 +1,36 @@
-/// Bare Shift tap detector for macOS Chinese/English toggling (`ShiftTapDetector`).
+/// 1:1 port of `Sources/ShiftTapDetector.swift` (93 lines):
+/// Detects a bare Shift tap (press and release of a single Shift key with no other modifier,
+/// key press, or mouse/scroll interaction in between) for seamless Chinese/English toggling on macOS.
 
 use std.option.{Option, Some, None}
 
+// ============================================================================
+// ShiftTapModifiers Bitmask (`ShiftTapModifiers` lines 4-17)
+// ============================================================================
+
+pub def modNone(): Int = 0
 pub def modShift(): Int = 1
 pub def modControl(): Int = 2
 pub def modOption(): Int = 4
 pub def modCommand(): Int = 8
 pub def modFunction(): Int = 16
 pub def modCapsLock(): Int = 32
+
+/// Convert `NSEvent.modifierFlags` into a `ShiftTapModifiers` bitmask (`InputController.shiftTapModifiers`).
+pub def nsEventModifiersToShiftMask(flags: Int64): Int = {
+    let m = cellNew(0);
+    if ((flags & intToI64(0x20000)) != intToI64(0)) cellSet(m, cellGet(m) | modShift()) else ();
+    if ((flags & intToI64(0x40000)) != intToI64(0)) cellSet(m, cellGet(m) | modControl()) else ();
+    if ((flags & intToI64(0x80000)) != intToI64(0)) cellSet(m, cellGet(m) | modOption()) else ();
+    if ((flags & intToI64(0x100000)) != intToI64(0)) cellSet(m, cellGet(m) | modCommand()) else ();
+    if ((flags & intToI64(0x800000)) != intToI64(0)) cellSet(m, cellGet(m) | modFunction()) else ();
+    if ((flags & intToI64(0x10000)) != intToI64(0)) cellSet(m, cellGet(m) | modCapsLock()) else ();
+    cellGet(m)
+}
+
+// ============================================================================
+// ShiftTapDetector (`ShiftTapDetector` lines 21-93)
+// ============================================================================
 
 pub def leftShiftKeyCode(): Int = 0x38
 pub def rightShiftKeyCode(): Int = 0x3C
@@ -32,46 +55,71 @@ pub def shiftTapReset(d: ShiftTapDetector): Void = {
     cellSet(d.lastModifiers, 0)
 }
 
-pub def shiftTapCancel(d: ShiftTapDetector): Void = {
+pub def shiftTapCancelPendingTap(d: ShiftTapDetector): Void = {
     cellSet(d.activeKeyCode, None);
     cellSet(d.downTimestamp, 0.0)
 }
 
-pub def shiftTapHandleKeyDown(d: ShiftTapDetector): Void =
-    shiftTapCancel(d)
+/// Backward-compatible alias for `shiftTapCancelPendingTap`.
+pub def shiftTapCancel(d: ShiftTapDetector): Void =
+    shiftTapCancelPendingTap(d)
 
-/// Process a `flagsChanged` event; returns `true` iff it completes a bare Shift tap.
-pub def shiftTapHandleFlagsChanged(
+pub def shiftTapHandleKeyDown(d: ShiftTapDetector): Void =
+    shiftTapCancelPendingTap(d)
+
+/// Full `ShiftTapDetector.handleFlagsChanged` with `hadInterveningHIDEvent: Float -> Bool` callback.
+pub def shiftTapHandleFlagsChangedWithHid(
     d: ShiftTapDetector,
     keyCode: Int,
     modifiers: Int,
     timestampSec: Float,
+    hadInterveningHidEvent: (Float) -> Bool
 ): Bool = {
-    let prev = cellGet(d.lastModifiers);
+    let previous = cellGet(d.lastModifiers);
     cellSet(d.lastModifiers, modifiers);
-    let isShiftKey = keyCode == leftShiftKeyCode() || keyCode == rightShiftKeyCode();
+
+    let isShiftKey = (keyCode == leftShiftKeyCode()) || (keyCode == rightShiftKeyCode());
 
     if (modifiers == modShift()) {
-        let isIdle = match cellGet(d.activeKeyCode) { None -> true, Some(_) -> false };
-        if (isShiftKey && prev == 0 && isIdle) {
+        // Only arm when transitioning from no modifiers into a bare Shift press by a Shift key.
+        // Releasing another modifier (e.g. releasing Cmd before Shift in Cmd+Shift+S) leaves
+        // `modifiers == modShift()` with a non-Shift keyCode and non-empty `previous`, so it must not arm.
+        let isIdle = match cellGet(d.activeKeyCode) {
+            None -> true,
+            Some(_) -> false,
+        };
+        if (isShiftKey && previous == 0 && isIdle) {
             cellSet(d.activeKeyCode, Some(keyCode));
             cellSet(d.downTimestamp, timestampSec)
         } else {
-            shiftTapCancel(d)
+            shiftTapCancelPendingTap(d)
         };
         false
     } else if (modifiers == 0) {
         match cellGet(d.activeKeyCode) {
-            Some(armed) -> {
+            Some(armedKeyCode) -> {
                 let downTs = cellGet(d.downTimestamp);
-                shiftTapCancel(d);
-                let elapsed = timestampSec - downTs;
-                isShiftKey && keyCode == armed && elapsed >= 0.0 && elapsed < maxShiftTapDuration()
+                shiftTapCancelPendingTap(d);
+                if (!isShiftKey || keyCode != armedKeyCode) false
+                else {
+                    let elapsed = timestampSec - downTs;
+                    if (elapsed < 0.0 || elapsed >= maxShiftTapDuration()) false
+                    else !hadInterveningHidEvent(downTs)
+                }
             },
             None -> false,
         }
     } else {
-        shiftTapCancel(d);
+        shiftTapCancelPendingTap(d);
         false
     }
 }
+
+/// Convenience `handleFlagsChanged` without intervening HID callback (`hadInterveningHIDEvent = { _ in false }`).
+pub def shiftTapHandleFlagsChanged(
+    d: ShiftTapDetector,
+    keyCode: Int,
+    modifiers: Int,
+    timestampSec: Float
+): Bool =
+    shiftTapHandleFlagsChangedWithHid(d, keyCode, modifiers, timestampSec, (_ts: Float) -> false)

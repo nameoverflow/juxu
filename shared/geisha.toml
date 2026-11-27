@@ -8,9 +8,15 @@ tests = ["tests/shared_test.gsa"]
 juxu_core = { git = "https://github.com/nameoverflow/juxu-core.git", version = "0.1.9" }
 objc = { git = "https://github.com/geisha-lang/objc.gsa.git", version = "0.1.0" }
 
+[target.native]
+c_sources = ["csrc/apple_abi.c"]
+c_flags   = ["-O2"]
+
 [[target.native.when]]
 os = "macos"
-link_flags = ["-framework", "Security"]
+link_flags = ["-framework", "Foundation", "-framework", "CoreGraphics", "-framework", "Security"]
 
 [target.ios]
-frameworks = ["Security"]
+c_sources  = ["csrc/apple_abi.c"]
+c_flags    = ["-O2"]
+frameworks = ["Foundation", "CoreGraphics", "Security"]

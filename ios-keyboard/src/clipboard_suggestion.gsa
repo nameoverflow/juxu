@@ -1,0 +1,741 @@
+/// Complete 1:1 port of `iOS/Shared/IOSClipboardSuggestion.swift` (482 lines):
+/// - `IOSClipboardSuggestion`
+/// - `IOSClipboardParser` (multiline preview collapse + Chinese/English SMS/email OTP extraction with noise & URL filtering)
+/// - `IOSClipboardKVStore` (`NSUserDefaults.standardUserDefaults` + `inMemoryClipboardKVStore`)
+/// - `IOSClipboardSuggestionStore` (`defaultTTLSeconds = 300.0`, 2-step `lookup`/`recordRead`, `refresh`, `consume`, `dismiss`)
+/// - `IOSClipboardVisibilityGate`.
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGetOr}
+use std.map.{StrMap, strMapNew, strMapGet, strMapInsert, strMapRemove}
+use std.buf.{bufWithCap, bufPushByte, bufToString}
+use std.str.{strContains, strStartsWith, strEndsWith}
+use std.generic
+use objc.{
+    objcClass, objcSel, msgSend0, msgSend1Ptr, msgSendVoid1Ptr, msgSendVoid2Ptr,
+}
+use juxu_shared.{
+    nsStr, nsStrPtrToOpt,
+    isUnicodeWhitespaceScalar, utf8ToScalars, scalarsToUtf8, headScalars,
+}
+
+extern "objc_msgSend" def msgSendI64_1Ptr(obj: Ptr, sel: Ptr, k: Ptr): Int64
+extern "objc_msgSend" def msgSendF64_1Ptr(obj: Ptr, sel: Ptr, k: Ptr): Float
+extern "objc_msgSend" def msgSendVoid1I64_1Ptr(obj: Ptr, sel: Ptr, v: Int64, k: Ptr): Void
+extern "objc_msgSend" def msgSendVoid1F64_1Ptr(obj: Ptr, sel: Ptr, v: Float, k: Ptr): Void
+
+// ============================================================================
+// IOSClipboardSuggestion
+// ============================================================================
+
+pub data IOSClipboardSuggestion : Eq {
+    csChangeCount: Int,
+    csInsertText: String,
+    csDisplayText: String,
+    csSubtitle: String,
+    csIsOTP: Bool,
+}
+
+pub def optClipSuggestionEq(a: Option IOSClipboardSuggestion, b: Option IOSClipboardSuggestion): Bool =
+    match (a, b) {
+        (None, None) -> true,
+        (Some(ca), Some(cb)) -> ca == cb,
+        _ -> false,
+    }
+
+// ============================================================================
+// Unicode Classification & Trimming Helpers
+// ============================================================================
+
+def isNewlineOrWsScalar(cp: Int): Bool =
+    isUnicodeWhitespaceScalar(cp)
+
+def isHorizontalWsScalar(cp: Int): Bool =
+    isUnicodeWhitespaceScalar(cp) && cp != 10 && cp != 11 && cp != 12 && cp != 13 && cp != 0x85 && cp != 0x2028 && cp != 0x2029
+
+def isLetterScalar(cp: Int): Bool =
+    (cp >= 65 && cp <= 90)
+        || (cp >= 97 && cp <= 122)
+        || (cp >= 0x00C0 && cp <= 0x00D6)
+        || (cp >= 0x00D8 && cp <= 0x00F6)
+        || (cp >= 0x00F8 && cp <= 0x02AF)
+        || (cp >= 0x0370 && cp <= 0x052F)
+        || (cp >= 0x1E00 && cp <= 0x1EFF)
+        || (cp >= 0x3040 && cp <= 0x30FF)
+        || (cp >= 0x3400 && cp <= 0x4DBF)
+        || (cp >= 0x4E00 && cp <= 0x9FFF)
+        || (cp >= 0xAC00 && cp <= 0xD7AF)
+        || (cp >= 0xF900 && cp <= 0xFAFF)
+        || (cp >= 0x20000 && cp <= 0x323AF)
+
+def isAsciiDigitScalar(cp: Int): Bool =
+    cp >= 48 && cp <= 57
+
+def trimWsAndNewlines(s: String): String = {
+    let scs = utf8ToScalars(s);
+    let n = vecLen(scs);
+    let lo = cellNew(0);
+    while (cellGet(lo) < n && isNewlineOrWsScalar(vecGetOr(scs, cellGet(lo), 0))) {
+        cellSet(lo, cellGet(lo) + 1)
+    };
+    let hi = cellNew(n);
+    while (cellGet(hi) > cellGet(lo) && isNewlineOrWsScalar(vecGetOr(scs, cellGet(hi) - 1, 0))) {
+        cellSet(hi, cellGet(hi) - 1)
+    };
+    scalarsToUtf8(scs, cellGet(lo), cellGet(hi))
+}
+
+def trimHorizontalWs(s: String): String = {
+    let scs = utf8ToScalars(s);
+    let n = vecLen(scs);
+    let lo = cellNew(0);
+    while (cellGet(lo) < n && isHorizontalWsScalar(vecGetOr(scs, cellGet(lo), 0))) {
+        cellSet(lo, cellGet(lo) + 1)
+    };
+    let hi = cellNew(n);
+    while (cellGet(hi) > cellGet(lo) && isHorizontalWsScalar(vecGetOr(scs, cellGet(hi) - 1, 0))) {
+        cellSet(hi, cellGet(hi) - 1)
+    };
+    scalarsToUtf8(scs, cellGet(lo), cellGet(hi))
+}
+
+def asciiLowerStr(s: String): String = {
+    let n = strLen(s);
+    let b = bufWithCap(n);
+    let i = cellNew(0);
+    while (cellGet(i) < n) {
+        let ch = strByteAt(s, cellGet(i));
+        bufPushByte(b, if (ch >= 65 && ch <= 90) ch + 32 else ch);
+        cellSet(i, cellGet(i) + 1)
+    };
+    bufToString(b)
+}
+
+def containsWsOrNewline(scs: Vec Int): Bool = {
+    let n = vecLen(scs);
+    let i = cellNew(0);
+    let found = cellNew(false);
+    while (cellGet(i) < n && !cellGet(found)) {
+        if (isNewlineOrWsScalar(vecGetOr(scs, cellGet(i), 0))) cellSet(found, true) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}
+
+def allAsciiDigits(scs: Vec Int): Bool = {
+    let n = vecLen(scs);
+    if (n == 0) false
+    else {
+        let i = cellNew(0);
+        let ok = cellNew(true);
+        while (cellGet(i) < n && cellGet(ok)) {
+            if (!isAsciiDigitScalar(vecGetOr(scs, cellGet(i), 0))) cellSet(ok, false) else ();
+            cellSet(i, cellGet(i) + 1)
+        };
+        cellGet(ok)
+    }
+}
+
+// ============================================================================
+// IOSClipboardParser (`IOSClipboardSuggestion.swift` lines 31–287)
+// ============================================================================
+
+def zhOTPKeywords(): Vec String = {
+    let v: Vec String = vecWithCap(13);
+    vecPush(v, "验证码"); vecPush(v, "校验码"); vecPush(v, "动态码"); vecPush(v, "动态密码");
+    vecPush(v, "确认码"); vecPush(v, "安全码"); vecPush(v, "认证码"); vecPush(v, "短信码");
+    vecPush(v, "登录码"); vecPush(v, "授权码"); vecPush(v, "取件码"); vecPush(v, "临时密码");
+    vecPush(v, "口令");
+    v
+}
+
+def enOTPKeywords(): Vec String = {
+    let v: Vec String = vecWithCap(12);
+    vecPush(v, "verification code"); vecPush(v, "security code");
+    vecPush(v, "confirmation code"); vecPush(v, "confirm code");
+    vecPush(v, "login code"); vecPush(v, "auth code");
+    vecPush(v, "passcode"); vecPush(v, "one-time"); vecPush(v, "one time");
+    vecPush(v, "otp"); vecPush(v, "code is"); vecPush(v, "code:");
+    v
+}
+
+def excludedLeadingTokens(): Vec String = {
+    let v: Vec String = vecWithCap(10);
+    vecPush(v, "尾号"); vecPush(v, "末四位"); vecPush(v, "后四位");
+    vecPush(v, "卡号"); vecPush(v, "订单"); vecPush(v, "单号");
+    vecPush(v, "满"); vecPush(v, "¥"); vecPush(v, "￥"); vecPush(v, "$");
+    v
+}
+
+def isExcludedTrailingScalar(cp: Int): Bool =
+    cp == 0x5E74      // 年
+        || cp == 0x6708 // 月
+        || cp == 0x65E5 // 日
+        || cp == 0x5143 // 元
+        || cp == 0x5757 // 块
+        || cp == 0x5206 // 分
+        || cp == 0x79D2 // 秒
+        || cp == 37     // %
+        || cp == 0xFF05 // ％
+
+pub def clipboardMakeSingleLinePreview(raw: String): String = {
+    let maxPreviewScanChars = 240;
+    let maxPreviewDisplayChars = 80;
+    let sliceScs = utf8ToScalars(headScalars(raw, maxPreviewScanChars));
+    let n = vecLen(sliceScs);
+    let outScs: Vec Int = vecWithCap(maxPreviewDisplayChars + 2);
+    let prevSpace = cellNew(true);
+    let i = cellNew(0);
+    let stop = cellNew(false);
+    while (cellGet(i) < n && !cellGet(stop)) {
+        let cp = vecGetOr(sliceScs, cellGet(i), 0);
+        if (isNewlineOrWsScalar(cp)) {
+            if (!cellGet(prevSpace)) {
+                vecPush(outScs, 32);
+                cellSet(prevSpace, true)
+            } else ()
+        } else {
+            vecPush(outScs, cp);
+            cellSet(prevSpace, false)
+        };
+        if (vecLen(outScs) >= maxPreviewDisplayChars + 1) {
+            cellSet(stop, true)
+        } else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    let cleaned = trimHorizontalWs(scalarsToUtf8(outScs, 0, vecLen(outScs)));
+    let cleanedScs = utf8ToScalars(cleaned);
+    if (vecLen(cleanedScs) > maxPreviewDisplayChars) {
+        scalarsToUtf8(cleanedScs, 0, maxPreviewDisplayChars) + "…"
+    } else {
+        cleaned
+    }
+}
+
+def appendPatternMatches(
+    pattern: Vec Int,
+    haystack: Vec Int,
+    out: Vec (Int, Int)
+): Void = {
+    let pLen = vecLen(pattern);
+    let hLen = vecLen(haystack);
+    if (pLen > 0 && hLen >= pLen) {
+        let allAscii = cellNew(true);
+        let pi = cellNew(0);
+        while (cellGet(pi) < pLen && cellGet(allAscii)) {
+            if (vecGetOr(pattern, cellGet(pi), 0) >= 128) cellSet(allAscii, false) else ();
+            cellSet(pi, cellGet(pi) + 1)
+        };
+        let isShortASCII = pLen <= 4 && cellGet(allAscii);
+
+        let i = cellNew(0);
+        while (cellGet(i) <= hLen - pLen) {
+            let idx = cellGet(i);
+            let matched = cellNew(true);
+            let j = cellNew(0);
+            while (cellGet(j) < pLen && cellGet(matched)) {
+                let k = cellGet(j);
+                if (vecGetOr(haystack, idx + k, -1) != vecGetOr(pattern, k, -2)) {
+                    cellSet(matched, false)
+                } else ();
+                cellSet(j, k + 1)
+            };
+            if (cellGet(matched)) {
+                let leftOK = !isShortASCII || idx == 0 || !isLetterScalar(vecGetOr(haystack, idx - 1, 0));
+                let rightOK = !isShortASCII || (idx + pLen == hLen) || !isLetterScalar(vecGetOr(haystack, idx + pLen, 0));
+                if (leftOK && rightOK) {
+                    vecPush(out, (idx, idx + pLen))
+                } else ();
+                cellSet(i, idx + pLen)
+            } else {
+                cellSet(i, idx + 1)
+            }
+        }
+    } else ()
+}
+
+def isExcludedOTPContext(chars: Vec Int, start: Int, end: Int): Bool = {
+    let n = vecLen(chars);
+    if (end < n && isExcludedTrailingScalar(vecGetOr(chars, end, 0))) true
+    else {
+        let tokStart = cellNew(start);
+        while (cellGet(tokStart) > 0 && !isNewlineOrWsScalar(vecGetOr(chars, cellGet(tokStart) - 1, 0))) {
+            cellSet(tokStart, cellGet(tokStart) - 1)
+        };
+        let tokenPrefix = asciiLowerStr(scalarsToUtf8(chars, cellGet(tokStart), end));
+        if (strContains(tokenPrefix, "http://") || strContains(tokenPrefix, "https://")) true
+        else {
+            let prefixStart = if (start > 6) start - 6 else 0;
+            let prefixStr = trimHorizontalWs(scalarsToUtf8(chars, prefixStart, start));
+            let toks = excludedLeadingTokens();
+            let tLen = vecLen(toks);
+            let ti = cellNew(0);
+            let excluded = cellNew(false);
+            while (cellGet(ti) < tLen && !cellGet(excluded)) {
+                if (strEndsWith(prefixStr, vecGetOr(toks, cellGet(ti), ""))) {
+                    cellSet(excluded, true)
+                } else ();
+                cellSet(ti, cellGet(ti) + 1)
+            };
+            cellGet(excluded)
+        }
+    }
+}
+
+data OTPCandidate {
+    ocDigits: String,
+    ocStart: Int,
+    ocEnd: Int,
+}
+
+pub def clipboardExtractOTPCode(text: String): Option String = {
+    let chars = utf8ToScalars(text);
+    let n = vecLen(chars);
+    let lowerChars: Vec Int = vecWithCap(n);
+    let li = cellNew(0);
+    while (cellGet(li) < n) {
+        let cp = vecGetOr(chars, cellGet(li), 0);
+        // Basic Latin + Latin-1 uppercase folding
+        let lcp =
+            if (cp >= 65 && cp <= 90) cp + 32
+            else if (cp >= 0x00C0 && cp <= 0x00D6) cp + 32
+            else if (cp >= 0x00D8 && cp <= 0x00DE) cp + 32
+            else cp;
+        vecPush(lowerChars, lcp);
+        cellSet(li, cellGet(li) + 1)
+    };
+
+    let keywordPositions: Vec (Int, Int) = vecNew();
+    let zhKws = zhOTPKeywords();
+    let zi = cellNew(0);
+    while (cellGet(zi) < vecLen(zhKws)) {
+        appendPatternMatches(utf8ToScalars(vecGetOr(zhKws, cellGet(zi), "")), chars, keywordPositions);
+        cellSet(zi, cellGet(zi) + 1)
+    };
+    let enKws = enOTPKeywords();
+    let ei = cellNew(0);
+    while (cellGet(ei) < vecLen(enKws)) {
+        appendPatternMatches(utf8ToScalars(vecGetOr(enKws, cellGet(ei), "")), lowerChars, keywordPositions);
+        cellSet(ei, cellGet(ei) + 1)
+    };
+
+    if (vecLen(keywordPositions) == 0) None
+    else {
+        let candidates: Vec OTPCandidate = vecNew();
+        let i = cellNew(0);
+        while (cellGet(i) < n) {
+            let cur = cellGet(i);
+            if (isAsciiDigitScalar(vecGetOr(chars, cur, 0))) {
+                let start = cur;
+                let scan = cellNew(cur);
+                while (cellGet(scan) < n && isAsciiDigitScalar(vecGetOr(chars, cellGet(scan), 0))) {
+                    cellSet(scan, cellGet(scan) + 1)
+                };
+                let end = cellGet(scan);
+                let len = end - start;
+
+                let sepCp = if (end < n) vecGetOr(chars, end, 0) else 0;
+                let isGrouped3x3 =
+                    len == 3
+                        && end + 3 < n
+                        && (sepCp == 32 || sepCp == 45)
+                        && isAsciiDigitScalar(vecGetOr(chars, end + 1, 0))
+                        && isAsciiDigitScalar(vecGetOr(chars, end + 2, 0))
+                        && isAsciiDigitScalar(vecGetOr(chars, end + 3, 0))
+                        && (end + 4 == n || !isAsciiDigitScalar(vecGetOr(chars, end + 4, 0)));
+
+                if (isGrouped3x3) {
+                    let groupedEnd = end + 4;
+                    let digits = scalarsToUtf8(chars, start, end) + scalarsToUtf8(chars, end + 1, groupedEnd);
+                    if (!isExcludedOTPContext(chars, start, groupedEnd)) {
+                        vecPush(candidates, OTPCandidate { ocDigits: digits, ocStart: start, ocEnd: groupedEnd })
+                    } else ();
+                    cellSet(i, groupedEnd)
+                } else {
+                    if (len >= 4 && len <= 8) {
+                        let digits = scalarsToUtf8(chars, start, end);
+                        if (!isExcludedOTPContext(chars, start, end)) {
+                            vecPush(candidates, OTPCandidate { ocDigits: digits, ocStart: start, ocEnd: end })
+                        } else ()
+                    } else ();
+                    cellSet(i, end)
+                }
+            } else {
+                cellSet(i, cur + 1)
+            }
+        };
+
+        let candCount = vecLen(candidates);
+        if (candCount == 0) None
+        else {
+            let bestCode: Cell (Option String) = cellNew(None);
+            let bestScore = cellNew(1.0e18);
+            let dummyCand = OTPCandidate { ocDigits: "", ocStart: 0, ocEnd: 0 };
+            let kwCount = vecLen(keywordPositions);
+
+            let ci = cellNew(0);
+            while (cellGet(ci) < candCount) {
+                let cand = vecGetOr(candidates, cellGet(ci), dummyCand);
+                let ki = cellNew(0);
+                while (cellGet(ki) < kwCount) {
+                    let (kwStart, kwEnd) = vecGetOr(keywordPositions, cellGet(ki), (0, 0));
+                    let (dist, isAfter) =
+                        if (cand.ocStart >= kwEnd) (intToFloat(cand.ocStart - kwEnd), true)
+                        else if (kwStart >= cand.ocEnd) (intToFloat(kwStart - cand.ocEnd), false)
+                        else (0.0, true);
+
+                    if (dist <= 36.0) {
+                        let directionPenalty = if (isAfter) 0.0 else 4.0;
+                        let dLen = strLen(cand.ocDigits);
+                        let lengthBonus =
+                            if (dLen == 6) -1.5
+                            else if (dLen == 4) -0.5
+                            else 0.0;
+                        let score = dist + directionPenalty + lengthBonus;
+                        if (score < cellGet(bestScore)) {
+                            cellSet(bestScore, score);
+                            cellSet(bestCode, Some(cand.ocDigits))
+                        } else ()
+                    } else ();
+                    cellSet(ki, cellGet(ki) + 1)
+                };
+                cellSet(ci, cellGet(ci) + 1)
+            };
+            cellGet(bestCode)
+        }
+    }
+}
+
+pub def clipboardParse(raw: String, changeCount: Int, prefersOTP: Bool): Option IOSClipboardSuggestion = {
+    let trimmed = trimWsAndNewlines(raw);
+    if (strLen(trimmed) == 0) None
+    else {
+        let trimmedScs = utf8ToScalars(trimmed);
+        let trimmedCount = vecLen(trimmedScs);
+        let lowerTrimmed = asciiLowerStr(trimmed);
+        let isSingleURL = !containsWsOrNewline(trimmedScs)
+            && (strStartsWith(lowerTrimmed, "http://") || strStartsWith(lowerTrimmed, "https://"));
+
+        let directOrOtp: Cell (Option IOSClipboardSuggestion) = cellNew(None);
+        if (!isSingleURL) {
+            if (trimmedCount >= 4 && trimmedCount <= 8 && allAsciiDigits(trimmedScs)) {
+                cellSet(
+                    directOrOtp,
+                    Some(
+                        IOSClipboardSuggestion {
+                            csChangeCount: changeCount,
+                            csInsertText: trimmed,
+                            csDisplayText: trimmed,
+                            csSubtitle: if (prefersOTP) "剪贴板验证码" else "来自剪贴板",
+                            csIsOTP: prefersOTP,
+                        }
+                    )
+                )
+            } else if (trimmedCount <= 600) {
+                match clipboardExtractOTPCode(trimmed) {
+                    Some(otp) ->
+                        cellSet(
+                            directOrOtp,
+                            Some(
+                                IOSClipboardSuggestion {
+                                    csChangeCount: changeCount,
+                                    csInsertText: otp,
+                                    csDisplayText: otp,
+                                    csSubtitle: "剪贴板验证码",
+                                    csIsOTP: true,
+                                }
+                            )
+                        ),
+                    None -> (),
+                }
+            } else ()
+        } else ();
+
+        match cellGet(directOrOtp) {
+            Some(found) -> Some(found),
+            None -> {
+                let display = clipboardMakeSingleLinePreview(raw);
+                if (strLen(display) == 0) None
+                else Some(
+                    IOSClipboardSuggestion {
+                        csChangeCount: changeCount,
+                        csInsertText: raw,
+                        csDisplayText: display,
+                        csSubtitle: "来自剪贴板",
+                        csIsOTP: false,
+                    }
+                )
+            },
+        }
+    }
+}
+
+// ============================================================================
+// IOSClipboardKeyValueStore & IOSClipboardSuggestionStore (`lines 290–456`)
+// ============================================================================
+
+pub data IOSClipboardKVStore {
+    kvGetIntOpt: (String) -> Option Int,
+    kvGetFloat: (String) -> Float,
+    kvGetStringOpt: (String) -> Option String,
+    kvSetInt: (String, Int) -> Void,
+    kvSetFloat: (String, Float) -> Void,
+    kvSetString: (String, String) -> Void,
+    kvRemove: (String) -> Void,
+}
+
+/// Production `NSUserDefaults.standardUserDefaults` backing store.
+pub def userDefaultsClipboardKVStore(): IOSClipboardKVStore = {
+    let getDefaults = () -> {
+        let cls = objcClass("NSUserDefaults");
+        if (ptrIsNull(cls)) ptrNull() else msgSend0(cls, objcSel("standardUserDefaults"))
+    };
+    IOSClipboardKVStore {
+        kvGetIntOpt: (key: String) -> {
+            let ud = getDefaults();
+            if (ptrIsNull(ud)) None
+            else {
+                let kObj = nsStr(key);
+                let rawObj = msgSend1Ptr(ud, objcSel("objectForKey:"), kObj);
+                if (ptrIsNull(rawObj)) None
+                else Some(i64ToInt(msgSendI64_1Ptr(ud, objcSel("integerForKey:"), kObj)))
+            }
+        },
+        kvGetFloat: (key: String) -> {
+            let ud = getDefaults();
+            if (ptrIsNull(ud)) 0.0
+            else msgSendF64_1Ptr(ud, objcSel("doubleForKey:"), nsStr(key))
+        },
+        kvGetStringOpt: (key: String) -> {
+            let ud = getDefaults();
+            if (ptrIsNull(ud)) None
+            else nsStrPtrToOpt(msgSend1Ptr(ud, objcSel("stringForKey:"), nsStr(key)))
+        },
+        kvSetInt: (key: String, val: Int) -> {
+            let ud = getDefaults();
+            if (!ptrIsNull(ud)) {
+                msgSendVoid1I64_1Ptr(ud, objcSel("setInteger:forKey:"), intToI64(val), nsStr(key))
+            } else ()
+        },
+        kvSetFloat: (key: String, val: Float) -> {
+            let ud = getDefaults();
+            if (!ptrIsNull(ud)) {
+                msgSendVoid1F64_1Ptr(ud, objcSel("setDouble:forKey:"), val, nsStr(key))
+            } else ()
+        },
+        kvSetString: (key: String, val: String) -> {
+            let ud = getDefaults();
+            if (!ptrIsNull(ud)) {
+                msgSendVoid2Ptr(ud, objcSel("setObject:forKey:"), nsStr(val), nsStr(key))
+            } else ()
+        },
+        kvRemove: (key: String) -> {
+            let ud = getDefaults();
+            if (!ptrIsNull(ud)) {
+                msgSendVoid1Ptr(ud, objcSel("removeObjectForKey:"), nsStr(key))
+            } else ()
+        },
+    }
+}
+
+/// In-memory `IOSClipboardKVStore` for deterministic unit tests.
+pub def inMemoryClipboardKVStore(): IOSClipboardKVStore = {
+    let ints: StrMap Int = strMapNew();
+    let floats: StrMap Float = strMapNew();
+    let strs: StrMap String = strMapNew();
+    IOSClipboardKVStore {
+        kvGetIntOpt: (key: String) -> strMapGet(ints, key),
+        kvGetFloat: (key: String) -> match strMapGet(floats, key) {
+            Some(v) -> v,
+            None -> 0.0,
+        },
+        kvGetStringOpt: (key: String) -> strMapGet(strs, key),
+        kvSetInt: (key: String, val: Int) -> {
+            let _ = strMapInsert(ints, key, val);
+            ()
+        },
+        kvSetFloat: (key: String, val: Float) -> {
+            let _ = strMapInsert(floats, key, val);
+            ()
+        },
+        kvSetString: (key: String, val: String) -> {
+            let _ = strMapInsert(strs, key, val);
+            ()
+        },
+        kvRemove: (key: String) -> {
+            let _ = strMapRemove(ints, key);
+            let _ = strMapRemove(floats, key);
+            let _ = strMapRemove(strs, key);
+            ()
+        },
+    }
+}
+
+pub def clipboardDefaultTTLSeconds(): Float = 300.0
+
+def keyHandledChangeCount(): String = "priswubi.clip.handledChangeCount"
+def keySeenChangeCount(): String = "priswubi.clip.seenChangeCount"
+def keySeenTimestamp(): String = "priswubi.clip.seenTimestamp"
+def keyCachedRawText(): String = "priswubi.clip.cachedRawText"
+
+pub data ClipboardLookupResult : Eq {
+    ClipNone,
+    ClipCached(IOSClipboardSuggestion),
+    ClipNeedsRead(Int),
+}
+
+pub data IOSClipboardSuggestionStore {
+    cssStore: IOSClipboardKVStore,
+    cssTtlSeconds: Float,
+}
+
+pub def clipboardStoreNew(store: IOSClipboardKVStore, ttlSeconds: Float): IOSClipboardSuggestionStore =
+    IOSClipboardSuggestionStore {
+        cssStore: store,
+        cssTtlSeconds: ttlSeconds,
+    }
+
+pub def clipboardStoreDefault(): IOSClipboardSuggestionStore =
+    clipboardStoreNew(userDefaultsClipboardKVStore(), clipboardDefaultTTLSeconds())
+
+pub def clipboardStoreSeenChangeCount(s: IOSClipboardSuggestionStore): Option Int =
+    s.cssStore.kvGetIntOpt(keySeenChangeCount())
+
+pub def clipboardStoreHandledChangeCount(s: IOSClipboardSuggestionStore): Option Int =
+    s.cssStore.kvGetIntOpt(keyHandledChangeCount())
+
+def optIntEq(opt: Option Int, target: Int): Bool =
+    match opt {
+        Some(v) -> v == target,
+        None -> false,
+    }
+
+pub def clipboardStoreLookup(
+    s: IOSClipboardSuggestionStore,
+    hasFullAccess: Bool,
+    enabled: Bool,
+    hasStrings: Bool,
+    changeCount: Int,
+    prefersOTP: Bool,
+    now: Float
+): ClipboardLookupResult =
+    if (!enabled || !hasFullAccess) ClipNone
+    else if (optIntEq(s.cssStore.kvGetIntOpt(keyHandledChangeCount()), changeCount)) ClipNone
+    else {
+        let seen = s.cssStore.kvGetIntOpt(keySeenChangeCount());
+        if (!hasStrings) {
+            if (!optIntEq(seen, changeCount)) {
+                s.cssStore.kvSetInt(keySeenChangeCount(), changeCount);
+                s.cssStore.kvSetFloat(keySeenTimestamp(), now);
+                s.cssStore.kvRemove(keyCachedRawText())
+            } else ();
+            ClipNone
+        } else if (!optIntEq(seen, changeCount)) {
+            ClipNeedsRead(changeCount)
+        } else {
+            let firstSeen = s.cssStore.kvGetFloat(keySeenTimestamp());
+            let age = now - firstSeen;
+            if (age > s.cssTtlSeconds || age < -60.0) ClipNone
+            else match s.cssStore.kvGetStringOpt(keyCachedRawText()) {
+                None -> ClipNone,
+                Some(cached) ->
+                    if (strLen(cached) == 0) ClipNone
+                    else match clipboardParse(cached, changeCount, prefersOTP) {
+                        Some(parsed) -> ClipCached(parsed),
+                        None -> ClipNone,
+                    },
+            }
+        }
+    }
+
+pub def clipboardStoreRecordRead(
+    s: IOSClipboardSuggestionStore,
+    changeCount: Int,
+    rawTextOpt: Option String,
+    prefersOTP: Bool,
+    now: Float
+): Option IOSClipboardSuggestion =
+    if (optIntEq(s.cssStore.kvGetIntOpt(keyHandledChangeCount()), changeCount)) None
+    else {
+        s.cssStore.kvSetInt(keySeenChangeCount(), changeCount);
+        s.cssStore.kvSetFloat(keySeenTimestamp(), now);
+        match rawTextOpt {
+            Some(rawText) if (strLen(rawText) > 0) -> {
+                s.cssStore.kvSetString(keyCachedRawText(), rawText);
+                clipboardParse(rawText, changeCount, prefersOTP)
+            },
+            _ -> {
+                s.cssStore.kvRemove(keyCachedRawText());
+                None
+            },
+        }
+    }
+
+pub def clipboardStoreRefresh(
+    s: IOSClipboardSuggestionStore,
+    hasFullAccess: Bool,
+    enabled: Bool,
+    hasStrings: Bool,
+    changeCount: Int,
+    prefersOTP: Bool,
+    now: Float,
+    readString: () -> Option String
+): Option IOSClipboardSuggestion =
+    match clipboardStoreLookup(s, hasFullAccess, enabled, hasStrings, changeCount, prefersOTP, now) {
+        ClipNone -> None,
+        ClipCached(suggestion) -> Some(suggestion),
+        ClipNeedsRead(cc) -> {
+            let fetched = readString();
+            clipboardStoreRecordRead(s, cc, fetched, prefersOTP, now)
+        },
+    }
+
+def markClipboardHandled(s: IOSClipboardSuggestionStore, changeCount: Int): Void = {
+    s.cssStore.kvSetInt(keyHandledChangeCount(), changeCount);
+    s.cssStore.kvSetInt(keySeenChangeCount(), changeCount);
+    s.cssStore.kvRemove(keyCachedRawText())
+}
+
+pub def clipboardStoreConsume(s: IOSClipboardSuggestionStore, changeCount: Int): Void =
+    markClipboardHandled(s, changeCount)
+
+pub def clipboardStoreDismiss(s: IOSClipboardSuggestionStore, changeCount: Int): Void =
+    markClipboardHandled(s, changeCount)
+
+// ============================================================================
+// IOSClipboardVisibilityGate (`lines 461–482`)
+// ============================================================================
+
+pub data IOSClipboardVisibilityGate {
+    cvgLastObservedChangeCount: Cell (Option Int),
+    cvgIsSuppressedByTyping: Cell Bool,
+}
+
+pub def clipboardGateNew(): IOSClipboardVisibilityGate =
+    IOSClipboardVisibilityGate {
+        cvgLastObservedChangeCount: cellNew(None),
+        cvgIsSuppressedByTyping: cellNew(false),
+    }
+
+pub def clipboardGateClone(g: IOSClipboardVisibilityGate): IOSClipboardVisibilityGate =
+    IOSClipboardVisibilityGate {
+        cvgLastObservedChangeCount: cellNew(cellGet(g.cvgLastObservedChangeCount)),
+        cvgIsSuppressedByTyping: cellNew(cellGet(g.cvgIsSuppressedByTyping)),
+    }
+
+pub def clipboardGateIsSuppressed(g: IOSClipboardVisibilityGate): Bool =
+    cellGet(g.cvgIsSuppressedByTyping)
+
+pub def clipboardGateResetForAppearance(g: IOSClipboardVisibilityGate): Void =
+    cellSet(g.cvgIsSuppressedByTyping, false)
+
+pub def clipboardGateMarkUserTyped(g: IOSClipboardVisibilityGate): Void =
+    cellSet(g.cvgIsSuppressedByTyping, true)
+
+pub def clipboardGateShouldAllowDisplay(g: IOSClipboardVisibilityGate, changeCount: Int): Bool = {
+    if (!optIntEq(cellGet(g.cvgLastObservedChangeCount), changeCount)) {
+        cellSet(g.cvgLastObservedChangeCount, Some(changeCount));
+        cellSet(g.cvgIsSuppressedByTyping, false)
+    } else ();
+    !cellGet(g.cvgIsSuppressedByTyping)
+}

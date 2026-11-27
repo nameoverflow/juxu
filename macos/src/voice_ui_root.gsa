@@ -1,0 +1,39 @@
+/// Root entry module for `juxu_macos_voice_ui` (`VoiceHUDPanel` + `VoiceSettingsView`).
+/// Re-exports all public HUD metrics, text fitting, dB level meter, vDSP 11-band spectrum analyzer,
+/// floating HUD panel controller + `voice_common` hooks, and AppKit `VoiceSettingsView` builders.
+
+pub use voice_hud.{
+    VoiceHUDMetricsSpec,
+    vhmCanvasWidth, vhmCanvasHeight, vhmCanvasSize,
+    vhmPillBottom, vhmPillHeight, vhmListeningWidth, vhmProcessingWidth,
+    vhmBarCount, vhmBarWidth, vhmBarMinHeight, vhmBarPitch, vhmBarMaxHeight, vhmBarsInset,
+    vhmCardGap, vhmCardMaxWidth, vhmCardLineHeight, vhmCardPadX, vhmCardPadY,
+    vhmNoticeMaxTextWidth, vhmFadeDuration, vhmPillResizeDuration, vhmCaptionFadeDuration, vhmCaptionMaxStagger,
+    voiceHUDMetrics,
+    voiceHUDTextFitAttributes, voiceHUDTextFitLineCount, voiceHUDTextFitTailFitting,
+    VoiceLevelMeter,
+    vlmQuietestDB, vlmLowestFloorDB, vlmHighestFloorDB, vlmFloorMarginDB,
+    vlmMinSpanDB, vlmInitialCeilingDB, vlmMaxCeilingDB,
+    voiceLevelMeterNew, voiceLevelMeterProcess,
+    VoiceSpectrumAnalyzer,
+    voiceSpectrumFrameDuration, voiceSpectrumBarCount,
+    voiceSpectrumBandEdgesHz, voiceSpectrumBarToBand, voiceSpectrumBarTaper,
+    voiceSpectrumNew, voiceSpectrumProcessPtr, voiceSpectrumProcessVec, voiceSpectrumProcessFrame,
+    VoiceHUDMode, VhmListening, VhmProcessing, VhmNotice,
+    VoiceHUDContentViewState,
+    voiceHUDViewCreate, voiceHUDViewSetOnBackdropLayout, voiceHUDViewReportBackdropLayout,
+    voiceHUDViewEnqueueSpectrumFrames, voiceHUDViewResetForPresentation,
+    voiceHUDViewApply, voiceHUDViewAdvance,
+    voiceHUDViewStartAnimating, voiceHUDViewStopAnimating, voiceHUDViewIsAnimating,
+    voiceHUDWeakBoxNew, voiceHUDWeakBoxIsAlive, voiceHUDWeakBoxFree,
+    VoiceHUDPanelController,
+    voiceHUDControllerIsLoaded, voiceHUDControllerShared, voiceHUDResolvedPanelOrigin,
+    voiceHUDControllerShow, voiceHUDControllerHide, voiceHUDControllerUnload,
+    voiceHUDControllerEnqueueSpectrum, voiceHUDInitHooks,
+}
+
+pub use voice_settings_view.{
+    VoiceSettingsPageState,
+    voiceBuildSettingsPageView,
+    voiceOnSettingsWindowClosed,
+}

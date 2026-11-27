@@ -1,0 +1,623 @@
+/// Complete 1:1 port of `iOS/Shared/IOSKeyboardGesturesAndEditing.swift` (406 lines):
+/// - `IOSSwipeUp` (re-exported from `layout_engine`)
+/// - `IOSLineClear` (`Plan`, `plan`, `Expected`) & `IOSLineClearUndo` (8-slot document-scoped undo history)
+/// - `IOSBackspaceChunkDelete` & `BackspaceRepeatSchedule`
+/// - `IOSTextCursorNavigation` (`verticalMoveOffset`)
+/// - `IOSKeyAlternates` (Pinyin tone vowels, symbol alternates, `stripFrame`, `indexAtX`)
+/// - `IOSKeyboardTrackpadHold` & `SpaceTrackpadAccumulator` (with velocity boost).
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecWithCap, vecLen, vecPush, vecGetOr, vecClear}
+use std.str.{strStartsWith, strEndsWith}
+use std.math.{abs, floor, sqrt}
+use std.generic
+use juxu_shared.{
+    CGPoint, CGRect, cgPoint, cgRect, rectMidX,
+    utf8ToScalars, utf8ScalarCount, tailScalars, dropLastScalars,
+}
+use layout_engine.{
+    IOSKeyKind, KeyBackspace, KeyGlobe, KeyPlaneSwitch, KeySpace,
+    swipeUpSymbolForLetter,
+}
+
+pub use layout_engine.{
+    swipeUpSymbolForLetter, swipeUpArmDistance, swipeUpIsActive,
+}
+
+// ============================================================================
+// Math & Scalar Helpers
+// ============================================================================
+
+def minInt(a: Int, b: Int): Int = if (a < b) a else b
+def maxInt(a: Int, b: Int): Int = if (a > b) a else b
+def minFloat(a: Float, b: Float): Float = if (a < b) a else b
+def maxFloat(a: Float, b: Float): Float = if (a > b) a else b
+
+pub def isNewlineScalar(cp: Int): Bool =
+    cp == 10 || cp == 11 || cp == 12 || cp == 13 || cp == 0x85 || cp == 0x2028 || cp == 0x2029
+
+/// True when `s` is a single newline character (including CRLF `"\r\n"`).
+pub def isSingleNewlineString(s: String): Bool =
+    if (s == "\r\n") true
+    else if (utf8ScalarCount(s) == 1) {
+        let scs = utf8ToScalars(s);
+        isNewlineScalar(vecGetOr(scs, 0, 0))
+    } else false
+
+// ============================================================================
+// IOSLineClear (`IOSKeyboardGesturesAndEditing.swift` lines 53–86)
+// ============================================================================
+
+pub data LineClearPlan : Eq {
+    lcpDeleteCount: Int,
+    lcpReachesLineStart: Bool,
+}
+
+pub def lineClearPlan(before: String, maxBatch: Int): LineClearPlan = {
+    let scs = utf8ToScalars(before);
+    let n = vecLen(scs);
+    let lineLen = cellNew(0);
+    let i = cellNew(n - 1);
+    let stop = cellNew(false);
+    while (cellGet(i) >= 0 && !cellGet(stop)) {
+        if (isNewlineScalar(vecGetOr(scs, cellGet(i), 0))) {
+            cellSet(stop, true)
+        } else {
+            cellSet(lineLen, cellGet(lineLen) + 1);
+            cellSet(i, cellGet(i) - 1)
+        }
+    };
+    let ll = cellGet(lineLen);
+    let sawLineBreak = ll < n;
+    if (ll > maxBatch) {
+        LineClearPlan { lcpDeleteCount: maxBatch, lcpReachesLineStart: false }
+    } else {
+        LineClearPlan { lcpDeleteCount: ll, lcpReachesLineStart: sawLineBreak }
+    }
+}
+
+pub data LineClearExpected : Eq {
+    lcePrevious: String,
+    lceRemaining: String,
+}
+
+pub def lineClearExpectedNew(previous: String, removed: Int): LineClearExpected =
+    LineClearExpected {
+        lcePrevious: previous,
+        lceRemaining: dropLastScalars(previous, removed),
+    }
+
+pub def lineClearExpectedIsSatisfied(exp: LineClearExpected, before: String): Bool =
+    if (strLen(exp.lceRemaining) == 0) {
+        !strStartsWith(exp.lcePrevious, before)
+    } else {
+        strEndsWith(before, exp.lceRemaining)
+    }
+
+// ============================================================================
+// IOSLineClearUndo (`IOSKeyboardGesturesAndEditing.swift` lines 90–126)
+// ============================================================================
+
+pub data LineClearRecord : Eq {
+    lcrText: String,
+    lcrContextAfter: String,
+    lcrDocumentId: String,
+}
+
+pub def lineClearUndoMaxRecords(): Int = 8
+
+pub data IOSLineClearUndo {
+    lcuRecords: Vec LineClearRecord,
+}
+
+pub def lineClearUndoNew(): IOSLineClearUndo =
+    IOSLineClearUndo { lcuRecords: vecNew() }
+
+pub def lineClearUndoCount(u: IOSLineClearUndo): Int =
+    vecLen(u.lcuRecords)
+
+pub def lineClearUndoPush(
+    u: IOSLineClearUndo,
+    text: String,
+    contextBefore: String,
+    documentIdOpt: Option String
+): Void =
+    match documentIdOpt {
+        None -> (),
+        Some(docId) ->
+            if (strLen(text) == 0 || strLen(docId) == 0) ()
+            else {
+                vecPush(
+                    u.lcuRecords,
+                    LineClearRecord {
+                        lcrText: text,
+                        lcrContextAfter: tailScalars(contextBefore, 32),
+                        lcrDocumentId: docId,
+                    }
+                );
+                let maxRec = lineClearUndoMaxRecords();
+                let n = vecLen(u.lcuRecords);
+                if (n > maxRec) {
+                    let dropN = n - maxRec;
+                    let kept: Vec LineClearRecord = vecWithCap(maxRec);
+                    let dummy = LineClearRecord { lcrText: "", lcrContextAfter: "", lcrDocumentId: "" };
+                    let i = cellNew(dropN);
+                    while (cellGet(i) < n) {
+                        vecPush(kept, vecGetOr(u.lcuRecords, cellGet(i), dummy));
+                        cellSet(i, cellGet(i) + 1)
+                    };
+                    vecClear(u.lcuRecords);
+                    let j = cellNew(0);
+                    while (cellGet(j) < vecLen(kept)) {
+                        vecPush(u.lcuRecords, vecGetOr(kept, cellGet(j), dummy));
+                        cellSet(j, cellGet(j) + 1)
+                    }
+                } else ()
+            },
+    }
+
+pub def lineClearUndoRestorableIndex(
+    u: IOSLineClearUndo,
+    before: String,
+    documentIdOpt: Option String
+): Option Int =
+    match documentIdOpt {
+        None -> None,
+        Some(docId) ->
+            if (strLen(docId) == 0) None
+            else {
+                let dummy = LineClearRecord { lcrText: "", lcrContextAfter: "", lcrDocumentId: "" };
+                let i = cellNew(vecLen(u.lcuRecords) - 1);
+                let found: Cell (Option Int) = cellNew(None);
+                while (cellGet(i) >= 0 && match cellGet(found) { None -> true, Some(_) -> false }) {
+                    let idx = cellGet(i);
+                    let rec = vecGetOr(u.lcuRecords, idx, dummy);
+                    if (rec.lcrDocumentId == docId) {
+                        let ok =
+                            if (strLen(rec.lcrContextAfter) == 0) strLen(before) == 0
+                            else strEndsWith(before, rec.lcrContextAfter);
+                        if (ok) cellSet(found, Some(idx)) else ()
+                    } else ();
+                    cellSet(i, idx - 1)
+                };
+                cellGet(found)
+            },
+    }
+
+pub def lineClearUndoTake(
+    u: IOSLineClearUndo,
+    before: String,
+    documentIdOpt: Option String
+): Option String =
+    match lineClearUndoRestorableIndex(u, before, documentIdOpt) {
+        None -> None,
+        Some(targetIdx) -> {
+            let dummy = LineClearRecord { lcrText: "", lcrContextAfter: "", lcrDocumentId: "" };
+            let targetText = vecGetOr(u.lcuRecords, targetIdx, dummy).lcrText;
+            let n = vecLen(u.lcuRecords);
+            let kept: Vec LineClearRecord = vecWithCap(maxInt(0, n - 1));
+            let i = cellNew(0);
+            while (cellGet(i) < n) {
+                let idx = cellGet(i);
+                if (idx != targetIdx) {
+                    vecPush(kept, vecGetOr(u.lcuRecords, idx, dummy))
+                } else ();
+                cellSet(i, idx + 1)
+            };
+            vecClear(u.lcuRecords);
+            let j = cellNew(0);
+            while (cellGet(j) < vecLen(kept)) {
+                vecPush(u.lcuRecords, vecGetOr(kept, cellGet(j), dummy));
+                cellSet(j, cellGet(j) + 1)
+            };
+            Some(targetText)
+        },
+    }
+
+pub def lineClearUndoRemoveAll(u: IOSLineClearUndo): Void =
+    vecClear(u.lcuRecords)
+
+// ============================================================================
+// IOSBackspaceChunkDelete & BackspaceRepeatSchedule
+// ============================================================================
+
+pub def acceleratedDeleteCount(before: String): Int =
+    if (strLen(before) == 0) 0
+    else {
+        let scs = utf8ToScalars(before);
+        let n = vecLen(scs);
+        if (n == 0) 0
+        else if (vecGetOr(scs, n - 1, 0) == 10) 1
+        else {
+            let count = cellNew(0);
+            let i = cellNew(n - 1);
+            let stop = cellNew(false);
+            while (cellGet(i) >= 0 && !cellGet(stop)) {
+                let cp = vecGetOr(scs, cellGet(i), 0);
+                if (cp == 10 || cellGet(count) >= 3) {
+                    cellSet(stop, true)
+                } else {
+                    let nextCnt = cellGet(count) + 1;
+                    cellSet(count, nextCnt);
+                    if (nextCnt >= 2 && (cp == 32 || cp == 0xFF0C || cp == 0x3002 || cp == 44 || cp == 46)) {
+                        cellSet(stop, true)
+                    } else ()
+                };
+                cellSet(i, cellGet(i) - 1)
+            };
+            maxInt(1, cellGet(count))
+        }
+    }
+
+pub def backspaceRepeatInterval(): Float = 0.068
+pub def backspaceInitialHoldDelay(): Float = 0.36
+pub def backspaceFastHoldDelay(): Float = 1.55
+
+pub def backspaceShouldFireRepeat(heldSeconds: Float): Bool =
+    heldSeconds >= backspaceInitialHoldDelay()
+
+pub def backspaceShouldUseFastChunk(heldSeconds: Float, isComposing: Bool): Bool =
+    heldSeconds >= backspaceFastHoldDelay() && !isComposing
+
+// ============================================================================
+// IOSTextCursorNavigation (`IOSKeyboardGesturesAndEditing.swift` lines 148–180)
+// ============================================================================
+
+def findLastScalarInRange(scs: Vec Int, start: Int, end: Int, needle: Int): Option Int = {
+    let i = cellNew(end - 1);
+    let found: Cell (Option Int) = cellNew(None);
+    while (cellGet(i) >= start && match cellGet(found) { None -> true, Some(_) -> false }) {
+        let idx = cellGet(i);
+        if (vecGetOr(scs, idx, 0) == needle) cellSet(found, Some(idx)) else ();
+        cellSet(i, idx - 1)
+    };
+    cellGet(found)
+}
+
+def findFirstScalarInRange(scs: Vec Int, start: Int, end: Int, needle: Int): Option Int = {
+    let i = cellNew(start);
+    let found: Cell (Option Int) = cellNew(None);
+    while (cellGet(i) < end && match cellGet(found) { None -> true, Some(_) -> false }) {
+        let idx = cellGet(i);
+        if (vecGetOr(scs, idx, 0) == needle) cellSet(found, Some(idx)) else ();
+        cellSet(i, idx + 1)
+    };
+    cellGet(found)
+}
+
+pub def verticalMoveOffset(before: String, after: String, lines: Int): Option Int =
+    if (lines == 0) None
+    else {
+        let bScs = utf8ToScalars(before);
+        let bLen = vecLen(bScs);
+        let lastNL = findLastScalarInRange(bScs, 0, bLen, 10);
+        let currentCol = match lastNL {
+            Some(idx) -> bLen - (idx + 1),
+            None -> bLen,
+        };
+        if (lines < 0) {
+            match lastNL {
+                None -> if (bLen == 0) None else Some(0 - bLen),
+                Some(lnl) -> {
+                    let prevNL = findLastScalarInRange(bScs, 0, lnl, 10);
+                    let prevLineStart = match prevNL {
+                        Some(p) -> p + 1,
+                        None -> 0,
+                    };
+                    let prevLineLen = lnl - prevLineStart;
+                    let targetCol = minInt(currentCol, prevLineLen);
+                    Some(0 - (currentCol + 1 + (prevLineLen - targetCol)))
+                },
+            }
+        } else {
+            let aScs = utf8ToScalars(after);
+            let aLen = vecLen(aScs);
+            match findFirstScalarInRange(aScs, 0, aLen, 10) {
+                None -> if (aLen == 0) None else Some(aLen),
+                Some(nnl) -> {
+                    let toEndOfCurLine = nnl;
+                    let nextLineEnd = match findFirstScalarInRange(aScs, nnl + 1, aLen, 10) {
+                        Some(nle) -> nle,
+                        None -> aLen,
+                    };
+                    let nextLineLen = nextLineEnd - (nnl + 1);
+                    let targetCol = minInt(currentCol, nextLineLen);
+                    Some(toEndOfCurLine + 1 + targetCol)
+                },
+            }
+        }
+    }
+
+// ============================================================================
+// IOSKeyAlternates (`IOSKeyboardGesturesAndEditing.swift` lines 183–298)
+// ============================================================================
+
+def push2(s0: String, s1: String): Vec String = {
+    let v: Vec String = vecWithCap(2);
+    vecPush(v, s0); vecPush(v, s1);
+    v
+}
+
+def push3(s0: String, s1: String, s2: String): Vec String = {
+    let v: Vec String = vecWithCap(3);
+    vecPush(v, s0); vecPush(v, s1); vecPush(v, s2);
+    v
+}
+
+def push4(s0: String, s1: String, s2: String, s3: String): Vec String = {
+    let v: Vec String = vecWithCap(4);
+    vecPush(v, s0); vecPush(v, s1); vecPush(v, s2); vecPush(v, s3);
+    v
+}
+
+def push5(s0: String, s1: String, s2: String, s3: String, s4: String): Vec String = {
+    let v: Vec String = vecWithCap(5);
+    vecPush(v, s0); vecPush(v, s1); vecPush(v, s2); vecPush(v, s3); vecPush(v, s4);
+    v
+}
+
+def push6(s0: String, s1: String, s2: String, s3: String, s4: String, s5: String): Vec String = {
+    let v: Vec String = vecWithCap(6);
+    vecPush(v, s0); vecPush(v, s1); vecPush(v, s2); vecPush(v, s3); vecPush(v, s4); vecPush(v, s5);
+    v
+}
+
+def push7(s0: String, s1: String, s2: String, s3: String, s4: String, s5: String, s6: String): Vec String = {
+    let v: Vec String = vecWithCap(7);
+    vecPush(v, s0); vecPush(v, s1); vecPush(v, s2); vecPush(v, s3); vecPush(v, s4); vecPush(v, s5); vecPush(v, s6);
+    v
+}
+
+def letterLowerStr(ascii: Int): String = {
+    let letters = "abcdefghijklmnopqrstuvwxyz";
+    let idx = if (ascii >= 97 && ascii <= 122) ascii - 97 else if (ascii >= 65 && ascii <= 90) ascii - 65 else -1;
+    if (idx >= 0 && idx < 26) strSlice(letters, idx, idx + 1) else ""
+}
+
+def letterUpperStr(ascii: Int): String = {
+    let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let idx = if (ascii >= 97 && ascii <= 122) ascii - 97 else if (ascii >= 65 && ascii <= 90) ascii - 65 else -1;
+    if (idx >= 0 && idx < 26) strSlice(letters, idx, idx + 1) else ""
+}
+
+def pushAccentsForLetter(letter: Int, out: Vec String): Void =
+    if (letter == 97) {
+        vecPush(out, "ā"); vecPush(out, "á"); vecPush(out, "ǎ"); vecPush(out, "à")
+    } else if (letter == 101) {
+        vecPush(out, "ē"); vecPush(out, "é"); vecPush(out, "ě"); vecPush(out, "è")
+    } else if (letter == 105) {
+        vecPush(out, "ī"); vecPush(out, "í"); vecPush(out, "ǐ"); vecPush(out, "ì")
+    } else if (letter == 111) {
+        vecPush(out, "ō"); vecPush(out, "ó"); vecPush(out, "ǒ"); vecPush(out, "ò")
+    } else if (letter == 117) {
+        vecPush(out, "ū"); vecPush(out, "ú"); vecPush(out, "ǔ"); vecPush(out, "ù")
+    } else if (letter == 118) {
+        vecPush(out, "ǖ"); vecPush(out, "ǘ"); vecPush(out, "ǚ"); vecPush(out, "ǜ"); vecPush(out, "ü")
+    } else ()
+
+/// Long-press alternates for a letter key; returns `(items, defaultIndex)`.
+pub def keyAlternatesOptions(letter: Int, asciiMode: Bool): (Vec String, Int) = {
+    let norm = if (letter >= 65 && letter <= 90) letter + 32 else letter;
+    let items: Vec String = vecWithCap(8);
+    pushAccentsForLetter(norm, items);
+    vecPush(items, letterUpperStr(norm));
+    let defIdx = cellNew(vecLen(items) - 1);
+    match swipeUpSymbolForLetter(norm, asciiMode) {
+        Some(sym) -> {
+            vecPush(items, sym);
+            cellSet(defIdx, vecLen(items) - 1)
+        },
+        None -> (),
+    };
+    vecPush(items, letterLowerStr(norm));
+    (items, cellGet(defIdx))
+}
+
+/// Long-press alternates for symbol/number keys (`IOSKeyAlternates.symbolOptions`).
+pub def keyAlternatesSymbolOptions(symbol: String, asciiMode: Bool): Option (Vec String, Int) =
+    if (symbol == "-" && !asciiMode) Some((push5("-", "－", "—", "–", "•"), 0))
+    else if (symbol == "0") Some((push2("0", "°"), 0))
+    else if (symbol == "-") Some((push4("-", "–", "—", "•"), 0))
+    else if (symbol == "/") Some((push2("/", "\\"), 0))
+    else if (symbol == ":") Some((push2(":", "："), 0))
+    else if (symbol == "：") Some((push2("：", ":"), 0))
+    else if (symbol == ";") Some((push2(";", "；"), 0))
+    else if (symbol == "；") Some((push2("；", ";"), 0))
+    else if (symbol == "(") Some((push4("(", "（", "[", "{"), 0))
+    else if (symbol == "（") Some((push6("（", "(", "「", "『", "【", "{"), 0))
+    else if (symbol == ")") Some((push4(")", "）", "]", "}"), 0))
+    else if (symbol == "）") Some((push6("）", ")", "」", "』", "】", "}"), 0))
+    else if (symbol == "$") Some((push7("$", "￥", "€", "£", "¥", "₩", "¢"), 0))
+    else if (symbol == "￥") Some((push7("￥", "$", "€", "£", "¥", "₩", "¢"), 0))
+    else if (symbol == "&") Some((push2("&", "§"), 0))
+    else if (symbol == "\"") Some((push6("\"", "“", "”", "„", "«", "»"), 0))
+    else if (symbol == "“") Some((push6("“", "\"", "”", "„", "«", "»"), 0))
+    else if (symbol == "”") Some((push6("”", "\"", "“", "„", "«", "»"), 0))
+    else if (symbol == ".") Some((push3(".", "…", "。"), 0))
+    else if (symbol == "。") Some((push4("。", ".", "…", "．"), 0))
+    else if (symbol == ",") Some((push2(",", "，"), 0))
+    else if (symbol == "，") Some((push3("，", ",", "、"), 0))
+    else if (symbol == "、") Some((push3("、", "\\", "|"), 0))
+    else if (symbol == "?") Some((push3("?", "¿", "？"), 0))
+    else if (symbol == "？") Some((push3("？", "?", "¿"), 0))
+    else if (symbol == "!") Some((push3("!", "¡", "！"), 0))
+    else if (symbol == "！") Some((push3("！", "!", "¡"), 0))
+    else if (symbol == "'") Some((push4("'", "‘", "’", "`"), 0))
+    else if (symbol == "‘") Some((push4("‘", "'", "’", "`"), 0))
+    else if (symbol == "’") Some((push4("’", "'", "‘", "`"), 0))
+    else if (symbol == "[") Some((push5("[", "【", "「", "『", "〔"), 0))
+    else if (symbol == "]") Some((push5("]", "】", "」", "』", "〕"), 0))
+    else if (symbol == "{") Some((push4("{", "「", "『", "【"), 0))
+    else if (symbol == "}") Some((push4("}", "」", "』", "】"), 0))
+    else if (symbol == "%") Some((push2("%", "‰"), 0))
+    else if (symbol == "=") Some((push3("=", "≠", "≈"), 0))
+    else if (symbol == "+") Some((push2("+", "±"), 0))
+    else if (symbol == "*") Some((push3("*", "×", "•"), 0))
+    else if (symbol == "~") Some((push2("~", "～"), 0))
+    else if (symbol == "～") Some((push2("～", "~"), 0))
+    else if (symbol == "<") Some((push4("<", "《", "〈", "≤"), 0))
+    else if (symbol == ">") Some((push4(">", "》", "〉", "≥"), 0))
+    else if (symbol == "《") Some((push4("《", "〈", "<", "«"), 0))
+    else if (symbol == "》") Some((push4("》", "〉", ">", "»"), 0))
+    else if (symbol == "〈") Some((push3("〈", "《", "<"), 0))
+    else if (symbol == "〉") Some((push3("〉", "》", ">"), 0))
+    else if (symbol == "【") Some((push5("【", "「", "『", "[", "〔"), 0))
+    else if (symbol == "】") Some((push5("】", "」", "』", "]", "〕"), 0))
+    else if (symbol == "…") Some((push3("…", "……", "..."), 0))
+    else if (symbol == "·") Some((push3("·", "•", "°"), 0))
+    else if (symbol == "•") Some((push3("•", "·", "°"), 0))
+    else if (symbol == "——") Some((push5("——", "—", "–", "-", "_"), 0))
+    else if (symbol == "_") Some((push4("_", "——", "—", "–"), 0))
+    else if (symbol == "€") Some((push5("€", "$", "￥", "£", "¥"), 0))
+    else if (symbol == "£") Some((push5("£", "$", "￥", "€", "¥"), 0))
+    else if (symbol == "¥") Some((push5("¥", "￥", "$", "€", "£"), 0))
+    else None
+
+pub def keyAlternatesCellWidth(count: Int, containerWidth: Float): Float =
+    minFloat(42.0, (containerWidth - 8.0) / intToFloat(maxInt(count, 1)))
+
+pub def keyAlternatesStripFrameWithHeight(
+    keyFrame: CGRect,
+    count: Int,
+    defaultIndex: Int,
+    containerWidth: Float,
+    height: Float
+): CGRect = {
+    let cell = keyAlternatesCellWidth(count, containerWidth);
+    let width = cell * intToFloat(count);
+    let idealX = rectMidX(keyFrame) - cell * (intToFloat(defaultIndex) + 0.5);
+    let x = minFloat(maxFloat(4.0, idealX), maxFloat(4.0, containerWidth - width - 4.0));
+    cgRect(x, maxFloat(2.0, keyFrame.origin.y - height - 5.0), width, height)
+}
+
+pub def keyAlternatesStripFrame(
+    keyFrame: CGRect,
+    count: Int,
+    defaultIndex: Int,
+    containerWidth: Float
+): CGRect =
+    keyAlternatesStripFrameWithHeight(keyFrame, count, defaultIndex, containerWidth, 50.0)
+
+pub def keyAlternatesIndexAtX(x: Float, strip: CGRect, count: Int): Int =
+    if (count <= 0 || strip.size.width <= 0.0) 0
+    else {
+        let cellW = strip.size.width / intToFloat(count);
+        let rel = (x - strip.origin.x) / cellW;
+        if (rel <= 0.0) 0
+        else {
+            let raw = floatToInt(floor(rel));
+            minInt(maxInt(0, raw), count - 1)
+        }
+    }
+
+// ============================================================================
+// IOSKeyboardTrackpadHold (`IOSKeyboardGesturesAndEditing.swift` lines 304–347)
+// ============================================================================
+
+pub def trackpadDelay(): Float = 0.35
+pub def defaultSpaceHoldDelay(): Float = 0.42
+pub def defaultAlternatesDelay(): Float = 0.40
+pub def alternatesPromotionDelay(): Float = 0.78
+pub def trackpadMoveCancelDistance(): Float = 12.0
+
+pub def supportsTrackpadHold(kind: IOSKeyKind, wholeKeyboardEnabled: Bool): Bool =
+    if (kind == KeySpace) true
+    else if (!wholeKeyboardEnabled) false
+    else match kind {
+        KeyBackspace -> false,
+        KeyGlobe -> false,
+        KeyPlaneSwitch { targetPlane: _, switchLabel: _ } -> false,
+        _ -> true,
+    }
+
+pub def trackpadHoldDelay(wholeKeyboardEnabled: Bool): Float =
+    if (wholeKeyboardEnabled) trackpadDelay() else defaultSpaceHoldDelay()
+
+pub def alternatesDelay(wholeKeyboardEnabled: Bool): Float =
+    if (wholeKeyboardEnabled) alternatesPromotionDelay() else defaultAlternatesDelay()
+
+pub def shouldCancelAlternatesOnMove(start: CGPoint, current: CGPoint): Bool = {
+    let dx = current.x - start.x;
+    let dy = current.y - start.y;
+    sqrt(dx * dx + dy * dy) > trackpadMoveCancelDistance()
+}
+
+pub def shouldCancelAlternatesInTrackpad(start: CGPoint, current: CGPoint, dx: Int, dy: Int): Bool =
+    dx != 0 || dy != 0 || shouldCancelAlternatesOnMove(start, current)
+
+// ============================================================================
+// SpaceTrackpadAccumulator (`IOSKeyboardGesturesAndEditing.swift` lines 349–406)
+// ============================================================================
+
+pub def trackpadStepPoints(): Float = 9.5
+pub def trackpadLineStepPoints(): Float = 24.0
+
+pub data SpaceTrackpadAccumulator {
+    tpIsActive: Cell Bool,
+    tpAnchorX: Cell Float,
+    tpAnchorY: Cell Float,
+    tpLastUpdateTimestamp: Cell Float,
+}
+
+pub def trackpadNew(): SpaceTrackpadAccumulator =
+    SpaceTrackpadAccumulator {
+        tpIsActive: cellNew(false),
+        tpAnchorX: cellNew(0.0),
+        tpAnchorY: cellNew(0.0),
+        tpLastUpdateTimestamp: cellNew(0.0),
+    }
+
+pub def trackpadIsActive(tp: SpaceTrackpadAccumulator): Bool =
+    cellGet(tp.tpIsActive)
+
+pub def trackpadBegin(tp: SpaceTrackpadAccumulator, point: CGPoint, timestamp: Float): Void = {
+    cellSet(tp.tpIsActive, true);
+    cellSet(tp.tpAnchorX, point.x);
+    cellSet(tp.tpAnchorY, point.y);
+    cellSet(tp.tpLastUpdateTimestamp, timestamp)
+}
+
+pub def trackpadBeginX(tp: SpaceTrackpadAccumulator, x: Float): Void =
+    trackpadBegin(tp, cgPoint(x, 0.0), 0.0)
+
+pub def trackpadUpdate(tp: SpaceTrackpadAccumulator, point: CGPoint, timestamp: Float): (Int, Int) =
+    if (!cellGet(tp.tpIsActive)) (0, 0)
+    else {
+        let anchorX = cellGet(tp.tpAnchorX);
+        let anchorY = cellGet(tp.tpAnchorY);
+        let diffX = point.x - anchorX;
+        let diffY = point.y - anchorY;
+
+        let rawX = floatToInt(diffX / trackpadStepPoints());
+        let finalX = cellNew(rawX);
+        if (rawX != 0) {
+            cellSet(tp.tpAnchorX, anchorX + intToFloat(rawX) * trackpadStepPoints());
+            let prevTs = cellGet(tp.tpLastUpdateTimestamp);
+            if (timestamp > 0.0 && prevTs > 0.0) {
+                let dt = maxFloat(0.004, timestamp - prevTs);
+                let speed = abs(diffX) / dt;
+                if (speed > 520.0 && (rawX == 1 || rawX == -1)) {
+                    cellSet(finalX, rawX * 2)
+                } else ()
+            } else ()
+        } else ();
+
+        let dySteps = floatToInt(diffY / trackpadLineStepPoints());
+        if (dySteps != 0) {
+            cellSet(tp.tpAnchorY, anchorY + intToFloat(dySteps) * trackpadLineStepPoints())
+        } else ();
+
+        let outDx = cellGet(finalX);
+        if (outDx != 0 || dySteps != 0) {
+            cellSet(tp.tpLastUpdateTimestamp, timestamp)
+        } else ();
+        (outDx, dySteps)
+    }
+
+pub def trackpadUpdateX(tp: SpaceTrackpadAccumulator, x: Float): Int = {
+    let (dx, _) = trackpadUpdate(tp, cgPoint(x, cellGet(tp.tpAnchorY)), 0.0);
+    dx
+}
+
+pub def trackpadEnd(tp: SpaceTrackpadAccumulator): Void =
+    cellSet(tp.tpIsActive, false)
