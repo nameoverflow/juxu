@@ -13,6 +13,7 @@ bundle_id        = "im.juxu.app"
 bundle_name      = "Juxu"
 version          = "0.2.0"
 min_os           = "16.0"
+info_plist       = "Info.plist"
 frameworks       = ["UIKit", "Foundation", "QuartzCore", "Security"]
 embed_extensions = ["../ios-keyboard/build/JuxuKeyboard.appex"]
 codesign         = "-"

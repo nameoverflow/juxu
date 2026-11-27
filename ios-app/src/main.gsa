@@ -147,12 +147,7 @@ def phrasesVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
     cellSet(gHostPhraseStatus, st)
 }
 
-def appDidFinishLaunching(_self: Ptr, _cmd: Ptr, _app: Ptr, _opts: Ptr): Bool = {
-    let screen = msgSend0(objcClass("UIScreen"), objcSel("mainScreen"));
-    let bounds = msgSendRect0(screen, objcSel("bounds"));
-    let winAlloc = msgSend0(objcClass("UIWindow"), objcSel("alloc"));
-    let win = msgSendInitFrame(winAlloc, objcSel("initWithFrame:"), bounds);
-
+def makeMainTabBarController(): Ptr = {
     let vcSettings = objcAllocInit("JuxuIOSSettingsVC");
     msgSendVoid1Ptr(vcSettings, objcSel("setTitle:"), nsStr("设置"));
     let vcSandbox = objcAllocInit("JuxuIOSSandboxVC");
@@ -167,11 +162,25 @@ def appDidFinishLaunching(_self: Ptr, _cmd: Ptr, _app: Ptr, _opts: Ptr): Bool = 
 
     let tabs = objcAllocInit("UITabBarController");
     msgSendVoid1Ptr(tabs, objcSel("setViewControllers:"), arr);
-    msgSendVoid1Ptr(win, objcSel("setRootViewController:"), tabs);
-    msgSendVoid0(win, objcSel("makeKeyAndVisible"));
-    cellSet(gAppWindow, win);
-    true
+    tabs
 }
+
+def sceneGetWindow(_self: Ptr, _cmd: Ptr): Ptr =
+    cellGet(gAppWindow)
+
+def sceneSetWindow(_self: Ptr, _cmd: Ptr, w: Ptr): Void =
+    cellSet(gAppWindow, w)
+
+def sceneWillConnect(_self: Ptr, _cmd: Ptr, scene: Ptr, _session: Ptr, _opts: Ptr): Void = {
+    let winAlloc = msgSend0(objcClass("UIWindow"), objcSel("alloc"));
+    let win = msgSend1Ptr(winAlloc, objcSel("initWithWindowScene:"), scene);
+    msgSendVoid1Ptr(win, objcSel("setRootViewController:"), makeMainTabBarController());
+    msgSendVoid0(win, objcSel("makeKeyAndVisible"));
+    cellSet(gAppWindow, win)
+}
+
+def appDidFinishLaunching(_self: Ptr, _cmd: Ptr, _app: Ptr, _opts: Ptr): Bool =
+    true
 
 extern init(100) def registerIosHostAppClasses(): Void = {
     let sCls = objcAllocateClass("UIViewController", "JuxuIOSSettingsVC");
@@ -192,6 +201,14 @@ extern init(100) def registerIosHostAppClasses(): Void = {
         let _ = objcAddMethod(pCls, "viewDidLoad", cFnPtr(phrasesVcViewDidLoad), "v@:");
         let _ = objcAddMethod(pCls, "onHostAddPhrase:", cFnPtr(onHostAddPhrase), "v@:@");
         objcRegisterClass(pCls)
+    } else ();
+
+    let scCls = objcAllocateClass("UIResponder", "JuxuIOSSceneDelegate");
+    if (!ptrIsNull(scCls)) {
+        let _ = objcAddMethod(scCls, "window", cFnPtr(sceneGetWindow), "@@:");
+        let _ = objcAddMethod(scCls, "setWindow:", cFnPtr(sceneSetWindow), "v@:@");
+        let _ = objcAddMethod(scCls, "scene:willConnectToSession:options:", cFnPtr(sceneWillConnect), "v@:@@@");
+        objcRegisterClass(scCls)
     } else ();
 
     let appCls = objcAllocateClass("UIResponder", "JuxuIOSAppDelegate");

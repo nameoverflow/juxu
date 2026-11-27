@@ -14,6 +14,7 @@ pub use apple_geom.{
     msgSend2Ptr, msgSend1Ptr1Bool, msgSend1Ptr1I64, msgSend1I64_1Ptr, msgSend1Range,
     msgSendBool1Ptr, msgSendBool2Ptr,
     msgSendVoid1Ptr1Bool, msgSendVoid1Int1Bool, msgSendVoid2I64,
+    msgSendVoid1F32,
     msgSendVoid1Ptr1I64, msgSendVoid1Ptr1Sel, msgSendVoid1Ptr1Sel1U64,
     mainBundleResourcePath, mainBundleIdentifier, nsStr, nsStrPtrToString,
     readCGRectFromBuf, objcAllocInit, objcAllocInitFrame,
