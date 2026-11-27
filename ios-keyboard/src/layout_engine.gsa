@@ -1,0 +1,173 @@
+/// iOS virtual keyboard geometry & hit-testing (`IOSKeyboardLayoutEngine`).
+/// Preserves Juxu's exact portrait metrics:
+/// - Total height: 273pt (53pt candidate ribbon + 220pt 4-row keyboard)
+/// - keyH = 45pt, rowGap = 11pt, gapX = 6pt, cornerRadius = 7.8pt, bottomInset = 7pt.
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecLen, vecPush, vecGetOr}
+use std.generic
+use juxu_shared.{CGRect, CGPoint, cgRect, rectContainsPoint}
+
+pub def portraitTotalHeight(): Float = 273.0
+pub def ribbonHeight(): Float = 53.0
+pub def keyAreaHeight(): Float = 220.0
+pub def keyHeight(): Float = 45.0
+pub def rowGap(): Float = 11.0
+pub def keyGapX(): Float = 6.0
+pub def keyCornerRadius(): Float = 7.8
+pub def bottomCushion(): Float = 7.0
+
+pub data KeyClass : Eq {
+    CharClass,
+    FuncClass,
+}
+
+pub data KeyAction : Eq {
+    ActLetter(Int),
+    ActShift,
+    ActBackspace,
+    ActSwitchMode,
+    ActGlobe,
+    ActSpace,
+    ActReturn,
+}
+
+pub data KeySpec {
+    label: String,
+    action: KeyAction,
+    keyClass: KeyClass,
+    frame: CGRect,
+}
+
+pub def emptyKeySpec(): KeySpec =
+    KeySpec {
+        label: "",
+        action: ActSpace,
+        keyClass: FuncClass,
+        frame: cgRect(0.0, 0.0, 0.0, 0.0),
+    }
+
+/// Compute the 4-row QWERTY portrait layout for a given view width (`ribbonHeight` = 53pt at top).
+pub def buildQwertyLayout(viewWidth: Float): Vec KeySpec = {
+    let out: Vec KeySpec = vecNew();
+    let padX = 3.0;
+    let gap = keyGapX();
+    let kh = keyHeight();
+    let rg = rowGap();
+    let y0 = ribbonHeight() + 2.0;
+    let avail = viewWidth - padX * 2.0;
+
+    // Row 0: q w e r t y u i o p (10 keys)
+    let r0 = "qwertyuiop";
+    let w10 = (avail - gap * 9.0) / 10.0;
+    let i0 = cellNew(0);
+    while (cellGet(i0) < 10) {
+        let idx = cellGet(i0);
+        let ch = strByteAt(r0, idx);
+        let x = padX + intToFloat(idx) * (w10 + gap);
+        vecPush(out, KeySpec {
+            label: strSlice(r0, idx, idx + 1),
+            action: ActLetter(ch),
+            keyClass: CharClass,
+            frame: cgRect(x, y0, w10, kh),
+        });
+        cellSet(i0, idx + 1)
+    };
+
+    // Row 1: a s d f g h j k l (9 keys centered)
+    let r1 = "asdfghjkl";
+    let y1 = y0 + kh + rg;
+    let row1W = 9.0 * w10 + 8.0 * gap;
+    let x1Start = (viewWidth - row1W) * 0.5;
+    let i1 = cellNew(0);
+    while (cellGet(i1) < 9) {
+        let idx = cellGet(i1);
+        let ch = strByteAt(r1, idx);
+        let x = x1Start + intToFloat(idx) * (w10 + gap);
+        vecPush(out, KeySpec {
+            label: strSlice(r1, idx, idx + 1),
+            action: ActLetter(ch),
+            keyClass: CharClass,
+            frame: cgRect(x, y1, w10, kh),
+        });
+        cellSet(i1, idx + 1)
+    };
+
+    // Row 2: Shift + z x c v b n m + Backspace
+    let r2 = "zxcvbnm";
+    let y2 = y1 + kh + rg;
+    let row2LettersW = 7.0 * w10 + 6.0 * gap;
+    let sideW = (avail - row2LettersW - gap * 2.0) * 0.5;
+    vecPush(out, KeySpec {
+        label: "⇧",
+        action: ActShift,
+        keyClass: FuncClass,
+        frame: cgRect(padX, y2, sideW, kh),
+    });
+    let x2Start = padX + sideW + gap;
+    let i2 = cellNew(0);
+    while (cellGet(i2) < 7) {
+        let idx = cellGet(i2);
+        let ch = strByteAt(r2, idx);
+        let x = x2Start + intToFloat(idx) * (w10 + gap);
+        vecPush(out, KeySpec {
+            label: strSlice(r2, idx, idx + 1),
+            action: ActLetter(ch),
+            keyClass: CharClass,
+            frame: cgRect(x, y2, w10, kh),
+        });
+        cellSet(i2, idx + 1)
+    };
+    vecPush(out, KeySpec {
+        label: "⌫",
+        action: ActBackspace,
+        keyClass: FuncClass,
+        frame: cgRect(x2Start + row2LettersW + gap, y2, sideW, kh),
+    });
+
+    // Row 3: 123 | 🌐 | 空格 | 换行 (leaving 7pt bottom cushion)
+    let y3 = y2 + kh + rg;
+    let modeW = avail * 0.14;
+    let globeW = avail * 0.12;
+    let retW = avail * 0.22;
+    let spaceW = avail - modeW - globeW - retW - gap * 3.0;
+    vecPush(out, KeySpec {
+        label: "中/英",
+        action: ActSwitchMode,
+        keyClass: FuncClass,
+        frame: cgRect(padX, y3, modeW, kh),
+    });
+    vecPush(out, KeySpec {
+        label: "🌐",
+        action: ActGlobe,
+        keyClass: FuncClass,
+        frame: cgRect(padX + modeW + gap, y3, globeW, kh),
+    });
+    vecPush(out, KeySpec {
+        label: "句序",
+        action: ActSpace,
+        keyClass: FuncClass,
+        frame: cgRect(padX + modeW + globeW + gap * 2.0, y3, spaceW, kh),
+    });
+    vecPush(out, KeySpec {
+        label: "换行",
+        action: ActReturn,
+        keyClass: FuncClass,
+        frame: cgRect(padX + modeW + globeW + spaceW + gap * 3.0, y3, retW, kh),
+    });
+    out
+}
+
+/// Hit-test a touch point against `keys`.
+pub def hitTestKeys(keys: Vec KeySpec, pt: CGPoint): Option KeySpec = {
+    let n = vecLen(keys);
+    let dummy = emptyKeySpec();
+    let found: Cell (Option KeySpec) = cellNew(None);
+    let i = cellNew(0);
+    while (cellGet(i) < n && match cellGet(found) { None -> true, Some(_) -> false }) {
+        let k = vecGetOr(keys, cellGet(i), dummy);
+        if (rectContainsPoint(k.frame, pt)) cellSet(found, Some(k)) else ();
+        cellSet(i, cellGet(i) + 1)
+    };
+    cellGet(found)
+}

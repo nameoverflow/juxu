@@ -1,0 +1,77 @@
+/// Bare Shift tap detector for macOS Chinese/English toggling (`ShiftTapDetector`).
+
+use std.option.{Option, Some, None}
+
+pub def modShift(): Int = 1
+pub def modControl(): Int = 2
+pub def modOption(): Int = 4
+pub def modCommand(): Int = 8
+pub def modFunction(): Int = 16
+pub def modCapsLock(): Int = 32
+
+pub def leftShiftKeyCode(): Int = 0x38
+pub def rightShiftKeyCode(): Int = 0x3C
+pub def maxShiftTapDuration(): Float = 0.35
+
+pub data ShiftTapDetector {
+    activeKeyCode: Cell (Option Int),
+    downTimestamp: Cell Float,
+    lastModifiers: Cell Int,
+}
+
+pub def shiftTapDetectorNew(): ShiftTapDetector =
+    ShiftTapDetector {
+        activeKeyCode: cellNew(None),
+        downTimestamp: cellNew(0.0),
+        lastModifiers: cellNew(0),
+    }
+
+pub def shiftTapReset(d: ShiftTapDetector): Void = {
+    cellSet(d.activeKeyCode, None);
+    cellSet(d.downTimestamp, 0.0);
+    cellSet(d.lastModifiers, 0)
+}
+
+pub def shiftTapCancel(d: ShiftTapDetector): Void = {
+    cellSet(d.activeKeyCode, None);
+    cellSet(d.downTimestamp, 0.0)
+}
+
+pub def shiftTapHandleKeyDown(d: ShiftTapDetector): Void =
+    shiftTapCancel(d)
+
+/// Process a `flagsChanged` event; returns `true` iff it completes a bare Shift tap.
+pub def shiftTapHandleFlagsChanged(
+    d: ShiftTapDetector,
+    keyCode: Int,
+    modifiers: Int,
+    timestampSec: Float,
+): Bool = {
+    let prev = cellGet(d.lastModifiers);
+    cellSet(d.lastModifiers, modifiers);
+    let isShiftKey = keyCode == leftShiftKeyCode() || keyCode == rightShiftKeyCode();
+
+    if (modifiers == modShift()) {
+        let isIdle = match cellGet(d.activeKeyCode) { None -> true, Some(_) -> false };
+        if (isShiftKey && prev == 0 && isIdle) {
+            cellSet(d.activeKeyCode, Some(keyCode));
+            cellSet(d.downTimestamp, timestampSec)
+        } else {
+            shiftTapCancel(d)
+        };
+        false
+    } else if (modifiers == 0) {
+        match cellGet(d.activeKeyCode) {
+            Some(armed) -> {
+                let downTs = cellGet(d.downTimestamp);
+                shiftTapCancel(d);
+                let elapsed = timestampSec - downTs;
+                isShiftKey && keyCode == armed && elapsed >= 0.0 && elapsed < maxShiftTapDuration()
+            },
+            None -> false,
+        }
+    } else {
+        shiftTapCancel(d);
+        false
+    }
+}

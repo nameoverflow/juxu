@@ -1,5 +1,6 @@
 build/
-Core/target/
-iOS/build-lib/
+*/build/
+*.o
 .DS_Store
-
+geisha.local.toml
+*/geisha.local.toml

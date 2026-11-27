@@ -1,0 +1,65 @@
+/// Pure Geisha iOS Host App (`Juxu.app`, embedding `JuxuKeyboard.appex`).
+/// Uses native UIKit (`UIApplicationMain`, `UIWindow`, `UIViewController`, `UILabel`, `UITextField`).
+
+use objc.{
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    msgSend0, msgSend1Ptr, msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64,
+}
+use juxu_shared.{
+    cgRect, nsStr, msgSendRect0, msgSendInitFrame, msgSend4Float, objcAllocInit, objcAllocInitFrame,
+}
+
+extern "UIApplicationMain" def c_UIApplicationMain(argc: Int, argv: Ptr, principal: Ptr, delegate: Ptr): Int
+
+def gAppWindow: Cell Ptr = cellNew(ptrNull())
+
+def mainVcViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
+    let view = msgSend0(self, objcSel("view"));
+    let bg = msgSend4Float(objcClass("UIColor"), objcSel("colorWithRed:green:blue:alpha:"), 0.97, 0.97, 0.98, 1.0);
+    msgSendVoid1Ptr(view, objcSel("setBackgroundColor:"), bg);
+
+    let title = objcAllocInitFrame("UILabel", cgRect(24.0, 90.0, 340.0, 36.0));
+    msgSendVoid1Ptr(title, objcSel("setText:"), nsStr("句序输入法（纯 Geisha 版）"));
+    msgSendVoid1Ptr(view, objcSel("addSubview:"), title);
+
+    let hint = objcAllocInitFrame("UILabel", cgRect(24.0, 134.0, 340.0, 56.0));
+    msgSendVoid1I64(hint, objcSel("setNumberOfLines:"), intToI64(0));
+    msgSendVoid1Ptr(hint, objcSel("setText:"), nsStr("在「设置 → 通用 → 键盘 → 添加新键盘」中启用「句序」，然后在下方输入框试打："));
+    msgSendVoid1Ptr(view, objcSel("addSubview:"), hint);
+
+    let tf = objcAllocInitFrame("UITextField", cgRect(24.0, 206.0, 340.0, 44.0));
+    msgSendVoid1I64(tf, objcSel("setBorderStyle:"), intToI64(3)); // UITextBorderStyleRoundedRect
+    msgSendVoid1Ptr(tf, objcSel("setPlaceholder:"), nsStr("点击此处体验句序键盘…"));
+    msgSendVoid1Ptr(view, objcSel("addSubview:"), tf)
+}
+
+def appDidFinishLaunching(_self: Ptr, _cmd: Ptr, _app: Ptr, _opts: Ptr): Bool = {
+    let screen = msgSend0(objcClass("UIScreen"), objcSel("mainScreen"));
+    let bounds = msgSendRect0(screen, objcSel("bounds"));
+    let winAlloc = msgSend0(objcClass("UIWindow"), objcSel("alloc"));
+    let win = msgSendInitFrame(winAlloc, objcSel("initWithFrame:"), bounds);
+    let vc = objcAllocInit("JuxuIOSMainVC");
+    msgSendVoid1Ptr(win, objcSel("setRootViewController:"), vc);
+    msgSendVoid0(win, objcSel("makeKeyAndVisible"));
+    cellSet(gAppWindow, win);
+    true
+}
+
+extern init(100) def registerIosHostAppClasses(): Void = {
+    let vcCls = objcAllocateClass("UIViewController", "JuxuIOSMainVC");
+    if (!ptrIsNull(vcCls)) {
+        let _ = objcAddMethod(vcCls, "viewDidLoad", cFnPtr(mainVcViewDidLoad), "v@:");
+        objcRegisterClass(vcCls)
+    } else ();
+
+    let appCls = objcAllocateClass("UIResponder", "JuxuIOSAppDelegate");
+    if (!ptrIsNull(appCls)) {
+        let _ = objcAddMethod(appCls, "application:didFinishLaunchingWithOptions:", cFnPtr(appDidFinishLaunching), "B@:@@");
+        objcRegisterClass(appCls)
+    } else ()
+}
+
+def main(): Void = {
+    let _ = c_UIApplicationMain(0, ptrNull(), ptrNull(), nsStr("JuxuIOSAppDelegate"));
+    ()
+}

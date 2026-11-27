@@ -1,0 +1,20 @@
+name = "juxu_ios_keyboard"
+version = "0.2.0"
+entry = "src/main.gsa"
+src_dir = "src"
+
+[deps]
+juxu_shared = { path = "../shared" }
+juxu_core = { git = "https://github.com/nameoverflow/juxu-core.git", version = "0.1.9" }
+objc = { git = "https://github.com/geisha-lang/objc.gsa.git", version = "0.1.0" }
+
+[target.ios]
+bundle_id       = "im.juxu.app.keyboard"
+bundle_name     = "JuxuKeyboard"
+version         = "0.2.0"
+min_os          = "16.0"
+is_extension    = true
+extension_point = "com.apple.keyboard-service"
+principal_class = "KeyboardViewController"
+frameworks      = ["UIKit", "Foundation", "QuartzCore", "CoreGraphics", "CoreText", "Security"]
+codesign        = "-"

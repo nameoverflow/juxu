@@ -1,0 +1,103 @@
+/// Pure AppKit settings window for macOS (`NSWindow` + `NSPopUpButton` + `NSButton`),
+/// directly mutating `JuxuSession` (zero SwiftUI).
+
+use std.option.{Option, Some, None}
+use objc.{
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    msgSend0, msgSend1Ptr, msgSendInt0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool,
+}
+use juxu_core.{ConfigFormat, Toml, applyConfig, exportConfig, getSchema, schemaDisplayName}
+use juxu_shared.{
+    JuxuSession, sessionSaveConfig,
+    cgRect, nsStr, msgSend1Rect1U64_1I64_1Bool, objcAllocInitFrame,
+}
+
+def gSettingsWindow: Cell Ptr = cellNew(ptrNull())
+def gSettingsSession: Cell (Option JuxuSession) = cellNew(None)
+def gSchemaPopup: Cell Ptr = cellNew(ptrNull())
+def gSettingsTarget: Cell Ptr = cellNew(ptrNull())
+
+def schemaTagAtIndex(idx: Int): String =
+    if (idx == 0) "pinyin"
+    else if (idx == 1) "xiaohe_sp"
+    else if (idx == 2) "86"
+    else if (idx == 3) "98"
+    else if (idx == 4) "06"
+    else if (idx == 5) "xiaohe"
+    else if (idx == 6) "cangjie3"
+    else if (idx == 7) "cangjie5"
+    else "cangjie6"
+
+def onSchemaChanged(_self: Ptr, _cmd: Ptr, sender: Ptr): Void = {
+    let idx = msgSendInt0(sender, objcSel("indexOfSelectedItem"));
+    let tag = schemaTagAtIndex(idx);
+    match cellGet(gSettingsSession) {
+        Some(s) -> {
+            applyConfig(s.engine, Toml, "[general]\nschema = \"" + tag + "\"\n");
+            let _ = sessionSaveConfig(s);
+            ()
+        },
+        None -> (),
+    }
+}
+
+extern init(101) def registerSettingsTargetClass(): Void = {
+    let cls = objcAllocateClass("NSObject", "JuxuSettingsTarget");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "onSchemaChanged:", cFnPtr(onSchemaChanged), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}
+
+pub def settingsWindowShow(s: JuxuSession): Void = {
+    cellSet(gSettingsSession, Some(s));
+    let win = if (!ptrIsNull(cellGet(gSettingsWindow))) cellGet(gSettingsWindow)
+    else {
+        // NSWindowStyleMaskTitled (1) | Closable (2) | Miniaturizable (4) = 7
+        let wAlloc = msgSend0(objcClass("NSWindow"), objcSel("alloc"));
+        let w = msgSend1Rect1U64_1I64_1Bool(
+            wAlloc,
+            objcSel("initWithContentRect:styleMask:backing:defer:"),
+            cgRect(320.0, 260.0, 420.0, 220.0),
+            intToI64(7),
+            intToI64(2),
+            false
+        );
+        msgSendVoid1Ptr(w, objcSel("setTitle:"), nsStr("句序设置"));
+        msgSendVoid1Bool(w, objcSel("setReleasedWhenClosed:"), false);
+
+        let content = msgSend0(w, objcSel("contentView"));
+        let lbl = objcAllocInitFrame("NSTextField", cgRect(24.0, 150.0, 110.0, 24.0));
+        msgSendVoid1Bool(lbl, objcSel("setBezeled:"), false);
+        msgSendVoid1Bool(lbl, objcSel("setDrawsBackground:"), false);
+        msgSendVoid1Bool(lbl, objcSel("setEditable:"), false);
+        msgSendVoid1Ptr(lbl, objcSel("setStringValue:"), nsStr("输入方案："));
+        msgSendVoid1Ptr(content, objcSel("addSubview:"), lbl);
+
+        let popup = objcAllocInitFrame("NSPopUpButton", cgRect(140.0, 146.0, 240.0, 28.0));
+        let addOpt = (title: String) ->
+            msgSendVoid1Ptr(popup, objcSel("addItemWithTitle:"), nsStr(title));
+        addOpt("全拼");
+        addOpt("小鹤双拼");
+        addOpt("86版五笔");
+        addOpt("98版五笔");
+        addOpt("新世纪五笔");
+        addOpt("小鹤音形");
+        addOpt("仓颉三代");
+        addOpt("仓颉五代");
+        addOpt("仓颉六代");
+
+        let tgt = msgSend0(msgSend0(objcClass("JuxuSettingsTarget"), objcSel("alloc")), objcSel("init"));
+        msgSendVoid1Ptr(popup, objcSel("setTarget:"), tgt);
+        msgSendVoid1Ptr(popup, objcSel("setAction:"), objcSel("onSchemaChanged:"));
+        msgSendVoid1Ptr(content, objcSel("addSubview:"), popup);
+
+        cellSet(gSettingsTarget, tgt);
+        cellSet(gSchemaPopup, popup);
+        cellSet(gSettingsWindow, w);
+        w
+    };
+    msgSendVoid0(win, objcSel("center"));
+    msgSendVoid1Ptr(win, objcSel("makeKeyAndOrderFront:"), ptrNull())
+}

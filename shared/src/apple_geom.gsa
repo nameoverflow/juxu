@@ -1,0 +1,144 @@
+/// CoreGraphics / Foundation C ABI geometry structs and typed `objc_msgSend` helpers
+/// shared across macOS (AppKit/InputMethodKit) and iOS (UIKit).
+
+use objc.{objcClass, objcSel, msgSend0, msgSend1Ptr, msgSendVoid0, msgSendVoid1Ptr, nsString, withId}
+
+pub extern data CGPoint {
+    x: Float,
+    y: Float,
+}
+
+pub extern data CGSize {
+    width: Float,
+    height: Float,
+}
+
+pub extern data CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
+pub extern data NSRange {
+    location: Int64,
+    length: Int64,
+}
+
+pub def cgPoint(x: Float, y: Float): CGPoint =
+    CGPoint { x: x, y: y }
+
+pub def cgSize(w: Float, h: Float): CGSize =
+    CGSize { width: w, height: h }
+
+pub def cgRect(x: Float, y: Float, w: Float, h: Float): CGRect =
+    CGRect { origin: CGPoint { x: x, y: y }, size: CGSize { width: w, height: h } }
+
+pub def nsRange(loc: Int64, len: Int64): NSRange =
+    NSRange { location: loc, length: len }
+
+pub def nsNotFound(): Int64 =
+    intToI64(2147483647) * intToI64(65536) * intToI64(65536)
+        + intToI64(2147483647) * intToI64(2)
+        + intToI64(1)
+
+pub def rectContainsPoint(r: CGRect, p: CGPoint): Bool =
+    p.x >= r.origin.x
+        && p.x <= r.origin.x + r.size.width
+        && p.y >= r.origin.y
+        && p.y <= r.origin.y + r.size.height
+
+pub def rectMidX(r: CGRect): Float = r.origin.x + r.size.width * 0.5
+pub def rectMidY(r: CGRect): Float = r.origin.y + r.size.height * 0.5
+pub def rectMaxX(r: CGRect): Float = r.origin.x + r.size.width
+pub def rectMaxY(r: CGRect): Float = r.origin.y + r.size.height
+
+// ============================================================================
+// Typed `objc_msgSend` helpers for C ABI structs & Apple frameworks
+// ============================================================================
+
+pub extern "objc_msgSend" def msgSendRect0(obj: Ptr, sel: Ptr): CGRect
+pub extern "objc_msgSend" def msgSendPoint0(obj: Ptr, sel: Ptr): CGPoint
+pub extern "objc_msgSend" def msgSendSize0(obj: Ptr, sel: Ptr): CGSize
+pub extern "objc_msgSend" def msgSendRange0(obj: Ptr, sel: Ptr): NSRange
+pub extern "objc_msgSend" def msgSendPoint1Ptr(obj: Ptr, sel: Ptr, a0: Ptr): CGPoint
+pub extern "objc_msgSend" def msgSendPoint1Point1Ptr(obj: Ptr, sel: Ptr, p: CGPoint, a1: Ptr): CGPoint
+pub extern "objc_msgSend" def msgSendInitFrame(obj: Ptr, sel: Ptr, frame: CGRect): Ptr
+pub extern "objc_msgSend" def msgSendVoid1Rect(obj: Ptr, sel: Ptr, r: CGRect): Void
+pub extern "objc_msgSend" def msgSendVoid1Point(obj: Ptr, sel: Ptr, p: CGPoint): Void
+pub extern "objc_msgSend" def msgSendVoid1Size(obj: Ptr, sel: Ptr, s: CGSize): Void
+pub extern "objc_msgSend" def msgSendVoid1Ptr1Range(obj: Ptr, sel: Ptr, a0: Ptr, r: NSRange): Void
+pub extern "objc_msgSend" def msgSendVoid1Ptr2Range(obj: Ptr, sel: Ptr, a0: Ptr, r1: NSRange, r2: NSRange): Void
+pub extern "objc_msgSend" def msgSend1Rect1U64_1I64_1Bool(
+    obj: Ptr, sel: Ptr, rect: CGRect, style: Int64, backing: Int64, defer: Bool
+): Ptr
+pub extern "objc_msgSend" def msgSend4Float(
+    obj: Ptr, sel: Ptr, a0: Float, a1: Float, a2: Float, a3: Float
+): Ptr
+pub extern "objc_msgSend" def msgSend2Float(obj: Ptr, sel: Ptr, a0: Float, a1: Float): Ptr
+pub extern "objc_msgSend" def msgSend2Ptr(obj: Ptr, sel: Ptr, a0: Ptr, a1: Ptr): Ptr
+pub extern "objc_msgSend" def msgSend1Ptr1Bool(obj: Ptr, sel: Ptr, a0: Ptr, a1: Bool): Ptr
+pub extern "objc_msgSend" def msgSendBool1Ptr(obj: Ptr, sel: Ptr, a0: Ptr): Bool
+pub extern "objc_msgSend" def msgSendBool2Ptr(obj: Ptr, sel: Ptr, a0: Ptr, a1: Ptr): Bool
+pub extern "objc_msgSend" def msgSendVoid1Ptr1Bool(obj: Ptr, sel: Ptr, a0: Ptr, a1: Bool): Void
+pub extern "objc_msgSend" def msgSendVoid1Int1Bool(obj: Ptr, sel: Ptr, a0: Int, a1: Bool): Void
+pub extern "objc_msgSend" def msgSendVoid2I64(obj: Ptr, sel: Ptr, a0: Int64, a1: Int64): Void
+pub extern "objc_msgSend" def msgSendVoid1Ptr1I64(obj: Ptr, sel: Ptr, a0: Ptr, a1: Int64): Void
+pub extern "objc_msgSend" def msgSendVoid1Ptr1Sel(obj: Ptr, sel: Ptr, target: Ptr, action: Ptr): Void
+pub extern "objc_msgSend" def msgSendVoid1Ptr1Sel1U64(obj: Ptr, sel: Ptr, target: Ptr, action: Ptr, events: Int64): Void
+
+/// Return `NSBundle.mainBundle.resourcePath` (or `""` if unavailable).
+pub def mainBundleResourcePath(): String = {
+    let cls = objcClass("NSBundle");
+    let bundle = msgSend0(cls, objcSel("mainBundle"));
+    if (ptrIsNull(bundle)) ""
+    else {
+        let p = msgSend0(bundle, objcSel("resourcePath"));
+        if (ptrIsNull(p)) ""
+        else {
+            let utf8 = msgSend0(p, objcSel("UTF8String"));
+            if (ptrIsNull(utf8)) "" else ptrToString(utf8)
+        }
+    }
+}
+
+/// Return `NSBundle.mainBundle.bundleIdentifier` (or `fallback`).
+pub def mainBundleIdentifier(fallback: String): String = {
+    let cls = objcClass("NSBundle");
+    let bundle = msgSend0(cls, objcSel("mainBundle"));
+    if (ptrIsNull(bundle)) fallback
+    else {
+        let p = msgSend0(bundle, objcSel("bundleIdentifier"));
+        if (ptrIsNull(p)) fallback
+        else {
+            let utf8 = msgSend0(p, objcSel("UTF8String"));
+            if (ptrIsNull(utf8)) fallback else ptrToString(utf8)
+        }
+    }
+}
+
+pub extern "objc_msgSend" def msgSend1Str(obj: Ptr, sel: Ptr, a0: String): Ptr
+
+/// Create an autoreleased `NSString*` from a Geisha UTF-8 `String` (`+[NSString stringWithUTF8String:]`).
+pub def nsStr(s: String): Ptr =
+    msgSend1Str(objcClass("NSString"), objcSel("stringWithUTF8String:"), s)
+
+/// Convert a raw `NSString*` pointer (nullable) to a Geisha `String`.
+pub def nsStrPtrToString(p: Ptr): String =
+    if (ptrIsNull(p)) ""
+    else {
+        let utf8 = msgSend0(p, objcSel("UTF8String"));
+        if (ptrIsNull(utf8)) "" else ptrToString(utf8)
+    }
+
+/// Allocate and initialize an ObjC object with `[[cls alloc] init]`.
+pub def objcAllocInit(className: String): Ptr = {
+    let cls = objcClass(className);
+    let obj = msgSend0(cls, objcSel("alloc"));
+    msgSend0(obj, objcSel("init"))
+}
+
+/// Allocate and initialize an ObjC view with `[[cls alloc] initWithFrame:frame]`.
+pub def objcAllocInitFrame(className: String, frame: CGRect): Ptr = {
+    let cls = objcClass(className);
+    let obj = msgSend0(cls, objcSel("alloc"));
+    msgSendInitFrame(obj, objcSel("initWithFrame:"), frame)
+}

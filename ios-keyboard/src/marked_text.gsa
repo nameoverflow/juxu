@@ -1,0 +1,71 @@
+/// iOS inline marked-text session (`IOSInlineMarkedTextSession`).
+/// Preserves Juxu's critical iOS UITextDocumentProxy invariants:
+/// - Clearing marked text ALWAYS sends `setMarkedText("", selectedRange: (0,0))` + `unmarkText()`.
+/// - Committing while marked text is active atomically replaces it via `setMarkedText(text, ...)` + `unmarkText()`
+///   (compatible with `YYTextView` and TextKit 2).
+/// - Tracks orphan marked text across `KeyboardViewController` teardown/recreation.
+
+use objc.{objcSel, msgSendVoid0, msgSendVoid1Ptr}
+use juxu_shared.{nsRange, nsStr, msgSendVoid1Ptr1Range}
+
+def gHasMarkedText: Cell Bool = cellNew(false)
+def gOrphanMarkedText: Cell String = cellNew("")
+
+/// Clear inline marked text safely on `proxy` (`UITextDocumentProxy`).
+pub def proxyClearMarkedText(proxy: Ptr): Void =
+    if (!ptrIsNull(proxy)) {
+        if (cellGet(gHasMarkedText)) {
+            msgSendVoid1Ptr1Range(proxy, objcSel("setMarkedText:selectedRange:"), nsStr(""), nsRange(intToI64(0), intToI64(0)));
+            msgSendVoid0(proxy, objcSel("unmarkText"));
+            cellSet(gHasMarkedText, false);
+            cellSet(gOrphanMarkedText, "")
+        } else ()
+    } else ()
+
+/// Commit `text` to `proxy` (atomically replacing any active marked text).
+pub def proxyCommitText(proxy: Ptr, text: String): Void =
+    if (!ptrIsNull(proxy) && strLen(text) > 0) {
+        if (cellGet(gHasMarkedText)) {
+            msgSendVoid1Ptr1Range(
+                proxy,
+                objcSel("setMarkedText:selectedRange:"),
+                nsStr(text),
+                nsRange(intToI64(strLen(text)), intToI64(0))
+            );
+            msgSendVoid0(proxy, objcSel("unmarkText"));
+            cellSet(gHasMarkedText, false);
+            cellSet(gOrphanMarkedText, "")
+        } else {
+            msgSendVoid1Ptr(proxy, objcSel("insertText:"), nsStr(text))
+        }
+    } else ()
+
+/// Set or clear inline marked text on `proxy`.
+pub def proxySetMarkedText(proxy: Ptr, preedit: String): Void =
+    if (!ptrIsNull(proxy)) {
+        if (strLen(preedit) == 0) {
+            proxyClearMarkedText(proxy)
+        } else {
+            msgSendVoid1Ptr1Range(
+                proxy,
+                objcSel("setMarkedText:selectedRange:"),
+                nsStr(preedit),
+                nsRange(intToI64(strLen(preedit)), intToI64(0))
+            );
+            cellSet(gHasMarkedText, true);
+            cellSet(gOrphanMarkedText, preedit)
+        }
+    } else ()
+
+/// Delete one character backward on `proxy`.
+pub def proxyDeleteBackward(proxy: Ptr): Void =
+    if (!ptrIsNull(proxy)) msgSendVoid0(proxy, objcSel("deleteBackward")) else ()
+
+/// Clean up any orphan marked text left over from a prior extension lifecycle.
+pub def proxyCleanupOrphanIfNeeded(proxy: Ptr): Void =
+    if (!ptrIsNull(proxy) && strLen(cellGet(gOrphanMarkedText)) > 0) {
+        msgSendVoid1Ptr1Range(proxy, objcSel("setMarkedText:selectedRange:"), nsStr(""), nsRange(intToI64(0), intToI64(0)));
+        msgSendVoid0(proxy, objcSel("unmarkText"));
+        cellSet(gHasMarkedText, false);
+        cellSet(gOrphanMarkedText, "")
+    } else ()

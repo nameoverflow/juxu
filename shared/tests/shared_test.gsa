@@ -1,0 +1,54 @@
+/// Unit & integration tests for `juxu_shared` (punctuation pairing, auto-spacing, and `JuxuSession`).
+
+use std.vec.{vecLen, vecGetOr}
+use std.str.{intToStr}
+use sys.proc.{exit}
+use juxu_core.{
+    Pinyin, Toml, SelectPage, emptyCandidate,
+    applyConfig, typeAscii, step, snapCommitText, predictNext, setContext,
+}
+use juxu_shared.{
+    InsertPair, SkipClose, Plain,
+    punctuationTrackerNew, punctuationTrackerHandleSymbol, punctuationTrackerConsumeBackspacePair,
+    defaultAutoSpaceOptions, formatAutoSpace,
+    sessionNew, sessionLoadDictsFromDir,
+}
+
+def fail(msg: String): Void = {
+    printLn("ASSERT FAILED: " + msg);
+    exit(1)
+}
+
+def assertTrue(cond: Bool, msg: String): Void =
+    if (!cond) fail(msg) else ()
+
+def main(): Void = {
+    // 1. Punctuation pairing tracker
+    let pt = punctuationTrackerNew();
+    assertTrue(punctuationTrackerHandleSymbol(pt, "“", "") == InsertPair("”"), "open quote inserts pair");
+    assertTrue(punctuationTrackerHandleSymbol(pt, "”", "”") == SkipClose, "typing closer skips close");
+    assertTrue(punctuationTrackerHandleSymbol(pt, "（", "") == InsertPair("）"), "open paren inserts pair");
+    assertTrue(punctuationTrackerConsumeBackspacePair(pt, "（", "）"), "backspace deletes pair");
+
+    // 2. Chinese/English auto-spacing
+    let opts = defaultAutoSpaceOptions();
+    assertTrue(formatAutoSpace("使用", "Geisha", opts) == " Geisha", "CJK -> ASCII inserts space");
+    assertTrue(formatAutoSpace("Geisha", "输入法", opts) == " 输入法", "ASCII -> CJK inserts space");
+    assertTrue(formatAutoSpace("使用 ", "Geisha", opts) == "Geisha", "existing space not doubled");
+
+    // 3. End-to-end JuxuSession backed directly by `juxu_core`
+    let s = sessionNew();
+    let loaded = sessionLoadDictsFromDir(s, "/Users/nomofu/code/juxu/Resources/Dicts");
+    assertTrue(loaded >= 4, "loaded dicts >= 4 (got " + intToStr(loaded) + ")");
+    applyConfig(s.engine, Toml, "[general]\nschema = \"pinyin\"\n");
+    let snap = typeAscii(s.engine, "nihao", intToI64(1000), intToI64(50));
+    let top1 = vecGetOr(snap.pageCandidates, 0, emptyCandidate());
+    assertTrue(top1.text == "你好", "nihao top1 == 你好");
+    let out = step(s.engine, SelectPage { index: 0, atMs: intToI64(2000) });
+    assertTrue(snapCommitText(out) == "你好", "SelectPage commits 你好");
+    setContext(s.engine, "你好");
+    let preds = predictNext(s.engine, 5);
+    assertTrue(vecLen(preds) > 0, "predictNext non-empty");
+
+    printLn("shared_test: ALL PASSED (loaded=" + intToStr(loaded) + " dicts, top1=" + top1.text + ")")
+}

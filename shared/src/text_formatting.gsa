@@ -1,0 +1,243 @@
+/// Chinese punctuation pairing and Chinese/English auto-spacing
+/// shared between macOS (`JuxuInputController`) and iOS (`KeyboardViewController`).
+
+use std.option.{Option, Some, None}
+use std.vec.{Vec, vecNew, vecLen, vecPush, vecPop, vecGetOr, vecClear}
+use std.buf.{bufNew, bufPushStr, bufToString}
+use std.generic
+
+// ============================================================================
+// UTF-8 First / Last Character Helpers
+// ============================================================================
+
+def utf8CharByteLen(b0: Int): Int =
+    if (b0 < 0x80) 1
+    else if ((b0 & 0xE0) == 0xC0) 2
+    else if ((b0 & 0xF0) == 0xE0) 3
+    else if ((b0 & 0xF8) == 0xF0) 4
+    else 1
+
+/// Decode the first Unicode scalar of `s` (returns `(codepoint, byteLen)`, or `(0, 0)` if empty).
+pub def utf8FirstScalar(s: String): (Int, Int) = {
+    let n = strLen(s);
+    if (n == 0) (0, 0)
+    else {
+        let b0 = strByteAt(s, 0);
+        if (b0 < 0x80) (b0, 1)
+        else if ((b0 & 0xE0) == 0xC0 && n >= 2) {
+            let b1 = strByteAt(s, 1);
+            (((b0 & 0x1F) << 6) | (b1 & 0x3F), 2)
+        } else if ((b0 & 0xF0) == 0xE0 && n >= 3) {
+            let b1 = strByteAt(s, 1);
+            let b2 = strByteAt(s, 2);
+            (((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F), 3)
+        } else if ((b0 & 0xF8) == 0xF0 && n >= 4) {
+            let b1 = strByteAt(s, 1);
+            let b2 = strByteAt(s, 2);
+            let b3 = strByteAt(s, 3);
+            (((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F), 4)
+        } else (b0, 1)
+    }
+}
+
+/// Return the first UTF-8 character of `s` as a `String` (or `""` if empty).
+pub def firstCharStr(s: String): String = {
+    let (_, len) = utf8FirstScalar(s);
+    if (len == 0) "" else strSlice(s, 0, len)
+}
+
+/// Decode the last Unicode scalar of `s` (returns `(codepoint, startByteIdx)`).
+pub def utf8LastScalar(s: String): (Int, Int) = {
+    let n = strLen(s);
+    if (n == 0) (0, 0)
+    else {
+        let idx = cellNew(n - 1);
+        while (cellGet(idx) > 0 && (strByteAt(s, cellGet(idx)) & 0xC0) == 0x80) {
+            cellSet(idx, cellGet(idx) - 1)
+        };
+        let start = cellGet(idx);
+        let (cp, _) = utf8FirstScalar(strSlice(s, start, n));
+        (cp, start)
+    }
+}
+
+/// Return the last UTF-8 character of `s` as a `String` (or `""` if empty).
+pub def lastCharStr(s: String): String = {
+    let n = strLen(s);
+    if (n == 0) ""
+    else {
+        let (_, start) = utf8LastScalar(s);
+        strSlice(s, start, n)
+    }
+}
+
+// ============================================================================
+// Chinese Punctuation Pairing
+// ============================================================================
+
+pub data PunctuationAction : Eq {
+    Plain,
+    InsertPair(String),
+    SkipClose,
+}
+
+pub def closerForOpen(openSym: String): Option String =
+    if (openSym == "“") Some("”")
+    else if (openSym == "‘") Some("’")
+    else if (openSym == "（") Some("）")
+    else if (openSym == "《") Some("》")
+    else if (openSym == "〈") Some("〉")
+    else if (openSym == "【") Some("】")
+    else if (openSym == "〔") Some("〕")
+    else if (openSym == "「") Some("」")
+    else if (openSym == "『") Some("』")
+    else None
+
+def isCloserSymbol(sym: String): Bool =
+    sym == "”" || sym == "’" || sym == "）" || sym == "》" || sym == "〉"
+        || sym == "】" || sym == "〕" || sym == "」" || sym == "』"
+
+def isSafeFollower(ch: String): Bool =
+    ch == " " || ch == "\t" || ch == "\n" || ch == "\r"
+        || ch == "，" || ch == "。" || ch == "！" || ch == "？" || ch == "；" || ch == "：" || ch == "、"
+        || ch == "）" || ch == "》" || ch == "〉" || ch == "】" || ch == "〕" || ch == "」" || ch == "』"
+        || ch == "”" || ch == "’"
+        || ch == "," || ch == "." || ch == "!" || ch == "?" || ch == ";" || ch == ":"
+        || ch == ")" || ch == "]" || ch == "}"
+
+pub data PunctuationPairingTracker {
+    openClosers: Vec String,
+    openPairTail: Cell String,
+}
+
+pub def punctuationTrackerNew(): PunctuationPairingTracker =
+    PunctuationPairingTracker {
+        openClosers: vecNew(),
+        openPairTail: cellNew(""),
+    }
+
+pub def punctuationTrackerReset(t: PunctuationPairingTracker): Void = {
+    vecClear(t.openClosers);
+    cellSet(t.openPairTail, "")
+}
+
+def trackerLastCloser(t: PunctuationPairingTracker): Option String = {
+    let n = vecLen(t.openClosers);
+    if (n == 0) None else Some(vecGetOr(t.openClosers, n - 1, ""))
+}
+
+pub def punctuationTrackerPrune(t: PunctuationPairingTracker, after: String): Void = {
+    let n = vecLen(t.openClosers);
+    if (n > 0) {
+        let first = firstCharStr(after);
+        let last = vecGetOr(t.openClosers, n - 1, "");
+        if (first != last) {
+            punctuationTrackerReset(t)
+        } else ()
+    } else ()
+}
+
+pub def punctuationTrackerHandleSymbol(t: PunctuationPairingTracker, symbol: String, after: String): PunctuationAction = {
+    punctuationTrackerPrune(t, after);
+    match closerForOpen(symbol) {
+        Some(close) -> {
+            let nextCh = firstCharStr(after);
+            if (strLen(nextCh) == 0 || isSafeFollower(nextCh)) {
+                if (vecLen(t.openClosers) == 0) cellSet(t.openPairTail, after) else ();
+                vecPush(t.openClosers, close);
+                InsertPair(close)
+            } else Plain
+        },
+        None -> {
+            if (isCloserSymbol(symbol)) {
+                match trackerLastCloser(t) {
+                    Some(last) if (last == symbol && firstCharStr(after) == symbol) -> {
+                        let _ = vecPop(t.openClosers);
+                        if (vecLen(t.openClosers) == 0) cellSet(t.openPairTail, "") else ();
+                        SkipClose
+                    },
+                    _ -> Plain,
+                }
+            } else Plain
+        },
+    }
+}
+
+pub def punctuationTrackerConsumeBackspacePair(t: PunctuationPairingTracker, before: String, after: String): Bool = {
+    if (vecLen(t.openClosers) == 0) false
+    else {
+        punctuationTrackerPrune(t, after);
+        match trackerLastCloser(t) {
+            Some(close) -> {
+                let openSym = lastCharStr(before);
+                let matches = match closerForOpen(openSym) {
+                    Some(expected) -> expected == close && firstCharStr(after) == close,
+                    None -> false,
+                };
+                if (matches) {
+                    let _ = vecPop(t.openClosers);
+                    if (vecLen(t.openClosers) == 0) cellSet(t.openPairTail, "") else ();
+                    true
+                } else false
+            },
+            None -> false,
+        }
+    }
+}
+
+// ============================================================================
+// Chinese / English Auto-Spacing
+// ============================================================================
+
+pub data AutoSpaceOptions : Eq {
+    enabled: Bool,
+    spaceDigits: Bool,
+}
+
+pub def defaultAutoSpaceOptions(): AutoSpaceOptions =
+    AutoSpaceOptions { enabled: true, spaceDigits: true }
+
+data CharClass : Eq {
+    CCjk,
+    CAsciiLetter,
+    CAsciiDigit,
+    CWhitespace,
+    COther,
+}
+
+def classifyScalar(v: Int): CharClass =
+    if (v == 0x20 || v == 0x09 || v == 0x0A || v == 0x0D || v == 0xA0 || v == 0x3000
+        || v == 0x200B || v == 0x200C || v == 0x200D || v == 0xFEFF) {
+        CWhitespace
+    } else if (v >= 0x30 && v <= 0x39) {
+        CAsciiDigit
+    } else if ((v >= 0x41 && v <= 0x5A) || (v >= 0x61 && v <= 0x7A)
+        || (v >= 0xC0 && v <= 0xD6) || (v >= 0xD8 && v <= 0xF6) || (v >= 0xF8 && v <= 0x24F)) {
+        CAsciiLetter
+    } else if ((v >= 0x4E00 && v <= 0x9FFF) || (v >= 0x3400 && v <= 0x4DBF)
+        || (v >= 0x20000 && v <= 0x2A6DF) || (v >= 0xF900 && v <= 0xFAFF)
+        || (v >= 0x2E80 && v <= 0x2FDF) || v == 0x3007) {
+        CCjk
+    } else {
+        COther
+    }
+
+/// Decide whether a leading ASCII space should be inserted between `before` and `inserting`.
+pub def shouldInsertLeadingSpace(before: String, inserting: String, opts: AutoSpaceOptions): Bool =
+    if (!opts.enabled || strLen(before) == 0 || strLen(inserting) == 0) false
+    else {
+        let (leftCp, _) = utf8LastScalar(before);
+        let (rightCp, _) = utf8FirstScalar(inserting);
+        let lc = classifyScalar(leftCp);
+        let rc = classifyScalar(rightCp);
+        if (lc == CWhitespace || rc == CWhitespace) false
+        else if (lc == CCjk && rc == CAsciiLetter) true
+        else if (lc == CAsciiLetter && rc == CCjk) true
+        else if (opts.spaceDigits && ((lc == CCjk && rc == CAsciiDigit) || (lc == CAsciiDigit && rc == CCjk))) true
+        else false
+    }
+
+/// Apply leading Chinese/English auto-spacing to `inserting` given preceding text `before`.
+pub def formatAutoSpace(before: String, inserting: String, opts: AutoSpaceOptions): String =
+    if (shouldInsertLeadingSpace(before, inserting, opts)) " " + inserting
+    else inserting

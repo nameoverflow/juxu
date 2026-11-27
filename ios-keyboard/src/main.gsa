@@ -1,0 +1,90 @@
+/// Pure Geisha iOS Keyboard Extension (`JuxuKeyboard.appex`).
+/// Dynamically registers `KeyboardViewController : UIInputViewController` in `extern init`
+/// before `_NSExtensionMain` instantiates it.
+
+use std.option.{Option, Some, None}
+use std.path.{pathJoin}
+use sys.fs.{isDir}
+use objc.{
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    msgSend0, msgSend1Ptr, msgSend1Float, msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1Bool, msgSendVoid1Float,
+}
+use juxu_core.{ConfigFormat, Toml, applyConfig, trimMemory, setContext}
+use juxu_shared.{
+    JuxuSession, sessionNew, sessionLoadDictsFromDir, sessionResetForFocusChange,
+    cgRect, mainBundleResourcePath, nsStrPtrToString, objcAllocInitFrame,
+}
+use layout_engine.{portraitTotalHeight}
+use marked_text.{proxyCleanupOrphanIfNeeded}
+use keyboard_view.{iosCanvasBind}
+
+def gExtSession: Cell (Option JuxuSession) = cellNew(None)
+
+def ensureExtSession(): JuxuSession =
+    match cellGet(gExtSession) {
+        Some(s) -> s,
+        None -> {
+            let s = sessionNew();
+            let resDir = mainBundleResourcePath();
+            let dictDir = pathJoin(resDir, "Dicts");
+            if (strLen(resDir) > 0 && isDir(dictDir)) {
+                let _ = sessionLoadDictsFromDir(s, dictDir);
+                ()
+            } else ();
+            applyConfig(s.engine, Toml, "[general]\nschema = \"pinyin\"\n");
+            cellSet(gExtSession, Some(s));
+            s
+        },
+    }
+
+def kbViewDidLoad(self: Ptr, _cmd: Ptr): Void = {
+    let session = ensureExtSession();
+    let rootView = msgSend0(self, objcSel("view"));
+    let canvas = objcAllocInitFrame("JuxuIOSKeyboardView", cgRect(0.0, 0.0, 390.0, portraitTotalHeight()));
+    // UIViewAutoresizingFlexibleWidth (2) | UIViewAutoresizingFlexibleHeight (16) = 18
+    msgSendVoid1Bool(canvas, objcSel("setMultipleTouchEnabled:"), true);
+    msgSendVoid1Ptr(rootView, objcSel("addSubview:"), canvas);
+
+    // Fix portrait keyboard height to 273pt with priority 999 (never set preferredContentSize)
+    let heightAnchor = msgSend0(rootView, objcSel("heightAnchor"));
+    let constraint = msgSend1Float(heightAnchor, objcSel("constraintEqualToConstant:"), portraitTotalHeight());
+    msgSendVoid1Float(constraint, objcSel("setPriority:"), 999.0);
+    msgSendVoid1Bool(constraint, objcSel("setActive:"), true);
+
+    iosCanvasBind(self, session)
+}
+
+def kbTextDidChange(self: Ptr, _cmd: Ptr, _textInput: Ptr): Void = {
+    let proxy = msgSend0(self, objcSel("textDocumentProxy"));
+    proxyCleanupOrphanIfNeeded(proxy);
+    match cellGet(gExtSession) {
+        Some(s) -> {
+            let before = nsStrPtrToString(msgSend0(proxy, objcSel("documentContextBeforeInput")));
+            if (strLen(before) > 0) setContext(s.engine, before) else ()
+        },
+        None -> (),
+    }
+}
+
+def kbTextWillChange(_self: Ptr, _cmd: Ptr, _textInput: Ptr): Void =
+    match cellGet(gExtSession) {
+        Some(s) -> sessionResetForFocusChange(s),
+        None -> (),
+    }
+
+def kbDidReceiveMemoryWarning(_self: Ptr, _cmd: Ptr): Void =
+    match cellGet(gExtSession) {
+        Some(s) -> trimMemory(s.engine),
+        None -> (),
+    }
+
+extern init(102) def registerKeyboardViewControllerClass(): Void = {
+    let cls = objcAllocateClass("UIInputViewController", "KeyboardViewController");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "viewDidLoad", cFnPtr(kbViewDidLoad), "v@:");
+        let _ = objcAddMethod(cls, "textWillChange:", cFnPtr(kbTextWillChange), "v@:@");
+        let _ = objcAddMethod(cls, "textDidChange:", cFnPtr(kbTextDidChange), "v@:@");
+        let _ = objcAddMethod(cls, "didReceiveMemoryWarning", cFnPtr(kbDidReceiveMemoryWarning), "v@:");
+        objcRegisterClass(cls)
+    } else ()
+}

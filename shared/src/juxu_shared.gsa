@@ -1,0 +1,34 @@
+/// Public facade for `juxu_shared`:
+/// Re-exports Apple CoreGraphics/ObjC geometry, text formatting (punctuation pairing & auto-space),
+/// and the high-level `JuxuSession` built directly on `juxu_core`.
+
+pub use apple_geom.{
+    CGPoint, CGSize, CGRect, NSRange,
+    cgPoint, cgSize, cgRect, nsRange, nsNotFound,
+    rectContainsPoint, rectMidX, rectMidY, rectMaxX, rectMaxY,
+    msgSendRect0, msgSendPoint0, msgSendSize0, msgSendRange0,
+    msgSendPoint1Ptr, msgSendPoint1Point1Ptr, msgSendInitFrame,
+    msgSendVoid1Rect, msgSendVoid1Point, msgSendVoid1Size,
+    msgSendVoid1Ptr1Range, msgSendVoid1Ptr2Range,
+    msgSend1Rect1U64_1I64_1Bool, msgSend4Float, msgSend2Float,
+    msgSend2Ptr, msgSend1Ptr1Bool, msgSendBool1Ptr, msgSendBool2Ptr,
+    msgSendVoid1Ptr1Bool, msgSendVoid1Int1Bool, msgSendVoid2I64,
+    msgSendVoid1Ptr1I64, msgSendVoid1Ptr1Sel, msgSendVoid1Ptr1Sel1U64,
+    mainBundleResourcePath, mainBundleIdentifier, nsStr, nsStrPtrToString,
+    objcAllocInit, objcAllocInitFrame,
+}
+pub use text_formatting.{
+    utf8FirstScalar, firstCharStr, utf8LastScalar, lastCharStr,
+    PunctuationAction, Plain, InsertPair, SkipClose,
+    closerForOpen, PunctuationPairingTracker,
+    punctuationTrackerNew, punctuationTrackerReset,
+    punctuationTrackerPrune, punctuationTrackerHandleSymbol,
+    punctuationTrackerConsumeBackspacePair,
+    AutoSpaceOptions, defaultAutoSpaceOptions,
+    shouldInsertLeadingSpace, formatAutoSpace,
+}
+pub use session.{
+    JuxuSession, sessionNew, sessionLoadDictsFromDir, sessionLoadPersistence,
+    sessionFlushUserData, sessionSaveConfig, sessionStep, sessionState,
+    sessionResetForFocusChange,
+}

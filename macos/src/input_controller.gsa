@@ -1,0 +1,165 @@
+/// Dynamic `IMKInputController` subclass (`JuxuInputController`) registered in `extern init`.
+/// Bridges macOS `IMKTextInput` client events directly into `juxu_core` via `JuxuSession`.
+
+use std.option.{Option, Some, None}
+use sys.time.{monotonicMs}
+use objc.{
+    objcClass, objcSel, objcAllocateClass, objcAddMethod, objcRegisterClass,
+    msgSend0, msgSend1Ptr, msgSendInt0, msgSendI64_0, msgSendFloat0,
+    msgSendVoid0, msgSendVoid1Ptr, msgSendVoid1I64,
+}
+use juxu_core.{
+    InputEvent, ToggleAscii, CommitPending, keyRaw,
+    snapConsumed, snapCommitText,
+}
+use juxu_shared.{
+    JuxuSession, sessionStep, sessionResetForFocusChange, sessionFlushUserData,
+    CGRect, cgRect, nsRange, nsNotFound, nsStr,
+    utf8FirstScalar, nsStrPtrToString,
+    msgSendVoid1Ptr1Range, msgSendVoid1Ptr2Range,
+}
+use shift_tap.{
+    ShiftTapDetector, shiftTapDetectorNew, shiftTapReset,
+    shiftTapHandleKeyDown, shiftTapHandleFlagsChanged,
+    modShift, modControl, modOption, modCommand, modFunction, modCapsLock,
+}
+use candidate_panel.{candidatePanelUpdate, candidatePanelHide}
+use floating_hud.{hudShow}
+use settings_window.{settingsWindowShow}
+
+def gSharedSession: Cell (Option JuxuSession) = cellNew(None)
+def gShiftDetector: Cell ShiftTapDetector = cellNew(shiftTapDetectorNew())
+
+pub def inputControllerSetSession(s: JuxuSession): Void =
+    cellSet(gSharedSession, Some(s))
+
+def nsModifiersToShiftMask(flags: Int64): Int = {
+    let m = cellNew(0);
+    // NSEventModifierFlagCapsLock = 1 << 16, Shift = 1 << 17, Control = 1 << 18, Option = 1 << 19, Command = 1 << 20, Function = 1 << 23
+    if ((flags & intToI64(1 << 17)) != intToI64(0)) cellSet(m, cellGet(m) | modShift()) else ();
+    if ((flags & intToI64(1 << 18)) != intToI64(0)) cellSet(m, cellGet(m) | modControl()) else ();
+    if ((flags & intToI64(1 << 19)) != intToI64(0)) cellSet(m, cellGet(m) | modOption()) else ();
+    if ((flags & intToI64(1 << 20)) != intToI64(0)) cellSet(m, cellGet(m) | modCommand()) else ();
+    if ((flags & intToI64(1 << 23)) != intToI64(0)) cellSet(m, cellGet(m) | modFunction()) else ();
+    if ((flags & intToI64(1 << 16)) != intToI64(0)) cellSet(m, cellGet(m) | modCapsLock()) else ();
+    cellGet(m)
+}
+
+def commitTextToClient(client: Ptr, text: String): Void =
+    if (!ptrIsNull(client) && strLen(text) > 0) {
+        let repl = nsRange(nsNotFound(), nsNotFound());
+        msgSendVoid1Ptr1Range(client, objcSel("insertText:replacementRange:"), nsStr(text), repl)
+    } else ()
+
+def setMarkedTextToClient(client: Ptr, preedit: String): Void =
+    if (!ptrIsNull(client)) {
+        let selRange = nsRange(intToI64(strLen(preedit)), intToI64(0));
+        let repl = nsRange(nsNotFound(), nsNotFound());
+        msgSendVoid1Ptr2Range(client, objcSel("setMarkedText:selectionRange:replacementRange:"), nsStr(preedit), selRange, repl)
+    } else ()
+
+def imkHandleEvent(_self: Ptr, _cmd: Ptr, event: Ptr, client: Ptr): Bool = {
+    if (ptrIsNull(event)) false
+    else match cellGet(gSharedSession) {
+        None -> false,
+        Some(s) -> {
+            let evType = msgSendI64_0(event, objcSel("type"));
+            // NSEventTypeFlagsChanged == 12
+            if (evType == intToI64(12)) {
+                let kc = msgSendInt0(event, objcSel("keyCode"));
+                let flags = msgSendI64_0(event, objcSel("modifierFlags"));
+                let ts = msgSendFloat0(event, objcSel("timestamp"));
+                let mask = nsModifiersToShiftMask(flags);
+                if (shiftTapHandleFlagsChanged(cellGet(gShiftDetector), kc, mask, ts)) {
+                    let snap = sessionStep(s, ToggleAscii);
+                    let committed = snapCommitText(snap);
+                    commitTextToClient(client, committed);
+                    setMarkedTextToClient(client, snap.displayPreedit);
+                    candidatePanelHide();
+                    hudShow(if (snap.asciiMode) "英" else "中");
+                    true
+                } else false
+            // NSEventTypeKeyDown == 10
+            } else if (evType == intToI64(10)) {
+                shiftTapHandleKeyDown(cellGet(gShiftDetector));
+                let kc = msgSendInt0(event, objcSel("keyCode"));
+                let flags = msgSendI64_0(event, objcSel("modifierFlags"));
+                let hasCmdOrCtrl = (flags & intToI64((1 << 20) | (1 << 18))) != intToI64(0);
+                let chars = nsStrPtrToString(msgSend0(event, objcSel("characters")));
+                let (scalar, _) = utf8FirstScalar(chars);
+                let nowMs = monotonicMs();
+
+                let snap = sessionStep(s, keyRaw(kc, scalar, hasCmdOrCtrl, nowMs));
+                if (snapConsumed(snap)) {
+                    let committed = snapCommitText(snap);
+                    commitTextToClient(client, committed);
+                    setMarkedTextToClient(client, snap.displayPreedit);
+                    candidatePanelUpdate(snap, cgRect(420.0, 420.0, 2.0, 18.0));
+                    true
+                } else false
+            } else false
+        },
+    }
+}
+
+def imkActivateServer(_self: Ptr, _cmd: Ptr, _client: Ptr): Void = {
+    shiftTapReset(cellGet(gShiftDetector));
+    match cellGet(gSharedSession) {
+        Some(s) -> sessionResetForFocusChange(s),
+        None -> (),
+    }
+}
+
+def imkDeactivateServer(_self: Ptr, _cmd: Ptr, client: Ptr): Void = {
+    candidatePanelHide();
+    match cellGet(gSharedSession) {
+        Some(s) -> {
+            let snap = sessionStep(s, CommitPending(monotonicMs()));
+            commitTextToClient(client, snapCommitText(snap));
+            sessionResetForFocusChange(s);
+            let _ = sessionFlushUserData(s);
+            ()
+        },
+        None -> (),
+    }
+}
+
+def imkCommitComposition(_self: Ptr, _cmd: Ptr, client: Ptr): Void = {
+    candidatePanelHide();
+    match cellGet(gSharedSession) {
+        Some(s) -> {
+            let snap = sessionStep(s, CommitPending(monotonicMs()));
+            commitTextToClient(client, snapCommitText(snap))
+        },
+        None -> (),
+    }
+}
+
+def imkShowSettings(_self: Ptr, _cmd: Ptr, _sender: Ptr): Void =
+    match cellGet(gSharedSession) {
+        Some(s) -> settingsWindowShow(s),
+        None -> (),
+    }
+
+def imkMenu(self: Ptr, _cmd: Ptr): Ptr = {
+    let m = msgSend0(msgSend0(objcClass("NSMenu"), objcSel("alloc")), objcSel("init"));
+    let item = msgSend0(msgSend0(objcClass("NSMenuItem"), objcSel("alloc")), objcSel("init"));
+    msgSendVoid1Ptr(item, objcSel("setTitle:"), nsStr("句序设置…"));
+    msgSendVoid1Ptr(item, objcSel("setTarget:"), self);
+    msgSendVoid1Ptr(item, objcSel("setAction:"), objcSel("showSettings:"));
+    msgSendVoid1Ptr(m, objcSel("addItem:"), item);
+    m
+}
+
+extern init(102) def registerInputControllerClass(): Void = {
+    let cls = objcAllocateClass("IMKInputController", "JuxuInputController");
+    if (!ptrIsNull(cls)) {
+        let _ = objcAddMethod(cls, "handleEvent:client:", cFnPtr(imkHandleEvent), "B@:@@");
+        let _ = objcAddMethod(cls, "activateServer:", cFnPtr(imkActivateServer), "v@:@");
+        let _ = objcAddMethod(cls, "deactivateServer:", cFnPtr(imkDeactivateServer), "v@:@");
+        let _ = objcAddMethod(cls, "commitComposition:", cFnPtr(imkCommitComposition), "v@:@");
+        let _ = objcAddMethod(cls, "menu", cFnPtr(imkMenu), "@@:");
+        let _ = objcAddMethod(cls, "showSettings:", cFnPtr(imkShowSettings), "v@:@");
+        objcRegisterClass(cls)
+    } else ()
+}

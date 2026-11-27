@@ -1,0 +1,125 @@
+/// High-level Juxu input session wrapping `juxu_core.JuxuEngine` directly in Geisha
+/// (zero C FFI, zero JSON parsing on hot paths).
+
+use std.option.{Option, Some, None}
+use std.result.{Result, Ok, Err}
+use std.path.{pathJoin}
+use sys.fs.{fileExists, writeFileAtomic, mkdirAll}
+use juxu_core.{
+    JuxuEngine, JuxuError,
+    InputSchema, Wubi86, Wubi98, Wubi06, Xiaohe, Pinyin, XiaoheShuangpin,
+    Cangjie3, Cangjie5, Cangjie6,
+    DictKind, SchemaDict, PinyinDict, EnglishDict, EmojiTable, AuxModel,
+    ConfigFormat, Toml,
+    InputEvent, EngineSnapshot,
+    engineNew, loadDict, hasActiveDict,
+    loadConfig, saveConfig, applyConfig, exportConfig, getSchema,
+    loadUserData, exportUserDataTsv, isUserDirty,
+    step, state, clear, trimMemory, setContext, predictNext,
+}
+use text_formatting.{
+    PunctuationPairingTracker, punctuationTrackerNew, punctuationTrackerReset,
+    AutoSpaceOptions, defaultAutoSpaceOptions,
+}
+
+pub data JuxuSession {
+    engine: JuxuEngine,
+    punctuation: PunctuationPairingTracker,
+    autoSpace: Cell AutoSpaceOptions,
+    configPath: Cell String,
+    userDataPath: Cell String,
+    dictDir: Cell String,
+}
+
+/// Create a new Juxu session with an initialized engine and default trackers.
+pub def sessionNew(): JuxuSession =
+    JuxuSession {
+        engine: engineNew(),
+        punctuation: punctuationTrackerNew(),
+        autoSpace: cellNew(defaultAutoSpaceOptions()),
+        configPath: cellNew(""),
+        userDataPath: cellNew(""),
+        dictDir: cellNew(""),
+    }
+
+/// Load all available dictionaries from `dictDir` into the session's engine.
+/// Missing optional schema dicts are tolerated; returns `Ok(loadedCount)`.
+pub def sessionLoadDictsFromDir(s: JuxuSession, dir: String): Int = {
+    cellSet(s.dictDir, dir);
+    let loaded = cellNew(0);
+    let tryOne = (kind: DictKind, file: String) -> {
+        let p = pathJoin(dir, file);
+        if (fileExists(p)) {
+            match loadDict(s.engine, kind, p) {
+                Ok(_) -> cellSet(loaded, cellGet(loaded) + 1),
+                Err(_) -> (),
+            }
+        } else ()
+    };
+    tryOne(PinyinDict, "pinyin.pydict");
+    tryOne(AuxModel, "wubi_aux.wbaux");
+    tryOne(EnglishDict, "english.endict");
+    tryOne(EmojiTable, "emoji.tsv");
+    tryOne(SchemaDict(Wubi86), "wubi86.wbdict");
+    tryOne(SchemaDict(Wubi98), "wubi98.wbdict");
+    tryOne(SchemaDict(Wubi06), "wubi06.wbdict");
+    tryOne(SchemaDict(Xiaohe), "xiaohe.wbdict");
+    tryOne(SchemaDict(Cangjie3), "cangjie3.wbdict");
+    tryOne(SchemaDict(Cangjie5), "cangjie5.wbdict");
+    tryOne(SchemaDict(Cangjie6), "cangjie6.wbdict");
+    cellGet(loaded)
+}
+
+/// Bind persistent config & user-data paths in `dataDir` and load them if present.
+pub def sessionLoadPersistence(s: JuxuSession, dataDir: String): Void = {
+    let _ = mkdirAll(dataDir);
+    let cfgP = pathJoin(dataDir, "config.toml");
+    let usrP = pathJoin(dataDir, "user_data.tsv");
+    cellSet(s.configPath, cfgP);
+    cellSet(s.userDataPath, usrP);
+    if (fileExists(cfgP)) {
+        let _ = loadConfig(s.engine, cfgP);
+        ()
+    } else ();
+    if (fileExists(usrP)) {
+        let _ = loadUserData(s.engine, usrP);
+        ()
+    } else ()
+}
+
+/// Flush dirty user data to disk atomically if `userDataPath` is configured.
+pub def sessionFlushUserData(s: JuxuSession): Bool = {
+    let p = cellGet(s.userDataPath);
+    if (strLen(p) > 0 && isUserDirty(s.engine)) {
+        let tsv = exportUserDataTsv(s.engine);
+        match writeFileAtomic(p, tsv) {
+            Ok(_) -> true,
+            Err(_) -> false,
+        }
+    } else false
+}
+
+/// Save current config TOML to `configPath` if configured.
+pub def sessionSaveConfig(s: JuxuSession): Bool = {
+    let p = cellGet(s.configPath);
+    if (strLen(p) > 0) {
+        match saveConfig(s.engine, p) {
+            Ok(_) -> true,
+            Err(_) -> false,
+        }
+    } else false
+}
+
+/// Step the session's engine with an `InputEvent`.
+pub def sessionStep(s: JuxuSession, ev: InputEvent): EngineSnapshot =
+    step(s.engine, ev)
+
+/// Read the current `EngineSnapshot` without mutating state.
+pub def sessionState(s: JuxuSession): EngineSnapshot =
+    state(s.engine)
+
+/// Reset composition & punctuation trackers on client switch / deactivation.
+pub def sessionResetForFocusChange(s: JuxuSession): Void = {
+    clear(s.engine);
+    punctuationTrackerReset(s.punctuation)
+}

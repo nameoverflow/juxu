@@ -1,0 +1,44 @@
+/// Pure AppKit floating mode HUD toast (`中` / `英` / schema switch).
+
+use objc.{
+    objcClass, objcSel, msgSend0, msgSendVoid1Ptr, msgSendVoid1I64, msgSendVoid1Bool,
+}
+use juxu_shared.{
+    cgRect, nsStr, msgSend1Rect1U64_1I64_1Bool, msgSendVoid1Rect, objcAllocInitFrame,
+}
+
+def gHudPanel: Cell Ptr = cellNew(ptrNull())
+def gHudLabel: Cell Ptr = cellNew(ptrNull())
+
+pub def hudShow(text: String): Void = {
+    let panel = if (!ptrIsNull(cellGet(gHudPanel))) cellGet(gHudPanel)
+    else {
+        let frame = cgRect(600.0, 120.0, 96.0, 44.0);
+        let pAlloc = msgSend0(objcClass("NSPanel"), objcSel("alloc"));
+        let p = msgSend1Rect1U64_1I64_1Bool(
+            pAlloc,
+            objcSel("initWithContentRect:styleMask:backing:defer:"),
+            frame, intToI64(128), intToI64(2), false
+        );
+        msgSendVoid1I64(p, objcSel("setLevel:"), intToI64(6));
+        msgSendVoid1I64(p, objcSel("setAnimationBehavior:"), intToI64(2));
+        let lbl = objcAllocInitFrame("NSTextField", cgRect(8.0, 10.0, 80.0, 24.0));
+        msgSendVoid1Bool(lbl, objcSel("setBezeled:"), false);
+        msgSendVoid1Bool(lbl, objcSel("setDrawsBackground:"), false);
+        msgSendVoid1Bool(lbl, objcSel("setEditable:"), false);
+        msgSendVoid1Bool(lbl, objcSel("setSelectable:"), false);
+        msgSendVoid1I64(lbl, objcSel("setAlignment:"), intToI64(1)); // NSTextAlignmentCenter
+        msgSendVoid1Ptr(p, objcSel("setContentView:"), lbl);
+        cellSet(gHudPanel, p);
+        cellSet(gHudLabel, lbl);
+        p
+    };
+    let lbl = cellGet(gHudLabel);
+    msgSendVoid1Ptr(lbl, objcSel("setStringValue:"), nsStr(text));
+    msgSendVoid1Ptr(panel, objcSel("orderFrontRegardless"), ptrNull())
+}
+
+pub def hudHide(): Void = {
+    let p = cellGet(gHudPanel);
+    if (!ptrIsNull(p)) msgSendVoid1Ptr(p, objcSel("orderOut:"), ptrNull()) else ()
+}
