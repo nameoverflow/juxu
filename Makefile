@@ -71,7 +71,8 @@ ios-sim-app:
 	codesign --force --sign - ios-app/build/Juxu.app
 
 ios-app:
-	cd ios-keyboard && $(GEISHA) build --target ios-app -o build/JuxuKeyboard-device.appex
+	cd ios-keyboard && $(GEISHA) build --target ios-app -o build/JuxuKeyboard.appex
+	cp -R ios-keyboard/build/JuxuKeyboard.appex ios-keyboard/build/JuxuKeyboard-device.appex
 	cd ios-app && $(GEISHA) build --target ios-app -o build/Juxu-device.app
 
 all-targets: macos-app ios-sim-app ios-app
